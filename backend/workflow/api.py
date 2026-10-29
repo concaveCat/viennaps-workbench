@@ -324,7 +324,7 @@ async def execute_segment_endpoint(segment_id: str, request: Request) -> Segment
 async def cancel_segment(segment_id: str, request: Request) -> SegmentV1:
     store = get_store()
     segment = _call(lambda: store.get_segment(segment_id))
-    if segment.runId and segment.status in {"running", "planned"}:
+    if segment.runId and segment.status == "running":
         supervisor = getattr(request.app.state, "supervisor", None)
         if supervisor is not None:
             supervisor.cancel(segment.runId)
