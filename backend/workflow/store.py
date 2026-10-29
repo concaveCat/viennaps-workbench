@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .binding import verify_binding
+from .hashing import full_project_hash
 from .ids import sha256_hex
 from .metrology import (
     MeasurementResultV1,
@@ -15,7 +18,9 @@ from .metrology import (
     MetricDefinitionV1,
     measure_snapshot,
 )
+from ..models import parse_project
 from .models import CompiledWorkflowV1
+from .provenance import VerificationRecordV1
 from .routes import (
     AttemptV1,
     RoutePlanV1,
@@ -27,7 +32,7 @@ from .routes import (
 from .verification import prefix_compatibility, verify_route_plan_compiles
 
 
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 
 
 class WorkflowError(Exception):
@@ -63,7 +68,7 @@ class WorkflowStore:
                     row = preflight.execute(
                         "SELECT value FROM schema_meta WHERE key = 'schema_version'"
                     ).fetchone()
-                    if row is not None and row[0] not in {"1", "2", SCHEMA_VERSION}:
+                    if row is not None and row[0] not in {"1", "2", "3", SCHEMA_VERSION}:
                         raise RuntimeError(
                             f"unsupported workflow schema version {row[0]!r}; "
                             f"expected {SCHEMA_VERSION!r}"
@@ -169,13 +174,26 @@ class WorkflowStore:
                     coordinate_system TEXT NOT NULL,
                     uncertainty REAL,
                     uncertainty_status TEXT NOT NULL,
+                    binding_status TEXT NOT NULL DEFAULT 'unbound',
+                    binding_evidence_json TEXT,
+                    equivalence_status TEXT NOT NULL DEFAULT 'not_evaluated',
+                    equivalence_evidence_json TEXT,
                     created_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS attempts_route_idx ON attempts(route_id);
                 CREATE INDEX IF NOT EXISTS segments_attempt_idx ON segments(attempt_id);
                 CREATE INDEX IF NOT EXISTS reuse_attempt_idx ON reuse(attempt_id);
+                CREATE TABLE IF NOT EXISTS measurement_verifications (
+                    verification_id TEXT PRIMARY KEY,
+                    measurement_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    method_version TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS measurements_run_idx ON measurements(source_run_id);
                 CREATE INDEX IF NOT EXISTS measurements_recipe_idx ON measurements(recipe_id, recipe_version);
+                CREATE INDEX IF NOT EXISTS measurement_verifications_idx ON measurement_verifications(measurement_id);
                 CREATE TABLE IF NOT EXISTS schema_meta (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
@@ -193,6 +211,15 @@ class WorkflowStore:
             reuse_columns = {row[1] for row in connection.execute("PRAGMA table_info(reuse)")}
             if "legacy_compatibility_json" not in reuse_columns:
                 connection.execute("ALTER TABLE reuse ADD COLUMN legacy_compatibility_json TEXT")
+            measurement_columns = {row[1] for row in connection.execute("PRAGMA table_info(measurements)")}
+            if "binding_status" not in measurement_columns:
+                connection.execute("ALTER TABLE measurements ADD COLUMN binding_status TEXT NOT NULL DEFAULT 'unbound'")
+            if "binding_evidence_json" not in measurement_columns:
+                connection.execute("ALTER TABLE measurements ADD COLUMN binding_evidence_json TEXT")
+            if "equivalence_status" not in measurement_columns:
+                connection.execute("ALTER TABLE measurements ADD COLUMN equivalence_status TEXT NOT NULL DEFAULT 'not_evaluated'")
+            if "equivalence_evidence_json" not in measurement_columns:
+                connection.execute("ALTER TABLE measurements ADD COLUMN equivalence_evidence_json TEXT")
 
             version_row = connection.execute(
                 "SELECT value FROM schema_meta WHERE key = 'schema_version'"
@@ -208,6 +235,11 @@ class WorkflowStore:
                     "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
                     (SCHEMA_VERSION,),
                 )
+            elif version_row["value"] == "3":
+                connection.execute(
+                    "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
+                    (SCHEMA_VERSION,),
+                )
             elif version_row["value"] != SCHEMA_VERSION:
                 raise RuntimeError(
                     f"unsupported workflow schema version {version_row['value']!r}; "
@@ -215,11 +247,18 @@ class WorkflowStore:
                 )
 
     def _migrate_legacy_compatibility(self, connection: sqlite3.Connection) -> None:
-        """Repair v2 prefix summaries from saved compiles; otherwise mark legacy."""
+        """Repair v2 prefix summaries only after a full cross-compile check.
 
-        route_rows = connection.execute("SELECT route_id FROM routes").fetchall()
-        for route_row in route_rows:
-            route_id = route_row["route_id"]
+        A source and target can each be rebuilt from their own compile and still
+        be incompatible with each other. The migrated RoutePlan is therefore
+        assembled in memory and validated before any row is updated. If that
+        fails, the original summaries are preserved and the whole route is
+        marked legacy/unverified.
+        """
+
+        route_rows = connection.execute("SELECT * FROM routes").fetchall()
+        for route in route_rows:
+            route_id = route["route_id"]
             attempts = connection.execute(
                 "SELECT * FROM attempts WHERE route_id = ?", (route_id,)
             ).fetchall()
@@ -231,88 +270,144 @@ class WorkflowStore:
                 "SELECT * FROM reuse WHERE attempt_id IN (SELECT attempt_id FROM attempts WHERE route_id = ?)",
                 (route_id,),
             ).fetchall()
-            attempts_by_id = {row["attempt_id"]: row for row in attempts}
             segments_by_id = {row["segment_id"]: row for row in segments}
-            legacy = False
-
-            for attempt in attempts:
-                raw = attempt["prefix_compatibility_json"]
-                if raw is None:
-                    continue
-                old = json.loads(raw)
-                if "solverDigest" in old:
-                    continue
-                candidate = None
+            attempts_by_id = {row["attempt_id"]: row for row in attempts}
+            compiles: dict[str, CompiledWorkflowV1] = {}
+            for compile_id in {row["compile_id"] for row in attempts} | {row["source_compile_id"] for row in segments}:
                 compile_row = connection.execute(
                     "SELECT envelope_json FROM compiles WHERE compile_id = ?",
-                    (attempt["compile_id"],),
+                    (compile_id,),
                 ).fetchone()
-                if compile_row is not None:
-                    try:
-                        compiled = CompiledWorkflowV1.model_validate(json.loads(compile_row["envelope_json"]))
-                        candidate = prefix_compatibility(compiled, old["stepIds"], attempt["run_seed"]).model_dump(mode="json", exclude_none=True)
-                    except (ValueError, KeyError, TypeError):
-                        candidate = None
-                if candidate is not None and all(
-                    old.get(key) == candidate.get(key)
-                    for key in ("geometryBindingHash", "seedPolicy", "runSeed", "stepIds", "resolvedStepDigest")
-                ):
-                    connection.execute(
-                        "UPDATE attempts SET prefix_compatibility_json = ?, legacy_compatibility_json = NULL WHERE attempt_id = ?",
-                        (self._dump(candidate), attempt["attempt_id"]),
-                    )
-                else:
-                    legacy = True
-                    old.setdefault("prefixDigest", "0" * 64)
-                    old["solverDigest"] = "0" * 64
-                    connection.execute(
-                        "UPDATE attempts SET prefix_compatibility_json = ?, legacy_compatibility_json = ? WHERE attempt_id = ?",
-                        (self._dump(old), raw, attempt["attempt_id"]),
-                    )
-
-            for item in reuse:
-                raw = item["compatibility_json"]
-                if raw is None:
+                if compile_row is None:
                     continue
+                try:
+                    compiles[compile_id] = CompiledWorkflowV1.model_validate(json.loads(compile_row["envelope_json"]))
+                except (ValueError, TypeError, KeyError):
+                    continue
+
+            legacy = False
+
+            def repair_attempt(row: sqlite3.Row) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+                nonlocal legacy
+                raw = row["prefix_compatibility_json"]
+                if raw is None:
+                    return None, None
                 old = json.loads(raw)
                 if "solverDigest" in old:
-                    continue
+                    return old, old
+                compiled = compiles.get(row["compile_id"])
+                if compiled is not None:
+                    try:
+                        candidate = prefix_compatibility(compiled, old["stepIds"], row["run_seed"]).model_dump(mode="json", exclude_none=True)
+                        if all(
+                            old.get(key) == candidate.get(key)
+                            for key in ("geometryBindingHash", "seedPolicy", "runSeed", "stepIds", "resolvedStepDigest")
+                        ):
+                            return candidate, old
+                    except (ValueError, KeyError, TypeError):
+                        pass
+                legacy = True
+                placeholder = dict(old)
+                placeholder.setdefault("prefixDigest", "0" * 64)
+                placeholder["solverDigest"] = "0" * 64
+                return placeholder, old
+
+            def repair_reuse(item: sqlite3.Row) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+                nonlocal legacy
+                raw = item["compatibility_json"]
+                if raw is None:
+                    return None, None
+                old = json.loads(raw)
+                if "solverDigest" in old:
+                    return old, old
                 source = segments_by_id.get(item["reused_from_segment_id"])
                 source_attempt = None if source is None else attempts_by_id.get(source["attempt_id"])
-                candidate = None
                 if source is not None and source_attempt is not None:
-                    compile_row = connection.execute(
-                        "SELECT envelope_json FROM compiles WHERE compile_id = ?",
-                        (source["source_compile_id"],),
-                    ).fetchone()
-                    if compile_row is not None:
+                    compiled = compiles.get(source["source_compile_id"])
+                    if compiled is not None:
                         try:
-                            compiled = CompiledWorkflowV1.model_validate(json.loads(compile_row["envelope_json"]))
                             candidate = prefix_compatibility(compiled, old["stepIds"], source_attempt["run_seed"]).model_dump(mode="json", exclude_none=True)
+                            if all(
+                                old.get(key) == candidate.get(key)
+                                for key in ("geometryBindingHash", "seedPolicy", "runSeed", "stepIds", "resolvedStepDigest")
+                            ):
+                                return candidate, old
                         except (ValueError, KeyError, TypeError):
-                            candidate = None
-                if candidate is not None and all(
-                    old.get(key) == candidate.get(key)
-                    for key in ("geometryBindingHash", "seedPolicy", "runSeed", "stepIds", "resolvedStepDigest")
-                ):
-                    connection.execute(
-                        "UPDATE reuse SET compatibility_json = ?, legacy_compatibility_json = NULL WHERE reuse_id = ?",
-                        (self._dump(candidate), item["reuse_id"]),
-                    )
-                else:
-                    legacy = True
-                    old.setdefault("prefixDigest", "0" * 64)
-                    old["solverDigest"] = "0" * 64
-                    connection.execute(
-                        "UPDATE reuse SET compatibility_json = ?, legacy_compatibility_json = ? WHERE reuse_id = ?",
-                        (self._dump(old), raw, item["reuse_id"]),
-                    )
+                            pass
+                legacy = True
+                placeholder = dict(old)
+                placeholder.setdefault("prefixDigest", "0" * 64)
+                placeholder["solverDigest"] = "0" * 64
+                return placeholder, old
 
-            if legacy:
+            attempt_candidates = {row["attempt_id"]: repair_attempt(row) for row in attempts}
+            reuse_candidates = {item["reuse_id"]: repair_reuse(item) for item in reuse}
+
+            def payload(*, legacy_flag: bool) -> dict[str, Any]:
+                attempt_payloads = []
+                for row in attempts:
+                    item = self._attempt_payload(row)
+                    candidate, original = attempt_candidates[row["attempt_id"]]
+                    item["prefixCompatibility"] = candidate
+                    item["legacyCompatibility"] = original if legacy_flag else None
+                    attempt_payloads.append(item)
+                reuse_payloads = []
+                for item_row in reuse:
+                    item = self._reuse_payload(item_row)
+                    candidate, original = reuse_candidates[item_row["reuse_id"]]
+                    item["compatibility"] = candidate
+                    item["legacyCompatibility"] = original if legacy_flag else None
+                    reuse_payloads.append(item)
+                return {
+                    "route": {
+                        "routeId": route["route_id"],
+                        "flowId": route["flow_id"],
+                        "name": route["name"],
+                        "headAttemptId": route["head_attempt_id"],
+                        "legacyUnverified": legacy_flag,
+                    },
+                    "stepOrder": json.loads(route["step_order_json"]),
+                    "attempts": attempt_payloads,
+                    "segments": [self._segment_payload(row) for row in segments],
+                    "reuse": reuse_payloads,
+                }
+
+            verified_payload = payload(legacy_flag=False)
+            try:
+                migrated = RoutePlanV1.model_validate(verified_payload)
+                verify_route_plan_compiles(migrated, compiles)
+            except (ValueError, KeyError, TypeError):
+                legacy = True
+            final_payload = payload(legacy_flag=legacy)
+            try:
+                RoutePlanV1.model_validate(final_payload)
+            except (ValueError, KeyError, TypeError) as exc:
+                raise RuntimeError(f"legacy route {route_id!r} cannot be reconstructed safely: {exc}") from exc
+
+            for row in attempts:
+                candidate, original = attempt_candidates[row["attempt_id"]]
                 connection.execute(
-                    "UPDATE routes SET legacy_unverified = 1 WHERE route_id = ?",
-                    (route_id,),
+                    "UPDATE attempts SET prefix_compatibility_json = ?, legacy_compatibility_json = ? WHERE attempt_id = ?",
+                    (
+                        None if candidate is None else self._dump(candidate),
+                        None if not legacy or original is None else self._dump(original),
+                        row["attempt_id"],
+                    ),
                 )
+            for item in reuse:
+                candidate, original = reuse_candidates[item["reuse_id"]]
+                connection.execute(
+                    "UPDATE reuse SET compatibility_json = ?, legacy_compatibility_json = ? WHERE reuse_id = ?",
+                    (
+                        None if candidate is None else self._dump(candidate),
+                        None if not legacy or original is None else self._dump(original),
+                        item["reuse_id"],
+                    ),
+                )
+            connection.execute(
+                "UPDATE routes SET legacy_unverified = ? WHERE route_id = ?",
+                (1 if legacy else 0, route_id),
+            )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30.0)
@@ -574,6 +669,10 @@ class WorkflowStore:
             "coordinateSystem": row["coordinate_system"],
             "uncertainty": row["uncertainty"],
             "uncertaintyStatus": row["uncertainty_status"],
+            "bindingStatus": row["binding_status"],
+            "bindingEvidence": None if row["binding_evidence_json"] is None else json.loads(row["binding_evidence_json"]),
+            "equivalenceStatus": row["equivalence_status"],
+            "equivalenceEvidence": None if row["equivalence_evidence_json"] is None else json.loads(row["equivalence_evidence_json"]),
             "createdAt": row["created_at"],
         }
 
@@ -588,8 +687,9 @@ class WorkflowStore:
                         algorithm_version, source_run_id, source_step_id, source_state_id,
                         source_snapshot_hash, status, value, unit, reason,
                         intersections_json, material, region_json, coordinate_system,
-                        uncertainty, uncertainty_status, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        uncertainty, uncertainty_status, binding_status, binding_evidence_json,
+                        equivalence_status, equivalence_evidence_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         result.measurementId, result.metricId, result.recipeId, result.recipeVersion,
@@ -598,6 +698,10 @@ class WorkflowStore:
                         result.unit, result.reason, self._dump(result.intersections), result.material,
                         None if result.region is None else self._dump(result.region.model_dump(mode="json")),
                         result.coordinateSystem, result.uncertainty, result.uncertaintyStatus,
+                        result.bindingStatus,
+                        None if result.bindingEvidence is None else self._dump(result.bindingEvidence.model_dump(mode="json", exclude_none=True)),
+                        result.equivalenceStatus,
+                        None if result.equivalenceEvidence is None else self._dump(result.equivalenceEvidence.model_dump(mode="json", exclude_none=True)),
                         result.createdAt or self._now(),
                     ),
                 )
@@ -615,7 +719,13 @@ class WorkflowStore:
             raise WorkflowNotFound(f"measurement {measurement_id!r} does not exist")
         return MeasurementResultV1.model_validate(self._measurement_payload(row))
 
-    def list_measurements(self, *, run_id: str | None = None, recipe_id: str | None = None) -> list[MeasurementResultV1]:
+    def list_measurements(
+        self,
+        *,
+        run_id: str | None = None,
+        recipe_id: str | None = None,
+        binding_status: str | None = None,
+    ) -> list[MeasurementResultV1]:
         clauses = []
         params: list[Any] = []
         if run_id is not None:
@@ -624,6 +734,9 @@ class WorkflowStore:
         if recipe_id is not None:
             clauses.append("recipe_id = ?")
             params.append(recipe_id)
+        if binding_status is not None:
+            clauses.append("binding_status = ?")
+            params.append(binding_status)
         query = "SELECT * FROM measurements"
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
@@ -674,6 +787,129 @@ class WorkflowStore:
             source_step_id=step_id,
             source_state_id=state_id,
         )
+
+    @staticmethod
+    def _verification_payload(row: sqlite3.Row) -> dict[str, Any]:
+        evidence = json.loads(row["evidence_json"])
+        return {
+            "verificationId": row["verification_id"],
+            "measurementId": row["measurement_id"],
+            "status": row["status"],
+            "methodVersion": row["method_version"],
+            "createdAt": row["created_at"],
+            "evidence": evidence,
+        }
+
+    def list_verifications(self, measurement_id: str) -> list[VerificationRecordV1]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM measurement_verifications WHERE measurement_id = ? ORDER BY rowid",
+                (measurement_id,),
+            ).fetchall()
+        return [VerificationRecordV1.model_validate(self._verification_payload(row)) for row in rows]
+
+    def _record_verification(self, measurement_id: str, evidence, now: str) -> VerificationRecordV1:
+        verification_id = f"v_{uuid.uuid4().hex}"
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO measurement_verifications (
+                    verification_id, measurement_id, status, method_version, evidence_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    verification_id,
+                    measurement_id,
+                    "verified" if evidence.binding_verified else "failed",
+                    evidence.methodVersion,
+                    self._dump(evidence.model_dump(mode="json", exclude_none=True)),
+                    now,
+                ),
+            )
+        return VerificationRecordV1(
+            verificationId=verification_id,
+            measurementId=measurement_id,
+            status="verified" if evidence.binding_verified else "failed",
+            methodVersion=evidence.methodVersion,
+            createdAt=now,
+            evidence=evidence,
+        )
+
+    def bind_measurement(self, measurement_id: str, segment_id: str, run_id: str, step_id: str) -> MeasurementResultV1:
+        """Recompute execution/step/source evidence; keep failures explicit."""
+
+        from .. import snapshots, storage
+
+        measurement = self.get_measurement(measurement_id)
+        segment = self.get_segment(segment_id)
+        attempt = self.get_attempt(segment.attemptId)
+        plan = self.get_plan(attempt.routeId)
+        compile_record = self.get_compile(segment.sourceCompileId)
+
+        manifest: dict[str, Any] | None = None
+        snapshot_row: dict[str, Any] | None = None
+        snapshot: dict[str, Any] | None = None
+        state_hash: str | None = None
+        submitted_project_hash: str | None = None
+        submitted_project = None
+        try:
+            run_dir = storage.run_path(run_id)
+            manifest = storage.read_json(run_dir / "manifest.json")
+            snapshot_row = next(
+                (item for item in manifest.get("snapshots", []) if item.get("stepId") == step_id),
+                None,
+            )
+            if snapshot_row is not None:
+                snapshot_path = snapshots.ensure_materialized(run_dir, step_id)
+                snapshot = storage.read_json(snapshot_path)
+                state = snapshot_row.get("nativeState") or {}
+                if state:
+                    state_path = storage.resolve_domain_state(state)
+                    state_hash = storage.file_sha256(state_path)
+            try:
+                submitted_project = parse_project(manifest["normalizedProject"])
+                submitted_project_hash = full_project_hash(submitted_project)
+            except (KeyError, ValueError, TypeError):
+                submitted_project = None
+                submitted_project_hash = None
+        except (FileNotFoundError, OSError, ValueError):
+            pass
+
+        evidence = verify_binding(
+            measurement=measurement,
+            plan=plan,
+            attempt=attempt,
+            segment=segment,
+            compile_record=compile_record,
+            manifest=manifest,
+            snapshot_row=snapshot_row,
+            snapshot=snapshot,
+            state_hash=state_hash,
+            submitted_project=submitted_project,
+            submitted_project_hash=submitted_project_hash,
+            run_id=run_id,
+            step_id=step_id,
+        )
+        now = self._now()
+        self._record_verification(measurement_id, evidence, now)
+        status = "verified" if evidence.binding_verified else "failed"
+        update_cache = True
+        if status == "failed" and measurement.bindingStatus == "verified":
+            current = measurement.bindingEvidence
+            same_binding = (
+                current is not None
+                and current.execution.segmentId == segment_id
+                and current.execution.runId == run_id
+                and current.targetStep.stepId == step_id
+            )
+            update_cache = same_binding
+        if update_cache:
+            with self._connect() as connection:
+                connection.execute(
+                    "UPDATE measurements SET binding_status = ?, binding_evidence_json = ? WHERE measurement_id = ?",
+                    (status, self._dump(evidence.model_dump(mode="json", exclude_none=True)), measurement_id),
+                )
+        return self.get_measurement(measurement_id)
 
     def create_plan(self, plan: RoutePlanV1) -> RoutePlanV1:
         self._verify_plan_compiles(plan)

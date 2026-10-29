@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from backend.models import (
     AdvectionSettingsV7,
+    Domain,
     Domain3D,
     FixedRandom,
     RayTracingSettingsV7,
@@ -21,6 +22,7 @@ from backend.workflow import (
     SegmentV1,
     compile_flow,
 )
+from backend.workflow.hashing import full_project_hash
 from backend.workflow.verification import prefix_compatibility
 
 
@@ -88,6 +90,63 @@ def _flow(revision: int, step4_duration: float, solver: SolverV7 | None = None) 
         name="fixture flow",
         steps=[_step(step_id, duration) for step_id, duration in zip(STEP_IDS, durations)],
         solver=solver or _solver(),
+    )
+
+
+def _binding_2d() -> GeometryBindingV1:
+    return GeometryBindingV1(
+        schemaVersion=1,
+        bindingId="bind_fixture_2d",
+        name="fixture 2D plane",
+        dimension=2,
+        units=UNITS,
+        domain=Domain(gridDelta=0.2, xExtent=4.0, xBoundary="reflective"),
+        geometry={"kind": "plane", "height": 0.0, "substrateMaterial": "Si"},
+    )
+
+
+def compiled_2d() -> CompiledWorkflowV1:
+    return compile_flow(_flow(1, 0.2), _binding_2d())
+
+
+def binding_plan_2d(compiled: CompiledWorkflowV1, *, suffix: str, run_id: str, state_hash: str) -> RoutePlanV1:
+    step_ids = [step.id for step in compiled.project.steps]
+    end = _checkpoint("cp_end", step_ids[-1], "e")
+    end.stateHash = state_hash
+    attempt = AttemptV1(
+        attemptId=f"A{suffix}",
+        routeId=f"R{suffix}",
+        compileId=compiled.compileRecord.compileId,
+        submissionKey=f"sub{suffix}",
+        startAfterStepId=None,
+        throughStepId=step_ids[-1],
+        seedPolicy="shared-run-seed",
+        runSeed=compiled.project.solver.random.seed,
+        flowDigest=compiled.compileRecord.fullProjectHash,
+        status="succeeded",
+    )
+    segment = SegmentV1(
+        segmentId=f"S{suffix}",
+        attemptId=attempt.attemptId,
+        sourceCompileId=compiled.compileRecord.compileId,
+        segmentProjectHash=full_project_hash(compiled.project),
+        startAfterStepId=None,
+        throughStepId=step_ids[-1],
+        startCheckpointRef=None,
+        endCheckpointRef=end,
+        runId=run_id,
+        provenanceInputHash="a" * 64,
+        flowDigest=compiled.compileRecord.fullProjectHash,
+        executionHash="e" * 64,
+        resultDigest="d" * 64,
+        status="succeeded",
+    )
+    return RoutePlanV1(
+        route={"routeId": f"R{suffix}", "flowId": "flow_fixture_01", "name": "binding route", "headAttemptId": attempt.attemptId},
+        stepOrder=step_ids,
+        attempts=[attempt],
+        segments=[segment],
+        reuse=[],
     )
 
 

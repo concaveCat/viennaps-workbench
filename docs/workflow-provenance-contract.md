@@ -1,6 +1,6 @@
 # Workflow provenance and measurement binding contract
 
-**Status**: Draft for implementation after P0-3  
+**Status**: Binding v1 implemented; equivalence remains separate and unimplemented.
 **Scope**: Measurement → Route/Attempt/Segment binding  
 **Non-goal**: claiming that a measurement is a verified result of a real run until every required evidence item below is present.
 
@@ -27,6 +27,7 @@ Rules:
 | Evidence object | Minimum requirement |
 |---|---|
 | **Execution ownership** | Server establishes or verifies `Segment → actual Run`. The actual submitted project must match `segmentProjectHash` and the source `CompileRecord`. |
+| **Segment input derivation** | From the full Compile, step range, starting checkpoint and actual seed, derive the expected Segment input; compare it with the real Run's `normalizedProject` (not only its hash). |
 | **Target step** | The target step belongs to that segment; the run manifest contains its snapshot; the step is recorded as completed. |
 | **Source identity** | Measurement `sourceStateId` equals the native state of that step; `sourceSnapshotHash` is recomputed from the snapshot actually read. |
 | **Verification record** | Persist method version, evidence references, result, and failure reason. |
@@ -35,6 +36,8 @@ Additional rules:
 
 - If any item is missing or mismatched, `bindingStatus=failed` (with reason) or remains `unbound`; never `verified`.
 - The actual submitted project hash is compared to `segmentProjectHash`; the segment's `sourceCompileId` must resolve to an immutable CompileRecord.
+- The expected Segment input is derived from the full Compile slice (steps, geometry/domain/material binding, solver settings, starting checkpoint and seed) and compared with the real Run `normalizedProject`. A matching hash alone is insufficient if the project cannot be derived from the Compile.
+- If Measurement already has `sourceRunId` or `sourceStepId`, the binding request must match them. Equal geometry hashes do not permit reattributing the Measurement to another run.
 - The run manifest must record the step as completed and reference the snapshot/state. A step that merely appears in a string field is not sufficient.
 - If the snapshot is re-materialized or its content changes, `sourceSnapshotHash` must be recomputed and the binding re-checked.
 
@@ -91,12 +94,16 @@ ProvenanceVerificationV1 {
 unbound ──verify success──► verified
 unbound ──verify failure──► failed (reason preserved)
 failed  ──new evidence────► verified
-verified ──hash/state mismatch──► failed (revoked)
+verified ──same-binding re-verification mismatch──► failed (revoked)
+verified ──different candidate fails──► verified (failure recorded separately)
 ```
 
 - A measurement created with `POST /measurements` from a raw snapshot is `unbound` unless the caller also supplies a server-verifiable segment/run/step identity.
 - `POST /measurements/from-run` may verify execution ownership only when the run/step/state exists and matches. Otherwise it returns the Measurement as `unbound` with a reason.
 - Binding is idempotent for the same evidence; a new verification method version produces a new verification record, not a mutated old one.
+- Verification records are append-only and carry their own ID. Measurement caches only the current status/evidence.
+- A failed attempt to bind a different Segment/run/step must be recorded but must not automatically revoke an existing verified binding.
+- The same failed binding may revoke `verified` only when it re-verifies the identical Segment/run/step and the current evidence no longer matches.
 
 ## 6. Persistence and API proposal
 
@@ -109,16 +116,30 @@ equivalence_status TEXT NOT NULL DEFAULT 'not_evaluated',
 equivalence_evidence_json TEXT
 ```
 
-Proposed endpoints:
+Verification records are stored separately:
+
+```text
+measurement_verifications {
+  verificationId, measurementId, status,
+  methodVersion, evidenceJson, createdAt
+}
+```
+
+Implemented endpoints for binding v1:
 
 ```text
 POST /api/v1/workflow/measurements/{measurementId}/bind
 GET  /api/v1/workflow/measurements/{measurementId}/provenance
-POST /api/v1/workflow/measurements/{measurementId}/equivalence
 GET  /api/v1/workflow/measurements?binding_status=unbound
 ```
 
-`POST /bind` accepts an explicit `segmentId`, `runId`, `stepId` and evidence references; it must not trust arbitrary strings without manifest/state/snapshot checks.
+Equivalence remains separate and is not part of `/bind`:
+
+```text
+POST /api/v1/workflow/measurements/{measurementId}/equivalence   # not implemented
+```
+
+`POST /bind` accepts an explicit `segmentId`, `runId`, `stepId` and evidence references; it must not trust arbitrary strings without manifest/state/snapshot checks. `GET /provenance` returns the current cached binding plus the ordered verification records.
 
 ## 7. Acceptance tests for the next stage
 

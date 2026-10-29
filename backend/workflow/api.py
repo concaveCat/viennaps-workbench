@@ -13,6 +13,7 @@ from .. import storage
 from ..models import StrictModel
 from .metrology import MeasurementResultV1, MetrologyRecipeV1, MetricDefinitionV1
 from .models import CompiledWorkflowV1
+from .provenance import ProvenanceVerificationV1, VerificationRecordV1
 from .routes import AttemptV1, RoutePlanV1, SegmentRefV1, SegmentReuseV1, SegmentV1
 from .store import WorkflowConflict, WorkflowError, WorkflowNotFound, WorkflowStore, WorkflowValidation
 
@@ -61,6 +62,19 @@ class MeasureRunRequest(StrictModel):
 
 class MeasurementListResponse(StrictModel):
     measurements: list[MeasurementResultV1]
+
+
+class BindMeasurementRequest(StrictModel):
+    segmentId: str
+    runId: str
+    stepId: str
+
+
+class MeasurementProvenanceResponse(StrictModel):
+    measurementId: str
+    bindingStatus: str
+    bindingEvidence: ProvenanceVerificationV1 | None = None
+    verifications: list[VerificationRecordV1] = Field(default_factory=list)
 
 
 class RouteSummaryV1(StrictModel):
@@ -177,9 +191,44 @@ async def measure_run(request: MeasureRunRequest) -> MeasurementResultV1:
 
 
 @router.get("/measurements", response_model=MeasurementListResponse)
-async def list_measurements(run_id: str | None = None, recipe_id: str | None = None) -> MeasurementListResponse:
-    rows = _call(lambda: get_store().list_measurements(run_id=run_id, recipe_id=recipe_id))
+async def list_measurements(
+    run_id: str | None = None,
+    recipe_id: str | None = None,
+    binding_status: str | None = None,
+) -> MeasurementListResponse:
+    rows = _call(
+        lambda: get_store().list_measurements(
+            run_id=run_id,
+            recipe_id=recipe_id,
+            binding_status=binding_status,
+        )
+    )
     return MeasurementListResponse(measurements=rows)
+
+
+@router.post("/measurements/{measurement_id}/bind", response_model=MeasurementResultV1)
+async def bind_measurement(measurement_id: str, request: BindMeasurementRequest) -> MeasurementResultV1:
+    return _call(
+        lambda: get_store().bind_measurement(
+            measurement_id,
+            request.segmentId,
+            request.runId,
+            request.stepId,
+        )
+    )
+
+
+@router.get("/measurements/{measurement_id}/provenance", response_model=MeasurementProvenanceResponse)
+async def measurement_provenance(measurement_id: str) -> MeasurementProvenanceResponse:
+    store = get_store()
+    measurement = _call(lambda: store.get_measurement(measurement_id))
+    verifications = _call(lambda: store.list_verifications(measurement_id))
+    return MeasurementProvenanceResponse(
+        measurementId=measurement.measurementId,
+        bindingStatus=measurement.bindingStatus,
+        bindingEvidence=measurement.bindingEvidence,
+        verifications=verifications,
+    )
 
 
 @router.get("/measurements/{measurement_id}", response_model=MeasurementResultV1)

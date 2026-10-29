@@ -10,6 +10,7 @@ from pydantic import Field, model_validator
 
 from ..models import Number, StrictModel
 from .ids import sha256_hex
+from .provenance import EquivalenceEvidenceV1, ProvenanceVerificationV1
 
 
 ALGORITHM_VERSION = "1"
@@ -107,6 +108,10 @@ class MeasurementResultV1(StrictModel):
     coordinateSystem: Literal["cartesian_um"] = "cartesian_um"
     uncertainty: float | None = None
     uncertaintyStatus: Literal["not_evaluated", "estimated"] = "not_evaluated"
+    bindingStatus: Literal["unbound", "verified", "failed"] = "unbound"
+    bindingEvidence: ProvenanceVerificationV1 | None = None
+    equivalenceStatus: Literal["not_evaluated", "established", "failed", "inconclusive"] = "not_evaluated"
+    equivalenceEvidence: EquivalenceEvidenceV1 | None = None
     createdAt: str | None = None
 
 

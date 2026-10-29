@@ -25,6 +25,29 @@ class WorkflowStoreSchemaTests(unittest.TestCase):
         store.initialize()
         self.assertEqual(store.schema_version(), SCHEMA_VERSION)
 
+    def test_version_three_store_adds_binding_columns(self):
+        path = storage.VAR / f"test-workflow-v3-{uuid.uuid4().hex}.sqlite3"
+        store = WorkflowStore(path)
+        store.initialize()
+        with sqlite3.connect(path) as connection:
+            for column in (
+                "binding_status",
+                "binding_evidence_json",
+                "equivalence_status",
+                "equivalence_evidence_json",
+            ):
+                connection.execute(f"ALTER TABLE measurements DROP COLUMN {column}")
+            connection.execute("UPDATE schema_meta SET value = '3' WHERE key = 'schema_version'")
+        migrated = WorkflowStore(path)
+        migrated.initialize()
+        self.assertEqual(migrated.schema_version(), SCHEMA_VERSION)
+        with sqlite3.connect(path) as connection:
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(measurements)")}
+        self.assertIn("binding_status", columns)
+        self.assertIn("binding_evidence_json", columns)
+        self.assertIn("equivalence_status", columns)
+        self.assertIn("equivalence_evidence_json", columns)
+
     def test_unknown_schema_version_is_rejected(self):
         path = storage.VAR / f"test-workflow-bad-{uuid.uuid4().hex}.sqlite3"
         with sqlite3.connect(path) as connection:

@@ -9,7 +9,8 @@ import uuid
 
 from backend import storage
 from backend.workflow.store import SCHEMA_VERSION, WorkflowStore
-from tests.workflow_fixtures import compiled_base, compiled_branch, plan_from_compiled
+from backend.workflow.verification import verify_route_plan_compiles
+from tests.workflow_fixtures import compiled_base, compiled_branch, compiled_with_solver, plan_from_compiled
 
 
 def downgrade_to_v2(path, *, drop_compiles: bool = False) -> None:
@@ -71,6 +72,39 @@ class WorkflowMigrationTests(unittest.TestCase):
             plan.reuse[0].compatibility.solverDigest,
         )
         self.assertIsNone(plan.attempts[1].legacyCompatibility)
+
+    def test_v2_route_with_incompatible_source_and_target_solvers_becomes_legacy(self):
+        suffix = uuid.uuid4().hex[:6]
+        base = compiled_base()
+        changed = compiled_with_solver()
+        plan = plan_from_compiled(base, base, suffix=suffix)
+        path = storage.VAR / f"test-workflow-migrate-solver-{suffix}.sqlite3"
+        store = WorkflowStore(path)
+        store.initialize()
+        store.register_compile(base)
+        store.register_compile(changed)
+        store.create_plan(plan)
+        with sqlite3.connect(path) as connection:
+            connection.execute(
+                "UPDATE attempts SET compile_id = ?, flow_digest = ? WHERE attempt_id = ?",
+                (changed.compileRecord.compileId, changed.compileRecord.fullProjectHash, plan.attempts[1].attemptId),
+            )
+            connection.execute(
+                "UPDATE segments SET source_compile_id = ?, flow_digest = ? WHERE segment_id = ?",
+                (changed.compileRecord.compileId, changed.compileRecord.fullProjectHash, plan.segments[2].segmentId),
+            )
+        downgrade_to_v2(path)
+        migrated = WorkflowStore(path)
+        migrated.initialize()
+        migrated_plan = migrated.get_plan(plan.route.routeId)
+        self.assertTrue(migrated_plan.route.legacyUnverified)
+        self.assertIsNotNone(migrated_plan.attempts[1].legacyCompatibility)
+        self.assertIsNotNone(migrated_plan.reuse[0].legacyCompatibility)
+        with self.assertRaises(ValueError):
+            verify_route_plan_compiles(
+                migrated_plan,
+                {base.compileRecord.compileId: base, changed.compileRecord.compileId: changed},
+            )
 
     def test_v2_route_without_compiles_loads_as_unverified(self):
         store, path, route_id = self._store_with_plan()
