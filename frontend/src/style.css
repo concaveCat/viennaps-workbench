@@ -373,6 +373,44 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .warning-line { margin: 9px 0 0; color: #987533; font-size: 8px; line-height: 1.5; }
 .validation-foot { display: flex; justify-content: space-between; gap: 8px; margin-top: 10px; padding-top: 8px; border-top: 1px solid #e9efed; color: #98a3ac; font-size: 8px; }
 .validation-foot strong { color: #697889; font-size: 8px; font-weight: 650; text-align: right; }
+.validation-foot.artifact-foot.ok strong { color: #16816f; }
+.validation-foot.artifact-foot.warning strong { color: #8a6826; }
+.validation-foot.artifact-foot.reject strong { color: #a9483b; }
+.status-engine { color: #4b6275; }
+
+/* Run-artifact preflight card (backend/preflight.py artifactEstimate). */
+.artifact-preflight-panel { border-bottom: 1px solid #e9edf1; }
+.artifact-risk { flex: 0 0 auto; padding: 3px 8px; border: 1px solid #d4e7e1; border-radius: 9px; color: #16816f; background: #e7f4f0; font-size: 8px; font-weight: 700; white-space: nowrap; }
+.artifact-risk.warning { color: #8a6826; border-color: #ead9b7; background: #faf2da; }
+.artifact-risk.reject { color: #a9483b; border-color: #f0d3cc; background: #fff0ed; }
+.artifact-meter { height: 6px; margin: 10px 0 4px; overflow: hidden; border-radius: 3px; background: #eef1f4; }
+.artifact-meter i { display: block; height: 100%; border-radius: 3px; background: #2e9b7d; }
+.artifact-meter.warning i { background: #d7a23d; }
+.artifact-meter.reject i { background: #c76b5b; }
+.artifact-metrics { display: grid; gap: 7px; margin-top: 9px; }
+.artifact-metrics > div { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; align-items: baseline; }
+.artifact-metrics span { color: #8794a1; font-size: 8px; }
+.artifact-metrics strong { color: #536276; font-size: 9px; font-weight: 650; text-align: right; font-variant-numeric: tabular-nums; }
+.artifact-metrics small { grid-column: 1 / -1; color: #98a3ac; font-size: 8px; line-height: 1.45; }
+.artifact-contributors { display: grid; gap: 5px; margin-top: 12px; }
+.artifact-contributors > div { display: flex; justify-content: space-between; gap: 8px; color: #7b8794; font-size: 8px; line-height: 1.45; }
+.artifact-contributors > div strong { flex: 0 0 auto; color: #536276; font-size: 8px; font-variant-numeric: tabular-nums; }
+.artifact-suggestions { margin-top: 12px; }
+.artifact-suggestions ul { margin: 5px 0 0; padding-left: 16px; color: #7b8794; font-size: 8px; line-height: 1.55; }
+.artifact-blocked { display: grid; gap: 4px; margin-top: 10px; padding: 9px; border: 1px solid #f0d3cc; border-radius: 6px; color: #9a4a3d; background: #fff4f1; }
+.artifact-blocked strong { font-size: 9px; }
+.artifact-blocked span { font-size: 8px; line-height: 1.45; }
+.artifact-source { color: #9aa5b0; }
+
+/* Host capability vs. the run's actual engine (RunInfo.actualExecution). */
+.engine-badge, .engine-chip { display: inline-flex; align-items: center; gap: 4px; width: fit-content; padding: 2px 7px; border: 1px solid #e5e9ed; border-radius: 9px; color: #7b8794; background: #f6f8fa; font-size: 8px; font-weight: 650; white-space: nowrap; }
+.engine-badge.gpu, .engine-chip.gpu { color: #1c6f88; border-color: #cfe3ea; background: #eef7fa; }
+.engine-badge.cpu, .engine-chip.cpu { color: #16816f; border-color: #d4e7e1; background: #e7f4f0; }
+.engine-badge.mixed, .engine-chip.mixed { color: #8a6826; border-color: #ead9b7; background: #faf2da; }
+.engine-badge.idle, .engine-chip.idle { color: #7b8794; border-color: #e5e9ed; background: #f6f8fa; }
+.engine-chip.step { color: #5c6c7d; border-color: #e1e6eb; background: #f8fafb; }
+.run-engine-summary { display: grid; gap: 5px; margin-top: 10px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+.run-engine-summary small { color: #8794a1; font-size: 9px; line-height: 1.45; }
 .toast { position: fixed; z-index: 20; right: 20px; bottom: 20px; max-width: min(470px, calc(100vw - 32px)); display: flex; align-items: flex-start; gap: 14px; padding: 12px 14px; border: 1px solid #d7e3de; border-radius: 7px; background: #fff; box-shadow: 0 8px 30px #24344820; color: #4b5c6f; font-size: 11px; line-height: 1.5; }
 .toast button { border: 0; color: #9ba5ad; background: transparent; font-size: 17px; line-height: 1; }
 .run-error-dialog { width: min(560px, calc(100vw - 28px)); max-width: 560px; max-height: min(82dvh, 720px); margin: auto; padding: 0; overflow: auto; border: 1px solid #e1e6eb; border-radius: 12px; background: #fff; color: var(--ink); box-shadow: 0 24px 80px #17243435; }
@@ -573,6 +611,10 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .snapshot-chip small, .viewer-meta, .compare-select { font-size: 10px; }
 .run-id { color: #718294; font-size: 9px; }
 .tag { font-size: 9px; }
+.artifact-risk, .artifact-metrics span, .artifact-metrics small, .artifact-contributors > div,
+.artifact-contributors > div strong, .artifact-suggestions ul, .artifact-blocked span { font-size: 10px; }
+.artifact-metrics strong, .artifact-blocked strong, .engine-badge, .engine-chip { font-size: 10px; }
+.run-engine-summary small { color: #687b8e; font-size: 10px; }
 .viewer-legend { font-size: 10px; }
 .viewer-grid-note, .scale-label { color: #697b8d; font-size: 9px; }
 .result-readout { font-size: 10px; }
@@ -657,7 +699,7 @@ input[type="range"]:focus-visible { outline-offset: 4px; }
 .rail-item:hover { background: #f1f6f5; }
 .rail-item.selected { border-color: #d4e7e1; color: var(--green); background: var(--green-light); font-weight: 700; }
 .rail-foot { display: grid; gap: 7px; justify-items: center; color: #8391a0; font-size: 9px; }
-.rail-gpu { padding: 3px 5px; border: 1px solid #e8dfc8; border-radius: 5px; color: #97702b; background: #fcf8ee; font-size: 8px; }
+.rail-gpu { padding: 3px 5px; border: 1px solid #e8dfc8; border-radius: 5px; color: #97702b; background: #fcf8ee; font-size: 8px; white-space: nowrap; }
 .rail-gpu.verified { color: #16816f; border-color: #d4e7e1; background: #e7f4f0; }
 .side-panel, .viewer-panel { border: 0; border-radius: 0; }
 .structure-panel { grid-column: 2; min-width: 0; overflow-y: auto; overscroll-behavior: contain; border-right: 1px solid var(--line); }

@@ -8,3 +8,31 @@ export type Selection =
   | { kind: 'artifact'; key: string };
 
 export type DockTab = 'log' | 'flux' | 'intermediate' | 'native' | 'artifacts';
+
+// Additive response field from backend/preflight.py. `risk` is advisory:
+// `warning` starts at 75 % of the 512 MiB run-directory cap, and `reject`
+// above 100 % (POST /api/runs answers 422 before the worker starts). A
+// low-confidence estimate is downgraded to `warning` instead of `reject`.
+export type ArtifactEstimateRisk = 'ok' | 'warning' | 'reject';
+export type ArtifactEstimateContributor = { kind: string; bytes: number; detail: string };
+export type ArtifactEstimate = {
+  schemaVersion?: number;
+  estimatedBytes: number;
+  estimatedMiB: number;
+  archiveEstimateBytes: number;
+  archiveEstimateMiB: number;
+  capBytes: number;
+  capMiB: number;
+  utilization: number;
+  risk: ArtifactEstimateRisk;
+  archiveRisk: ArtifactEstimateRisk;
+  confidence: 'high' | 'medium' | 'low';
+  rejectionDowngraded?: boolean;
+  lazySnapshots?: boolean;
+  kind?: string;
+  safetyFactor?: number;
+  warningFraction?: number;
+  rejectFraction?: number;
+  contributors?: ArtifactEstimateContributor[];
+  suggestions?: string[];
+};
