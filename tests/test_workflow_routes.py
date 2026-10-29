@@ -65,6 +65,7 @@ def compatibility(*, step_ids: list[str] | None = None, run_seed: int = 1) -> Pr
     return PrefixCompatibilityV1(
         prefixDigest=FLOW_DIGEST,
         geometryBindingHash=GEOMETRY_HASH,
+        solverDigest="5" * 64,
         seedPolicy="shared-run-seed",
         runSeed=run_seed,
         stepIds=step_ids or ["s001", "s002", "s003"],

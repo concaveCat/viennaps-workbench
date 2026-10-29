@@ -24,16 +24,22 @@ def prefix_compatibility(
     steps = compiled.project.steps[: len(step_ids)]
     step_payloads = [step.model_dump(mode="json", exclude_none=True) for step in steps]
     resolved_digest = sha256_hex(step_payloads)
+    solver_payload = compiled.project.solver.model_dump(mode="json", exclude_none=True)
+    for key in ("random", "timeoutSeconds"):
+        solver_payload.pop(key, None)
+    solver_digest = sha256_hex(solver_payload)
     prefix_digest = sha256_hex(
         {
             "stepIds": step_ids,
             "steps": step_payloads,
             "geometryBindingHash": compiled.compileRecord.geometryBindingHash,
+            "solverDigest": solver_digest,
         }
     )
     return PrefixCompatibilityV1(
         prefixDigest=prefix_digest,
         geometryBindingHash=compiled.compileRecord.geometryBindingHash,
+        solverDigest=solver_digest,
         seedPolicy=compiled.compileRecord.seedPolicy,
         runSeed=run_seed,
         stepIds=list(step_ids),

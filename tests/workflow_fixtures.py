@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from backend.models import Domain3D, FixedRandom, SolverV7, Units
+from backend.models import (
+    AdvectionSettingsV7,
+    Domain3D,
+    FixedRandom,
+    RayTracingSettingsV7,
+    SolverV7,
+    Units,
+)
 from backend.workflow import (
     AttemptV1,
     CheckpointRefV1,
@@ -42,14 +49,20 @@ def _binding() -> GeometryBindingV1:
     )
 
 
-def _solver() -> SolverV7:
+def _solver(
+    *,
+    spatial_scheme: str = "ENGQUIST_OSHER_1ST_ORDER",
+    rays_per_point: int = 32,
+) -> SolverV7:
     return SolverV7(
         timeStepRatio=0.25,
-        raysPerPoint=32,
+        raysPerPoint=rays_per_point,
         cpuThreads=1,
         random=FixedRandom(mode="fixed", seed=314159),
         enginePreference="cpu",
         timeoutSeconds=60,
+        advection=AdvectionSettingsV7(spatialScheme=spatial_scheme),
+        rayTracing=RayTracingSettingsV7(),
     )
 
 
@@ -66,7 +79,7 @@ def _step(step_id: str, duration: float) -> dict:
     }
 
 
-def _flow(revision: int, step4_duration: float) -> FlowRevisionV1:
+def _flow(revision: int, step4_duration: float, solver: SolverV7 | None = None) -> FlowRevisionV1:
     durations = [0.2, 0.2, 0.2, step4_duration, 0.2]
     return FlowRevisionV1(
         schemaVersion=1,
@@ -74,7 +87,7 @@ def _flow(revision: int, step4_duration: float) -> FlowRevisionV1:
         revision=revision,
         name="fixture flow",
         steps=[_step(step_id, duration) for step_id, duration in zip(STEP_IDS, durations)],
-        solver=_solver(),
+        solver=solver or _solver(),
     )
 
 
@@ -84,6 +97,13 @@ def compiled_base() -> CompiledWorkflowV1:
 
 def compiled_branch() -> CompiledWorkflowV1:
     return compile_flow(_flow(2, 0.7), _binding())
+
+
+def compiled_with_solver(*, spatial_scheme: str = "WENO_3RD_ORDER", rays_per_point: int = 64) -> CompiledWorkflowV1:
+    return compile_flow(
+        _flow(3, 0.2, _solver(spatial_scheme=spatial_scheme, rays_per_point=rays_per_point)),
+        _binding(),
+    )
 
 
 def _checkpoint(name: str, step_id: str, char: str) -> CheckpointRefV1:

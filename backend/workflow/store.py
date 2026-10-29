@@ -52,6 +52,22 @@ class WorkflowStore:
 
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.exists():
+            # Read-only preflight: an unknown future schema must be rejected
+            # before this process creates any tables in the database.
+            with sqlite3.connect(f"file:{self.path}?mode=ro", uri=True) as preflight:
+                table = preflight.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta'"
+                ).fetchone()
+                if table is not None:
+                    row = preflight.execute(
+                        "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+                    ).fetchone()
+                    if row is not None and row[0] not in {"1", SCHEMA_VERSION}:
+                        raise RuntimeError(
+                            f"unsupported workflow schema version {row[0]!r}; "
+                            f"expected {SCHEMA_VERSION!r}"
+                        )
         with self._connect() as connection:
             connection.executescript(
                 """

@@ -10,7 +10,6 @@ from backend.workflow.metrology import (
     ALGORITHM_VERSION,
     CDAtHeightParametersV1,
     EtchDepthParametersV1,
-    MeasurementResultV1,
     MetrologyRecipeV1,
     MetricDefinitionV1,
     RegionV1,
@@ -56,11 +55,11 @@ def recipe(
     )
 
 
-def snapshot(points, lines, materials=None) -> dict:
+def snapshot(points, lines, materials=None, coordinate_unit: str = "um") -> dict:
     return {
         "dimension": 2,
         "axisMap": {"x": 0, "h": 1, "z": 2},
-        "coordinateUnit": "um",
+        "coordinateUnit": coordinate_unit,
         "gridDelta": 0.1,
         "points": [[x, h, 0.0] for x, h in points],
         "lines": lines,
@@ -78,6 +77,12 @@ def trench() -> dict:
 def trapezoid() -> dict:
     points = [(-2.0, 0.0), (0.0, 0.0), (2.0, -2.0), (4.0, 0.0), (6.0, 0.0)]
     lines = [[0, 1], [1, 2], [2, 3], [3, 4]]
+    return snapshot(points, lines)
+
+
+def trench_with_outside_edge() -> dict:
+    points = [(-2.0, 0.0), (1.0, 0.0), (1.0, -2.0), (3.0, -2.0), (3.0, 0.0), (5.0, 0.0), (10.0, -1.0), (11.0, -1.0)]
+    lines = [[0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [6, 7]]
     return snapshot(points, lines)
 
 
@@ -149,6 +154,24 @@ class MetrologyAlgorithmTests(unittest.TestCase):
         )
         self.assertEqual(result.status, "region_empty")
         self.assertIsNone(result.value)
+
+    def test_unsupported_coordinate_unit_is_not_silently_converted(self):
+        data = trench()
+        data["coordinateUnit"] = "nm"
+        data["points"] = [[x * 1000.0, h * 1000.0, z] for x, h, z in data["points"]]
+        result = measure_snapshot(recipe(), metric(), data)
+        self.assertEqual(result.status, "unsupported_units")
+        self.assertIsNone(result.value)
+        self.assertTrue(result.reason)
+
+    def test_horizontal_edge_outside_region_does_not_make_cd_ambiguous(self):
+        result = measure_snapshot(
+            recipe(region=RegionV1(xMin=-2.5, xMax=6.5)),
+            metric(),
+            trench_with_outside_edge(),
+        )
+        self.assertEqual(result.status, "measured")
+        self.assertAlmostEqual(result.value, 2.0)
 
     def test_etch_depth_on_trench(self):
         result = measure_snapshot(

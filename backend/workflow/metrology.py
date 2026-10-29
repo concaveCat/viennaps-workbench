@@ -80,6 +80,7 @@ MeasurementStatus = Literal[
     "material_not_found",
     "region_empty",
     "unsupported_dimension",
+    "unsupported_units",
     "invalid_geometry",
 ]
 
@@ -208,6 +209,13 @@ def measure_snapshot(
             source_run_id=source_run_id, source_step_id=source_step_id, source_state_id=source_state_id,
             status="unsupported_dimension", reason="P0-3 metrology supports 2D snapshots only",
         )
+    if snapshot.get("coordinateUnit") != "um":
+        return _result(
+            recipe, metric, snapshot,
+            source_run_id=source_run_id, source_step_id=source_step_id, source_state_id=source_state_id,
+            status="unsupported_units",
+            reason="P0-3 V1 requires snapshot coordinates in um; normalize before measuring",
+        )
     points = snapshot.get("points")
     lines = snapshot.get("lines")
     material_ids = (snapshot.get("cellData") or {}).get("materialIds")
@@ -259,7 +267,8 @@ def measure_snapshot(
                 )
             if abs(h2 - h1) <= 1e-12:
                 if abs(h1 - height) <= 1e-12:
-                    degenerate = True
+                    if recipe.region is None or not (max(x1, x2) < recipe.region.xMin or min(x1, x2) > recipe.region.xMax):
+                        degenerate = True
                 continue
             if min(h1, h2) <= height <= max(h1, h2):
                 x = x1 + (height - h1) * (x2 - x1) / (h2 - h1)

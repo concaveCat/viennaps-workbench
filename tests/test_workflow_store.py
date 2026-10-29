@@ -33,6 +33,11 @@ class WorkflowStoreSchemaTests(unittest.TestCase):
         store = WorkflowStore(path)
         with self.assertRaises(RuntimeError):
             store.initialize()
+        with sqlite3.connect(path) as connection:
+            tables = [row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")]
+            version = connection.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()[0]
+        self.assertEqual(tables, ["schema_meta"])
+        self.assertEqual(version, "99")
 
 
 if __name__ == "__main__":

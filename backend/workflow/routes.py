@@ -30,6 +30,7 @@ class PrefixCompatibilityV1(StrictModel):
 
     prefixDigest: Hash64
     geometryBindingHash: Hash64
+    solverDigest: Hash64
     seedPolicy: Literal["shared-run-seed"]
     runSeed: Annotated[int, Field(ge=0, le=4294967295)]
     stepIds: Annotated[list[StepId], Field(min_length=1)]
