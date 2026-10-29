@@ -11,7 +11,7 @@ import { ContextPanel } from './app/ContextPanel';
 import { Inspector } from './app/Inspector';
 import { Dock } from './app/Dock';
 import { StatusBar } from './app/StatusBar';
-import type { Activity, DockTab, Selection } from './app/types';
+import type { Activity, ArtifactEstimate, ArtifactEstimateRisk, DockTab, Selection } from './app/types';
 import { Icon } from './ui/Icon';
 import { Menu } from './ui/Menu';
 import { StructurePanel } from './panels/StructurePanel';
@@ -106,7 +106,14 @@ type GpuKnownFailure = { model: string; dimension: number; operation: string; bo
 type GpuEngineLimitation = { model: string; engine: string; engineVersion: string; limit: string; maxIonSpecies: number; dimensions: number[]; extraIonBehavior: string; cpuVerifiedProductDirectCases: number; evidence: string[] };
 type GpuCapabilityRow = { status: string; schemaVersions?: number[]; dimension: number; model: string; nativeModel?: string; operation: string; boundaryXY: string; engine: string; geometryKinds?: string[]; patternKinds?: string[]; finExtrusionMode?: 'direct' | 'extruded'; finConstruction?: 'native' | 'boolean'; materials?: string[]; materialRoles?: Record<string, string[]>; materialBindings?: Record<string, string>; speciesSignature?: { species: ParticleSpecies[]; rateCoefficients: MultiParticleRateCoefficients }; executionStrategy?: string; solverProfile?: { gridDelta: number; timeStepRatio: number; raysPerPoint: number; randomMode: 'fixed' | 'random'; advection?: AdvectionSettings; rayTracing?: RayTracingSettings }; materialScope?: GpuMaterialScope; speciesScope?: GpuSpeciesScope; gdsScope?: { kind: string; engineVersion: string; dimensions: number[]; maxLayerMappings: number; supports3DMask: boolean } };
 type GpuProfileFailure = { dimension: number; model: string; operation: string; boundaryXY: string; engine: string; geometryKind: string; solverProfile: Record<string, unknown>; materials: string[]; materialRoles: Record<string, string[]>; materialBindings: Record<string, string>; speciesSignature?: { species: ParticleSpecies[]; rateCoefficients: MultiParticleRateCoefficients } | null; reason: string };
-type Capabilities = { capabilities?: { gpuModelRows?: GpuCapabilityRow[]; knownGpuProfileFailures?: GpuProfileFailure[]; knownNativeFailures?: GpuKnownFailure[]; knownEngineLimitations?: GpuEngineLimitation[]; threeDimensional?: { rows?: GpuCapabilityRow[] }; engines?: { gpu?: { status?: string; exposed?: boolean; engine?: string } } }; resourcePolicy?: { run?: { maximumSteps?: number | null; cpuThreads?: { default?: number; minimum?: number; maximum?: number; limitSource?: string } } } };
+type ArtifactPreflightPolicy = { capBytes?: number | null; capMiB?: number | null; artifactLimitSource?: string | null };
+type RunPolicy = {
+  maximumSteps?: number | null; maximumArtifactBytes?: number | null; maximumResultArchiveBytes?: number | null; maximumArtifactMiB?: number | null;
+  artifactLimitBytes?: number | null; artifactLimitMiB?: number | null; artifactLimitSource?: string | null; artifactLimitEnvironmentVariable?: string | null;
+  artifactLimitDefaultMiB?: number | null; artifactLimitMinimumMiB?: number | null; artifactLimitMaximumMiB?: number | null;
+  artifactPreflight?: ArtifactPreflightPolicy; cpuThreads?: { default?: number; minimum?: number; maximum?: number; limitSource?: string };
+};
+type Capabilities = { capabilities?: { gpuModelRows?: GpuCapabilityRow[]; knownGpuProfileFailures?: GpuProfileFailure[]; knownNativeFailures?: GpuKnownFailure[]; knownEngineLimitations?: GpuEngineLimitation[]; threeDimensional?: { rows?: GpuCapabilityRow[] }; engines?: { gpu?: { status?: string; exposed?: boolean; engine?: string } } }; resourcePolicy?: { run?: RunPolicy } };
 type GpuDevice = { index: number; name: string; pciBusId: string; uuid: string; memoryTotalMiB: number | null; vendor: string; computeApi: string };
 type GpuDeviceInventory = { status: 'available' | 'unavailable' | 'error'; devices: GpuDevice[]; preferredGpuDeviceId: string | null; reason: string | null; probe?: { bounded: boolean; returnCode?: number; elapsedSeconds?: number } };
 
@@ -354,7 +361,28 @@ function gdsAssetIdFromProject(value: Project): string | null {
   return null;
 }
 const terminalStates = new Set(['succeeded', 'failed', 'timed_out', 'cancelled', 'interrupted']);
-const maxPackageBytes = 512 * 1024 * 1024;
+const ARTIFACT_CAP_FALLBACK_BYTES = 512 * 1024 * 1024;
+// The backend publishes the effective run-artifact cap in /api/capabilities
+// (deployments can raise it with WORKBENCH_MAX_ARTIFACT_MIB, default 4096 MiB).
+// Prefer the published byte/MiB fields; the 512 MiB historical guard is only a
+// fallback for backends that predate the configurable cap.
+function effectiveArtifactCapBytes(capabilities: Capabilities | null | undefined): number {
+  const run = capabilities?.resourcePolicy?.run;
+  const preflight = run?.artifactPreflight;
+  const resolved = [
+    run?.maximumArtifactBytes,
+    run?.artifactLimitBytes,
+    run?.maximumArtifactMiB != null ? run.maximumArtifactMiB * 1024 * 1024 : null,
+    run?.artifactLimitMiB != null ? run.artifactLimitMiB * 1024 * 1024 : null,
+    preflight?.capBytes,
+    preflight?.capMiB != null ? preflight.capMiB * 1024 * 1024 : null,
+    run?.maximumResultArchiveBytes,
+  ].find(value => typeof value === 'number' && Number.isFinite(value) && value > 0);
+  return resolved ?? ARTIFACT_CAP_FALLBACK_BYTES;
+}
+function formatArtifactCapMiB(bytes: number): string {
+  return `${Math.round(bytes / (1024 * 1024)).toLocaleString('zh-CN')} MiB`;
+}
 type PanelWidths = { structure: number; settings: number };
 type ResizablePanel = keyof PanelWidths;
 const panelWidthLimits = { structure: { min: 260, max: 420 }, settings: { min: 280, max: 420 }, viewerMin: 320, splitter: 10, workspacePadding: 20, rail: 64 } as const;
@@ -430,6 +458,39 @@ function humanStatus(status?: string): string {
   const labels: Record<string, string> = { pending: '排队中', running: '运行中', cancelling: '正在取消', succeeded: '已完成', failed: '失败', timed_out: '超时', cancelled: '已取消', interrupted: '服务中断' };
   return labels[status ?? ''] ?? '未运行';
 }
+// --- Run-artifact preflight (backend/preflight.py) -------------------------
+const ARTIFACT_RISK_LABELS: Record<ArtifactEstimateRisk, string> = { ok: '可运行', warning: '接近上限', reject: '将拒绝运行' };
+const ARTIFACT_CONFIDENCE_LABELS: Record<ArtifactEstimate['confidence'], string> = { high: '高', medium: '中', low: '低 · 未校准输出' };
+const NOT_APPLICABLE_ENGINE = 'not-applicable';
+function formatEstimateMiB(mib: number): string {
+  if (!Number.isFinite(mib)) return '—';
+  return mib >= 1024 ? `${(mib / 1024).toFixed(2)} GiB` : `${mib < 10 ? mib.toFixed(1) : Math.round(mib)} MiB`;
+}
+// The 422 from POST /api/runs carries the same structured estimate under
+// detail.artifactEstimate; keep the card in sync even if validation lagged.
+function artifactEstimateFromError(error: unknown): ArtifactEstimate | null {
+  if (!(error instanceof ApiError) || typeof error.detail !== 'object' || error.detail === null) return null;
+  if (!('artifactEstimate' in error.detail)) return null;
+  const estimate = (error.detail as { artifactEstimate?: unknown }).artifactEstimate;
+  return typeof estimate === 'object' && estimate !== null && 'risk' in estimate ? estimate as ArtifactEstimate : null;
+}
+// Host GPU capability is about the machine; a displayed run has its own engine
+// recorded in RunInfo.actualExecution (actualEngine per step).
+function runEnginesOf(info: RunInfo | null | undefined): string[] {
+  return [...new Set((info?.actualExecution ?? [])
+    .map(item => item.actualEngine)
+    .filter((engine): engine is string => !!engine && engine !== NOT_APPLICABLE_ENGINE))].sort();
+}
+function runEngineLabel(engines: string[]): string {
+  if (engines.length === 0) return '未执行/无粒子步骤';
+  return engines.length === 1 ? engines[0] : '混合';
+}
+function engineTone(engines: string[]): 'gpu' | 'cpu' | 'mixed' | 'idle' {
+  if (engines.length > 1) return 'mixed';
+  if (engines[0] === 'GPU_DISK') return 'gpu';
+  if (engines[0] === 'CPU_DISK') return 'cpu';
+  return 'idle';
+}
 type RunFailureDialogData = { runId: string; status: string; reason: string; details: string; stepLabel?: string };
 const errorRunStates = new Set(['failed', 'timed_out', 'interrupted']);
 function cleanRunOutput(value?: string | null): string {
@@ -489,6 +550,47 @@ function SelectField({ label, value, options, onChange, hint }: { label: string;
   return <label className="field"><span className="field-label">{label}{hint && <small>{hint}</small>}</span>
     <select aria-label={label} value={value} onChange={event => onChange(event.target.value)}>{options.map(item => <option key={item.value} value={item.value} disabled={item.disabled}>{item.label}</option>)}</select>
   </label>;
+}
+
+function ArtifactPreflightCard({ estimate }: { estimate: ArtifactEstimate | null }) {
+  const risk = estimate?.risk ?? null;
+  return <section className="panel-section artifact-preflight-panel" aria-label="运行产物预估">
+    <div className="section-heading">
+      <div><span className="eyebrow">运行目录 · 工艺运行</span><h2>运行产物预估</h2></div>
+      {risk && <span className={`artifact-risk ${risk}`}>{ARTIFACT_RISK_LABELS[risk]}</span>}
+    </div>
+    {!estimate ? <div className="inline-note">等待工作台校验后显示本次工艺运行目录的预估大小。该数值来自运行产物预检，是保守估算而不是实际测量。</div> : <>
+      <div className={`artifact-meter ${estimate.risk}`} role="img"
+        aria-label={`预估占 ${estimate.capMiB} MiB 上限的 ${Math.round(estimate.utilization * 100)}%`}>
+        <i style={{ width: `${Math.min(100, Math.max(2, Math.round(estimate.utilization * 100)))}%` }} />
+      </div>
+      <div className="artifact-metrics">
+        <div><span>预估运行目录</span><strong>{formatEstimateMiB(estimate.estimatedMiB)} / {estimate.capMiB} MiB</strong><small>占上限 {Math.round(estimate.utilization * 100)}% · 安全系数 ×{estimate.safetyFactor ?? 1.2}</small></div>
+        <div><span>导出 ZIP 预估</span><strong>{formatEstimateMiB(estimate.archiveEstimateMiB)}</strong><small>{estimate.archiveRisk === 'ok' ? '低于上限；下载全部快照预计可用。' : '物化全部步骤快照后会超过上限；一次下载全部快照可能返回 HTTP 413。'}</small></div>
+        <div><span>估算置信度</span><strong>{ARTIFACT_CONFIDENCE_LABELS[estimate.confidence]}</strong><small>{estimate.lazySnapshots === false ? '每个步骤快照都立即写入磁盘。' : '延迟快照仅在首次读取（查看器或下载）时物化。'}</small></div>
+      </div>
+      {(estimate.contributors?.length ?? 0) > 0 && <div className="artifact-contributors">
+        <span className="field-label">主要占用</span>
+        {[...(estimate.contributors ?? [])]
+          .filter(item => item.bytes > 0 && item.kind !== 'archiveAllSnapshots')
+          .sort((a, b) => b.bytes - a.bytes).slice(0, 3).map(item =>
+          <div key={item.kind}><span>{item.detail}</span><strong>{formatEstimateMiB(item.bytes / (1024 * 1024))}</strong></div>)}
+      </div>}
+      {(estimate.suggestions?.length ?? 0) > 0 && <div className="artifact-suggestions">
+        <span className="field-label">建议</span>
+        <ul>{(estimate.suggestions ?? []).map((suggestion, index) => <li key={index}>{suggestion}</li>)}</ul>
+      </div>}
+      {estimate.risk === 'reject'
+        ? <div className="artifact-blocked" role="alert">
+            <strong>运行会在工作进程启动前被拒绝</strong>
+            <span>预估值超过 {estimate.capMiB} MiB 上限，POST /api/runs 返回 422（artifact-budget-preflight），“运行工艺”按钮已置灰。结构预览仍可提交。</span>
+          </div>
+        : estimate.risk === 'warning'
+          ? <div className="inline-note warning">预估值已进入警告区间（≥ {Math.round((estimate.warningFraction ?? 0.75) * 100)}% 上限）；仍可运行，但实际占用接近上限时下载或快照读取可能失败。{estimate.rejectionDowngraded ? '该配置使用未校准的输出模式，超限只警告、不拒绝。' : ''}</div>
+          : <div className="inline-note">预估值低于警告阈值；实际占用仍以运行时目录为准。</div>}
+      <div className="inline-note artifact-source">按当前工程的工艺运行规模估算；提交运行时后端会重新计算并强制执行上限。</div>
+    </>}
+  </section>;
 }
 
 function MaterialPropertyInspector({ material, busy, onSave }: { material: MaterialCatalogItem; busy: boolean; onSave: (name: string, event: FormEvent<HTMLFormElement>) => Promise<void> }) {
@@ -651,6 +753,7 @@ export default function App() {
   const [health, setHealth] = useState<'checking' | 'ready' | 'offline'>('checking');
   const [inputHash, setInputHash] = useState('');
   const [warnings, setWarnings] = useState<string[]>([]);
+  const [artifactEstimate, setArtifactEstimate] = useState<ArtifactEstimate | null>(null);
   const [validationMessage, setValidationMessage] = useState('');
   const [notice, setNotice] = useState('');
   const [loading, setLoading] = useState(false);
@@ -922,12 +1025,12 @@ export default function App() {
     const sequence = ++validationSequence.current;
     const timeout = window.setTimeout(async () => {
       try {
-        const result = await api<{ valid: boolean; warnings: string[]; requestedInputHash: string }>('/api/projects/validate', { method: 'POST', body: JSON.stringify(project) });
+        const result = await api<{ valid: boolean; warnings: string[]; requestedInputHash: string; artifactEstimate?: ArtifactEstimate | null }>('/api/projects/validate', { method: 'POST', body: JSON.stringify(project) });
         if (sequence === validationSequence.current) {
-          setInputHash(result.requestedInputHash); setWarnings(result.warnings); setValidationMessage('输入通过校验');
+          setInputHash(result.requestedInputHash); setWarnings(result.warnings); setArtifactEstimate(result.artifactEstimate ?? null); setValidationMessage('输入通过校验');
         }
       } catch (error) {
-        if (sequence === validationSequence.current) { setInputHash(''); setWarnings([]); setValidationMessage(prettyError(error)); }
+        if (sequence === validationSequence.current) { setInputHash(''); setWarnings([]); setArtifactEstimate(null); setValidationMessage(prettyError(error)); }
       }
     }, 350);
     return () => window.clearTimeout(timeout);
@@ -1017,6 +1120,10 @@ export default function App() {
   }, [fetchRunInfo, fetchSnapshot, fetchFluxResult, latestRunId, fluxResultRunId]);
 
   const startRun = async (kind: 'preview' | 'simulate') => {
+    if (kind === 'simulate' && artifactEstimate?.risk === 'reject') {
+      setNotice(`运行产物预估约 ${formatEstimateMiB(artifactEstimate.estimatedMiB)}，超过 ${artifactEstimate.capMiB} MiB 上限；工作台会在启动前拒绝该运行。请按“运行产物预估”中的建议调整网格、步骤或输出后再试。`);
+      return;
+    }
     setLoading(true); setNotice(''); setFluxResult(null); setFluxResultRunId(null);
     try {
       await api('/api/projects/validate', { method: 'POST', body: JSON.stringify(project) });
@@ -1026,7 +1133,11 @@ export default function App() {
       setRunLog(''); cursorRef.current = 0; setLogCursor(0); setSelectedSnapshot(null); setSelectedStepId(null); setAutoFollow(true);
       setNotice(kind === 'preview' ? '初始结构预览已提交。' : '工艺仿真已提交。');
       void refreshLists();
-    } catch (error) { setNotice(prettyError(error)); }
+    } catch (error) {
+      const rejected = artifactEstimateFromError(error);
+      if (rejected) setArtifactEstimate(rejected);
+      setNotice(prettyError(error));
+    }
     finally { setLoading(false); }
   };
 
@@ -1377,7 +1488,8 @@ export default function App() {
     try {
       setLoading(true);
       if (file.name.toLowerCase().endsWith('.zip')) {
-        if (file.size > maxPackageBytes) throw new Error('状态包不能超过 512 MiB。');
+        const maxPackageBytes = effectiveArtifactCapBytes(capabilities);
+        if (file.size > maxPackageBytes) throw new Error(`状态包不能超过 ${formatArtifactCapMiB(maxPackageBytes)}。`);
         const imported = await api<{ project: Project; replay?: unknown | null }>('/api/continuation-package/import', { method: 'POST', body: file, headers: { 'Content-Type': 'application/zip' } });
         if (imported.replay) await startReplay(imported.replay);
         else {
@@ -2051,6 +2163,22 @@ export default function App() {
   const gpuDeviceSelectable = (gpuInventory?.devices.length ?? 0) > 0;
   const gpuExposed = gpuDeviceSelectable;
   const defaultGpuDevice = gpuInventory?.devices.find(device => device.uuid === gpuInventory.preferredGpuDeviceId);
+  // Host capability (gpuExposed) answers "can this machine run CUDA flux at
+  // all"; the run's engine comes from actualExecution and may still be CPU_DISK
+  // (for example geometry or explicitly CPU steps in a mixed recipe).
+  const runEngines = runEnginesOf(displayInfo);
+  const runEngine = runEngineLabel(runEngines);
+  const runEngineTitle = runEngines.length > 1
+    ? `本次运行混合使用：${runEngines.join(' + ')}（RunInfo.actualExecution）`
+    : runEngines.length === 1
+      ? `本次运行实际使用 ${runEngines[0]}（RunInfo.actualExecution）`
+      : '所选运行的 actualExecution 中没有实际引擎：可能尚未执行、只有几何操作或全部为零速率 no-op。';
+  const selectedStepEngine = selectedExecution?.actualEngine && selectedExecution.actualEngine !== NOT_APPLICABLE_ENGINE ? selectedExecution.actualEngine : null;
+  const loadedRunSelection = selection.kind === 'run' && displayInfo?.runId === selection.id;
+  const artifactReject = artifactEstimate?.risk === 'reject';
+  const artifactRejectNotice = artifactReject && artifactEstimate
+    ? `运行产物预估约 ${formatEstimateMiB(artifactEstimate.estimatedMiB)}（上限 ${artifactEstimate.capMiB} MiB）已超限；工作进程启动前会返回 422，请按“运行产物预估”的建议调整。`
+    : '';
 
   return <div className={`app-shell ${isResizingPanels ? 'columns-resizing' : ''}`}>
     <TopBar>
@@ -2073,7 +2201,7 @@ export default function App() {
             <button className="button" onClick={() => void startRun('preview')} disabled={loading || health !== 'ready' || active}>生成结构预览</button>
             {active
               ? <button className="button danger" onClick={() => void cancelRun()}>取消运行</button>
-              : <button className="button primary run-button" onClick={() => void startRun('simulate')} disabled={loading || health !== 'ready' || !project.steps.some(step => step.enabled)}>运行工艺</button>}
+              : <button className="button primary run-button" onClick={() => void startRun('simulate')} disabled={loading || health !== 'ready' || !project.steps.some(step => step.enabled) || artifactReject} title={artifactRejectNotice || undefined}>运行工艺</button>}
             {project.schemaVersion >= 7 && selectedStepObject && usesFlux(selectedStepObject) && <button className="button" onClick={() => void startFlux(selectedStepObject.id)} disabled={loading || health !== 'ready' || active}>单次计算所选粒子过程通量</button>}
           </div>
         </nav>
@@ -2495,6 +2623,7 @@ export default function App() {
               <div className="inline-note">表面网格始终作为查看器结果保存；所选原生文件附带 SHA-256、尺寸和 level-set 材料映射，可逐个下载或打包导出。</div>
             </div>}
         </section>
+        <ArtifactPreflightCard estimate={artifactEstimate} />
         </section></SettingsPanel>}
       </ContextPanel>
       </aside>
@@ -2526,6 +2655,8 @@ export default function App() {
         <div className="viewer-meta">
           <span className="meta-item"><i className="meta-dot" />{selectedSnapshot ? `${selectedSnapshot.mesh.pointCount.toLocaleString()} 点 · ${(selectedSnapshot.mesh.triangleCount ?? selectedSnapshot.mesh.lineCount ?? 0).toLocaleString()} ${displayDimension === 3 ? '三角面' : '界面段'}` : '二维网格界面'}</span>
           <span className="meta-item">坐标：{displayDimension === 3 ? 'x / y / z' : 'x / h'} · µm</span>
+          <span className={`meta-item engine-chip ${engineTone(runEngines)}`} title={runEngineTitle}>本次运行引擎 {runEngine}</span>
+          {selectedExecution && <span className="meta-item engine-chip step" title="所选步骤在 RunInfo.actualExecution 中记录的 actualEngine">本步 {selectedStepEngine ?? '不适用'}</span>}
           {selectedExecutionGpu?.uuid && <span className="meta-item" title={`CUDA Runtime 设备/同步回读：${selectedExecutionGpu.pciBusId ?? '未知'}；nvidia-smi 进程清单：${selectedExecutionGpu.process?.processListed ? '已列出 worker' : '未列出 worker'}`}>
             计算设备：{selectedExecutionGpu.name ?? selectedExecutionGpu.uuid}
             {selectedExecutionGpu.afterProcessApply?.readbackStatus === 'verified' ? ' · CUDA 已同步核验' : ''}
@@ -2853,7 +2984,15 @@ export default function App() {
             <div className="step-tab-panel" data-step-tab-panel="basic"><div className="step-edit-actions"><button className="button" onClick={() => moveStep(selectedStepObject.id, -1)}>↑ 上移</button><button className="button" onClick={() => moveStep(selectedStepObject.id, 1)}>↓ 下移</button><button className="button" onClick={() => copyStep(selectedStepObject)}>复制</button><button className="button danger-quiet" onClick={() => { updateProject(previous => ({ ...previous, steps: previous.steps.filter(step => step.id !== selectedStepObject.id) })); setSelectedStep(null); }}>删除</button></div>
             <div className="section-divider" /></div>
           </StepInspector></> : selection.kind === 'run'
-            ? <RunInspector><div className="project-summary"><strong>运行 {selection.id.slice(0, 12)}</strong><span>{humanStatus(runs.find(row => row.runId === selection.id)?.status ?? displayInfo?.status)}</span><span>{runs.find(row => row.runId === selection.id)?.kind ?? displayInfo?.kind ?? '运行'}</span></div></RunInspector>
+            ? <RunInspector>
+                <div className="project-summary"><strong>运行 {selection.id.slice(0, 12)}</strong><span>{humanStatus(runs.find(row => row.runId === selection.id)?.status ?? displayInfo?.status)}</span><span>{runs.find(row => row.runId === selection.id)?.kind ?? displayInfo?.kind ?? '运行'}</span></div>
+                <div className="run-engine-summary" aria-label="本次运行引擎">
+                  <span className="field-label">本次运行引擎<small>来自 RunInfo.actualExecution 的实际引擎，与主机 GPU 能力无关</small></span>
+                  <span className={`engine-badge ${loadedRunSelection ? engineTone(runEngines) : 'idle'}`}>{loadedRunSelection ? runEngine : '未载入'}</span>
+                  <small>{loadedRunSelection ? runEngineTitle : '打开该运行记录后显示实际引擎。'}</small>
+                  {loadedRunSelection && selectedStepEngine && <small>当前所选步骤：{selectedStepEngine}</small>}
+                </div>
+              </RunInspector>
             : selection.kind === 'material'
               ? <MaterialInspector>{selectedMaterial ? <MaterialPropertyInspector material={selectedMaterial} busy={materialBusy} onSave={saveCustomMaterialMetadata} /> : <div className="project-summary"><strong>{selection.name}</strong><span>材料目录中找不到该材料。</span></div>}</MaterialInspector>
               : selection.kind === 'artifact'
@@ -2866,12 +3005,14 @@ export default function App() {
           <div className="validation-head"><span className={`validation-mark ${inputHash ? 'ok' : ''}`}>{inputHash ? '✓' : '!'}</span><div><strong>{inputHash ? '参数检查' : '需要修正输入'}</strong><small>{validationMessage || '等待工作台校验…'}</small></div></div>
           {warnings.map((warning, index) => <p key={index} className="warning-line">{warning}</p>)}
           <div className="validation-foot"><span>工艺步骤上限</span><strong>{capabilities?.resourcePolicy?.run?.maximumSteps == null ? '不限' : `${capabilities.resourcePolicy.run.maximumSteps} 步`}</strong></div>
-          <div className="validation-foot"><span>GPU 状态</span><strong>{gpuExposed ? 'GPU_DISK · 可选择' : gpuStatus === 'unverified-outside-sandbox' ? '设备不可用' : gpuStatus}</strong></div>
+          <div className="validation-foot" title="主机 GPU 能力来自 /api/gpu-devices，表示本机能否运行 CUDA 通量；不代表所选运行使用的引擎。"><span>主机 GPU 能力</span><strong>{gpuExposed ? 'GPU_DISK · 可选择' : gpuStatus === 'unverified-outside-sandbox' ? '设备不可用' : gpuStatus}</strong></div>
+          <div className="validation-foot" title={runEngineTitle}><span>本次运行引擎</span><strong>{runEngine}{selectedStepEngine ? ` · 本步 ${selectedStepEngine}` : ''}</strong></div>
+          {artifactEstimate && <div className={`validation-foot artifact-foot ${artifactEstimate.risk}`} title={`运行产物预检估算；当前配置上限 ${artifactEstimate.capMiB} MiB，超限的运行会在启动前被拒绝。`}><span>运行产物预估</span><strong>{formatEstimateMiB(artifactEstimate.estimatedMiB)} / {artifactEstimate.capMiB} MiB · {ARTIFACT_RISK_LABELS[artifactEstimate.risk]}</strong></div>}
         </section>
       </Inspector>
     </main>
 
-    <StatusBar health={health} validationMessage={validationMessage} hash={inputHash} gpu={gpuExposed ? 'GPU_DISK · 可选择' : gpuStatus === 'unverified-outside-sandbox' ? '设备不可用' : gpuStatus} stepCount={runInfo?.completedStepIds.length ?? project.steps.length} stepLimit={capabilities?.resourcePolicy?.run?.maximumSteps ?? null} elapsed={runInfo ? `${runInfo.elapsedSeconds.toFixed(1)} s` : '—'} runId={displayRunId ?? ''} warnings={warnings} />
+    <StatusBar health={health} validationMessage={validationMessage} hash={inputHash} gpu={gpuExposed ? 'GPU_DISK · 可选择' : gpuStatus === 'unverified-outside-sandbox' ? '设备不可用' : gpuStatus} engine={runEngine} stepEngine={selectedStepEngine} stepCount={runInfo?.completedStepIds.length ?? project.steps.length} stepLimit={capabilities?.resourcePolicy?.run?.maximumSteps ?? null} elapsed={runInfo ? `${runInfo.elapsedSeconds.toFixed(1)} s` : '—'} runId={displayRunId ?? ''} warnings={warnings} />
 
     {notice && <div className="toast" role="status"><span>{notice}</span><button aria-label="关闭提示" onClick={() => setNotice('')}>×</button></div>}
     {deleteMaterialCandidate && <DeleteMaterialDialog material={deleteMaterialCandidate} busy={deletingMaterial === deleteMaterialCandidate.name} error={deleteMaterialError}
