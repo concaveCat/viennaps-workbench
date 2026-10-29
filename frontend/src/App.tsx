@@ -123,6 +123,16 @@ const defaultProject: Project = {
 
 type MaterialCatalogItem = { name: string; id: number; color: string; isCustom?: boolean; category?: string; densityGcm3?: number; conductive?: boolean; description?: string; customId?: number };
 
+// Ray count is the dominant cost knob for stochastic flux steps: measured on
+// the RTX 3060 host, 8/64/256 rays per point cost 1.42/2.26/4.87 s of flux
+// engine time for a six-step 3D deposition. The numeric field stays available
+// for fine tuning; the presets give the common trade-off points a name.
+const RAY_PRESETS = [
+  { value: 16, label: '预览', detail: '每点 16 条射线：最快，统计噪声明显，适合看趋势或快速试几何' },
+  { value: 64, label: '标准', detail: '每点 64 条射线：射线耗时约为 256 的三分之一，噪声可接受' },
+  { value: 256, label: '精确', detail: '每点 256 条射线：默认精度，统计噪声最低，单步耗时最长' },
+] as const;
+
 function DeleteMaterialDialog({ material, busy, error, onClose, onConfirm }: {
   material: MaterialCatalogItem; busy: boolean; error: string; onClose: () => void; onConfirm: () => void;
 }) {
@@ -2024,7 +2034,19 @@ export default function App() {
           <div className="field-grid one-column solver-fields">
             {processSteps.length > 0 && <NumericField label="时间步比例" value={project.solver.timeStepRatio} min={0.05} max={0.5} step="0.01" hint="显式传入 AdvectionParameters" onChange={value => updateProject(previous => ({ ...previous, solver: { ...previous.solver, timeStepRatio: value } }))} />}
             {particleSteps > 0 ? <>
-              <NumericField label="每点射线数" value={project.solver.raysPerPoint} min={16} max={4096} step="16" onChange={value => updateProject(previous => ({ ...previous, solver: { ...previous.solver, raysPerPoint: Math.trunc(value) } }))} />
+              <div className="field">
+                <span className="field-label">射线档位<small>决定统计噪声与单步耗时；同一种子仍可复现</small></span>
+                <div className="segmented ray-presets" role="group" aria-label="射线档位">
+                  {RAY_PRESETS.map(preset => <button key={preset.value} type="button" title={preset.detail}
+                    aria-label={`射线档位 ${preset.label} ${preset.value}`}
+                    aria-pressed={project.solver.raysPerPoint === preset.value}
+                    className={project.solver.raysPerPoint === preset.value ? 'active' : ''}
+                    onClick={() => updateProject(previous => ({ ...previous, solver: { ...previous.solver, raysPerPoint: preset.value } }))}>
+                    {preset.label} · {preset.value}
+                  </button>)}
+                </div>
+              </div>
+              <NumericField label="每点射线数" value={project.solver.raysPerPoint} min={16} max={4096} step="16" hint="16–4096，可微调" onChange={value => updateProject(previous => ({ ...previous, solver: { ...previous.solver, raysPerPoint: Math.trunc(value) } }))} />
               <SelectField label="随机策略" value={project.solver.random.mode} options={[{ value: 'fixed', label: '固定种子（可重放）' }, { value: 'random', label: '每次运行生成' }]} onChange={value => updateProject(previous => ({ ...previous, solver: { ...previous.solver, random: value === 'fixed' ? { mode: 'fixed', seed: previous.solver.random.mode === 'fixed' ? previous.solver.random.seed : 314159 } : { mode: 'random' } } }))} />
               {project.solver.random.mode === 'fixed' && <NumericField label="随机种子" value={project.solver.random.seed} min={0} max={4294967295} step="1" onChange={value => updateProject(previous => ({ ...previous, solver: { ...previous.solver, random: { mode: 'fixed', seed: Math.trunc(value) } } }))} />}
               <SelectField label="引擎偏好" value={project.solver.enginePreference} options={[{ value: 'auto', label: '自动 · GPU 优先' }, { value: 'cpu', label: 'CPU · CPU_DISK' }, { value: 'gpu', label: 'GPU · GPU_DISK', disabled: !gpuDeviceSelectable }]} onChange={value => updateProject(previous => ({ ...previous, solver: { ...previous.solver, enginePreference: value as Solver['enginePreference'] } }))} />
