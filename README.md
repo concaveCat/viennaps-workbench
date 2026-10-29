@@ -234,8 +234,8 @@ disabled on purpose; `docs/api-contract.md` is the normative contract.
 | `VIENNAPS_PATCHED_RUNTIME_DIR` | unset | Optional patched ViennaPS runtime (set by `scripts/start.sh` when present) |
 | `VIENNAPS_PATCHED_RUNTIME_HISTORY_DIR` | unset | Version archive for the patched runtime |
 | `WORKBENCH_GPU_TEST` | unset | `1` enables GPU integration tests |
-| `VIENNAPS_WORKBENCH_PROFILE` | unset | `1` emits per-segment timing events |
-| `VIENNAPS_WORKBENCH_GPU_CONTEXT_REUSE` | unset | Reuse the CUDA context across consecutive GPU steps |
+| `VIENNAPS_WORKBENCH_PROFILE` | on | `0` disables the per-segment timing event |
+| `VIENNAPS_WORKBENCH_GPU_CONTEXT_REUSE` | on | `0` tears the CUDA/OptiX context down between consecutive GPU steps |
 | `VIENNAPS_DEBUG_NATIVE_CALLBACKS` | unset | Verbose native callback logging |
 | `WORKBENCH_HOST_VERIFY_SCRIPT` | unset | Optional host self-check used by `scripts/finalize-host.py` |
 

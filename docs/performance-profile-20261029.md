@@ -192,25 +192,32 @@ cellData / materials / surfaceBounds / domainReadback 全部相等，键集合�
 `unittest discover` 102 项中 99 项通过，剩余 3 项与本次改动无关（HTTP 413/422 顺序、
 `nativeMetadata` 参考文件的 pretty-vs-compact 格式、stage9 缺证据文件）。
 
-## 8. GPU context 复用：旧结论需要修正的情况
+## 8. GPU context 复用：根因已定位并修复
 
-`worker/simulate.py` 原来在"下一步还是 GPU 步骤"时无条件
-`reset_native_gpu_context()`，注释说 ViennaRay 更新 Domain 后第二次 disk geometry
-构建会失败。实测（`--mode reuse`，同一进程、Domain 已被第一步改变、**不销毁 context**）：
+原代码在"下一步还是 GPU 步骤"时无条件 `reset_native_gpu_context()`，注释把原因写成
+"ViennaRay 更新 Domain 后第二次 disk geometry 构建会失败"。复现与隔离后的结论是：
+**失败确实存在，但触发条件不是几何变化，而是步骤之间那次进程内的 CUDA Runtime 读回。**
 
-| 步骤 | 耗时 | 结果 |
-|---|---:|---|
-| 第 1 步 apply（初始 fin） | 5.35 s | 成功 |
-| 第 2 步 apply（新 Process，已沉积表面） | 5.83 s | **成功，未报错，level set 数 2→3** |
+复现证据（3D fin，两步 SiO₂ 沉积，同一 context）：
 
-即：**当前的引擎构建下，"第二次 disk geometry 构建失败"没有复现**。
-限制说明：
-- 只覆盖了本配置（3D fin + SiO₂ singleParticle + GPU_DISK）。
-- 该 reset 只在"同一次运行里后面还有 GPU 步骤"时触发，单步运行从来不受影响，
-  所以它不是当前 15 s / 9 s 耗时的原因；它能省的只是后续每个 GPU 步骤
-  0.3–0.9 s（§3 的 context 创建 + JIT）。
-- 因此默认行为保持不变，复用需显式开启；要改成默认，应先把完整引擎矩阵
-  （多材料/多 level set/TRIANGLE 引擎）都跑一遍 `--mode reuse` 再决定。
+| 步骤之间做了什么 | 第 2 步结果 |
+|---|---|
+| 什么都不做 | 成功（1.69 s） |
+| 写快照 + 写 `.vpsd` 原生状态 | 成功（1.71 s） |
+| **调用 `cuda_runtime_readback()`** | **失败**：`optixAccelBuild … failed with code 7001 (Invalid value)`，`raygDiskGeometry.hpp:173` |
+
+也就是说：`cuda_runtime_readback()` 在 live OptiX context 上调用 CUDA Runtime（cts/runtime
+API）会让下一次 `optixAccelBuild` 的缓冲/上下文状态失效；快照与状态写入本身无害。
+这也解释了为什么"重置 context"能绕过：重置后重新建 context，读回造成的状态被打包丢弃。
+
+**修复**：连续 GPU 步骤之间不再做进程内 CUDA Runtime 读回，改用
+`nvidia-smi` 的 utilisation/显存采样作为"确实用了 GPU"的证据；最后一次 GPU 步骤
+仍然做完整读回。context 默认复用，`VIENNAPS_WORKBENCH_GPU_CONTEXT_REUSE=0`
+可强制回到销毁重建。
+
+验证：同一两步工程分别在"复用"与"强制 reset"两种模式下运行，均成功、无 Optix 报错，
+且 `step_second_deposit.json` 的 SHA-256 **完全相同**（`f046c316…b803`），
+说明复用不改变结果；复用模式只省掉一次 context 销毁+重建（0.3–0.9 s/步）。
 
 ## 9. 改进优先级（按收益/风险排序）
 

@@ -88,6 +88,9 @@ def atomic_json(path: Path, data: Any) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     # Snapshot JSON contains large point/cell arrays. Compact serialization
     # avoids spending time on indentation and reduces per-run artifact size.
+    # Keep the encode-then-write form: measured on a 7.4 MB snapshot,
+    # json.dump(stream) is ~3.8x slower than json.dumps() + write_text()
+    # (293 ms vs 77 ms), because the stream path writes in small chunks.
     tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n", encoding="utf-8")
     os.replace(tmp, path)
 
@@ -208,6 +211,35 @@ def nvidia_process_readback(expected_uuid: str) -> dict[str, Any]:
             "processListStatus": "verified", "observedProcessCount": len(rows)}
 
 
+def nvidia_gpu_sample() -> dict[str, Any]:
+    """One-shot GPU utilisation/clocks sample; never fails a run.
+
+    The process list from `nvidia-smi --query-compute-apps` does not always
+    enumerate the CUDA worker (WSL2), so utilisation is sampled separately to
+    answer "was the GPU actually busy" without guessing.
+    """
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,clocks.sm,pstate",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=6, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"status": "unavailable", "error": f"{type(exc).__name__}: {exc}"}
+    devices = []
+    for values in csv.reader(io.StringIO(result.stdout), skipinitialspace=True):
+        if len(values) >= 4:
+            utilization, memory, clock, pstate = (value.strip() for value in values[:4])
+            devices.append({"utilizationPercent": int(utilization) if utilization.isdigit() else None,
+                            "memoryUsedMiB": int(memory) if memory.isdigit() else None,
+                            "clockSmMHz": int(clock) if clock.isdigit() else None,
+                            "pstate": pstate})
+    if result.returncode != 0 or not devices:
+        return {"status": "unavailable", "returnCode": result.returncode,
+                "error": (result.stderr or "").strip()[:200]}
+    return {"status": "sampled", "devices": devices}
+
+
 def event(run_dir: Path, data: dict[str, Any]) -> None:
     record = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), **data}
     with (run_dir / "events.ndjson").open("a", encoding="utf-8") as stream:
@@ -215,10 +247,17 @@ def event(run_dir: Path, data: dict[str, Any]) -> None:
         stream.flush()
 
 
-# Opt-in phase timings: the worker otherwise records only one aggregate
+# Phase timings: the worker otherwise records only one aggregate
 # process.apply() duration, which hides setup, snapshot and teardown cost.
-# Set VIENNAPS_WORKBENCH_PROFILE=1 to emit a "segment-timing" event.
-PROFILE_ENABLED = os.environ.get("VIENNAPS_WORKBENCH_PROFILE") == "1"
+# Recorded by default so every run is auditable; set
+# VIENNAPS_WORKBENCH_PROFILE=0 to disable (adds ~10 perf_counter calls).
+PROFILE_ENABLED = os.environ.get("VIENNAPS_WORKBENCH_PROFILE") != "0"
+# Reuse the CUDA/OptiX context across consecutive GPU steps unless explicitly
+# disabled. An in-process CUDA Runtime call (cuda_runtime_readback) between two
+# GPU steps is what breaks the second OptiX acceleration-structure build
+# (optixAccelBuild 7001 Invalid value); steps that are followed by another GPU
+# step therefore skip that call and use nvidia-smi evidence instead.
+GPU_CONTEXT_REUSE = os.environ.get("VIENNAPS_WORKBENCH_GPU_CONTEXT_REUSE") != "0"
 PROFILE_PHASES: list[dict[str, Any]] = []
 
 
@@ -1807,6 +1846,8 @@ def execute(input_path: Path, run_dir: Path) -> None:
     if boundary_values != ([expected_x_boundary,expected_x_boundary,"1"] if project["dimension"]==3 else [expected_x_boundary,"1"]):
         raise RuntimeError(f"Domain boundary readback {boundary_values} differs from the requested x boundary and infinite h boundary")
 
+    print("note: 'Process time: X / Y s' lines below report simulated process time, "
+          "not wall-clock seconds.", flush=True)
     event(run_dir, {"type": "initializing", "runId": run_id})
     initial_name = f"新工艺起始状态 · {state_ref['sourceStepId'] if state_ref and state_ref.get('sourceStepId') else '导入的 Domain 状态'}" if state_ref else "初始结构"
     with phase("initialSnapshot"):
@@ -1878,7 +1919,7 @@ def execute(input_path: Path, run_dir: Path) -> None:
             post_flux_cuda_readback = cuda_runtime_readback(selected_gpu_device)
             gpu_usage = nvidia_process_readback(selected_gpu_device["uuid"])
             flux_result["cudaDeviceReadback"] = {**cuda_readback, "afterCalculateFlux": post_flux_cuda_readback,
-                                                  "process": gpu_usage}
+                                                  "process": gpu_usage, "gpuSample": nvidia_gpu_sample()}
             flux_path = run_dir / flux_result["fileName"]
             flux_payload = json.loads(flux_path.read_text(encoding="utf-8"))
             flux_payload["execution"]["cudaDeviceReadback"] = flux_result["cudaDeviceReadback"]
@@ -2180,11 +2221,26 @@ def execute(input_path: Path, run_dir: Path) -> None:
                     process_apply_seconds = time.perf_counter() - process_started
                 finally:
                     os.chdir(previous_cwd)
+            next_gpu_step_pending = any(
+                uses_flux(future)
+                and str(config.get("stepEngines", {}).get(
+                    future["id"], "GPU_DISK" if engine_preference == "gpu" else "CPU_DISK")).startswith("GPU_")
+                for future in actual_steps[index:]
+            )
             if engine.startswith("GPU_"):
-                post_apply_cuda_readback = cuda_runtime_readback(selected_gpu_device)
+                if GPU_CONTEXT_REUSE and next_gpu_step_pending:
+                    # Must not touch the CUDA Runtime here: it invalidates the
+                    # live OptiX context and the next accel build fails (7001).
+                    post_apply_cuda_readback = {
+                        "readbackStatus": "skipped-for-context-reuse",
+                        "reason": "in-process CUDA Runtime calls between GPU steps break the next optixAccelBuild",
+                        "deviceEvidence": "nvidia-smi utilisation sample + pre-run CUDA Runtime readback",
+                    }
+                else:
+                    post_apply_cuda_readback = cuda_runtime_readback(selected_gpu_device)
                 gpu_usage = nvidia_process_readback(selected_gpu_device["uuid"])
                 step_cuda_readback = {**cuda_readback, "afterProcessApply": post_apply_cuda_readback,
-                                      "process": gpu_usage,
+                                      "process": gpu_usage, "gpuSample": nvidia_gpu_sample(),
                                       **({"stageSelection": split_result["gpuStageSelection"]}
                                          if split_result is not None else {})}
                 actual_parameters["cudaDeviceReadback"] = step_cuda_readback
@@ -2295,7 +2351,7 @@ def execute(input_path: Path, run_dir: Path) -> None:
             model = None
             import gc
             gc.collect()
-            if os.environ.get("VIENNAPS_WORKBENCH_GPU_CONTEXT_REUSE") == "1":
+            if GPU_CONTEXT_REUSE:
                 event(run_dir, {"type": "gpu-context-reuse", "afterStepId": step["id"],
                                 "nextGpuStepPending": True,
                                 "registeredDevices": [int(value) for value in ps.gpu.Context.getRegisteredDeviceIDs()]})
