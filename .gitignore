@@ -43,3 +43,10 @@ docs/refactor-after/
 # 杂项
 *.log
 .DS_Store
+
+# 同一路径在 worktree 里是软链（指向主工作区）。git 的 'name/' 只匹配目录，
+# 不匹配软链，因此再写一份不带斜杠的规则，避免 `git add -A` 把软链提交进来。
+.venv
+frontend/node_modules
+frontend/dist
+runtime-patched
