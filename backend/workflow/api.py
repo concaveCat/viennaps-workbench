@@ -12,6 +12,7 @@ from pydantic import Field, ValidationError
 from .. import storage
 from ..models import StrictModel
 from .metrology import MeasurementResultV1, MetrologyRecipeV1, MetricDefinitionV1
+from .adoption import adopt_project, first_route
 from .equivalence import ComparisonProtocolV1, EquivalenceResultV1, compare_snapshots
 from .execution import execute_segment
 from .models import CompiledWorkflowV1
@@ -118,6 +119,26 @@ class MaterializeResponse(StrictModel):
 class SegmentExecutionResponse(StrictModel):
     segment: SegmentV1
     runId: str
+
+
+class AdoptProjectRequest(StrictModel):
+    project: dict
+    flowId: str | None = None
+
+
+class AdoptProjectResponse(StrictModel):
+    flowId: str
+    bindingId: str
+    compileId: str
+    projectName: str
+    dimension: int
+    stepCount: int
+    compile: CompiledWorkflowV1
+
+
+class RouteFromCompileRequest(StrictModel):
+    compileId: str
+    name: str | None = None
 
 
 class EquivalenceCheckRequest(StrictModel):
@@ -291,6 +312,33 @@ async def list_compiles() -> CompileListResponse:
 @router.get("/compiles/{compile_id}", response_model=CompiledWorkflowV1)
 async def get_compile(compile_id: str) -> CompiledWorkflowV1:
     return _call(lambda: get_store().get_compile(compile_id))
+
+
+@router.post("/flows/from-project", response_model=AdoptProjectResponse, status_code=201)
+async def adopt_project_endpoint(request: AdoptProjectRequest) -> AdoptProjectResponse:
+    def operation():
+        flow, binding, compiled = adopt_project(request.project, flow_id=request.flowId)
+        get_store().register_compile(compiled)
+        return AdoptProjectResponse(
+            flowId=flow.flowId,
+            bindingId=binding.bindingId,
+            compileId=compiled.compileRecord.compileId,
+            projectName=compiled.project.name,
+            dimension=compiled.project.dimension,
+            stepCount=len(compiled.project.steps),
+            compile=compiled,
+        )
+    return _call(operation)
+
+
+@router.post("/routes/from-compile", response_model=RoutePlanResponse, status_code=201)
+async def route_from_compile(request: RouteFromCompileRequest) -> RoutePlanResponse:
+    def operation():
+        compiled = get_store().get_compile(request.compileId)
+        plan = first_route(compiled, name=request.name)
+        get_store().create_plan(plan)
+        return RoutePlanResponse(plan=plan)
+    return _call(operation)
 
 
 @router.post("/routes", response_model=RoutePlanResponse, status_code=201)
