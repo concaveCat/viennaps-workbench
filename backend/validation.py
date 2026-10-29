@@ -179,6 +179,7 @@ def validate_project(payload: Any, *, kind: str = "project") -> tuple[Project, l
     extent = project.domain.xExtent
     if project.schemaVersion in (3,4,5,6,7):
         issues.extend(_validate_materials(project))
+        warnings.extend(_planarize_warnings(project))
         if project.schemaVersion == 7:
             issues.extend(_validate_specialized_steps(project))
         if project.dimension == 3:
@@ -271,6 +272,30 @@ def validate_project(payload: Any, *, kind: str = "project") -> tuple[Project, l
     return project, warnings
 
 
+def _planarize_warnings(project: Any) -> list[str]:
+    """Explain what a material-aware planarize can and cannot do.
+
+    The installed ViennaPS 4.6.2 Planarize accepts a height only. A
+    ``stopMaterial`` step therefore derives one global cutoff from the measured
+    top of that material; it is not a CMP selectivity model. Surface the
+    limitation in the same place the UI shows validation warnings.
+    """
+    warnings: list[str] = []
+    for index, step in enumerate(project.steps):
+        if not is_geometry_step(step) or step_value(step, "model") != "planarize":
+            continue
+        stop_material = step_value(step, "stopMaterial")
+        if stop_material is None:
+            continue
+        warnings.append(
+            f"steps[{index}]: material-aware CMP derives one global cutoff from the measured top of "
+            f"{stop_material} minus overPolish. ViennaPS 4.6.2 Planarize still cuts every material above "
+            f"that height and models no lateral selectivity, so a stop material that is not flat at a single "
+            f"level can be over- or under-cut. The measured stop height and the effective cutoff are recorded "
+            f"in the step result.")
+    return warnings
+
+
 def _validate_materials(project: ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 | ProjectV7) -> list[FieldIssue]:
     try:
         from .materials import material_catalog
@@ -291,6 +316,7 @@ def _validate_materials(project: ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 |
         if name not in names: issues.append(FieldIssue(path,f"unknown or unavailable material {name!r}; choose a material from /api/materials"))
         roles.setdefault(name,set()).add(role)
     issues=list(issues_view)
+    available_by_step = _materials_available_by_step(project)
     uniform_protection=project.schemaVersion<4 or any(step_value(step,"rateMode","uniform")=="uniform" for step in project.steps)
     if g["kind"] == "gds":
         from . import storage
@@ -336,8 +362,21 @@ def _validate_materials(project: ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 |
         if is_geometry_step(step) and step_value(step,"model")=="removeMaterial" and step_value(step,"material") not in names:
             issues.append(FieldIssue(f"steps[{i}].material",f"unknown or unavailable material {step_value(step,'material')!r}"))
         if is_geometry_step(step) and step_value(step,"model")=="planarize":
-            if abs(float(step_value(step,"cutoffHeight")))/project.domain.gridDelta>1_000_000:
+            cutoff_height = step_value(step,"cutoffHeight")
+            stop_material = step_value(step,"stopMaterial")
+            if cutoff_height is not None and abs(float(cutoff_height))/project.domain.gridDelta>1_000_000:
                 issues.append(FieldIssue(f"steps[{i}].cutoffHeight","cutoff height exceeds the application coordinate budget"))
+            if stop_material is not None:
+                if stop_material not in names:
+                    issues.append(FieldIssue(f"steps[{i}].stopMaterial",f"unknown or unavailable material {stop_material!r}; choose a material from /api/materials"))
+                else:
+                    # The CMP stop height is measured from the exposed surface of
+                    # this material when the step runs, so it must exist by then.
+                    executed_names, planned_names = available_by_step[i]
+                    available_names = executed_names if step_value(step,"enabled") else planned_names
+                    if stop_material not in available_names:
+                        issues.append(FieldIssue(f"steps[{i}].stopMaterial",
+                            f"material {stop_material!r} is not present when this step runs; a stopMaterial CMP measures its exposed top, so it must come from the initial geometry or an earlier enabled deposition"))
         if is_geometry_step(step) and step_value(step,"model")=="boolean":
             position=step_value(step,"position"); width=float(step_value(step,"width")); height=float(step_value(step,"height")); depth=step_value(step,"depth")
             if width<2*project.domain.gridDelta-1e-12 or height<2*project.domain.gridDelta-1e-12 or (project.dimension==3 and float(depth)<2*project.domain.gridDelta-1e-12):

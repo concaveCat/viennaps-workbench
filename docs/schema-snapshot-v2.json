@@ -114,6 +114,143 @@
       ],
       "title": "Mesh3D",
       "type": "object"
+    },
+    "MaterialTop": {
+      "additionalProperties": false,
+      "properties": {
+        "topHeight": {
+          "title": "Topheight",
+          "type": "number"
+        },
+        "medianTopHeight": {
+          "title": "Mediantopheight",
+          "type": "number"
+        },
+        "upFacingArea": {
+          "minimum": 0,
+          "title": "Upfacingarea",
+          "type": "number"
+        },
+        "upFacingCellCount": {
+          "minimum": 0,
+          "title": "Upfacingcellcount",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "topHeight",
+        "medianTopHeight",
+        "upFacingArea",
+        "upFacingCellCount"
+      ],
+      "title": "MaterialTop",
+      "type": "object"
+    },
+    "MeasuredMaterialChange": {
+      "additionalProperties": false,
+      "properties": {
+        "material": {
+          "title": "Material",
+          "type": "string"
+        },
+        "topHeightBefore": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Topheightbefore"
+        },
+        "topHeightAfter": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Topheightafter"
+        },
+        "removedThickness": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Removedthickness"
+        },
+        "addedThickness": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Addedthickness"
+        },
+        "removedCompletely": {
+          "default": false,
+          "title": "Removedcompletely",
+          "type": "boolean"
+        },
+        "remainingTopHeight": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Remainingtopheight"
+        },
+        "method": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Method"
+        },
+        "materials": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "object"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Materials"
+        }
+      },
+      "required": [
+        "material"
+      ],
+      "title": "MeasuredMaterialChange",
+      "type": "object"
     }
   },
   "additionalProperties": false,
@@ -241,6 +378,45 @@
       "additionalProperties": true,
       "title": "Domainreadback",
       "type": "object"
+    },
+    "materialTops": {
+      "anyOf": [
+        {
+          "additionalProperties": {
+            "$ref": "#/$defs/MaterialTop"
+          },
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Materialtops"
+    },
+    "measuredRemoval": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MeasuredMaterialChange"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Measuredremoval"
+    },
+    "measuredAdded": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MeasuredMaterialChange"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Measuredadded"
     }
   },
   "required": [
