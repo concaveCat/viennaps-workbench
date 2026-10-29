@@ -221,8 +221,8 @@ curl -s http://127.0.0.1:8789/api/projects
 | `VIENNAPS_PATCHED_RUNTIME_DIR` | 未设置 | 可选的补丁版 ViennaPS 运行时（存在时由 `scripts/start.sh` 设置） |
 | `VIENNAPS_PATCHED_RUNTIME_HISTORY_DIR` | 未设置 | 补丁运行时的版本归档 |
 | `WORKBENCH_GPU_TEST` | 未设置 | 设为 `1` 启用 GPU 集成测试 |
-| `VIENNAPS_WORKBENCH_PROFILE` | 未设置 | 设为 `1` 输出分段计时事件 |
-| `VIENNAPS_WORKBENCH_GPU_CONTEXT_REUSE` | 未设置 | 连续 GPU 步骤复用 CUDA context |
+| `VIENNAPS_WORKBENCH_PROFILE` | 开 | 设为 `0` 关闭分段计时事件 |
+| `VIENNAPS_WORKBENCH_GPU_CONTEXT_REUSE` | 开 | 设为 `0` 时在连续 GPU 步骤之间销毁 CUDA/OptiX context |
 | `VIENNAPS_DEBUG_NATIVE_CALLBACKS` | 未设置 | 输出详细的原生回调日志 |
 | `WORKBENCH_HOST_VERIFY_SCRIPT` | 未设置 | `scripts/finalize-host.py` 可选调用的宿主自检脚本 |
 
