@@ -1,22 +1,53 @@
 # Artifact preflight contract
 
 `backend/preflight.py` estimates whether a normalized project is likely to fill
-the 512 MiB per-run artifact cap. The cap itself is unchanged:
-`backend.supervisor.ARTIFACT_LIMIT` and `backend.storage.check_artifact_budget`.
+the per-run artifact cap. The cap is shared by the supervisor, worker, snapshot
+staging, and streaming archives and is configured with
+`WORKBENCH_MAX_ARTIFACT_MIB` (default **4096 MiB**, minimum 64 MiB, no upper
+bound). `backend.runtime_limits` is the single source of truth;
+`GET /api/capabilities` reports the effective value, its source (`env` or
+`default`), and `artifactLimitMaximumMiB: null`.
 
 ## Thresholds
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `ARTIFACT_CAP_BYTES` | 536870912 (512 MiB) | hard run-directory cap |
+| `artifact_limit_bytes()` | 4294967296 (4096 MiB) by default | effective hard run-directory cap |
 | `WARNING_FRACTION` | 0.75 | allowed, returned with `artifactWarning` |
 | `REJECT_FRACTION` | 1.0 | `POST /api/runs` returns 422 before the worker starts |
 | `SAFETY_FACTOR` | 1.20 | margin applied to the raw fit |
 
-The same values are published under `run.artifactPreflight` in
-`docs/resource-policy.json`. A unit test keeps the two copies in sync.
+The defaults are published under `run.artifactPreflight` in
+`docs/resource-policy.json`. The static JSON documents the default; the API is
+the source of the effective runtime value. A unit test keeps the default in
+sync.
 
 ## API fields
+
+`GET /api/capabilities` reports the effective limits additively (existing
+fields are preserved and now reflect the runtime value):
+
+```json
+{
+  "runtimeLimits": {
+    "artifactLimitBytes": 4294967296,
+    "artifactLimitMiB": 4096,
+    "artifactLimitSource": "default",
+    "artifactLimitEnvironmentVariable": "WORKBENCH_MAX_ARTIFACT_MIB",
+    "artifactLimitDefaultMiB": 4096,
+    "artifactLimitMinimumMiB": 64,
+    "artifactLimitMaximumMiB": null
+  },
+  "resourcePolicy": {
+    "run": {
+      "maximumArtifactBytes": 4294967296,
+      "maximumResultArchiveBytes": 4294967296,
+      "artifactLimitMiB": 4096,
+      "artifactPreflight": {"capBytes": 4294967296, "capMiB": 4096}
+    }
+  }
+}
+```
 
 `POST /api/projects/validate` (unchanged success contract) adds:
 
@@ -36,16 +67,18 @@ an `artifactWarning` string in the warning band. Above the cap it returns 422:
 {
   "detail": {
     "code": "artifact-budget-preflight",
-    "message": "运行产物预检估算本次运行约 684 MiB（占 512 MiB 上限的 134%），已超过上限。...",
-    "estimatedBytes": 717053952,
-    "capBytes": 536870912,
+    "message": "运行产物预检估算本次运行约 6155 MiB（占 4096 MiB 上限的 150%），已超过上限。...",
+    "estimatedBytes": 6453612544,
+    "capBytes": 4294967296,
     "suggestions": ["..."],
     "artifactEstimate": { "...": "..." }
   }
 }
 ```
 
-`artifactEstimate` contains `estimatedBytes`, `estimatedMiB`, `utilization`,
+With `WORKBENCH_MAX_ARTIFACT_MIB=512`, the same message reports a 512 MiB cap
+and the 684 MiB shape is rejected. `artifactEstimate` contains
+`estimatedBytes`, `estimatedMiB`, `utilization`, `capBytes`, `capMiB`,
 `risk` (`ok` / `warning` / `reject`), `confidence` (`high` / `medium` / `low`),
 `archiveEstimateBytes` (all deferred snapshots materialized, i.e. the run ZIP),
 `lazySnapshots`, `contributors` and `suggestions`.
@@ -84,9 +117,12 @@ Calibration shapes (read-only manifests from completed local runs):
 
 The first row is the incident that motivated this work: the run itself reached
 462 MiB, and materializing its final snapshot took the directory to ~600 MiB.
-The preflight rejects that shape. The 0.004 um variant stays under the cap but
-is in the warning band. A 0.003 um run on the real 0.48 x 0.50 um cell is well
-below the warning threshold.
+With the default 4096 MiB cap that shape is allowed (it was rejected under the
+legacy 512 MiB cap, `WORKBENCH_MAX_ARTIFACT_MIB=512`). The 0.004 um variant is
+well below the cap. A 0.003 um run on the real 0.48 x 0.50 um cell is also far
+below the warning threshold. The warning/reject bands are still fractions of
+the *effective* cap, so a 4 GiB default warns at 3072 MiB and rejects above
+4096 MiB.
 
 ## Failure policy
 

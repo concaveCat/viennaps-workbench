@@ -14,9 +14,10 @@
   "notes": "No fixed grid interval, surface point, triangle, or snapshot JSON size cap. Native mesh extraction and simulation are supervised by bounded_child.py; RSS polling is best-effort and does not measure CUDA memory. Artifact and storage quotas remain.",
   "fixedResolutionCountCaps": false,
   "resourceControls": {
-    "boundedChildRssMiB": 2048,
+    "boundedChildRssMiB": 8192,
     "boundedChildTimeoutSeconds": 600,
-    "maximumRunArtifactBytes": 536870912,
+    "maximumRunArtifactBytes": 4294967296,
+    "maximumRunArtifactEnvironmentVariable": "WORKBENCH_MAX_ARTIFACT_MIB",
     "rssPollingMeasuresCudaMemory": false
   }
 }

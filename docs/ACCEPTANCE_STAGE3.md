@@ -31,7 +31,7 @@ Status: implemented and passed automated API, native-reference, and real Chromiu
 
 - Older historical runs created before Stage 3 have no native `.vpsd` snapshot. They remain viewable/replayable from their original recipe, but cannot be continued from a state that was never saved; the API reports this explicitly.
 - The installed `.vpsd` file does not contain engine version metadata. The application stores and verifies ViennaPS/ViennaLS versions in the sidecar project/manifest reference before calling Reader.
-- Native states and run artifacts share the existing 512 MiB per-run cap and 10 GiB workbench cap. Larger states are rejected before or during artifact creation.
+- Native states and run artifacts share the configurable per-run cap (`WORKBENCH_MAX_ARTIFACT_MIB`, default 4 GiB) and the 10 GiB workbench cap. Larger states are rejected before or during artifact creation.
 - GPU behavior is not expanded by this stage. The existing unverified-host GPU test remains skipped; all Stage 3 direct references use the verified CPU process path.
 - Items for independent review: schema-6 portability/hash semantics; ZIP import bounds; continuation state compatibility checks; whether snapshotting every completed step is appropriate for the current artifact budget.
 

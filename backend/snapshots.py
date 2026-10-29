@@ -11,16 +11,16 @@ state, and ``worker/materialize_snapshot.py`` re-checks the point/cell counts
 against the recorded metadata.
 
 Regeneration happens in an isolated staging directory, not in the run
-directory. ``worker.simulate.save_snapshot`` enforces the 512 MiB application
-cap on whatever directory it writes, so regenerating in place made a deferred
-snapshot unreadable for every run that had already reached the cap through its
-own native states -- a run that succeeded could never serve its final
-snapshot. Staging keeps the budget meaningful for the *new* files (the
-snapshot plus the native state it is derived from must fit under the cap,
-because the state is staged by reference and counted) without re-charging the
-budget of a run that is already finished. The produced files are then moved
-into the run directory with ``os.replace`` so the existing atomic-write and
-per-run-lock guarantees are preserved.
+directory. ``worker.simulate.save_snapshot`` enforces the application cap
+(``backend.runtime_limits``, default 4096 MiB) on whatever directory it writes,
+so regenerating in place made a deferred snapshot unreadable for every run that
+had already reached the cap through its own native states -- a run that
+succeeded could never serve its final snapshot. Staging keeps the budget
+meaningful for the *new* files (the snapshot plus the native state it is
+derived from must fit under the cap, because the state is staged by reference
+and counted) without re-charging the budget of a run that is already finished.
+The produced files are then moved into the run directory with ``os.replace`` so
+the existing atomic-write and per-run-lock guarantees are preserved.
 """
 from __future__ import annotations
 
@@ -33,6 +33,7 @@ import time
 from pathlib import Path
 
 from . import storage
+from .runtime_limits import artifact_limit_mib
 
 ROOT = storage.ROOT
 PYTHON = ROOT / ".venv" / "bin" / "python"
@@ -42,7 +43,6 @@ WORKER = ROOT / "worker" / "materialize_snapshot.py"
 # filesystem as ``var/runs`` so publishing is a rename, not a copy, and
 # ``scripts/bounded_child.py`` only supervises commands rooted at the workbench.
 STAGING_ROOT = storage.VAR / "snapshot-staging"
-ARTIFACT_CAP_BYTES = 512 * 1024**2
 # A staging tree only outlives its process if the API is killed mid-read; do
 # not let such trees accumulate silently in the data directory.
 STALE_STAGING_SECONDS = 24 * 3600
@@ -131,9 +131,9 @@ def ensure_materialized(run_dir: Path, step_id: str) -> Path:
                     detail = log.read_text(encoding="utf-8", errors="replace")[-800:]
                 detail = detail or (completed.stderr or "")[-800:]
                 message = f"snapshot materialisation failed: {detail.strip()}"
-                if "512 MiB" in detail:
+                if "application cap" in detail:
                     message = (f"{message}\nThe regenerated snapshot does not fit the "
-                               f"{ARTIFACT_CAP_BYTES // 1024**2} MiB artifact cap. It is staged under "
+                               f"{artifact_limit_mib()} MiB artifact cap. It is staged under "
                                f"{STAGING_ROOT} and the snapshot plus its native state must fit on "
                                f"their own, because the finished run is already over the cap.")
                 raise RuntimeError(message)

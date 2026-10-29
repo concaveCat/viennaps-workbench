@@ -13,6 +13,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .runtime_limits import (artifact_limit_bytes, artifact_limit_label, max_data_bytes,
+                             max_data_gib, min_free_bytes, min_free_gib)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 VAR = Path(os.environ.get("VIENNAPS_WORKBENCH_DATA_DIR", str(ROOT / "var"))).expanduser().resolve()
@@ -205,13 +208,13 @@ def app_storage_bytes() -> int:
 
 def check_disk_preflight(*, projected_bytes: int = 0) -> None:
     usage = shutil.disk_usage(VAR)
-    if usage.free < 20 * 1024**3:
-        raise OSError(f"available disk space is below 20 GiB; workbench data is stored at {VAR}")
-    if app_storage_bytes() + projected_bytes > 10 * 1024**3:
-        raise OSError(f"workbench data would exceed the 10 GiB storage budget; review data at {VAR}")
+    if usage.free < min_free_bytes():
+        raise OSError(f"available disk space is below {min_free_gib()} GiB; workbench data is stored at {VAR}")
+    if app_storage_bytes() + projected_bytes > max_data_bytes():
+        raise OSError(f"workbench data would exceed the {max_data_gib()} GiB storage budget; review data at {VAR}")
 
 
 def check_artifact_budget(run_dir: Path) -> None:
-    if directory_bytes(run_dir) > 512 * 1024**2:
-        raise OSError("run artifact size exceeded the 512 MiB application cap")
+    if directory_bytes(run_dir) > artifact_limit_bytes():
+        raise OSError(f"run artifact size exceeded the {artifact_limit_label()} application cap")
 

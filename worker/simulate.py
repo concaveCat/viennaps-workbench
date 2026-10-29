@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from backend.rates import has_motion, is_geometry_step, uses_flux, signed_rates, signed_directional_rates
 from backend.models import normalized_geometry_v3, parse_project, project_structure_hash
+from backend.runtime_limits import artifact_limit_bytes, artifact_limit_label
 from backend.validation import fin_construction_decision
 from backend.gpu_devices import cuda_devices, resolve_gpu_device
 from worker.gds_mask import CONSTRUCTION as GDS_MASK_CONSTRUCTION
@@ -38,7 +39,6 @@ MATERIAL_ROWS = MATERIAL_CATALOG["materials"]
 MATERIAL_NAMES = {int(row["id"]): row["name"] for row in MATERIAL_ROWS}
 MATERIAL_IDS = {row["name"]: int(row["id"]) for row in MATERIAL_ROWS}
 MATERIAL_COLORS = {int(row["id"]): row["color"] for row in MATERIAL_ROWS}
-MAX_RUN_BYTES = 512 * 1024 * 1024
 GPU_MULTIPARTICLE_SPLIT_SWEEPS = 4
 GPU_MULTIPARTICLE_SPLIT_STRATEGY = "symmetric-operator-splitting-v1"
 GPU_MULTIPARTICLE_FLUX_STRATEGY = "per-species-native-mesh-merge-v1"
@@ -98,6 +98,7 @@ def atomic_json(path: Path, data: Any) -> None:
 
 
 def check_artifact_budget(run_dir: Path) -> None:
+    max_run_bytes = artifact_limit_bytes()
     total = 0
     for item in run_dir.rglob("*"):
         try:
@@ -108,8 +109,10 @@ def check_artifact_budget(run_dir: Path) -> None:
             if item.name.endswith(".tmp") or not item.is_file():
                 continue
             total += item.stat().st_size
-            if total > MAX_RUN_BYTES:
-                raise RuntimeError("run artifacts exceeded the 512 MiB application cap")
+            if total > max_run_bytes:
+                raise RuntimeError(
+                    f"run artifacts exceeded the {artifact_limit_label()} application cap"
+                )
         except OSError:
             # A concurrent atomic replace may remove a file after rglob has
             # yielded its path. Continue with the remaining committed files.

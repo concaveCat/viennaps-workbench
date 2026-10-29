@@ -1,22 +1,25 @@
 """Deferred snapshots stay readable when the finished run is already over budget.
 
-A run that reached its 512 MiB artifact cap through its own native states used
-to lose its last deferred snapshot: materialisation re-ran
+A run that reached its artifact cap through its own native states used to lose
+its last deferred snapshot: materialisation re-ran
 ``worker.simulate.save_snapshot`` inside the run directory, and that function
-refuses to write once the directory is over the cap. These tests pin the
-fix (regenerate in an isolated staging directory, publish with ``os.replace``)
-and pin that the cap still applies to new runs and to the run archive.
+refuses to write once the directory is over the cap. These tests pin the fix
+(regenerate in an isolated staging directory, publish with ``os.replace``) and
+pin that the configured cap (here set to the legacy 512 MiB) still applies to
+new runs and to the run archive.
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from backend import runtime_limits
 from backend import snapshots as snapshot_store
 from backend import storage
 from backend.main import app
@@ -28,21 +31,24 @@ ROOT = Path(__file__).resolve().parents[1]
 CAP = 512 * 1024**2
 
 
-def pad_run_directory(run_dir: Path, extra_bytes: int = 8 * 1024**2) -> Path:
+def pad_run_directory(run_dir: Path, cap: int = CAP, extra_bytes: int = 8 * 1024**2) -> Path:
     """Grow a run directory past the cap with a sparse file (``st_size`` counts)."""
     padding = run_dir / "padding.bin"
     with padding.open("wb") as stream:
-        stream.truncate(CAP + extra_bytes)
+        stream.truncate(cap + extra_bytes)
     return padding
 
 
 class OverCapSnapshotReadback(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        self.env = patch.dict(os.environ, {"WORKBENCH_MAX_ARTIFACT_MIB": "512"})
+        self.env.start()
         self.life = app.router.lifespan_context(app)
         await self.life.__aenter__()
 
     async def asyncTearDown(self):
         await self.life.__aexit__(None, None, None)
+        self.env.stop()
 
     async def wait(self, run_id):
         for _ in range(600):
@@ -126,15 +132,16 @@ class OverCapSnapshotReadback(unittest.IsolatedAsyncioTestCase):
                 encoding="utf-8")
             (run_dir / f"state-{step_id}.vpsd").write_bytes(b"state")
             log_path = run_dir / f".materialize-{step_id}.log"
-            log_path.write_text("RuntimeError: run artifacts exceeded the 512 MiB application cap\n",
+            limit_mib = runtime_limits.artifact_limit_mib()
+            log_path.write_text(f"RuntimeError: run artifacts exceeded the {limit_mib} MiB application cap\n",
                                 encoding="utf-8")
             with patch.object(snapshot_store.subprocess, "run",
                               return_value=subprocess.CompletedProcess([], 1, "", "")):
                 with self.assertRaises(RuntimeError) as raised:
                     snapshot_store.ensure_materialized(run_dir, step_id)
             message = str(raised.exception)
-            self.assertIn("run artifacts exceeded the 512 MiB application cap", message)
-            self.assertIn("does not fit the 512 MiB artifact cap", message)
+            self.assertIn(f"run artifacts exceeded the {limit_mib} MiB application cap", message)
+            self.assertIn(f"does not fit the {limit_mib} MiB artifact cap", message)
             self.assertIn(str(snapshot_store.STAGING_ROOT), message)
             self.assertFalse((run_dir / f"{step_id}.json").exists())
 
@@ -178,21 +185,40 @@ class ArtifactCapStillApplies(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             run_dir = Path(directory)
             pad_run_directory(run_dir)
-            with self.assertRaises(RuntimeError) as worker_raised:
-                simulate.check_artifact_budget(run_dir)
-            self.assertIn("512 MiB application cap", str(worker_raised.exception))
-            with self.assertRaises(OSError) as supervisor_raised:
-                storage.check_artifact_budget(run_dir)
-            self.assertIn("512 MiB application cap", str(supervisor_raised.exception))
+            # Explicit legacy cap: this is the 512 MiB behavior we must keep.
+            with patch.dict(os.environ, {"WORKBENCH_MAX_ARTIFACT_MIB": "512"}):
+                with self.assertRaises(RuntimeError) as worker_raised:
+                    simulate.check_artifact_budget(run_dir)
+                self.assertIn("512 MiB application cap", str(worker_raised.exception))
+                with self.assertRaises(OSError) as supervisor_raised:
+                    storage.check_artifact_budget(run_dir)
+                self.assertIn("512 MiB application cap", str(supervisor_raised.exception))
+
+    def test_over_512_mib_is_accepted_by_the_default_4_gib_cap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            with (run_dir / "padding.bin").open("wb") as stream:
+                stream.truncate(640 * 1024**2)
+            # Default cap without touching 4 GiB of real data.
+            simulate.check_artifact_budget(run_dir)
+            storage.check_artifact_budget(run_dir)
+            with patch.dict(os.environ, {"WORKBENCH_MAX_ARTIFACT_MIB": "512"}):
+                with self.assertRaises(RuntimeError) as worker_raised:
+                    simulate.check_artifact_budget(run_dir)
+                self.assertIn("512 MiB application cap", str(worker_raised.exception))
+                with self.assertRaises(OSError) as supervisor_raised:
+                    storage.check_artifact_budget(run_dir)
+                self.assertIn("512 MiB application cap", str(supervisor_raised.exception))
 
     def test_run_directory_at_exactly_the_cap_is_accepted(self):
         with tempfile.TemporaryDirectory() as directory:
             run_dir = Path(directory)
             with (run_dir / "padding.bin").open("wb") as stream:
                 stream.truncate(CAP)
-            self.assertEqual(storage.directory_bytes(run_dir), CAP)
-            simulate.check_artifact_budget(run_dir)
-            storage.check_artifact_budget(run_dir)
+            with patch.dict(os.environ, {"WORKBENCH_MAX_ARTIFACT_MIB": "512"}):
+                self.assertEqual(storage.directory_bytes(run_dir), CAP)
+                simulate.check_artifact_budget(run_dir)
+                storage.check_artifact_budget(run_dir)
 
 
 if __name__ == "__main__":

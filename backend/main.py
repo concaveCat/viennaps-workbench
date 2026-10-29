@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
+import logging
 import os
 import platform
 import shutil
@@ -28,7 +29,7 @@ from . import preflight as artifact_preflight
 from . import materials as material_registry
 from .models import Project, ProjectV6, ProjectV7, FluxRunRequest, SliceRequestV7, normalized_geometry_v3, parse_project, parse_replay, project_structure_hash, RunRequest
 from .storage import atomic_json, read_json
-from .streamzip import MAX_ARCHIVE, stream_zip_async
+from .streamzip import stream_zip_async
 from .supervisor import ActiveRunError, ReplayMismatch, Supervisor
 from .validation import (GPU_MULTIPARTICLE_FLUX_STRATEGY, GPU_MULTIPARTICLE_SPLIT_STRATEGY,
                          GPU_MULTIPARTICLE_NATIVE_STRATEGY, GPU_MULTIPARTICLE_NATIVE_FLUX_STRATEGY,
@@ -36,11 +37,16 @@ from .validation import (GPU_MULTIPARTICLE_FLUX_STRATEGY, GPU_MULTIPARTICLE_SPLI
                          validate_project, capability_verified, gpu_project_signature)
 from .rates import uses_flux
 from .specialized_models import specialized_catalog
-from .runtime_limits import cpu_thread_limit
+from .runtime_limits import (artifact_limit_bytes, artifact_limit_label,
+                             artifact_limit_startup_message, deployment_limit_status,
+                             deployment_limits_startup_message, cpu_thread_limit)
 from .gpu_devices import cuda_devices
 
 
 ROOT = storage.ROOT
+# Uvicorn configures this logger with an INFO handler; a module logger would
+# otherwise fall back to logging.lastResort and drop the startup line.
+STARTUP_LOGGER = logging.getLogger("uvicorn.error")
 API_GDS_MAX_BODY = 64 * 1024 * 1024
 APP_VERSION = "0.1.0"
 CAPABILITIES = ROOT / "docs" / "capabilities.json"
@@ -138,6 +144,8 @@ class ApiContentTypeMiddleware:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    STARTUP_LOGGER.info("%s", artifact_limit_startup_message())
+    STARTUP_LOGGER.info("%s", deployment_limits_startup_message())
     lock_fd = storage.acquire_instance_lock()
     supervisor = Supervisor(lock_fd)
     app.state.supervisor = supervisor
@@ -207,6 +215,35 @@ async def health(request: Request) -> dict[str, Any]:
 async def capabilities() -> dict[str, Any]:
     capability_data = read_json(CAPABILITIES)
     resource_policy = read_json(RESOURCE_POLICY)
+    limits = deployment_limit_status()
+    resource_policy["run"].update({
+        "maximumArtifactBytes": limits["artifactLimitBytes"],
+        "maximumResultArchiveBytes": limits["artifactLimitBytes"],
+        **{key: value for key, value in limits.items() if key.startswith("artifactLimit")},
+        "rssTerminationMiB": limits["rssLimitMiB"],
+        "maximumCombinedStdoutStderrBytes": limits["maximumLogBytes"],
+    })
+    resource_policy["run"]["artifactPreflight"].update({
+        "capBytes": limits["artifactLimitBytes"],
+        "capMiB": limits["artifactLimitMiB"],
+        "artifactLimitSource": limits["artifactLimitSource"],
+    })
+    resource_policy["run"]["storage"].update({
+        "maximumWorkbenchBytes": limits["maximumDataBytes"],
+        "maximumWorkbenchGiB": limits["maximumDataGiB"],
+        "maximumWorkbenchSource": limits["maximumDataSource"],
+        "maximumWorkbenchEnvironmentVariable": limits["maximumDataEnvironmentVariable"],
+        "maxDataDefaultGiB": limits["maximumDataDefaultGiB"],
+        "maxDataMinimumGiB": limits["maximumDataMinimumGiB"],
+        "maxDataMaximumGiB": limits["maximumDataMaximumGiB"],
+        "minimumFreeBytes": limits["minimumFreeBytes"],
+        "minimumFreeGiB": limits["minimumFreeGiB"],
+        "minimumFreeSource": limits["minimumFreeSource"],
+        "minimumFreeEnvironmentVariable": limits["minimumFreeEnvironmentVariable"],
+        "minFreeDefaultGiB": limits["minimumFreeDefaultGiB"],
+        "minFreeMinimumGiB": limits["minimumFreeMinimumGiB"],
+        "minFreeMaximumGiB": limits["minimumFreeMaximumGiB"],
+    })
     resource_policy["run"]["cpuThreads"].update(cpu_thread_limit())
     try:
         gpu_matrix = read_json(ROOT / "docs" / "stage9-evidence" / "gpu-capability-matrix.json")
@@ -219,7 +256,8 @@ async def capabilities() -> dict[str, Any]:
         capability_data["knownGpuProfileFailures"] = []
         capability_data["knownNativeFailures"] = []
         capability_data["knownEngineLimitations"] = []
-    return {"capabilities": capability_data, "resourcePolicy": resource_policy}
+    return {"capabilities": capability_data, "resourcePolicy": resource_policy,
+            "runtimeLimits": limits}
 
 
 @app.get("/api/gpu-devices")
@@ -926,11 +964,13 @@ async def continuation_package_export(payload: Any = Body(...)):
 
 @app.post("/api/continuation-package/import")
 async def continuation_package_import(request: Request) -> dict[str, Any]:
+    archive_limit = artifact_limit_bytes()
+    archive_label = artifact_limit_label()
     content_length = request.headers.get("content-length")
     if content_length:
         try:
-            if int(content_length) > MAX_ARCHIVE:
-                raise HTTPException(status_code=413, detail="continuation package exceeds the 512 MiB archive limit")
+            if int(content_length) > archive_limit:
+                raise HTTPException(status_code=413, detail=f"continuation package exceeds the {archive_label} archive limit")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail="invalid Content-Length") from exc
     temp_dir = Path(tempfile.mkdtemp(prefix="continuation-import-", dir=storage.VAR))
@@ -940,8 +980,8 @@ async def continuation_package_import(request: Request) -> dict[str, Any]:
         with archive_path.open("wb") as output:
             async for chunk in request.stream():
                 size += len(chunk)
-                if size > MAX_ARCHIVE:
-                    raise HTTPException(status_code=413, detail="continuation package exceeds the 512 MiB archive limit")
+                if size > archive_limit:
+                    raise HTTPException(status_code=413, detail=f"continuation package exceeds the {archive_label} archive limit")
                 output.write(chunk)
         if not size:
             raise HTTPException(status_code=400, detail="continuation package is empty")
@@ -958,8 +998,8 @@ async def continuation_package_import(request: Request) -> dict[str, Any]:
             if (len(names) != len(set(names)) or "project.json" not in names or set(names) - allowed
                     or len(asset_names) > 1):
                 raise HTTPException(status_code=422, detail="package must contain project.json and only known native state, replay, and content-addressed GDS entries")
-            if sum(item.file_size for item in infos) > MAX_ARCHIVE:
-                raise HTTPException(status_code=413, detail="expanded continuation package exceeds the 512 MiB archive limit")
+            if sum(item.file_size for item in infos) > archive_limit:
+                raise HTTPException(status_code=413, detail=f"expanded continuation package exceeds the {archive_label} archive limit")
             by_name = {item.filename: item for item in infos}
             for item in infos:
                 mode = (item.external_attr >> 16) & 0xFFFF
@@ -1031,8 +1071,8 @@ async def continuation_package_import(request: Request) -> dict[str, Any]:
                 with archive.open(state_info, "r") as source_stream, state_path.open("wb") as target_stream:
                     while block := source_stream.read(1024 * 1024):
                         copied += len(block)
-                        if copied > MAX_ARCHIVE:
-                            raise HTTPException(status_code=413, detail="expanded native Domain state exceeds the 512 MiB limit")
+                        if copied > archive_limit:
+                            raise HTTPException(status_code=413, detail=f"expanded native Domain state exceeds the {archive_label} limit")
                         target_stream.write(block)
                 if copied != state_info.file_size or storage.file_sha256(state_path) != state_ref["stateId"]:
                     raise HTTPException(status_code=422, detail="domain-state.vpsd does not match continuationState.stateId")
@@ -1131,8 +1171,9 @@ def _archive_entries(run_dir: Path, manifest: dict[str, Any]) -> list[tuple[str,
         total += size
         budget += size + (size >> 12) + (size >> 14) + (size >> 25) + 13 + 92 + encoded_length * 2
         unique[name] = path
-    if total > MAX_ARCHIVE or budget > MAX_ARCHIVE:
-        raise HTTPException(status_code=413, detail="run result package exceeds the 512 MiB archive limit")
+    archive_limit = artifact_limit_bytes()
+    if total > archive_limit or budget > archive_limit:
+        raise HTTPException(status_code=413, detail=f"run result package exceeds the {artifact_limit_label()} archive limit")
     return list(unique.items())
 
 

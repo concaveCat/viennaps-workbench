@@ -237,6 +237,11 @@ disabled on purpose; `docs/api-contract.md` is the normative contract.
 | `VIENNAPS_WORKBENCH_PROFILE` | on | `0` disables the per-segment timing event |
 | `VIENNAPS_WORKBENCH_LAZY_SNAPSHOTS` | on | `0` writes every step snapshot eagerly instead of on first read |
 | `VIENNAPS_WORKBENCH_GPU_CONTEXT_REUSE` | on | `0` tears the CUDA/OptiX context down between consecutive GPU steps |
+| `WORKBENCH_MAX_ARTIFACT_MIB` | `4096` | Per-run artifact and archive/package cap in MiB (minimum 64, no upper bound) |
+| `WORKBENCH_MAX_DATA_GIB` | `10` | Total application-data budget in GiB (minimum 1, no upper bound) |
+| `WORKBENCH_MIN_FREE_GIB` | `20` | Free-disk floor before new data is accepted, in GiB (minimum 0) |
+| `WORKBENCH_RSS_LIMIT_MIB` | `8192` | Soft process-group RSS watch for a supervised run (minimum 512) |
+| `WORKBENCH_MAX_LOG_MIB` | `4` | Combined stdout/stderr cap per run, in MiB (minimum 1) |
 | `VIENNAPS_DEBUG_NATIVE_CALLBACKS` | unset | Verbose native callback logging |
 | `WORKBENCH_HOST_VERIFY_SCRIPT` | unset | Optional host self-check used by `scripts/finalize-host.py` |
 
@@ -245,11 +250,19 @@ disabled on purpose; `docs/api-contract.md` is the normative contract.
 - **One active run** per service instance; a second submission returns `409`.
 - Runs execute in their own session/process group and are terminated as a group.
 - Wall-clock timeout: 1–600 s per project (policy default 120 s).
-- RSS is sampled every 200 ms; the child is terminated above 2048 MiB. This is a
-  soft watch, not a hard cgroup limit, and does not account for CUDA memory.
-- Combined stdout/stderr is capped at 4 MiB per run; artifacts at 512 MiB.
-- Application data is capped at 10 GiB, and a run is refused if the filesystem has
-  less than 20 GiB free.
+- RSS is sampled every 200 ms; the child is terminated above 8192 MiB by
+  default (`WORKBENCH_RSS_LIMIT_MIB`, minimum 512). This is a soft watch, not a
+  hard cgroup limit, and does not account for CUDA memory.
+- Combined stdout/stderr is capped at 4 MiB per run by default
+  (`WORKBENCH_MAX_LOG_MIB`, minimum 1); artifacts at a configurable default of
+  4 GiB (`WORKBENCH_MAX_ARTIFACT_MIB`, minimum 64 MiB, no upper bound). The same
+  value bounds preflight, snapshot staging and ZIP packages.
+- Application data is capped at 10 GiB by default (`WORKBENCH_MAX_DATA_GIB`,
+  minimum 1), and a run is refused if the filesystem has less than 20 GiB free
+  by default (`WORKBENCH_MIN_FREE_GIB`, minimum 0). A large artifact cap does
+  not bypass either guard.
+- `GET /api/capabilities` reports the effective values, defaults, minimums, and
+  whether each value came from the environment or the default.
 - Uploaded GDS bodies are limited to 64 MiB.
 - The service never touches other processes: start/stop use a saved PID plus
   process start tick, so a recycled PID cannot be signalled.
@@ -289,7 +302,7 @@ references when adapting the suite.
 | `ModuleNotFoundError: viennaps` | `.venv` was created without `--system-site-packages`, or ViennaPS is not installed for this Python. |
 | GPU runs rejected or `gpuAvailable()` false | Check `nvidia-smi`, the CUDA build of ViennaPS, and `GET /api/gpu-devices`. GPU support is only exposed for `GPU_DISK` combinations recorded in `docs/stage9-evidence/gpu-capability-matrix.json`. |
 | `request Host must be the active loopback address` | Use `127.0.0.1:<port>` or `localhost:<port>`; reverse proxies and custom hostnames are intentionally rejected. |
-| Run stops with `run artifact size exceeded` | The step produced more than 512 MiB; reduce grid resolution, rays, or output frequency. |
+| Run stops with `run artifact size exceeded` | The step produced more than the effective artifact cap (4 GiB by default, `WORKBENCH_MAX_ARTIFACT_MIB`); reduce grid resolution, rays, or output frequency. |
 
 ## Repository layout
 
