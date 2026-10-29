@@ -400,4 +400,3 @@ class MaterialAwareCmp3DWorkflow(RunHarness):
         added = self.snapshot(run_id, "step_cmp3d_w")["measuredAdded"]
         self.assertEqual(added["material"], "W")
         self.assertAlmostEqual(added["addedThickness"], 0.2, delta=0.1)
-
