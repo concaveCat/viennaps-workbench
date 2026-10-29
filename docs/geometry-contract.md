@@ -20,8 +20,8 @@ This contract is based on bounded calls to the installed ViennaPS 4.6.2 package,
 ## Recipe geometry steps
 
 - `removeMaterial`, `planarize` and `boolean` steps call the native operations on the previous step's `Domain`.
-- `Planarize(domain, cutoffHeight)` accepts a height only. A `planarize` step with `stopMaterial` derives that height from the measured top of the stop material; it is a global height cut, not a CMP selectivity model. See `cmp-planarize-contract.md`.
-- Every executed step records the measured change of each material's exposed top (`measuredRemoval`/`measuredAdded`) from the surface mesh it already extracts. No volume mesh is built for the measurement.
+- `Planarize(domain, cutoffHeight)` accepts a height only. A `planarize` step with `stopMaterial` derives that height from the area-weighted 90th percentile of the stop material's exposed top (a large upper plateau wins over a larger lower one, a narrow sliver is ignored); it is a global height cut, not a CMP selectivity model. See `cmp-planarize-contract.md`.
+- Every executed step records the measured change of each material's exposed top (`measuredRemoval`/`measuredAdded`) from the surface mesh it already extracts: the thickness is the area-weighted median change, with the highest-point change recorded alongside. No volume mesh is built for the measurement.
 
 ## Discretization and geometry validation
 

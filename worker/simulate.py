@@ -454,6 +454,32 @@ def measure_initial_geometry(mesh: dict[str, Any], geometry: dict[str, Any], del
 # definition of a material's top surface.
 TOP_FACING_COSINE = 0.5
 MEASUREMENT_METHOD = "surface-mesh up-facing cells; no volume mesh"
+# CMP stop height: area-weighted 90th percentile of the stop material's
+# up-facing heights. A bimodal stop surface (for example STI at 0.036 and ILD
+# at 0.095 in the 22 nm FinFET flow, where the lower plateau is even slightly
+# larger) must select the upper plateau, while a narrow tall sliver must not
+# move the cut. The median cannot do the first job; the 90th percentile cannot
+# do it only when the upper plateau covers 10% of the area or less.
+STOP_HEIGHT_PERCENTILE = 0.9
+STOP_HEIGHT_METHOD = "area-weighted-p90"
+THICKNESS_BASIS_MEDIAN = "area-weighted-median"
+THICKNESS_BASIS_HIGHEST = "highest-top"
+
+
+def _area_percentile(rows: list[tuple[float, float]], fraction: float) -> float:
+    """Return the height where the accumulated up-facing area reaches fraction.
+
+    ``rows`` is sorted by height. This is the area-weighted percentile: each
+    surface cell contributes its own area, so a large plateau dominates while a
+    narrow sliver cannot.
+    """
+    total = sum(area for _height, area in rows)
+    running = 0.0
+    for height, area in rows:
+        running += area
+        if running >= fraction * total:
+            return float(height)
+    return float(rows[-1][0])
 
 
 def measure_material_tops(report: dict[str, Any], is3d: bool) -> dict[str, dict[str, float]]:
@@ -465,11 +491,15 @@ def measure_material_tops(report: dict[str, Any], is3d: bool) -> dict[str, dict[
 
     * ``topHeight``: the highest up-facing point, i.e. the top of that material
       (a blanket layer's surface, or the highest rim of a partially removed
-      one). Used for the measured add/remove thickness.
+      one). Reported for context only; a tall feature plus a low field makes it
+      unsuitable as a thickness, see ``medianTopHeight``.
     * ``medianTopHeight``: the area-weighted median of the up-facing heights,
-      i.e. the level that dominates the exposed surface. Used to derive a CMP
-      stop height, because a narrow tall sliver must not move the whole cut.
-    * ``upFacingArea``/``upFacingCellCount``: the evidence behind both values.
+      i.e. the level that dominates the exposed surface. Used for the measured
+      add/remove thickness.
+    * ``p90TopHeight``: the area-weighted 90th percentile. Used to derive a CMP
+      stop height so that a large upper plateau wins over a larger lower one
+      while a narrow tall sliver is ignored.
+    * ``upFacingArea``/``upFacingCellCount``: the evidence behind all values.
 
     A material with no up-facing cell (fully buried, fully removed, or only
     vertical sidewalls left) is absent from the result.
@@ -511,15 +541,9 @@ def measure_material_tops(report: dict[str, Any], is3d: bool) -> dict[str, dict[
             raise RuntimeError(f"surface mesh contains unknown material ID {material_id}")
         rows.sort()
         total_area = sum(area for _height, area in rows)
-        running = 0.0
-        median_height = rows[-1][0]
-        for height, area in rows:
-            running += area
-            if running >= 0.5 * total_area:
-                median_height = height
-                break
         result[name] = {"topHeight": float(rows[-1][0]),
-                        "medianTopHeight": float(median_height),
+                        "medianTopHeight": _area_percentile(rows, 0.5),
+                        "p90TopHeight": _area_percentile(rows, STOP_HEIGHT_PERCENTILE),
                         "upFacingArea": float(total_area),
                         "upFacingCellCount": len(rows)}
     return result
@@ -527,29 +551,66 @@ def measure_material_tops(report: dict[str, Any], is3d: bool) -> dict[str, dict[
 
 def _changed_material_rows(previous_tops: dict[str, Any], current_tops: dict[str, Any],
                            tolerance: float) -> list[dict[str, Any]]:
+    """Per-material rows describing the exposed-surface change of one step.
+
+    Thickness uses the area-weighted median of the up-facing heights, capped by
+    the highest up-facing change: a median that jumped to a different patch
+    (for example TiN keeping a low liner after the blanket was polished away)
+    must not report more removal than the material's topmost surface dropped.
+    """
     rows = []
     for name in sorted(set(previous_tops) | set(current_tops)):
         before = previous_tops.get(name) or {}
         after = current_tops.get(name) or {}
         top_before = before.get("topHeight")
         top_after = after.get("topHeight")
-        delta = None if top_before is None or top_after is None else float(top_after) - float(top_before)
-        if delta is None:
-            changed = before.get("upFacingArea") is not None and after.get("upFacingArea") is None
-            changed = changed or (before.get("upFacingArea") is None and after.get("upFacingArea") is not None)
+        median_before = before.get("medianTopHeight")
+        median_after = after.get("medianTopHeight")
+        top_delta = None if top_before is None or top_after is None else float(top_after) - float(top_before)
+        median_delta = (None if median_before is None or median_after is None
+                        else float(median_after) - float(median_before))
+        appeared = before.get("upFacingArea") is None and after.get("upFacingArea") is not None
+        vanished = before.get("upFacingArea") is not None and after.get("upFacingArea") is None
+        if top_delta is None:
+            changed = appeared or vanished
         else:
-            changed = abs(delta) > tolerance
+            changed = abs(top_delta) > tolerance or (median_delta is not None and abs(median_delta) > tolerance)
         if not changed:
             continue
+        # Median-based thickness, never larger than the highest-point change
+        # (both are negative for removal and positive for deposition, so the
+        # smaller magnitude is the larger value on the negative side).
+        delta_used = None
+        basis = None
+        if median_delta is not None and top_delta is not None:
+            if median_delta < 0.0 and top_delta < 0.0:
+                delta_used = max(median_delta, top_delta)
+                basis = (THICKNESS_BASIS_MEDIAN if median_delta >= top_delta
+                         else f"{THICKNESS_BASIS_HIGHEST} (median surface changed)")
+            elif median_delta > 0.0 and top_delta > 0.0:
+                delta_used = min(median_delta, top_delta)
+                basis = (THICKNESS_BASIS_MEDIAN if median_delta <= top_delta
+                         else f"{THICKNESS_BASIS_HIGHEST} (median surface changed)")
+            else:
+                delta_used = median_delta
+                basis = THICKNESS_BASIS_MEDIAN
+        elif top_delta is not None:
+            delta_used = top_delta
+            basis = THICKNESS_BASIS_HIGHEST
         rows.append({
-            "material": name, "topHeightBefore": top_before, "topHeightAfter": top_after,
-            "topHeightDelta": delta,
-            "removedThickness": -delta if delta is not None and delta < 0.0 else None,
-            "addedThickness": delta if delta is not None and delta > 0.0 else None,
-            "removedCompletely": before.get("upFacingArea") is not None and after.get("upFacingArea") is None,
+            "material": name,
+            "topHeightBefore": top_before, "topHeightAfter": top_after,
+            "medianHeightBefore": median_before, "medianHeightAfter": median_after,
+            "topHeightDelta": top_delta, "medianHeightDelta": median_delta,
+            "thicknessBasis": basis,
+            "removedThickness": -delta_used if delta_used is not None and delta_used < 0.0 else None,
+            "addedThickness": delta_used if delta_used is not None and delta_used > 0.0 else None,
+            "removedCompletely": vanished,
             "upFacingAreaBefore": before.get("upFacingArea"), "upFacingAreaAfter": after.get("upFacingArea"),
         })
-    rows.sort(key=lambda row: (-abs(row["topHeightDelta"]) if row["topHeightDelta"] is not None else 0.0, row["material"]))
+    rows.sort(key=lambda row: (-abs(row["medianHeightDelta"]) if row["medianHeightDelta"] is not None
+                               else (-abs(row["topHeightDelta"]) if row["topHeightDelta"] is not None else 0.0),
+                               row["material"]))
     return rows
 
 
@@ -561,6 +622,12 @@ def measure_step_change(step: dict[str, Any], previous_tops: dict[str, Any] | No
     this costs one classification pass and no extra native work. The nominal
     rate x duration of a particle or ion-beam step is a calibrated flux
     quantity, not a line speed; this record is what actually happened.
+
+    The reported thickness is the area-weighted median change, not the change of
+    the highest point: a blanket film on a tall feature loses its top first, so
+    the highest-point delta describes where the film used to be, not how much
+    came off (the 22 nm FinFET spacer etch read 49.7 nm that way while the
+    exposed surface only dropped about 12 nm).
     """
     if not previous_tops:
         return None
@@ -574,12 +641,18 @@ def measure_step_change(step: dict[str, Any], previous_tops: dict[str, Any] | No
         # ``Domain.duplicateTopLevelSet`` starts the new level set on the
         # previous top surface, so a material that did not exist before the
         # step grows from the highest point of the surface that existed then.
+        # The highest point is the only well-defined start for a conformal
+        # film that begins on the previous top level set.
         after = (current_tops.get(target) or {}).get("topHeight")
         previous_heights = [(row or {}).get("topHeight") for row in previous_tops.values()]
         before = max((value for value in previous_heights if value is not None), default=None)
         if after is not None and before is not None:
             appeared = {"material": target, "topHeightBefore": before, "topHeightAfter": after,
-                        "topHeightDelta": after - before, "removedThickness": None,
+                        "medianHeightBefore": None,
+                        "medianHeightAfter": (current_tops.get(target) or {}).get("medianTopHeight"),
+                        "topHeightDelta": after - before, "medianHeightDelta": None,
+                        "thicknessBasis": f"{THICKNESS_BASIS_HIGHEST} (new material)",
+                        "removedThickness": None,
                         "addedThickness": after - before if after > before else None,
                         "removedCompletely": False, "materialAppeared": True,
                         "upFacingAreaBefore": None,
@@ -592,12 +665,11 @@ def measure_step_change(step: dict[str, Any], previous_tops: dict[str, Any] | No
         # it is still a removal, so prefer real drops and then the topmost
         # completely removed layer.
         def removal_rank(row: dict[str, Any]) -> tuple[int, float]:
-            if row["topHeightDelta"] is not None and row["topHeightDelta"] < 0.0:
-                return (0, row["topHeightDelta"])
+            magnitude = row["removedThickness"]
+            if magnitude is not None and magnitude > 0.0:
+                return (0, -magnitude)
             return (1, -(row["topHeightBefore"] if row["topHeightBefore"] is not None else 0.0))
-        removals = [row for row in rows
-                    if (row["topHeightDelta"] is not None and row["topHeightDelta"] < 0.0)
-                    or row["removedCompletely"]]
+        removals = [row for row in rows if row["removedThickness"] is not None or row["removedCompletely"]]
         if removals and not deposition:
             primary = min(removals, key=removal_rank)
     if primary is None:
@@ -610,7 +682,12 @@ def measure_step_change(step: dict[str, Any], previous_tops: dict[str, Any] | No
         "material": primary["material"],
         "topHeightBefore": primary["topHeightBefore"],
         "topHeightAfter": primary["topHeightAfter"],
+        "medianHeightBefore": primary["medianHeightBefore"],
+        "medianHeightAfter": primary["medianHeightAfter"],
+        "topHeightDelta": primary["topHeightDelta"],
+        "medianHeightDelta": primary["medianHeightDelta"],
         thickness_key: primary[thickness_key],
+        "thicknessBasis": primary["thicknessBasis"],
         "removedCompletely": primary["removedCompletely"],
         # A material that vanished has no remaining top to difference against.
         # The highest remaining surface bounds where it went, so record it
@@ -1892,7 +1969,15 @@ def apply_geometry_operation(ps: Any, domain: Any, project: dict[str, Any], step
         # stop material measured on the previous step's surface mesh. The
         # native call then removes every level set above that height; it is
         # still one global cut, not lateral selectivity.
-        stop_top = ((previous_tops or {}).get(stop_material) or {}).get("medianTopHeight")
+        stop = (previous_tops or {}).get(stop_material) or {}
+        stop_top = stop.get("p90TopHeight")
+        stop_method = STOP_HEIGHT_METHOD
+        if stop_top is None:
+            # A recording made before the percentile existed only carries the
+            # median; keep such runs working but say so instead of pretending
+            # the robust rule was applied.
+            stop_top = stop.get("medianTopHeight")
+            stop_method = "area-weighted-median (p90 unavailable in the recorded surface)"
         if stop_top is None:
             raise RuntimeError(
                 f"planarize stopMaterial {stop_material!r} has no exposed up-facing surface before step "
@@ -1905,9 +1990,15 @@ def apply_geometry_operation(ps: Any, domain: Any, project: dict[str, Any], step
                 "stopMaterial": stop_material,
                 **({"stopMaterialId": MATERIAL_IDS[stop_material]} if stop_material in MATERIAL_IDS else {}),
                 "measuredStopTopHeight": float(stop_top), "overPolish": over_polish,
+                "stopHeight": float(stop_top), "stopHeightMethod": stop_method,
+                **({"stopHeightPercentile": STOP_HEIGHT_PERCENTILE} if stop_method == STOP_HEIGHT_METHOD else {}),
+                "stopMaterialUpFacingArea": stop.get("upFacingArea"),
+                "stopMaterialMedianTopHeight": stop.get("medianTopHeight"),
+                "stopMaterialHighestTopHeight": stop.get("topHeight"),
                 "cutoffMode": "material-aware",
-                "cutoffDerivation": ("area-weighted median height of the up-facing stopMaterial "
-                                     "surface at the start of this step minus overPolish"),
+                "cutoffDerivation": (f"{stop_method} height of the up-facing stopMaterial surface at the "
+                                     "start of this step minus overPolish; a large upper plateau wins over a "
+                                     "larger lower one and a narrow tall sliver is ignored"),
                 "nativePlanarizeScope": ("viennaps.Planarize(domain, cutoffHeight) cuts every level set "
                                          "above the derived height; lateral selectivity is not modeled")}
     if model == "boolean":

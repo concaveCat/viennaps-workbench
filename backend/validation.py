@@ -276,9 +276,10 @@ def _planarize_warnings(project: Any) -> list[str]:
     """Explain what a material-aware planarize can and cannot do.
 
     The installed ViennaPS 4.6.2 Planarize accepts a height only. A
-    ``stopMaterial`` step therefore derives one global cutoff from the measured
-    top of that material; it is not a CMP selectivity model. Surface the
-    limitation in the same place the UI shows validation warnings.
+    ``stopMaterial`` step therefore derives one global cutoff from the
+    area-weighted 90th percentile of that material's up-facing surface; it is
+    not a CMP selectivity model. Surface the limitation in the same place the
+    UI shows validation warnings.
     """
     warnings: list[str] = []
     for index, step in enumerate(project.steps):
@@ -288,11 +289,12 @@ def _planarize_warnings(project: Any) -> list[str]:
         if stop_material is None:
             continue
         warnings.append(
-            f"steps[{index}]: material-aware CMP derives one global cutoff from the measured top of "
-            f"{stop_material} minus overPolish. ViennaPS 4.6.2 Planarize still cuts every material above "
-            f"that height and models no lateral selectivity, so a stop material that is not flat at a single "
-            f"level can be over- or under-cut. The measured stop height and the effective cutoff are recorded "
-            f"in the step result.")
+            f"steps[{index}]: material-aware CMP derives one global cutoff from the area-weighted 90th "
+            f"percentile of {stop_material}'s up-facing surface, minus overPolish. ViennaPS 4.6.2 Planarize "
+            f"still cuts every material above that height and models no lateral selectivity, so a stop material "
+            f"whose upper plateau covers 10% of its exposed area or less, or that is genuinely multi-level "
+            f"without one dominant upper plateau, can be over- or under-cut. The measured stop height, the "
+            f"percentile and the effective cutoff are recorded in the step result.")
     return warnings
 
 

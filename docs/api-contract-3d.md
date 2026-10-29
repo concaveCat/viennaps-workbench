@@ -11,7 +11,7 @@
 
 三维 domain 为 gridDelta、xExtent、yExtent、boundaryXY（reflective/periodic）。几何支持 plane/trench/hole；孔使用 radius。solver 与步骤字段保留 v1 含义。view3D 保存 projection、camera、displayMode、visibleMaterialIds、opacityByMaterial、clip、section；camera 为 null/省略时首次 fit，其余视图字段有明确默认值。具体字段与范围以 Schema 为准。view3D 不进入任何物理输入哈希。
 
-三维快照显式 dimension=3、topology=triangles，points=N×3，triangles=M×3，cellData.materialIds=M 项；mesh 使用 pointCount、triangleCount、topology、vtk。surfaceBounds 是有限表面包络，domainReadback 明确请求范围、实际活动窄带/表面范围及无限边界标签。不得将 triangles 填进 lines，或把三维计数放进 lineCount。快照还可选带 `materialTops`（各材料上表面高度/面积）与 `measuredRemoval`/`measuredAdded`（该步实测去除/增加厚度），语义见 `cmp-planarize-contract.md`。
+三维快照显式 dimension=3、topology=triangles，points=N×3，triangles=M×3，cellData.materialIds=M 项；mesh 使用 pointCount、triangleCount、topology、vtk。surfaceBounds 是有限表面包络，domainReadback 明确请求范围、实际活动窄带/表面范围及无限边界标签。不得将 triangles 填进 lines，或把三维计数放进 lineCount。快照还可选带 `materialTops`（各材料上表面的最高/中位/90 分位高度与面积）与 `measuredRemoval`/`measuredAdded`（该步实测去除/增加厚度，按面积加权中位暴露面计算），语义见 `cmp-planarize-contract.md`。
 
 旧快照只有在 schemaVersion=1 时才允许省略 dimension 并按二维读取；浏览器依据选中快照维度选择查看器。跨二维/三维叠加比较禁用。三维比较在同一个 renderer 内使用共同世界坐标、相机及裁剪。
 
