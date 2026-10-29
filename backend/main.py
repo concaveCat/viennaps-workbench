@@ -679,6 +679,9 @@ async def snapshot_get(run_id: str, step_id: str) -> dict[str, Any]:
         filename = f"{step_id}.json"
         if Path(filename).name != filename:
             raise FileNotFoundError("invalid snapshot name")
+        if not (run_dir / filename).is_file():
+            from . import snapshots as snapshot_store
+            snapshot_store.ensure_materialized(run_dir, step_id)
         return read_json(run_dir / filename)
     except (FileNotFoundError, OSError, ValueError) as exc:
         raise HTTPException(status_code=404, detail="snapshot not found") from exc
@@ -1089,6 +1092,11 @@ async def run_download(run_id: str):
         manifest = read_json(run_dir / "manifest.json")
         if manifest.get("status") not in {"succeeded", "failed", "timed_out", "cancelled", "interrupted"}:
             raise HTTPException(status_code=409, detail="run result package is available after the run reaches a terminal state")
+        from . import snapshots as snapshot_store
+        for item in manifest.get("snapshots", []):
+            step_id = item.get("stepId")
+            if isinstance(step_id, str):
+                snapshot_store.ensure_materialized(run_dir, step_id)
         entries = _archive_entries(run_dir, manifest)
         filename = f"viennaps-run-{run_id}.zip"
         return StreamingResponse(stream_zip_async(entries), media_type="application/zip", headers={"Content-Disposition": f'attachment; filename="{filename}"'})

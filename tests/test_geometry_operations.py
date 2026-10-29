@@ -10,6 +10,7 @@ import zipfile
 import io
 from pathlib import Path
 
+from backend import snapshots as snapshot_store
 from backend import storage
 from backend.main import app
 from backend.validation import ProjectInputError, validate_project
@@ -134,6 +135,7 @@ class GeometryWorkflow(unittest.IsolatedAsyncioTestCase):
         topology_key = "lines" if value["dimension"] == 2 else "triangles"
         errors = []
         for row in info["snapshots"]:
+            snapshot_store.ensure_materialized(storage.run_path(run_id), row["stepId"])
             actual = storage.read_json(storage.run_path(run_id) / row["snapshot"])
             expected = reference[row["stepId"]]
             self.assertEqual(actual[topology_key], expected["cells"], row["stepId"])
@@ -178,6 +180,8 @@ class GeometryWorkflow(unittest.IsolatedAsyncioTestCase):
         replay_id = json_body(replay_response)["runId"]
         replay_info = await self.wait(replay_id)
         for row in info["snapshots"]:
+            snapshot_store.ensure_materialized(storage.run_path(run_id), row["stepId"])
+            snapshot_store.ensure_materialized(storage.run_path(replay_id), row["stepId"])
             original = storage.read_json(storage.run_path(run_id) / row["snapshot"])
             repeated = storage.read_json(storage.run_path(replay_id) / f"{row['stepId']}.json")
             self.assertEqual(original[topology_key], repeated[topology_key], row["stepId"])

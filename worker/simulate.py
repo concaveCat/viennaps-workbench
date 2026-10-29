@@ -258,6 +258,9 @@ PROFILE_ENABLED = os.environ.get("VIENNAPS_WORKBENCH_PROFILE") != "0"
 # (optixAccelBuild 7001 Invalid value); steps that are followed by another GPU
 # step therefore skip that call and use nvidia-smi evidence instead.
 GPU_CONTEXT_REUSE = os.environ.get("VIENNAPS_WORKBENCH_GPU_CONTEXT_REUSE") != "0"
+# Step snapshots are materialised on first read (see backend/snapshots.py).
+# The initial snapshot stays eager: the viewer needs it immediately.
+LAZY_SNAPSHOTS = os.environ.get("VIENNAPS_WORKBENCH_LAZY_SNAPSHOTS") != "0"
 PROFILE_PHASES: list[dict[str, Any]] = []
 
 
@@ -1315,6 +1318,7 @@ def save_snapshot(
     no_op: bool = False,
     extra: dict[str, Any] | None = None,
     extra_outputs: list[dict[str, Any]] | None = None,
+    defer_payload: bool = False,
 ) -> dict[str, Any]:
     """Extract the surface once and persist one snapshot JSON per step.
 
@@ -1491,13 +1495,21 @@ def save_snapshot(
                                    "pattern":requested["geometry"]["pattern"]}
     if extra:
         snapshot.update(extra)
-    atomic_json(run_dir / snapshot_name, snapshot)
+    metadata = {**({"dimension":3,"topology":"triangles"} if is3d else {}), "stepId": step_id, "name": step_name, "stepIndex": step_index, "snapshot": snapshot_name,
+                **({"vtk": vtk_name} if surface_vtk_enabled else {}), "outputs": output_rows,
+                "pointCount": len(display_points), count_key: len(display_triangles), "materialIds": sorted(set(ids)),
+                "materialIdsByLevelSetIndex": levelset_ids, "noOp": no_op, "measuredGeometry": measured_geometry,
+                "surfaceBounds": surface_bounds, **(extra or {})}
+    if defer_payload:
+        # Keep the run's critical path free of the multi-megabyte JSON encode
+        # and write. The document is regenerated from the step's .vpsd state
+        # the first time a consumer asks for it (backend.snapshots).
+        atomic_json(run_dir / f"{step_id}.meta.json",
+                    {"schemaVersion": 1, "deferred": True, "metadata": metadata})
+    else:
+        atomic_json(run_dir / snapshot_name, snapshot)
     check_artifact_budget(run_dir)
-    return {**({"dimension":3,"topology":"triangles"} if is3d else {}), "stepId": step_id, "name": step_name, "stepIndex": step_index, "snapshot": snapshot_name,
-            **({"vtk": vtk_name} if surface_vtk_enabled else {}), "outputs": output_rows,
-            "pointCount": len(display_points), count_key: len(display_triangles), "materialIds": sorted(set(ids)),
-            "materialIdsByLevelSetIndex": levelset_ids, "noOp": no_op, "measuredGeometry": measured_geometry,
-            "surfaceBounds": surface_bounds, **(extra or {})}
+    return metadata
 
 
 def _event_path(step: dict[str, Any]) -> str:
@@ -1976,7 +1988,8 @@ def execute(input_path: Path, run_dir: Path) -> None:
             event(run_dir, {"type": "step-configured", "stepId": step["id"], "operation": step["model"], "model": step["model"],
                             "noOp": False, "actualEngine": "not-applicable", "engineSelectionReason": "native geometry operation; no process engine or physical duration",
                             "actualSeed": None, "actualParameters": actual_parameters})
-            metadata = save_snapshot(ps, domain, run_dir, run_id=run_id, step_id=step["id"], step_name=step["name"], step_index=index, requested=project)
+            metadata = save_snapshot(ps, domain, run_dir, run_id=run_id, step_id=step["id"], step_name=step["name"], step_index=index, requested=project,
+                                     defer_payload=LAZY_SNAPSHOTS)
             metadata["nativeState"] = save_native_state(ps, domain, run_dir, project=project, run_id=run_id,
                                                         step_id=step["id"], viennaps_version=ps_version, viennals_version=ls_version)
             actual_execution.append({"stepId": step["id"], "engine": "not-applicable", "seed": None})
@@ -2329,7 +2342,8 @@ def execute(input_path: Path, run_dir: Path) -> None:
                     association="native DenseCellSet scalar grid; not projected onto surface mesh", nativeUnit=None))
             with phase(f"stepSnapshot:{step['id']}"):
                 metadata = save_snapshot(ps, domain, run_dir, run_id=run_id, step_id=step["id"], step_name=step["name"], step_index=index, requested=project,
-                                         extra_outputs=native_specialized_outputs or None)
+                                         extra_outputs=native_specialized_outputs or None,
+                                         defer_payload=LAZY_SNAPSHOTS)
             with phase(f"stepNativeState:{step['id']}"):
                 metadata["nativeState"] = save_native_state(ps, domain, run_dir, project=project, run_id=run_id,
                                                             step_id=step["id"], viennaps_version=ps_version, viennals_version=ls_version)
