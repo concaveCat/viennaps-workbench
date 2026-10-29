@@ -9,6 +9,12 @@ from pathlib import Path
 from typing import Any
 
 from .ids import sha256_hex
+from .metrology import (
+    MeasurementResultV1,
+    MetrologyRecipeV1,
+    MetricDefinitionV1,
+    measure_snapshot,
+)
 from .models import CompiledWorkflowV1
 from .routes import (
     AttemptV1,
@@ -19,6 +25,9 @@ from .routes import (
     materialize_attempt,
 )
 from .verification import verify_route_plan_compiles
+
+
+SCHEMA_VERSION = "2"
 
 
 class WorkflowError(Exception):
@@ -108,11 +117,70 @@ class WorkflowStore:
                     compatibility_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS metrics (
+                    metric_id TEXT PRIMARY KEY,
+                    definition_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS metrology_recipes (
+                    recipe_id TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    recipe_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (recipe_id, version)
+                );
+                CREATE TABLE IF NOT EXISTS measurements (
+                    measurement_id TEXT PRIMARY KEY,
+                    metric_id TEXT NOT NULL,
+                    recipe_id TEXT NOT NULL,
+                    recipe_version INTEGER NOT NULL,
+                    method TEXT NOT NULL,
+                    algorithm_version TEXT NOT NULL,
+                    source_run_id TEXT,
+                    source_step_id TEXT,
+                    source_state_id TEXT,
+                    source_snapshot_hash TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    value REAL,
+                    unit TEXT NOT NULL,
+                    reason TEXT,
+                    intersections_json TEXT NOT NULL,
+                    material TEXT NOT NULL,
+                    region_json TEXT,
+                    coordinate_system TEXT NOT NULL,
+                    uncertainty REAL,
+                    uncertainty_status TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS attempts_route_idx ON attempts(route_id);
                 CREATE INDEX IF NOT EXISTS segments_attempt_idx ON segments(attempt_id);
                 CREATE INDEX IF NOT EXISTS reuse_attempt_idx ON reuse(attempt_id);
+                CREATE INDEX IF NOT EXISTS measurements_run_idx ON measurements(source_run_id);
+                CREATE INDEX IF NOT EXISTS measurements_recipe_idx ON measurements(recipe_id, recipe_version);
+                CREATE TABLE IF NOT EXISTS schema_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
                 """
             )
+            version_row = connection.execute(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+            ).fetchone()
+            if version_row is None:
+                connection.execute(
+                    "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?)",
+                    (SCHEMA_VERSION,),
+                )
+            elif version_row["value"] == "1":
+                connection.execute(
+                    "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
+                    (SCHEMA_VERSION,),
+                )
+            elif version_row["value"] != SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"unsupported workflow schema version {version_row['value']!r}; "
+                    f"expected {SCHEMA_VERSION!r}"
+                )
             attempt_columns = {row[1] for row in connection.execute("PRAGMA table_info(attempts)")}
             if "request_hash" not in attempt_columns:
                 connection.execute("ALTER TABLE attempts ADD COLUMN request_hash TEXT NOT NULL DEFAULT ''")
@@ -263,6 +331,218 @@ class WorkflowStore:
             raise
         except (ValueError, KeyError) as exc:
             raise WorkflowValidation(str(exc)) from exc
+
+    def schema_version(self) -> str:
+        with self._connect() as connection:
+            row = connection.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()
+        return "" if row is None else str(row["value"])
+
+    def register_metric(self, metric: MetricDefinitionV1) -> MetricDefinitionV1:
+        payload = metric.model_dump(mode="json", exclude_none=True)
+        digest = sha256_hex(payload)
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT definition_json FROM metrics WHERE metric_id = ?",
+                (metric.metricId,),
+            ).fetchone()
+            if existing is not None:
+                if sha256_hex(json.loads(existing["definition_json"])) != digest:
+                    raise WorkflowConflict("metricId already exists with different content")
+                return metric
+            connection.execute(
+                "INSERT INTO metrics (metric_id, definition_json, created_at) VALUES (?, ?, ?)",
+                (metric.metricId, self._dump(payload), self._now()),
+            )
+        return metric
+
+    def get_metric(self, metric_id: str) -> MetricDefinitionV1:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT definition_json FROM metrics WHERE metric_id = ?",
+                (metric_id,),
+            ).fetchone()
+        if row is None:
+            raise WorkflowNotFound(f"metric {metric_id!r} does not exist")
+        return MetricDefinitionV1.model_validate(json.loads(row["definition_json"]))
+
+    def register_recipe(self, recipe: MetrologyRecipeV1) -> MetrologyRecipeV1:
+        payload = recipe.model_dump(mode="json", exclude_none=True)
+        digest = sha256_hex(payload)
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT recipe_json FROM metrology_recipes WHERE recipe_id = ? AND version = ?",
+                (recipe.recipeId, recipe.version),
+            ).fetchone()
+            if existing is not None:
+                if sha256_hex(json.loads(existing["recipe_json"])) != digest:
+                    raise WorkflowConflict("recipeId/version already exists with different content")
+                return recipe
+            connection.execute(
+                "INSERT INTO metrology_recipes (recipe_id, version, recipe_json, created_at) VALUES (?, ?, ?, ?)",
+                (recipe.recipeId, recipe.version, self._dump(payload), self._now()),
+            )
+        return recipe
+
+    def get_recipe(self, recipe_id: str, version: int | None = None) -> MetrologyRecipeV1:
+        with self._connect() as connection:
+            if version is None:
+                row = connection.execute(
+                    "SELECT recipe_json FROM metrology_recipes WHERE recipe_id = ? ORDER BY version DESC LIMIT 1",
+                    (recipe_id,),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT recipe_json FROM metrology_recipes WHERE recipe_id = ? AND version = ?",
+                    (recipe_id, version),
+                ).fetchone()
+        if row is None:
+            raise WorkflowNotFound(f"metrology recipe {recipe_id!r} does not exist")
+        return MetrologyRecipeV1.model_validate(json.loads(row["recipe_json"]))
+
+    def list_recipes(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT recipe_id, version, recipe_json, created_at FROM metrology_recipes ORDER BY recipe_id, version DESC"
+            ).fetchall()
+        result = []
+        for row in rows:
+            recipe = MetrologyRecipeV1.model_validate(json.loads(row["recipe_json"]))
+            result.append(
+                {
+                    "recipeId": recipe.recipeId,
+                    "version": recipe.version,
+                    "metricId": recipe.metricId,
+                    "method": recipe.method,
+                    "name": recipe.name,
+                    "createdAt": row["created_at"],
+                }
+            )
+        return result
+
+    @staticmethod
+    def _measurement_payload(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schemaVersion": 1,
+            "measurementId": row["measurement_id"],
+            "metricId": row["metric_id"],
+            "recipeId": row["recipe_id"],
+            "recipeVersion": row["recipe_version"],
+            "method": row["method"],
+            "algorithmVersion": row["algorithm_version"],
+            "sourceRunId": row["source_run_id"],
+            "sourceStepId": row["source_step_id"],
+            "sourceStateId": row["source_state_id"],
+            "sourceSnapshotHash": row["source_snapshot_hash"],
+            "status": row["status"],
+            "value": row["value"],
+            "unit": row["unit"],
+            "reason": row["reason"],
+            "intersections": json.loads(row["intersections_json"]),
+            "material": row["material"],
+            "region": None if row["region_json"] is None else json.loads(row["region_json"]),
+            "coordinateSystem": row["coordinate_system"],
+            "uncertainty": row["uncertainty"],
+            "uncertaintyStatus": row["uncertainty_status"],
+            "createdAt": row["created_at"],
+        }
+
+    def record_measurement(self, result: MeasurementResultV1) -> MeasurementResultV1:
+        payload = result.model_dump(mode="json", exclude_none=True)
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO measurements (
+                        measurement_id, metric_id, recipe_id, recipe_version, method,
+                        algorithm_version, source_run_id, source_step_id, source_state_id,
+                        source_snapshot_hash, status, value, unit, reason,
+                        intersections_json, material, region_json, coordinate_system,
+                        uncertainty, uncertainty_status, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        result.measurementId, result.metricId, result.recipeId, result.recipeVersion,
+                        result.method, result.algorithmVersion, result.sourceRunId, result.sourceStepId,
+                        result.sourceStateId, result.sourceSnapshotHash, result.status, result.value,
+                        result.unit, result.reason, self._dump(result.intersections), result.material,
+                        None if result.region is None else self._dump(result.region.model_dump(mode="json")),
+                        result.coordinateSystem, result.uncertainty, result.uncertaintyStatus,
+                        result.createdAt or self._now(),
+                    ),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise WorkflowConflict(f"measurement conflicts with an existing record: {exc}") from exc
+        return self.get_measurement(result.measurementId)
+
+    def get_measurement(self, measurement_id: str) -> MeasurementResultV1:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM measurements WHERE measurement_id = ?",
+                (measurement_id,),
+            ).fetchone()
+        if row is None:
+            raise WorkflowNotFound(f"measurement {measurement_id!r} does not exist")
+        return MeasurementResultV1.model_validate(self._measurement_payload(row))
+
+    def list_measurements(self, *, run_id: str | None = None, recipe_id: str | None = None) -> list[MeasurementResultV1]:
+        clauses = []
+        params: list[Any] = []
+        if run_id is not None:
+            clauses.append("source_run_id = ?")
+            params.append(run_id)
+        if recipe_id is not None:
+            clauses.append("recipe_id = ?")
+            params.append(recipe_id)
+        query = "SELECT * FROM measurements"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at DESC, measurement_id"
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [MeasurementResultV1.model_validate(self._measurement_payload(row)) for row in rows]
+
+    def measure_and_record(
+        self,
+        recipe: MetrologyRecipeV1,
+        metric: MetricDefinitionV1,
+        snapshot: dict[str, Any],
+        *,
+        source_run_id: str | None = None,
+        source_step_id: str | None = None,
+        source_state_id: str | None = None,
+    ) -> MeasurementResultV1:
+        result = measure_snapshot(
+            recipe,
+            metric,
+            snapshot,
+            source_run_id=source_run_id,
+            source_step_id=source_step_id,
+            source_state_id=source_state_id,
+        )
+        return self.record_measurement(result)
+
+    def measure_run(self, recipe: MetrologyRecipeV1, metric: MetricDefinitionV1, run_id: str, step_id: str) -> MeasurementResultV1:
+        from .. import snapshots, storage
+
+        try:
+            run_dir = storage.run_path(run_id)
+            manifest = storage.read_json(run_dir / "manifest.json")
+            row = next((item for item in manifest.get("snapshots", []) if item.get("stepId") == step_id), None)
+            if row is None:
+                raise WorkflowNotFound(f"snapshot {step_id!r} does not exist in run {run_id!r}")
+            snapshot_path = snapshots.ensure_materialized(run_dir, step_id)
+            snapshot = storage.read_json(snapshot_path)
+            state_id = (row.get("nativeState") or {}).get("stateId")
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            raise WorkflowNotFound(f"historical snapshot is unavailable: {exc}") from exc
+        return self.measure_and_record(
+            recipe,
+            metric,
+            snapshot,
+            source_run_id=run_id,
+            source_step_id=step_id,
+            source_state_id=state_id,
+        )
 
     def create_plan(self, plan: RoutePlanV1) -> RoutePlanV1:
         self._verify_plan_compiles(plan)

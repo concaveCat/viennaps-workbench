@@ -11,6 +11,7 @@ from pydantic import Field, ValidationError
 
 from .. import storage
 from ..models import StrictModel
+from .metrology import MeasurementResultV1, MetrologyRecipeV1, MetricDefinitionV1
 from .models import CompiledWorkflowV1
 from .routes import AttemptV1, RoutePlanV1, SegmentRefV1, SegmentReuseV1, SegmentV1
 from .store import WorkflowConflict, WorkflowError, WorkflowNotFound, WorkflowStore, WorkflowValidation
@@ -30,6 +31,36 @@ class CompileSummaryV1(StrictModel):
 
 class CompileListResponse(StrictModel):
     compiles: list[CompileSummaryV1]
+
+
+class RecipeSummaryV1(StrictModel):
+    recipeId: str
+    version: Annotated[int, Field(ge=1)]
+    metricId: str
+    method: str
+    name: str
+    createdAt: str
+
+
+class RecipeListResponse(StrictModel):
+    recipes: list[RecipeSummaryV1]
+
+
+class MeasureSnapshotRequest(StrictModel):
+    recipeId: str
+    recipeVersion: Annotated[int, Field(ge=1)]
+    snapshot: dict
+
+
+class MeasureRunRequest(StrictModel):
+    recipeId: str
+    recipeVersion: Annotated[int, Field(ge=1)]
+    runId: str
+    stepId: str
+
+
+class MeasurementListResponse(StrictModel):
+    measurements: list[MeasurementResultV1]
 
 
 class RouteSummaryV1(StrictModel):
@@ -96,6 +127,63 @@ def _call(operation):
         return operation()
     except (WorkflowError, ValidationError) as exc:
         raise _http_error(exc) from exc
+
+
+@router.post("/metrics", response_model=MetricDefinitionV1, status_code=201)
+async def register_metric(metric: MetricDefinitionV1) -> MetricDefinitionV1:
+    return _call(lambda: get_store().register_metric(metric))
+
+
+@router.get("/metrics/{metric_id}", response_model=MetricDefinitionV1)
+async def get_metric(metric_id: str) -> MetricDefinitionV1:
+    return _call(lambda: get_store().get_metric(metric_id))
+
+
+@router.post("/metrology-recipes", response_model=MetrologyRecipeV1, status_code=201)
+async def register_recipe(recipe: MetrologyRecipeV1) -> MetrologyRecipeV1:
+    return _call(lambda: get_store().register_recipe(recipe))
+
+
+@router.get("/metrology-recipes", response_model=RecipeListResponse)
+async def list_recipes() -> RecipeListResponse:
+    rows = _call(get_store().list_recipes)
+    return RecipeListResponse(recipes=[RecipeSummaryV1.model_validate(row) for row in rows])
+
+
+@router.get("/metrology-recipes/{recipe_id}", response_model=MetrologyRecipeV1)
+async def get_recipe(recipe_id: str, version: int | None = None) -> MetrologyRecipeV1:
+    return _call(lambda: get_store().get_recipe(recipe_id, version))
+
+
+@router.post("/measurements", response_model=MeasurementResultV1, status_code=201)
+async def measure_snapshot(request: MeasureSnapshotRequest) -> MeasurementResultV1:
+    def operation():
+        store = get_store()
+        recipe = store.get_recipe(request.recipeId, request.recipeVersion)
+        metric = store.get_metric(recipe.metricId)
+        return store.measure_and_record(recipe, metric, request.snapshot)
+    return _call(operation)
+
+
+@router.post("/measurements/from-run", response_model=MeasurementResultV1, status_code=201)
+async def measure_run(request: MeasureRunRequest) -> MeasurementResultV1:
+    def operation():
+        store = get_store()
+        recipe = store.get_recipe(request.recipeId, request.recipeVersion)
+        metric = store.get_metric(recipe.metricId)
+        return store.measure_run(recipe, metric, request.runId, request.stepId)
+    return _call(operation)
+
+
+@router.get("/measurements", response_model=MeasurementListResponse)
+async def list_measurements(run_id: str | None = None, recipe_id: str | None = None) -> MeasurementListResponse:
+    rows = _call(lambda: get_store().list_measurements(run_id=run_id, recipe_id=recipe_id))
+    return MeasurementListResponse(measurements=rows)
+
+
+@router.get("/measurements/{measurement_id}", response_model=MeasurementResultV1)
+async def get_measurement(measurement_id: str) -> MeasurementResultV1:
+    return _call(lambda: get_store().get_measurement(measurement_id))
 
 
 @router.post("/compiles", response_model=CompiledWorkflowV1, status_code=201)
