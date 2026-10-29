@@ -153,6 +153,7 @@ class DirectionalWorkflow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manifest["plannedExecution"], [{"stepId": s["id"], "engine": "not-applicable", "seed": None} for s in value["steps"]])
         self.assertTrue(any(item["model"] == "directional" for item in info["actualExecution"]))
         for row in info["snapshots"]:
+            snapshot_store.ensure_materialized(storage.run_path(run_id), row['stepId'])
             snapshot = storage.read_json(storage.run_path(run_id) / f"{row['stepId']}.json")
             expected = direct[row["stepId"]]
             self.assertEqual(snapshot[key], expected["cells"])
@@ -233,12 +234,15 @@ class DirectionalWorkflow(unittest.IsolatedAsyncioTestCase):
         replay_id = json_body(submitted)["runId"]
         replay_info = await self.wait(replay_id)
         for step in ("initial", "step_directional", "step_directional_zero"):
+            snapshot_store.ensure_materialized(storage.run_path(run_id), step)
+            snapshot_store.ensure_materialized(storage.run_path(replay_id), step)
             left = storage.read_json(storage.run_path(run_id) / f"{step}.json")
             right = storage.read_json(storage.run_path(replay_id) / f"{step}.json")
             self.assertEqual(left["points"], right["points"])
             self.assertEqual(left.get("lines"), right.get("lines"))
             self.assertEqual(left.get("triangles"), right.get("triangles"))
             self.assertEqual(left["cellData"]["materialIds"], right["cellData"]["materialIds"])
+        snapshot_store.ensure_materialized(storage.run_path(run_id), "step_directional_zero")
         self.assertTrue(storage.read_json(storage.run_path(run_id) / "step_directional_zero.json")["noOp"])
         self.assertTrue(replay_info["actualExecution"][-1]["noOp"])
         self.assertIn("not-applicable", replay_info["actualExecution"][-1]["actualParameters"]["calculateVisibility"])

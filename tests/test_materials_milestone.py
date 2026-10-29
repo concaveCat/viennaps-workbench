@@ -1,6 +1,7 @@
 """Parent-authored interface acceptance; no experimental physics calibration."""
 import asyncio,copy,json,math,subprocess,unittest,zipfile,io
 from pathlib import Path
+from backend import snapshots as snapshot_store
 from backend import storage
 from backend.main import app
 from backend.models import parse_project
@@ -66,7 +67,9 @@ class MaterialsWorkflow(unittest.IsolatedAsyncioTestCase):
     async def execute(self,p):
         response=await asgi_request('/api/runs',method='POST',payload={'kind':'simulate' if p['steps'] else 'preview','project':p})
         self.assertEqual(response[0],202,response[2]);rid=json_body(response)['runId'];return rid,await self.wait(rid)
-    def snap(self,rid,sid):return storage.read_json(storage.run_path(rid)/(sid+'.json'))
+    def snap(self,rid,sid):
+        snapshot_store.ensure_materialized(storage.run_path(rid),sid)
+        return storage.read_json(storage.run_path(rid)/(sid+'.json'))
     async def reference(self,p,label):
         path=EVIDENCE/(label+'-input.json');path.write_text(json.dumps(p));out=EVIDENCE/(label+'-reference.json')
         command=[str(ROOT/'.venv/bin/python'),str(ROOT/'scripts/bounded_child.py'),'--cwd',str(ROOT),'--record',str(EVIDENCE/(label+'-guard.json')),'--log-path',str(EVIDENCE/(label+'-reference.log')),'--timeout-seconds','30','--',str(ROOT/'.venv/bin/python'),str(ROOT/'tests/fixtures/materials_direct_reference.py'),str(path),str(out)]

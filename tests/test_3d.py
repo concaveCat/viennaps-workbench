@@ -1,6 +1,7 @@
 import asyncio,copy,hashlib,io,json,math,subprocess,unittest,zipfile
 from pathlib import Path
 from unittest.mock import patch
+from backend import snapshots as snapshot_store
 from backend import storage
 from backend.main import app
 from backend.models import parse_project, parse_replay, ProjectV2
@@ -63,7 +64,9 @@ class Workflow3D(unittest.IsolatedAsyncioTestCase):
     async def run_project(self,p,kind='simulate'):
         res=await asgi_request('/api/runs',method='POST',payload={'kind':kind,'project':p});self.assertEqual(res[0],202,res[2])
         rid=json_body(res)['runId'];r=await self.wait(rid);self.assertEqual(r['status'],'succeeded',r.get('failureReason'));return rid,r
-    def snapshot(self,rid,sid):return storage.read_json(storage.run_path(rid)/(sid+'.json'))
+    def snapshot(self,rid,sid):
+        snapshot_store.ensure_materialized(storage.run_path(rid),sid)
+        return storage.read_json(storage.run_path(rid)/(sid+'.json'))
     async def test_multistep_reference_replay_and_download(self):
         p=project();rid,r=await self.run_project(p)
         reference=EVIDENCE/'direct-3d';reference.mkdir(exist_ok=True)

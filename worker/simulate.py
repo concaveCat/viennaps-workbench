@@ -2017,22 +2017,30 @@ def execute(input_path: Path, run_dir: Path) -> None:
             next_vtk_name = f"{step['id']}.vtk"
             if previous.get("vtk"):
                 shutil.copyfile(run_dir / previous["vtk"], run_dir / next_vtk_name)
-            shutil.copyfile(run_dir / previous["snapshot"], run_dir / f"{step['id']}.json")
-            copied = json.loads((run_dir / f"{step['id']}.json").read_text(encoding="utf-8"))
-            copied_mesh = dict(copied["mesh"])
-            if previous.get("vtk"):
-                copied_mesh["vtk"] = next_vtk_name
-            else:
-                copied_mesh.pop("vtk", None)
-            copied.update({"stepId": step["id"], "stepName": step["name"], "stepIndex": index, "noOp": True,
-                           "mesh": copied_mesh})
-            atomic_json(run_dir / f"{step['id']}.json", copied)
+            previous_path = run_dir / previous["snapshot"]
+            copied = None
+            if previous_path.is_file():
+                shutil.copyfile(previous_path, run_dir / f"{step['id']}.json")
+                copied = json.loads((run_dir / f"{step['id']}.json").read_text(encoding="utf-8"))
+                copied_mesh = dict(copied["mesh"])
+                if previous.get("vtk"):
+                    copied_mesh["vtk"] = next_vtk_name
+                else:
+                    copied_mesh.pop("vtk", None)
+                copied.update({"stepId": step["id"], "stepName": step["name"], "stepIndex": index, "noOp": True,
+                               "mesh": copied_mesh})
+                atomic_json(run_dir / f"{step['id']}.json", copied)
             check_artifact_budget(run_dir)
             metadata = {"stepId": step["id"], "name": step["name"], "stepIndex": index, "snapshot": f"{step['id']}.json",
                         **({"vtk": next_vtk_name} if previous.get("vtk") else {}),
                         "pointCount": previous["pointCount"], **{k:previous[k] for k in ("lineCount","triangleCount","topology","dimension") if k in previous},
                         "materialIds": previous["materialIds"], "materialIdsByLevelSetIndex": previous["materialIdsByLevelSetIndex"], "noOp": True,
-                        "measuredGeometry": copied.get("measuredGeometry")}
+                        "measuredGeometry": (copied or previous).get("measuredGeometry")}
+            if copied is None:
+                # Previous step is deferred: this no-op step shares its native
+                # state and is materialised from state-<step>.vpsd on first read.
+                atomic_json(run_dir / f"{step['id']}.meta.json",
+                            {"schemaVersion": 1, "deferred": True, "metadata": metadata})
             metadata["nativeState"] = save_native_state(ps, domain, run_dir, project=project, run_id=run_id,
                                                         step_id=step["id"], viennaps_version=ps_version, viennals_version=ls_version)
             event(run_dir, {"type": "step-configured", "stepId": step["id"], "operation": step["operation"], "model": step["model"],
