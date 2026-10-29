@@ -109,6 +109,29 @@ def compiled_2d() -> CompiledWorkflowV1:
     return compile_flow(_flow(1, 0.2), _binding_2d())
 
 
+def compiled_2d_zero() -> CompiledWorkflowV1:
+    return compile_flow(
+        FlowRevisionV1(
+            schemaVersion=1,
+            flowId="flow_zero_2d_01",
+            revision=1,
+            name="zero-rate 2D flow",
+            steps=[{
+                "id": "step_zero_01",
+                "name": "no-op",
+                "enabled": True,
+                "operation": "etch",
+                "model": "isotropic",
+                "rateMagnitude": 0.0,
+                "duration": 0.01,
+                "rateMode": "uniform",
+            }],
+            solver=_solver(),
+        ),
+        _binding_2d(),
+    )
+
+
 def binding_plan_2d(compiled: CompiledWorkflowV1, *, suffix: str, run_id: str, state_hash: str) -> RoutePlanV1:
     step_ids = [step.id for step in compiled.project.steps]
     end = _checkpoint("cp_end", step_ids[-1], "e")

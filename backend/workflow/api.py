@@ -6,12 +6,13 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import Field, ValidationError
 
 from .. import storage
 from ..models import StrictModel
 from .metrology import MeasurementResultV1, MetrologyRecipeV1, MetricDefinitionV1
+from .execution import execute_segment
 from .models import CompiledWorkflowV1
 from .provenance import ProvenanceVerificationV1, VerificationRecordV1
 from .routes import AttemptV1, RoutePlanV1, SegmentRefV1, SegmentReuseV1, SegmentV1
@@ -111,6 +112,11 @@ class AttemptDetailResponse(StrictModel):
 class MaterializeResponse(StrictModel):
     attemptId: str
     segments: list[SegmentRefV1]
+
+
+class SegmentExecutionResponse(StrictModel):
+    segment: SegmentV1
+    runId: str
 
 
 @lru_cache(maxsize=8)
@@ -305,6 +311,22 @@ async def get_segment(segment_id: str) -> SegmentV1:
     return _call(lambda: get_store().get_segment(segment_id))
 
 
+@router.post("/segments/{segment_id}/execute", response_model=SegmentExecutionResponse)
+async def execute_segment_endpoint(segment_id: str, request: Request) -> SegmentExecutionResponse:
+    supervisor = getattr(request.app.state, "supervisor", None)
+    if supervisor is None:
+        raise HTTPException(status_code=503, detail="supervisor is unavailable")
+    segment, run_id = _call(lambda: execute_segment(get_store(), supervisor, segment_id))
+    return SegmentExecutionResponse(segment=segment, runId=run_id)
+
+
 @router.post("/segments/{segment_id}/cancel", response_model=SegmentV1)
-async def cancel_segment(segment_id: str) -> SegmentV1:
-    return _call(lambda: get_store().update_segment_status(segment_id, "cancelled"))
+async def cancel_segment(segment_id: str, request: Request) -> SegmentV1:
+    store = get_store()
+    segment = _call(lambda: store.get_segment(segment_id))
+    if segment.runId and segment.status in {"running", "planned"}:
+        supervisor = getattr(request.app.state, "supervisor", None)
+        if supervisor is not None:
+            supervisor.cancel(segment.runId)
+            return segment
+    return _call(lambda: store.update_segment_status(segment_id, "cancelled"))

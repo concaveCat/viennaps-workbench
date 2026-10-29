@@ -1202,3 +1202,59 @@ class WorkflowStore:
     def materialize(self, route_id: str, attempt_id: str) -> list[SegmentRefV1]:
         plan = self.get_plan(route_id)
         return materialize_attempt(plan, attempt_id)
+
+    def mark_segment_started(self, segment_id: str, run_id: str, segment_project_hash: str) -> None:
+        now = self._now()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT attempt_id, status FROM segments WHERE segment_id = ?",
+                (segment_id,),
+            ).fetchone()
+            if row is None:
+                raise WorkflowNotFound(f"segment {segment_id!r} does not exist")
+            if row["status"] not in {"planned"}:
+                raise WorkflowConflict(f"segment {segment_id!r} is not planned")
+            connection.execute(
+                "UPDATE segments SET run_id = ?, segment_project_hash = ?, status = 'running', updated_at = ? WHERE segment_id = ?",
+                (run_id, segment_project_hash, now, segment_id),
+            )
+            connection.execute(
+                "UPDATE attempts SET status = 'running', updated_at = ? WHERE attempt_id = ?",
+                (now, row["attempt_id"]),
+            )
+
+    def finish_segment(
+        self,
+        segment_id: str,
+        status: str,
+        end_checkpoint: CheckpointRefV1 | None,
+    ) -> None:
+        if status not in {"succeeded", "failed", "cancelled", "interrupted"}:
+            raise WorkflowConflict(f"invalid terminal segment status {status!r}")
+        now = self._now()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT attempt_id FROM segments WHERE segment_id = ?",
+                (segment_id,),
+            ).fetchone()
+            if row is None:
+                raise WorkflowNotFound(f"segment {segment_id!r} does not exist")
+            connection.execute(
+                "UPDATE segments SET status = ?, end_checkpoint_json = ?, updated_at = ? WHERE segment_id = ?",
+                (status, self._checkpoint_value(None if end_checkpoint is None else end_checkpoint.model_dump(mode="json")), now, segment_id),
+            )
+            attempt_id = row["attempt_id"]
+            statuses = [item["status"] for item in connection.execute(
+                "SELECT status FROM segments WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchall()]
+            if any(value in {"failed", "cancelled", "interrupted"} for value in statuses):
+                attempt_status = "failed" if "failed" in statuses else "cancelled" if "cancelled" in statuses else "interrupted"
+            elif statuses and all(value == "succeeded" for value in statuses):
+                attempt_status = "succeeded"
+            else:
+                attempt_status = "running"
+            connection.execute(
+                "UPDATE attempts SET status = ?, updated_at = ? WHERE attempt_id = ?",
+                (attempt_status, now, attempt_id),
+            )
