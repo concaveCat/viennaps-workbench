@@ -252,6 +252,13 @@ WORKBENCH_GPU_TEST=1 .venv/bin/python -m unittest discover -s tests -v
 cd frontend && npm run typecheck && npm run build
 ```
 
+如果工作台服务已经在使用 `./var`，测试会在毫秒级失败并报
+`another ViennaPS Workbench server already holds the data-directory lock`。
+此时把 `VIENNAPS_WORKBENCH_DATA_DIR` 指向一个**仓库内**的新目录（例如
+`$PWD/var/test-$(date +%s)`），并换一个运行中服务未占用的端口
+（`WORKBENCH_PORT=8767`）。目录必须留在仓库内，因为 `scripts/bounded_child.py`
+会拒绝仓库之外的 `--record`/`--log-path`。
+
 `frontend/tests/*.mjs` 是真实浏览器验收脚本（Playwright），需要已启动的服务和
 准备好的数据目录；它们面向宿主验收环境而非通用 CI，改造测试套件时可作为参考。
 

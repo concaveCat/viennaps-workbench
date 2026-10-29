@@ -266,6 +266,14 @@ WORKBENCH_GPU_TEST=1 .venv/bin/python -m unittest discover -s tests -v
 cd frontend && npm run typecheck && npm run build
 ```
 
+If the workbench service is already running against `./var`, the suite aborts in
+milliseconds with `another ViennaPS Workbench server already holds the
+data-directory lock`. In that case point `VIENNAPS_WORKBENCH_DATA_DIR` at a fresh
+directory **inside the repository** (for example
+`$PWD/var/test-$(date +%s)`) and use a port the running service does not own
+(`WORKBENCH_PORT=8767`). The directory has to stay inside the repository because
+`scripts/bounded_child.py` rejects `--record`/`--log-path` values outside it.
+
 `frontend/tests/*.mjs` are real-browser acceptance scripts (Playwright). They
 expect a running service and a prepared data directory, and are written for the
 host acceptance environment rather than a generic CI runner; use them as
