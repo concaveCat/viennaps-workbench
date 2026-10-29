@@ -11,11 +11,25 @@ from pydantic import Field, ValidationError
 
 from .. import storage
 from ..models import StrictModel
+from .models import CompiledWorkflowV1
 from .routes import AttemptV1, RoutePlanV1, SegmentRefV1, SegmentReuseV1, SegmentV1
-from .store import WorkflowConflict, WorkflowError, WorkflowNotFound, WorkflowStore
+from .store import WorkflowConflict, WorkflowError, WorkflowNotFound, WorkflowStore, WorkflowValidation
 
 
 router = APIRouter(prefix="/api/v1/workflow", tags=["workflow"])
+
+
+class CompileSummaryV1(StrictModel):
+    compileId: str
+    flowRevisionId: str
+    fullProjectHash: str
+    geometryBindingHash: str
+    stepCount: Annotated[int, Field(ge=0)]
+    createdAt: str
+
+
+class CompileListResponse(StrictModel):
+    compiles: list[CompileSummaryV1]
 
 
 class RouteSummaryV1(StrictModel):
@@ -70,6 +84,8 @@ def _http_error(exc: Exception) -> HTTPException:
         return HTTPException(status_code=404, detail=str(exc))
     if isinstance(exc, WorkflowConflict):
         return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, WorkflowValidation):
+        return HTTPException(status_code=422, detail=str(exc))
     if isinstance(exc, ValidationError):
         return HTTPException(status_code=422, detail=exc.errors(include_url=False, include_context=False, include_input=False))
     return HTTPException(status_code=500, detail="workflow persistence failed")
@@ -80,6 +96,22 @@ def _call(operation):
         return operation()
     except (WorkflowError, ValidationError) as exc:
         raise _http_error(exc) from exc
+
+
+@router.post("/compiles", response_model=CompiledWorkflowV1, status_code=201)
+async def register_compile(compiled: CompiledWorkflowV1) -> CompiledWorkflowV1:
+    return _call(lambda: get_store().register_compile(compiled))
+
+
+@router.get("/compiles", response_model=CompileListResponse)
+async def list_compiles() -> CompileListResponse:
+    rows = _call(get_store().list_compiles)
+    return CompileListResponse(compiles=[CompileSummaryV1.model_validate(row) for row in rows])
+
+
+@router.get("/compiles/{compile_id}", response_model=CompiledWorkflowV1)
+async def get_compile(compile_id: str) -> CompiledWorkflowV1:
+    return _call(lambda: get_store().get_compile(compile_id))
 
 
 @router.post("/routes", response_model=RoutePlanResponse, status_code=201)

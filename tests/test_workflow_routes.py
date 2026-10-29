@@ -63,7 +63,7 @@ def segment(
 
 def compatibility(*, step_ids: list[str] | None = None, run_seed: int = 1) -> PrefixCompatibilityV1:
     return PrefixCompatibilityV1(
-        flowDigest=FLOW_DIGEST,
+        prefixDigest=FLOW_DIGEST,
         geometryBindingHash=GEOMETRY_HASH,
         seedPolicy="shared-run-seed",
         runSeed=run_seed,
@@ -163,6 +163,31 @@ class RoutePlanTests(unittest.TestCase):
     def test_checkpoint_discontinuity_is_rejected(self):
         payload = plan_payload()
         payload["segments"][2]["startCheckpointRef"] = checkpoint("wrong_cp", "s005", "9").model_dump(mode="json")
+        with self.assertRaises(ValidationError):
+            RoutePlanV1.model_validate(payload)
+
+    def test_succeeded_noninitial_segment_requires_start_checkpoint(self):
+        payload = plan_payload()
+        payload["segments"][1]["startCheckpointRef"] = None
+        with self.assertRaises(ValidationError):
+            RoutePlanV1.model_validate(payload)
+
+    def test_segment_parent_cycle_is_rejected(self):
+        payload = plan_payload()
+        payload["segments"][0]["parentSegmentId"] = "S02"
+        payload["segments"][1]["parentSegmentId"] = "S01"
+        with self.assertRaises(ValidationError):
+            RoutePlanV1.model_validate(payload)
+
+    def test_missing_segment_parent_is_rejected(self):
+        payload = plan_payload()
+        payload["segments"][1]["parentSegmentId"] = "S99"
+        with self.assertRaises(ValidationError):
+            RoutePlanV1.model_validate(payload)
+
+    def test_start_checkpoint_must_match_start_after_step(self):
+        payload = plan_payload()
+        payload["segments"][1]["startCheckpointRef"] = checkpoint("wrong_start", "s002", "2").model_dump(mode="json")
         with self.assertRaises(ValidationError):
             RoutePlanV1.model_validate(payload)
 

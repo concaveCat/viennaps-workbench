@@ -22,9 +22,13 @@ class CheckpointRefV1(StrictModel):
 
 
 class PrefixCompatibilityV1(StrictModel):
-    """Identity of the executable prefix that a branch is allowed to reuse."""
+    """Identity of the executable prefix that a branch is allowed to reuse.
 
-    flowDigest: Hash64
+    ``prefixDigest`` covers the ordered resolved prefix steps and geometry
+    binding. It deliberately does not cover steps after the prefix.
+    """
+
+    prefixDigest: Hash64
     geometryBindingHash: Hash64
     seedPolicy: Literal["shared-run-seed"]
     runSeed: Annotated[int, Field(ge=0, le=4294967295)]
@@ -72,6 +76,22 @@ class SegmentV1(StrictModel):
     executionHash: Hash64
     resultDigest: Hash64 | None = None
     status: Status = "planned"
+
+    @model_validator(mode="after")
+    def completed_segment_boundaries(self) -> "SegmentV1":
+        if self.endCheckpointRef is not None and self.endCheckpointRef.stepId != self.throughStepId:
+            raise ValueError("end checkpoint must belong to throughStepId")
+        if self.startAfterStepId is None:
+            if self.startCheckpointRef is not None:
+                raise ValueError("an initial segment must not have a start checkpoint")
+        else:
+            if self.startCheckpointRef is not None and self.startCheckpointRef.stepId != self.startAfterStepId:
+                raise ValueError("start checkpoint must belong to startAfterStepId")
+            if self.status in {"running", "succeeded"} and self.startCheckpointRef is None:
+                raise ValueError(f"{self.status} segment requires a start checkpoint")
+        if self.status == "succeeded" and self.endCheckpointRef is None:
+            raise ValueError("succeeded segment requires an end checkpoint")
+        return self
 
 
 class SegmentReuseV1(StrictModel):
@@ -156,6 +176,29 @@ def _check_parent_cycles(plan: RoutePlanV1) -> None:
             parent = attempts.get(current.parentAttemptId)
             if parent is None:
                 raise ValueError(f"attempt {current.attemptId!r} references missing parent {current.parentAttemptId!r}")
+            current = parent
+
+
+def _check_segment_parent_cycles(plan: RoutePlanV1, segments: dict[str, SegmentV1]) -> None:
+    for segment in plan.segments:
+        seen: set[str] = set()
+        current: SegmentV1 | None = segment
+        while current is not None:
+            if current.segmentId in seen:
+                raise ValueError(f"segment parent cycle includes {current.segmentId!r}")
+            seen.add(current.segmentId)
+            if current.parentSegmentId is None:
+                break
+            parent = segments.get(current.parentSegmentId)
+            if parent is None:
+                raise ValueError(f"segment {current.segmentId!r} references missing parent {current.parentSegmentId!r}")
+            if parent.attemptId != current.attemptId:
+                raise ValueError(f"segment {current.segmentId!r} parent belongs to another attempt")
+            if parent.throughStepId != current.startAfterStepId:
+                raise ValueError(f"segment {current.segmentId!r} does not follow its parent step range")
+            if parent.endCheckpointRef is not None and current.startCheckpointRef is not None:
+                if parent.endCheckpointRef != current.startCheckpointRef:
+                    raise ValueError(f"segment {current.segmentId!r} checkpoint does not follow its parent")
             current = parent
 
 
@@ -262,6 +305,7 @@ def _validate_plan(plan: RoutePlanV1) -> None:
     if plan.route.headAttemptId not in attempts:
         raise ValueError("route headAttemptId does not reference an attempt")
     _check_parent_cycles(plan)
+    _check_segment_parent_cycles(plan, segments)
     own_by_attempt = _attempt_own_segments(plan)
 
     for attempt in plan.attempts:

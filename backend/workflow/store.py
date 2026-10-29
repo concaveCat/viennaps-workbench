@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .ids import sha256_hex
+from .models import CompiledWorkflowV1
 from .routes import (
     AttemptV1,
     RoutePlanV1,
@@ -16,6 +18,7 @@ from .routes import (
     SegmentV1,
     materialize_attempt,
 )
+from .verification import verify_route_plan_compiles
 
 
 class WorkflowError(Exception):
@@ -30,6 +33,10 @@ class WorkflowConflict(WorkflowError):
     pass
 
 
+class WorkflowValidation(WorkflowError):
+    pass
+
+
 class WorkflowStore:
     def __init__(self, path: Path):
         self.path = path
@@ -39,6 +46,12 @@ class WorkflowStore:
         with self._connect() as connection:
             connection.executescript(
                 """
+                CREATE TABLE IF NOT EXISTS compiles (
+                    compile_id TEXT PRIMARY KEY,
+                    envelope_json TEXT NOT NULL,
+                    envelope_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS routes (
                     route_id TEXT PRIMARY KEY,
                     flow_id TEXT NOT NULL,
@@ -54,6 +67,7 @@ class WorkflowStore:
                     parent_attempt_id TEXT,
                     compile_id TEXT NOT NULL,
                     submission_key TEXT NOT NULL UNIQUE,
+                    request_hash TEXT NOT NULL,
                     base_checkpoint_json TEXT,
                     start_after_step_id TEXT,
                     through_step_id TEXT NOT NULL,
@@ -99,6 +113,9 @@ class WorkflowStore:
                 CREATE INDEX IF NOT EXISTS reuse_attempt_idx ON reuse(attempt_id);
                 """
             )
+            attempt_columns = {row[1] for row in connection.execute("PRAGMA table_info(attempts)")}
+            if "request_hash" not in attempt_columns:
+                connection.execute("ALTER TABLE attempts ADD COLUMN request_hash TEXT NOT NULL DEFAULT ''")
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30.0)
@@ -169,7 +186,86 @@ class WorkflowStore:
             "compatibility": WorkflowStore._load(row["compatibility_json"]),
         }
 
+    def register_compile(self, compiled: CompiledWorkflowV1) -> CompiledWorkflowV1:
+        compiled = compiled.verify()
+        payload = compiled.model_dump(mode="json", exclude_none=True)
+        envelope_hash = sha256_hex(payload)
+        try:
+            with self._connect() as connection:
+                existing = connection.execute(
+                    "SELECT envelope_hash FROM compiles WHERE compile_id = ?",
+                    (compiled.compileRecord.compileId,),
+                ).fetchone()
+                if existing is not None:
+                    if existing["envelope_hash"] != envelope_hash:
+                        raise WorkflowConflict("compileId already exists with different content")
+                    return compiled
+                connection.execute(
+                    "INSERT INTO compiles (compile_id, envelope_json, envelope_hash, created_at) VALUES (?, ?, ?, ?)",
+                    (
+                        compiled.compileRecord.compileId,
+                        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False),
+                        envelope_hash,
+                        self._now(),
+                    ),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise WorkflowConflict(f"compile record conflicts with an existing object: {exc}") from exc
+        return compiled
+
+    def get_compile(self, compile_id: str) -> CompiledWorkflowV1:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT envelope_json FROM compiles WHERE compile_id = ?",
+                (compile_id,),
+            ).fetchone()
+        if row is None:
+            raise WorkflowNotFound(f"compile {compile_id!r} does not exist")
+        try:
+            return CompiledWorkflowV1.model_validate(json.loads(row["envelope_json"]))
+        except (ValueError, TypeError) as exc:
+            raise WorkflowValidation(f"stored compile {compile_id!r} is invalid") from exc
+
+    def list_compiles(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT compile_id, envelope_json, created_at FROM compiles ORDER BY created_at DESC"
+            ).fetchall()
+        result = []
+        for row in rows:
+            try:
+                compiled = CompiledWorkflowV1.model_validate(json.loads(row["envelope_json"]))
+            except (ValueError, TypeError):
+                continue
+            result.append(
+                {
+                    "compileId": compiled.compileRecord.compileId,
+                    "flowRevisionId": compiled.compileRecord.flowRevisionId,
+                    "fullProjectHash": compiled.compileRecord.fullProjectHash,
+                    "geometryBindingHash": compiled.compileRecord.geometryBindingHash,
+                    "stepCount": len(compiled.project.steps),
+                    "createdAt": row["created_at"],
+                }
+            )
+        return result
+
+    def _compile_map(self, plan: RoutePlanV1) -> dict[str, CompiledWorkflowV1]:
+        ids = {attempt.compileId for attempt in plan.attempts}
+        ids.update(segment.sourceCompileId for segment in plan.segments)
+        return {compile_id: self.get_compile(compile_id) for compile_id in ids}
+
+    def _verify_plan_compiles(self, plan: RoutePlanV1) -> None:
+        try:
+            verify_route_plan_compiles(plan, self._compile_map(plan))
+        except WorkflowNotFound as exc:
+            raise WorkflowValidation(str(exc)) from exc
+        except WorkflowError:
+            raise
+        except (ValueError, KeyError) as exc:
+            raise WorkflowValidation(str(exc)) from exc
+
     def create_plan(self, plan: RoutePlanV1) -> RoutePlanV1:
+        self._verify_plan_compiles(plan)
         now = self._now()
         payload = plan.model_dump(mode="json", exclude_none=True)
         try:
@@ -186,20 +282,28 @@ class WorkflowStore:
             raise WorkflowConflict(f"route plan conflicts with an existing workflow object: {exc}") from exc
         return self.get_plan(payload["route"]["routeId"])
 
-    def _insert_attempts(self, connection: sqlite3.Connection, attempts: list[dict[str, Any]], now: str) -> None:
+    def _insert_attempts(
+        self,
+        connection: sqlite3.Connection,
+        attempts: list[dict[str, Any]],
+        now: str,
+        request_hashes: dict[str, str] | None = None,
+    ) -> None:
+        request_hashes = request_hashes or {}
         for attempt in attempts:
+            request_hash = request_hashes.get(attempt["attemptId"], sha256_hex(attempt))
             connection.execute(
                 """
                 INSERT INTO attempts (
                     attempt_id, route_id, parent_attempt_id, compile_id, submission_key,
-                    base_checkpoint_json, start_after_step_id, through_step_id,
+                    request_hash, base_checkpoint_json, start_after_step_id, through_step_id,
                     changed_step_ids_json, prefix_compatibility_json, seed_policy,
                     run_seed, flow_digest, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     attempt["attemptId"], attempt["routeId"], attempt.get("parentAttemptId"),
-                    attempt["compileId"], attempt["submissionKey"],
+                    attempt["compileId"], attempt["submissionKey"], request_hash,
                     self._checkpoint_value(attempt.get("baseCheckpointRef")),
                     attempt.get("startAfterStepId"), attempt["throughStepId"],
                     self._dump(attempt.get("changedStepIds", [])),
@@ -316,6 +420,16 @@ class WorkflowStore:
             ).fetchone()
         return None if row is None else AttemptV1.model_validate(self._attempt_payload(row))
 
+    def get_attempt_request_hash(self, attempt_id: str) -> str:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT request_hash FROM attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+        if row is None:
+            raise WorkflowNotFound(f"attempt {attempt_id!r} does not exist")
+        return str(row["request_hash"])
+
     def append_attempt(
         self,
         route_id: str,
@@ -323,10 +437,19 @@ class WorkflowStore:
         segments: list[SegmentV1],
         reuse: list[SegmentReuseV1],
     ) -> RoutePlanV1:
+        request_hash = sha256_hex(
+            {
+                "attempt": attempt.model_dump(mode="json", exclude_none=True),
+                "segments": [segment.model_dump(mode="json", exclude_none=True) for segment in segments],
+                "reuse": [item.model_dump(mode="json", exclude_none=True) for item in reuse],
+            }
+        )
         existing = self.find_attempt_by_submission_key(attempt.submissionKey)
         if existing is not None:
             if existing.routeId != route_id or existing.attemptId != attempt.attemptId:
                 raise WorkflowConflict("submissionKey already belongs to a different attempt")
+            if self.get_attempt_request_hash(existing.attemptId) != request_hash:
+                raise WorkflowConflict("submissionKey already exists with different request content")
             return self.get_plan(route_id)
 
         if any(segment.attemptId != attempt.attemptId for segment in segments):
@@ -341,6 +464,7 @@ class WorkflowStore:
         payload["segments"].extend(segment.model_dump(mode="json", exclude_none=True) for segment in segments)
         payload["reuse"].extend(item.model_dump(mode="json", exclude_none=True) for item in reuse)
         updated = RoutePlanV1.model_validate(payload)
+        self._verify_plan_compiles(updated)
 
         now = self._now()
         try:
@@ -349,7 +473,12 @@ class WorkflowStore:
                     "UPDATE routes SET head_attempt_id = ?, updated_at = ? WHERE route_id = ?",
                     (attempt.attemptId, now, route_id),
                 )
-                self._insert_attempts(connection, [attempt.model_dump(mode="json", exclude_none=True)], now)
+                self._insert_attempts(
+                    connection,
+                    [attempt.model_dump(mode="json", exclude_none=True)],
+                    now,
+                    request_hashes={attempt.attemptId: request_hash},
+                )
                 self._insert_segments(connection, [segment.model_dump(mode="json", exclude_none=True) for segment in segments], now)
                 self._insert_reuse(connection, [item.model_dump(mode="json", exclude_none=True) for item in reuse], now)
         except sqlite3.IntegrityError as exc:
