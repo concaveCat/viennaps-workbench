@@ -106,7 +106,14 @@ type GpuKnownFailure = { model: string; dimension: number; operation: string; bo
 type GpuEngineLimitation = { model: string; engine: string; engineVersion: string; limit: string; maxIonSpecies: number; dimensions: number[]; extraIonBehavior: string; cpuVerifiedProductDirectCases: number; evidence: string[] };
 type GpuCapabilityRow = { status: string; schemaVersions?: number[]; dimension: number; model: string; nativeModel?: string; operation: string; boundaryXY: string; engine: string; geometryKinds?: string[]; patternKinds?: string[]; finExtrusionMode?: 'direct' | 'extruded'; finConstruction?: 'native' | 'boolean'; materials?: string[]; materialRoles?: Record<string, string[]>; materialBindings?: Record<string, string>; speciesSignature?: { species: ParticleSpecies[]; rateCoefficients: MultiParticleRateCoefficients }; executionStrategy?: string; solverProfile?: { gridDelta: number; timeStepRatio: number; raysPerPoint: number; randomMode: 'fixed' | 'random'; advection?: AdvectionSettings; rayTracing?: RayTracingSettings }; materialScope?: GpuMaterialScope; speciesScope?: GpuSpeciesScope; gdsScope?: { kind: string; engineVersion: string; dimensions: number[]; maxLayerMappings: number; supports3DMask: boolean } };
 type GpuProfileFailure = { dimension: number; model: string; operation: string; boundaryXY: string; engine: string; geometryKind: string; solverProfile: Record<string, unknown>; materials: string[]; materialRoles: Record<string, string[]>; materialBindings: Record<string, string>; speciesSignature?: { species: ParticleSpecies[]; rateCoefficients: MultiParticleRateCoefficients } | null; reason: string };
-type Capabilities = { capabilities?: { gpuModelRows?: GpuCapabilityRow[]; knownGpuProfileFailures?: GpuProfileFailure[]; knownNativeFailures?: GpuKnownFailure[]; knownEngineLimitations?: GpuEngineLimitation[]; threeDimensional?: { rows?: GpuCapabilityRow[] }; engines?: { gpu?: { status?: string; exposed?: boolean; engine?: string } } }; resourcePolicy?: { run?: { maximumSteps?: number | null; cpuThreads?: { default?: number; minimum?: number; maximum?: number; limitSource?: string } } } };
+type ArtifactPreflightPolicy = { capBytes?: number | null; capMiB?: number | null; artifactLimitSource?: string | null };
+type RunPolicy = {
+  maximumSteps?: number | null; maximumArtifactBytes?: number | null; maximumResultArchiveBytes?: number | null; maximumArtifactMiB?: number | null;
+  artifactLimitBytes?: number | null; artifactLimitMiB?: number | null; artifactLimitSource?: string | null; artifactLimitEnvironmentVariable?: string | null;
+  artifactLimitDefaultMiB?: number | null; artifactLimitMinimumMiB?: number | null; artifactLimitMaximumMiB?: number | null;
+  artifactPreflight?: ArtifactPreflightPolicy; cpuThreads?: { default?: number; minimum?: number; maximum?: number; limitSource?: string };
+};
+type Capabilities = { capabilities?: { gpuModelRows?: GpuCapabilityRow[]; knownGpuProfileFailures?: GpuProfileFailure[]; knownNativeFailures?: GpuKnownFailure[]; knownEngineLimitations?: GpuEngineLimitation[]; threeDimensional?: { rows?: GpuCapabilityRow[] }; engines?: { gpu?: { status?: string; exposed?: boolean; engine?: string } } }; resourcePolicy?: { run?: RunPolicy } };
 type GpuDevice = { index: number; name: string; pciBusId: string; uuid: string; memoryTotalMiB: number | null; vendor: string; computeApi: string };
 type GpuDeviceInventory = { status: 'available' | 'unavailable' | 'error'; devices: GpuDevice[]; preferredGpuDeviceId: string | null; reason: string | null; probe?: { bounded: boolean; returnCode?: number; elapsedSeconds?: number } };
 
@@ -354,7 +361,28 @@ function gdsAssetIdFromProject(value: Project): string | null {
   return null;
 }
 const terminalStates = new Set(['succeeded', 'failed', 'timed_out', 'cancelled', 'interrupted']);
-const maxPackageBytes = 512 * 1024 * 1024;
+const ARTIFACT_CAP_FALLBACK_BYTES = 512 * 1024 * 1024;
+// The backend publishes the effective run-artifact cap in /api/capabilities
+// (deployments can raise it with WORKBENCH_MAX_ARTIFACT_MIB, default 4096 MiB).
+// Prefer the published byte/MiB fields; the 512 MiB historical guard is only a
+// fallback for backends that predate the configurable cap.
+function effectiveArtifactCapBytes(capabilities: Capabilities | null | undefined): number {
+  const run = capabilities?.resourcePolicy?.run;
+  const preflight = run?.artifactPreflight;
+  const resolved = [
+    run?.maximumArtifactBytes,
+    run?.artifactLimitBytes,
+    run?.maximumArtifactMiB != null ? run.maximumArtifactMiB * 1024 * 1024 : null,
+    run?.artifactLimitMiB != null ? run.artifactLimitMiB * 1024 * 1024 : null,
+    preflight?.capBytes,
+    preflight?.capMiB != null ? preflight.capMiB * 1024 * 1024 : null,
+    run?.maximumResultArchiveBytes,
+  ].find(value => typeof value === 'number' && Number.isFinite(value) && value > 0);
+  return resolved ?? ARTIFACT_CAP_FALLBACK_BYTES;
+}
+function formatArtifactCapMiB(bytes: number): string {
+  return `${Math.round(bytes / (1024 * 1024)).toLocaleString('zh-CN')} MiB`;
+}
 type PanelWidths = { structure: number; settings: number };
 type ResizablePanel = keyof PanelWidths;
 const panelWidthLimits = { structure: { min: 260, max: 420 }, settings: { min: 280, max: 420 }, viewerMin: 320, splitter: 10, workspacePadding: 20, rail: 64 } as const;
@@ -1460,7 +1488,8 @@ export default function App() {
     try {
       setLoading(true);
       if (file.name.toLowerCase().endsWith('.zip')) {
-        if (file.size > maxPackageBytes) throw new Error('状态包不能超过 512 MiB。');
+        const maxPackageBytes = effectiveArtifactCapBytes(capabilities);
+        if (file.size > maxPackageBytes) throw new Error(`状态包不能超过 ${formatArtifactCapMiB(maxPackageBytes)}。`);
         const imported = await api<{ project: Project; replay?: unknown | null }>('/api/continuation-package/import', { method: 'POST', body: file, headers: { 'Content-Type': 'application/zip' } });
         if (imported.replay) await startReplay(imported.replay);
         else {
@@ -2978,7 +3007,7 @@ export default function App() {
           <div className="validation-foot"><span>工艺步骤上限</span><strong>{capabilities?.resourcePolicy?.run?.maximumSteps == null ? '不限' : `${capabilities.resourcePolicy.run.maximumSteps} 步`}</strong></div>
           <div className="validation-foot" title="主机 GPU 能力来自 /api/gpu-devices，表示本机能否运行 CUDA 通量；不代表所选运行使用的引擎。"><span>主机 GPU 能力</span><strong>{gpuExposed ? 'GPU_DISK · 可选择' : gpuStatus === 'unverified-outside-sandbox' ? '设备不可用' : gpuStatus}</strong></div>
           <div className="validation-foot" title={runEngineTitle}><span>本次运行引擎</span><strong>{runEngine}{selectedStepEngine ? ` · 本步 ${selectedStepEngine}` : ''}</strong></div>
-          {artifactEstimate && <div className={`validation-foot artifact-foot ${artifactEstimate.risk}`} title="运行产物预检估算；上限 512 MiB，超限的运行会在启动前被拒绝。"><span>运行产物预估</span><strong>{formatEstimateMiB(artifactEstimate.estimatedMiB)} / {artifactEstimate.capMiB} MiB · {ARTIFACT_RISK_LABELS[artifactEstimate.risk]}</strong></div>}
+          {artifactEstimate && <div className={`validation-foot artifact-foot ${artifactEstimate.risk}`} title={`运行产物预检估算；当前配置上限 ${artifactEstimate.capMiB} MiB，超限的运行会在启动前被拒绝。`}><span>运行产物预估</span><strong>{formatEstimateMiB(artifactEstimate.estimatedMiB)} / {artifactEstimate.capMiB} MiB · {ARTIFACT_RISK_LABELS[artifactEstimate.risk]}</strong></div>}
         </section>
       </Inspector>
     </main>

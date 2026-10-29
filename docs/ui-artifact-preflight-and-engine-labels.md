@@ -8,9 +8,21 @@
   `docs/artifact-preflight-contract.md`）。前端不新增接口，也不自行计算体积。
 - 位置：
   - 设置活动 → “运行产物预估”卡片（求解器与输出设置之后）：预估运行目录 /
-    512 MiB 上限、进度条、`risk` 徽标、导出 ZIP 预估与 `archiveRisk`、置信度、
+    当前配置上限、进度条、`risk` 徽标、导出 ZIP 预估与 `archiveRisk`、置信度、
     占用最多的前三项 `contributors`、`suggestions`。
   - 右侧属性检查器底部“参数检查”卡片中的一行摘要与 `warnings`。
+- 上限：运行目录硬上限由后端部署参数 `WORKBENCH_MAX_ARTIFACT_MIB` 配置
+  （默认 4096 MiB，无上限；旧部署可能是 512 MiB）。前端只读取
+  `artifactEstimate.capBytes` / `capMiB` 与 `/api/capabilities` 中的
+  `resourcePolicy.run.maximumArtifactBytes`、`artifactLimitMiB`、
+  `artifactPreflight.capBytes`，不把 512 MiB 写死。
+  - 状态包 / 续跑包导入的本地大小预检使用
+    `resourcePolicy.run.maximumArtifactBytes`（其次 `artifactLimitBytes`、
+    `artifactLimitMiB`、`artifactPreflight.capBytes/capMiB`、
+    `maximumResultArchiveBytes`），全部缺失时才退回历史的 512 MiB；
+    报错文案显示实际生效的 MiB。
+  - 若前端连不上能力接口或字段缺失，则沿用同一回退链，后端仍会以 413/422
+    最终拒绝超限请求。
 - 行为：
   - `risk = "reject"` → 卡片明确提示会在工作进程启动前被拒绝，“运行工艺”按钮
     置灰并给出 `title` 说明；`startRun` 仍会短路提示。结构预览不受影响，因为
