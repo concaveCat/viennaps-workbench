@@ -24,6 +24,7 @@ from pydantic import ValidationError
 from starlette.background import BackgroundTask
 
 from . import storage
+from . import preflight as artifact_preflight
 from . import materials as material_registry
 from .models import Project, ProjectV6, ProjectV7, FluxRunRequest, SliceRequestV7, normalized_geometry_v3, parse_project, parse_replay, project_structure_hash, RunRequest
 from .storage import atomic_json, read_json
@@ -442,7 +443,17 @@ async def gds_asset_inspect(asset_id: str, payload: Any = Body(...)) -> dict[str
 async def validate_endpoint(payload: Any = Body(...)) -> dict[str, Any]:
     project, normalized, warnings = _project_or_422(payload)
     from .hashing import requested_input_hash
-    return {"valid": True, "warnings": warnings, "requestedInputHash": requested_input_hash(project), "normalizedProject": normalized}
+    # Advisory only: validation stays 200/valid even when the estimate is over
+    # the run cap, so existing clients keep their current behavior. The warning
+    # is appended to the existing warning list and the structured estimate is
+    # an additive response field.
+    estimate = artifact_preflight.estimate_artifacts(normalized)
+    warning = artifact_preflight.warning_message(estimate)
+    validation_warnings = list(warnings)
+    if warning:
+        validation_warnings.append(warning)
+    return {"valid": True, "warnings": validation_warnings, "requestedInputHash": requested_input_hash(project),
+            "normalizedProject": normalized, "artifactEstimate": estimate}
 
 
 @app.get("/api/projects")
@@ -494,14 +505,24 @@ async def run_create(request: Request, payload: Any = Body(...)) -> dict[str, An
         project, normalized, _warnings = _project_or_422(run_request.project.model_dump(mode="python", exclude_none=True), kind=run_request.kind)
     except HTTPException:
         raise
+    estimate = artifact_preflight.estimate_artifacts(normalized, kind=run_request.kind)
+    if artifact_preflight.should_reject(estimate):
+        raise HTTPException(status_code=422, detail=artifact_preflight.rejection_detail(estimate))
     try:
-        return _supervisor(request).start(run_request.kind, normalized)
+        result = _supervisor(request).start(run_request.kind, normalized)
     except ActiveRunError as exc:
         raise HTTPException(status_code=409, detail={"message": str(exc), "runId": exc.run_id}) from exc
     except ReplayMismatch as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except OSError as exc:
         raise HTTPException(status_code=507, detail=str(exc)) from exc
+    # Additive fields: older clients ignore them; the run response keeps its
+    # runId/status/requestedInputHash contract.
+    warning = artifact_preflight.warning_message(estimate)
+    if warning:
+        result["artifactWarning"] = warning
+    result["artifactEstimate"] = estimate
+    return result
 
 
 @app.post("/api/runs/flux", status_code=202)
