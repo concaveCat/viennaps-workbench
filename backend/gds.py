@@ -39,6 +39,8 @@ class Structure:
     end: int
     references: frozenset[str]
     layers: frozenset[int]
+    layer_datatypes: frozenset[tuple[int, int]] = frozenset()
+    mask_layer_datatypes: frozenset[tuple[int, int]] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -79,9 +81,21 @@ class Library:
         closure = self.closure(name)
         return sorted({layer for structure in self.structures if structure.name in closure for layer in structure.layers})
 
+    def effective_layer_datatypes(self, name: str) -> list[tuple[int, int]]:
+        closure = self.closure(name)
+        return sorted({pair for structure in self.structures if structure.name in closure
+                       for pair in structure.layer_datatypes})
+
+    def effective_mask_layer_datatypes(self, name: str) -> list[tuple[int, int]]:
+        """Return layer/datatype pairs containing closed GDS BOUNDARY polygons."""
+        closure = self.closure(name)
+        return sorted({pair for structure in self.structures if structure.name in closure
+                       for pair in structure.mask_layer_datatypes})
+
     def select_and_transform(self, name: str, *, unit_scale: float = 1.0,
                               position_um: Iterable[float] = (0.0, 0.0),
-                              selected_layers: Iterable[int] | None = None) -> tuple[bytes, dict[str, object]]:
+                              selected_layers: Iterable[int] | None = None,
+                              selected_layer_datatypes: Iterable[tuple[int, int]] | None = None) -> tuple[bytes, dict[str, object]]:
         if not math.isfinite(unit_scale) or unit_scale <= 0 or unit_scale > 1_000_000:
             raise GdsFormatError("GDS unit scale must be finite, positive and at most 1,000,000")
         position = tuple(float(value) for value in position_um)
@@ -95,6 +109,9 @@ class Library:
         layers = None if selected_layers is None else {int(value) for value in selected_layers}
         if layers is not None and (not layers or layers - available_layers):
             raise GdsFormatError("selected GDS layers must be a nonempty subset of the selected structure's layers")
+        pairs = None if selected_layer_datatypes is None else {(int(layer), int(datatype)) for layer, datatype in selected_layer_datatypes}
+        if pairs is not None and (not pairs or pairs - set(self.effective_layer_datatypes(name))):
+            raise GdsFormatError("selected GDS layer/datatype pairs must exist in the selected structure")
         all_layers = {layer for structure in self.structures for layer in structure.layers}
         support_layer = next((value for value in range(32767, -1, -1) if value not in all_layers), None)
         if layers is not None and support_layer is None:
@@ -114,6 +131,7 @@ class Library:
             end_index = bisect_left(starts, item.end)
             element: list[Record] = []
             element_layer: int | None = None
+            element_datatype = 0
 
             def emit(record: Record, *, support_geometry: bool = False) -> None:
                 if record.kind == 0x10:
@@ -133,6 +151,10 @@ class Library:
                 elif support_geometry and record.kind == 0x0D and support_layer is not None:
                     shifted_records.append(_encode_record(record.kind, record.data_type,
                                                           struct.pack(">h", support_layer)))
+                elif record.kind == 0x0E:
+                    # ViennaPS uses geometry by layer and ignores DATATYPE; zero it
+                    # in the filtered copy after pair selection to avoid a warning per polygon.
+                    shifted_records.append(_encode_record(record.kind, record.data_type, struct.pack(">h", 0)))
                 else:
                     shifted_records.append(self.data[record.start:record.end])
 
@@ -142,14 +164,16 @@ class Library:
                 is_reference = element[0].kind in (0x0A, 0x0B)
                 keep_requested_layer = (layers is None or is_reference or element_layer is None
                                         or (keep_selected_geometry and element_layer in layers))
+                if pairs is not None and not is_reference and element_layer is not None:
+                    keep_requested_layer = (keep_selected_geometry and (element_layer, element_datatype) in pairs)
                 if keep_requested_layer:
                     for item_record in element:
                         emit(item_record)
                 elif element_layer is not None and support_layer is not None:
-                    # ViennaPS 4.6.2's 3D GDSGeometry needs layout-wide bounds
-                    # to construct a level set. Preserve other polygons on one
-                    # unselected support layer, so they affect reader bounds
-                    # but can never enter a selected layer's level set.
+                    # ViennaPS 4.6.2's GDSGeometry needs library-wide bounds to
+                    # construct a level set. Preserve non-selected polygons on
+                    # one unselected support layer; they size the native reader
+                    # but can never enter a selected layer's material level set.
                     for item_record in element:
                         emit(item_record, support_geometry=True)
                 element.clear()
@@ -161,11 +185,14 @@ class Library:
                     flush_element()
                     element = [record]
                     element_layer = None
+                    element_datatype = 0
                     continue
                 if element:
                     element.append(record)
                     if record.kind == 0x0D and record.payload_end - record.payload_start >= 2:
                         element_layer = struct.unpack_from(">h", self.data, record.payload_start)[0]
+                    elif record.kind == 0x0E and record.payload_end - record.payload_start >= 2:
+                        element_datatype = struct.unpack_from(">h", self.data, record.payload_start)[0]
                     if record.kind == 0x11:
                         flush_element()
                 else:
@@ -186,6 +213,7 @@ class Library:
             "includedStructures": [item.name for item in needed],
             "layers": self.effective_layers(name),
             "selectedLayers": sorted(layers) if layers is not None else self.effective_layers(name),
+            "selectedLayerDatatypes": sorted([list(pair) for pair in pairs]) if pairs is not None else self.effective_layer_datatypes(name),
             "supportLayer": support_layer if layers is not None else None,
             "supportStructures": [item.name for item in self.structures if item.name not in closure],
             "requestedPositionUm": list(position),
@@ -349,7 +377,13 @@ def parse_gds(data: bytes) -> Library:
     active_name: str | None = None
     active_refs: set[str] = set()
     active_layers: set[int] = set()
+    active_layer_datatypes: set[tuple[int, int]] = set()
+    active_mask_layer_datatypes: set[tuple[int, int]] = set()
+    current_layer: int | None = None
+    current_datatype = 0
     active_reference = False
+    current_element_kind: int | None = None
+    current_boundary_closed = False
     prefix_end: int | None = None
     suffix_start: int | None = None
     for record in records:
@@ -362,7 +396,13 @@ def parse_gds(data: bytes) -> Library:
             active_name = None
             active_refs = set()
             active_layers = set()
+            active_layer_datatypes = set()
+            active_mask_layer_datatypes = set()
+            current_layer = None
+            current_datatype = 0
             active_reference = False
+            current_element_kind = None
+            current_boundary_closed = False
         elif active_start is not None:
             if record.kind == 0x06:
                 if active_name is not None:
@@ -376,15 +416,38 @@ def parse_gds(data: bytes) -> Library:
                 reference = data[record.payload_start:record.payload_end].rstrip(b"\0").decode("ascii", errors="strict")
                 if reference:
                     active_refs.add(reference)
+            elif record.kind in (0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x15, 0x2D):
+                current_element_kind = record.kind
+                current_layer = None
+                current_datatype = 0
+                current_boundary_closed = False
             elif record.kind == 0x0D and record.payload_end - record.payload_start >= 2:
-                active_layers.add(struct.unpack_from(">h", data, record.payload_start)[0])
+                current_layer = struct.unpack_from(">h", data, record.payload_start)[0]
+                active_layers.add(current_layer)
+            elif record.kind == 0x0E and record.payload_end - record.payload_start >= 2:
+                current_datatype = struct.unpack_from(">h", data, record.payload_start)[0]
+            elif record.kind == 0x10 and current_element_kind == 0x08:
+                payload = data[record.payload_start:record.payload_end]
+                if len(payload) >= 32 and len(payload) % 8 == 0:
+                    coordinates = struct.unpack(">" + "i" * (len(payload) // 4), payload)
+                    current_boundary_closed = coordinates[:2] == coordinates[-2:]
             elif record.kind == 0x11:
+                if current_layer is not None:
+                    active_layer_datatypes.add((current_layer, current_datatype))
+                    if current_element_kind == 0x08 and current_boundary_closed:
+                        active_mask_layer_datatypes.add((current_layer, current_datatype))
+                current_layer = None
+                current_datatype = 0
                 active_reference = False
+                current_element_kind = None
+                current_boundary_closed = False
             elif record.kind == 0x07:
                 if active_name is None:
                     raise GdsFormatError("GDS structure is missing STRNAME")
                 structures.append(Structure(active_name, active_start, record.end,
-                                            frozenset(active_refs), frozenset(active_layers)))
+                                            frozenset(active_refs), frozenset(active_layers),
+                                            frozenset(active_layer_datatypes),
+                                            frozenset(active_mask_layer_datatypes)))
                 active_start = None
                 active_name = None
                 active_reference = False
@@ -406,7 +469,10 @@ def parse_gds(data: bytes) -> Library:
 def inspect_gds(data: bytes) -> dict[str, object]:
     library = parse_gds(data)
     return {
-        "structures": [{"name": item.name, "layers": sorted(item.layers), "references": sorted(item.references)}
+        "structures": [{"name": item.name, "layers": sorted(item.layers),
+                        "layerDatatypes": [list(pair) for pair in sorted(item.layer_datatypes)],
+                        "maskLayerDatatypes": [list(pair) for pair in sorted(item.mask_layer_datatypes)],
+                        "references": sorted(item.references)}
                        for item in library.structures],
         "units": {"userUnitsPerDatabaseUnit": library.user_units_per_database_unit,
                   "metersPerDatabaseUnit": library.meters_per_database_unit,

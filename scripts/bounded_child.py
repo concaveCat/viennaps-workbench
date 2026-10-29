@@ -163,8 +163,8 @@ def main() -> int:
     if (not _inside_root(cwd) or not _inside_root(record_path.parent) or not _inside_root(log_path.parent)
             or (ready_path is not None and not _inside_root(ready_path.parent))):
         parser.error("cwd、record 和 log 必须位于正式工作台目录内")
-    if args.timeout_seconds <= 0 or args.max_rss_mib <= 0 or args.max_log_bytes <= 0:
-        parser.error("资源限制必须为正数")
+    if args.timeout_seconds < 0 or args.max_rss_mib <= 0 or args.max_log_bytes <= 0:
+        parser.error("超时时间不能为负，资源限制必须为正数")
     if not cwd.is_dir():
         parser.error("cwd 不存在或不是目录")
 
@@ -242,7 +242,7 @@ def main() -> int:
                 reason = "rss_limit"
                 rss_limited = True
                 break
-            if elapsed > args.timeout_seconds:
+            if args.timeout_seconds > 0 and elapsed > args.timeout_seconds:
                 reason = "timeout"
                 timed_out = True
                 break
@@ -281,6 +281,7 @@ def main() -> int:
         "startedAtUnix": started_wall,
         "elapsedSeconds": round(elapsed_seconds, 6),
         "timeoutSeconds": args.timeout_seconds,
+        "timeoutDisabled": args.timeout_seconds <= 0,
         "rssLimitMiB": args.max_rss_mib,
         "peakObservedRssBytes": max_rss_bytes,
         "rssLimitIsPollingTerminationNotHardLimit": True,

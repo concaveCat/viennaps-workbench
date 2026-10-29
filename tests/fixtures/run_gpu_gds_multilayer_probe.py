@@ -85,6 +85,10 @@ def run() -> dict[str, Any]:
                                 row.update({"baseHeight": 0.25, "height": 0.75, "mask": is_mask})
                             mappings.append(row)
                         masked = any(is_mask for _, _, is_mask in profile_layers)
+                        # 2D maps GDS x to the periodic x axis; the two-layer
+                        # fixture at unitScale 1.5 spans x=0..6.75 um, so center
+                        # it first.  Periodic GDS requires the structure to fit
+                        # inside the requested period.
                         row = gds.run_case(
                             dimension, model, operation, boundary, masked,
                             deposit_material="Si3N4" if dimension == 2 else "Al2O3",
@@ -92,7 +96,8 @@ def run() -> dict[str, Any]:
                             material_tables=model == "multiParticle", label=f"two-layer-{profile_name}",
                             evidence_root=EVIDENCE, asset_id=asset_id, structure="MULTI",
                             layer_mappings=mappings,
-                            position_um=[-0.25, 0.25, 0.0] if dimension == 3 else None)
+                            position_um=([-0.25, 0.25, 0.0] if dimension == 3
+                                          else [-3.35, 0.1, 0.0]))
                         cases.append(row)
                         print(json.dumps({"name": row["name"], "status": row["status"],
                                           "comparisons": row.get("comparisons")}, ensure_ascii=False), flush=True)

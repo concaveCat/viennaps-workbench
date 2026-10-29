@@ -41,6 +41,14 @@ class BoundedChildTests(unittest.TestCase):
             self.assertEqual(record["terminationReason"], "timeout")
             self.assertEqual(record["remainingOwnedGroupMembers"], [])
 
+    def test_zero_timeout_disables_the_watchdog(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT / "var") as directory:
+            result, record, _ = self.run_guard(Path(directory), "import time; time.sleep(0.4)", timeout=0)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(record["terminationReason"], "exited")
+            self.assertTrue(record["timeoutDisabled"])
+            self.assertFalse(record["timedOut"])
+
     def test_rss_poll_threshold_terminates_the_owned_group(self) -> None:
         with tempfile.TemporaryDirectory(dir=ROOT / "var") as directory:
             result, record, _ = self.run_guard(Path(directory), "import time; time.sleep(10)", rss=1)

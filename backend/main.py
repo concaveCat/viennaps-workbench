@@ -43,6 +43,15 @@ ROOT = storage.ROOT
 API_GDS_MAX_BODY = 64 * 1024 * 1024
 APP_VERSION = "0.1.0"
 CAPABILITIES = ROOT / "docs" / "capabilities.json"
+
+
+def project_gds_asset(geometry: Any) -> dict[str, Any] | None:
+    if not isinstance(geometry, dict):
+        return None
+    if geometry.get("kind") == "gds":
+        return geometry
+    mask = geometry.get("gdsMask")
+    return mask if isinstance(mask, dict) else None
 RESOURCE_POLICY = ROOT / "docs" / "resource-policy.json"
 MATERIALS_CATALOG = ROOT / "docs" / "materials-catalog.json"
 FRONTEND_DIST = ROOT / "frontend" / "dist"
@@ -341,11 +350,13 @@ async def gds_asset_inspect(asset_id: str, payload: Any = Body(...)) -> dict[str
         library = parse_gds(source.read_bytes())
         structure = payload["structure"]
         available = library.effective_layers(structure)
+        available_layer_datatypes = set(library.effective_layer_datatypes(structure))
         dimension = payload["dimension"]
         delta = float(payload["gridDelta"])
         unit_scale = float(payload.get("unitScale", 1.0))
         position = payload.get("position", [0.0, 0.0])
         selected_layers = payload.get("selectedLayers", available)
+        selected_layer_datatypes = payload.get("selectedLayerDatatypes")
         boundary = payload.get("boundary", "reflective")
         x_extent = payload.get("xExtent")
         y_extent = payload.get("yExtent")
@@ -368,6 +379,21 @@ async def gds_asset_inspect(asset_id: str, payload: Any = Body(...)) -> dict[str
             raise ValueError("selectedLayers must be a nonempty list of integer layer IDs")
         if len(set(selected_layers)) != len(selected_layers) or set(selected_layers) - set(available):
             raise ValueError("selectedLayers must be a unique subset of the selected structure's layers")
+        if selected_layer_datatypes is not None:
+            if (not isinstance(selected_layer_datatypes, list) or not selected_layer_datatypes
+                    or any(not isinstance(pair, list) or len(pair) != 2
+                           or any(type(value) is not int for value in pair)
+                           for pair in selected_layer_datatypes)):
+                raise ValueError("selectedLayerDatatypes must be a nonempty list of [layer, datatype] pairs")
+            pairs = [tuple(pair) for pair in selected_layer_datatypes]
+            if len(set(pairs)) != len(pairs) or set(pairs) - available_layer_datatypes:
+                raise ValueError("selectedLayerDatatypes must exist in the selected GDS structure")
+            if {layer for layer, _datatype in pairs} - set(selected_layers):
+                raise ValueError("selectedLayerDatatypes must belong to selectedLayers")
+            non_mask_pairs = set(pairs) - set(library.effective_mask_layer_datatypes(structure))
+            if non_mask_pairs:
+                formatted = ", ".join(f"{layer}/{datatype}" for layer, datatype in sorted(non_mask_pairs))
+                raise ValueError(f"selected GDS layer/datatype pair(s) {formatted} contain no closed boundary polygons and cannot be used as a mask")
         if any(not isinstance(value, (int, float)) or isinstance(value, bool) or not __import__("math").isfinite(float(value)) for value in position):
             raise ValueError("GDS XY placement must contain finite coordinates")
         if not __import__("math").isfinite(probe_height) or probe_height <= 0:
@@ -387,7 +413,9 @@ async def gds_asset_inspect(asset_id: str, payload: Any = Body(...)) -> dict[str
                               "xExtent": float(x_extent) if x_extent is not None else None,
                               "yExtent": float(y_extent) if y_extent is not None else None,
                               "unitScale": unit_scale, "position": [float(value) for value in position],
-                              "selectedLayers": selected_layers, "probeHeight": probe_height})
+                              "selectedLayers": selected_layers,
+                              "selectedLayerDatatypes": selected_layer_datatypes,
+                              "probeHeight": probe_height})
     python = str(Path(sys.executable).resolve())
     command = [python, str(ROOT / "scripts/bounded_child.py"), "--cwd", str(ROOT),
                "--record", str(record_path), "--log-path", str(log_path), "--parent-pid", str(os.getpid()),
@@ -812,7 +840,8 @@ async def continuation_package_export(payload: Any = Body(...)):
     _project, normalized, _warnings = _project_or_422(payload["project"])
     reference = normalized.get("continuationState")
     gds_geometry = normalized.get("geometry", {})
-    gds_asset_id = gds_geometry.get("assetId") if gds_geometry.get("kind") == "gds" else None
+    gds_asset = project_gds_asset(gds_geometry)
+    gds_asset_id = gds_asset.get("assetId") if gds_asset else None
     gds_source = None
     if reference is None and gds_asset_id is None:
         raise HTTPException(status_code=422, detail="portable project packages require a GDS asset or a saved native Domain state")
@@ -843,7 +872,7 @@ async def continuation_package_export(payload: Any = Body(...)):
         if reference is not None:
             if replay.schemaVersion not in (6,7) or replay.normalizedProject.continuationState is None or replay.normalizedProject.continuationState.stateId != reference["stateId"]:
                 raise HTTPException(status_code=422, detail="replay package must reference the same native Domain state")
-        elif replay_project.get("geometry", {}).get("assetId") != gds_asset_id:
+        elif (project_gds_asset(replay_project.get("geometry")) or {}).get("assetId") != gds_asset_id:
             raise HTTPException(status_code=422, detail="replay package must reference the same GDS source asset")
         if replay.executionRequirements.viennapsVersion != _version("viennaps") or replay.executionRequirements.viennalsVersion != _version("viennals"):
             raise HTTPException(status_code=409, detail="replay engine versions do not match the installed ViennaPS/ViennaLS")
@@ -928,7 +957,8 @@ async def continuation_package_import(request: Request) -> dict[str, Any]:
                 return _validation_error(exc)
             normalized_pre_asset = parsed_project.model_dump(mode="json", exclude_none=True)
             geometry = normalized_pre_asset.get("geometry", {})
-            asset_id = geometry.get("assetId") if geometry.get("kind") == "gds" else None
+            gds_asset = project_gds_asset(geometry)
+            asset_id = gds_asset.get("assetId") if gds_asset else None
             state_payload = project_payload.get("continuationState")
             if state_payload is not None and (project_payload.get("schemaVersion") not in (6,7) or not isinstance(state_payload, dict)):
                 raise HTTPException(status_code=422, detail="native Domain state packages require schemaVersion 6 or 7 and a valid continuationState")
@@ -964,7 +994,7 @@ async def continuation_package_import(request: Request) -> dict[str, Any]:
                 if not destination.exists():
                     os.replace(asset_temp, destination)
                 from .gds import inspect_gds
-                gds_metadata = {"assetId":asset_id,"fileName":geometry.get("fileName", "layout.gds"), **inspect_gds(destination.read_bytes())}
+                gds_metadata = {"assetId":asset_id,"fileName":gds_asset.get("fileName", "layout.gds"), **inspect_gds(destination.read_bytes())}
                 atomic_json(storage.GDS_ASSETS / f"{asset_id}.json", gds_metadata)
             _project, normalized, _warnings = _project_or_422(project_payload)
             state_ref = normalized.get("continuationState")
@@ -996,7 +1026,7 @@ async def continuation_package_import(request: Request) -> dict[str, Any]:
                 if state_ref is not None:
                     if replay.schemaVersion not in (6,7) or replay.normalizedProject.continuationState is None or replay.normalizedProject.continuationState.stateId != state_ref["stateId"]:
                         raise HTTPException(status_code=422, detail="replay project must reference the packaged native Domain state")
-                elif replay.normalizedProject.model_dump(mode="json", exclude_none=True).get("geometry", {}).get("assetId") != asset_id:
+                elif (project_gds_asset(replay.normalizedProject.model_dump(mode="json", exclude_none=True).get("geometry")) or {}).get("assetId") != asset_id:
                     raise HTTPException(status_code=422, detail="replay project must reference the packaged GDS asset")
                 if replay.executionRequirements.viennapsVersion != _version("viennaps") or replay.executionRequirements.viennalsVersion != _version("viennals"):
                     raise HTTPException(status_code=409, detail="replay engine versions do not match the installed ViennaPS/ViennaLS")

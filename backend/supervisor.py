@@ -348,11 +348,13 @@ class Supervisor:
             run_dir.mkdir(mode=0o700, parents=False)
             gds_asset_path = None
             geometry = project.get("geometry", {})
-            if isinstance(geometry, dict) and geometry.get("kind") == "gds":
-                source_gds = storage.resolve_gds_asset(geometry.get("assetId", ""))
+            gds_asset = (geometry if isinstance(geometry, dict) and geometry.get("kind") == "gds"
+                         else geometry.get("gdsMask") if isinstance(geometry, dict) else None)
+            if isinstance(gds_asset, dict):
+                source_gds = storage.resolve_gds_asset(gds_asset.get("assetId", ""))
                 gds_asset_path = run_dir / "gds-source.gds"
                 shutil.copyfile(source_gds, gds_asset_path)
-                if storage.file_sha256(gds_asset_path) != geometry["assetId"]:
+                if storage.file_sha256(gds_asset_path) != gds_asset["assetId"]:
                     raise OSError("copied GDS asset does not match its SHA-256 reference")
             initial_state_path = None
             if state_path is not None:
@@ -410,7 +412,7 @@ class Supervisor:
                 "requestedInputHash": request_hash,
                 "executionHash": None,
                 "normalizedProject": project,
-                "gdsAssetId": geometry.get("assetId") if isinstance(geometry, dict) and geometry.get("kind") == "gds" else None,
+                "gdsAssetId": gds_asset.get("assetId") if isinstance(gds_asset, dict) else None,
                 "sliceRequest": slice_request if kind == "slice" else None,
                 "requestedSolver": project["solver"],
                 "selectedGpuDevice": selected_gpu_device,
@@ -479,7 +481,7 @@ class Supervisor:
                 return
             manifest = storage.read_json(run_dir / "manifest.json")
             project = manifest["normalizedProject"]
-            timeout = int(project["solver"]["timeoutSeconds"])
+            timeout = int(project["solver"].get("timeoutSeconds") or 0)
             ready_path = run_dir / ".guard-ready"
             cmd = [
                 str(PYTHON), str(GUARD), "--cwd", str(ROOT), "--record", str(run_dir / "child-record.json"),

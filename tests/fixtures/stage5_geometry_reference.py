@@ -51,6 +51,26 @@ def boundary(name: str):
     return ps.BoundaryType.REFLECTIVE_BOUNDARY if name == "reflective" else ps.BoundaryType.PERIODIC_BOUNDARY
 
 
+def _gds_layer_body(domain, planar, base_height: float, height: float, mask_tone: bool):
+    """Reference implementation of a finite GDS layer on the simulation grid."""
+    base_height = round(float(base_height), 12)
+    top = round(base_height + float(height), 12)
+    extruded = ps.ls.d3.Domain(float(domain.getSetup().gridDelta()))
+    ps.ls.Extrude(planar, extruded, [base_height, top], 2,
+                  list(domain.getSetup().boundaryCons())).apply()
+    upper = ps.ls.d3.Domain(extruded)
+    lower = ps.ls.d3.Domain(extruded)
+    ps.ls.d3.MakeGeometry(upper, ps.ls.d3.Plane([0.0, 0.0, top], [0.0, 0.0, 1.0])).apply()
+    ps.ls.d3.MakeGeometry(lower, ps.ls.d3.Plane([0.0, 0.0, base_height], [0.0, 0.0, 1.0])).apply()
+    ps.ls.d3.BooleanOperation(upper, lower, ps.ls.BooleanOperationEnum.RELATIVE_COMPLEMENT).apply()
+    ps.ls.d3.BooleanOperation(extruded, upper, ps.ls.BooleanOperationEnum.INTERSECT).apply()
+    if mask_tone:
+        ps.ls.d3.BooleanOperation(
+            upper, extruded, ps.ls.BooleanOperationEnum.RELATIVE_COMPLEMENT).apply()
+        extruded = upper
+    return extruded
+
+
 def build_domain(project: dict, gds_source: Path | None, run_dir: Path):
     dimension = int(project["dimension"])
     ps.setDimension(dimension)
@@ -137,7 +157,9 @@ def build_domain(project: dict, gds_source: Path | None, run_dir: Path):
                 raise RuntimeError("native 2D GDS layers differ from the requested selection")
             for row in g["layers"]:
                 level_set = geometry.layerToLevelSet(int(row["layer"]), True)
-                domain.insertNextLevelSetAsMaterial(level_set, material(row["material"]), False)
+                # All layers share this native GDS grid; wrap cumulatively so the
+                # top level set still contains every earlier material.
+                domain.insertNextLevelSetAsMaterial(level_set, material(row["material"]), True)
         else:
             geometry = ps.d3.GDSGeometry(float(d["gridDelta"]))
             geometry.setBoundaryConditions([edge, edge, ps.BoundaryType.INFINITE_BOUNDARY])
@@ -152,11 +174,16 @@ def build_domain(project: dict, gds_source: Path | None, run_dir: Path):
             native_layers = sorted(int(v) for v in geometry.getAllLayers())
             if sorted(set(native_layers) & {int(row["layer"]) for row in g["layers"]}) != sorted(int(row["layer"]) for row in g["layers"]):
                 raise RuntimeError("native 3D GDS layers differ from the requested selection")
+            planar_geometry = ps.d2.GDSGeometry(float(d["gridDelta"]))
+            planar_geometry.setBoundaryConditions([edge, edge])
+            ps.d2.GDSReader(planar_geometry, str(selected_path)).apply()
             for row in g["layers"]:
-                level_set = geometry.layerToLevelSet(
-                    int(row["layer"]), float(row["baseHeight"]) + float(g["position"][2]),
-                    float(row["height"]), bool(row.get("mask", False)), True)
-                domain.insertNextLevelSetAsMaterial(level_set, material(row["material"]), False)
+                planar = planar_geometry.layerToLevelSet(int(row["layer"]), True)
+                level_set = _gds_layer_body(
+                    domain, planar, float(row["baseHeight"]) + float(g["position"][2]),
+                    float(row["height"]), bool(row.get("mask", False)))
+                # Cumulative native union on the shared simulation grid.
+                domain.insertNextLevelSetAsMaterial(level_set, material(row["material"]), True)
         return domain, {"selectedFileSha256": hashlib.sha256(selected).hexdigest(),
                         "includedStructures": transform["includedStructures"],
                         "nativeLayers": native_layers,
