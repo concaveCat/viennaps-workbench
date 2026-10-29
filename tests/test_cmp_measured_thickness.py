@@ -59,6 +59,42 @@ def cmp_project() -> dict:
     }
 
 
+def cmp_bimodal_project() -> dict:
+    """Two SiO2 plateaus under a TiN/W overburden, lower plateau larger.
+
+    A SiO2 layer is deposited on a SiO2 substrate (two level sets of the same
+    material, so both their interface and the exposed substrate count as SiO2
+    up-facing) and a 2.4 um window is cut through it with a Boolean box. SiO2 is
+    then exposed at 0.0 across the whole 4 um width and at 0.3 on the 1.6 um
+    field, which mirrors the 22 nm FinFET ``ff22_w_fill`` surface where STI
+    (0.036) covers more area than ILD (0.095). The median picks the lower
+    plateau; the CMP stop height must pick the upper one.
+    """
+    return {
+        "schemaVersion": 5, "name": "双峰 SiO2 材质感知 CMP 回归", "dimension": 2,
+        "units": {"length": "um", "time": "s", "rate": "um/s", "angle": "deg"},
+        "domain": {"gridDelta": 0.02, "xExtent": 4.0, "xBoundary": "reflective"},
+        "geometry": {"kind": "plane", "height": 0.0, "substrateMaterial": "SiO2"},
+        "steps": [
+            {"id": "bimodal_ild_dep", "name": "ILD SiO2", "enabled": True, "operation": "deposit",
+             "model": "isotropic", "rateMagnitude": 0.1, "duration": 3.0, "depositMaterial": "SiO2"},
+            {"id": "bimodal_window", "name": "开窗露出下方 SiO2", "enabled": True, "model": "boolean",
+             "booleanOperation": "difference", "position": [0.0, 0.0, 0.0], "width": 2.4,
+             "height": 0.4, "angle": 0.0, "applyToAll": True},
+            {"id": "bimodal_tin", "name": "TiN 势垒", "enabled": True, "operation": "deposit",
+             "model": "isotropic", "rateMagnitude": 0.02, "duration": 2.5, "depositMaterial": "TiN"},
+            {"id": "bimodal_w", "name": "W 覆盖", "enabled": True, "operation": "deposit",
+             "model": "isotropic", "rateMagnitude": 0.1, "duration": 3.0, "depositMaterial": "W"},
+            {"id": "bimodal_cmp", "name": "CMP 停在 SiO2 上方平台", "enabled": True,
+             "model": "planarize", "stopMaterial": "SiO2", "overPolish": 0.003},
+        ],
+        "solver": {"timeStepRatio": 0.25, "raysPerPoint": 32, "cpuThreads": 1,
+                   "random": {"mode": "fixed", "seed": 314159}, "enginePreference": "cpu",
+                   "timeoutSeconds": 120},
+        "view": {"panX": 0.0, "panH": 0.0, "zoom": 1.0, "showGrid": True},
+    }
+
+
 def cmp_project_3d() -> dict:
     """A flat 3D SiO2 field buried under TiN/W, then CMP stopped on SiO2."""
     return {
@@ -191,7 +227,6 @@ class PlanarizeDerivationUnit(unittest.TestCase):
 
         def Planarize(self, domain, cutoff):
             self.cutoffs.append(cutoff)
-            fake = self
 
             class _Operation:
                 def apply(self_inner):
@@ -201,15 +236,66 @@ class PlanarizeDerivationUnit(unittest.TestCase):
     def test_effective_cutoff_comes_from_the_measured_stop_top(self):
         ps = self.FakePS()
         step = {"id": "cmp_w_cmp", "model": "planarize", "stopMaterial": "SiO2", "overPolish": 0.003}
-        previous_tops = {"SiO2": {"topHeight": 0.097, "medianTopHeight": 0.095, "upFacingArea": 1.0,
-                                  "upFacingCellCount": 12}}
+        # ff22_w_fill in run f6f5481fd1be123be6f90fa6: STI 0.036 and ILD 0.095,
+        # median 0.037 (lower plateau is larger), p90 0.095.
+        previous_tops = {"SiO2": {"topHeight": 0.09501, "medianTopHeight": 0.03701,
+                                  "p90TopHeight": 0.09501, "upFacingArea": 0.4347,
+                                  "upFacingCellCount": 1234}}
         actual = apply_geometry_operation(ps, object(), {"dimension": 2}, step, previous_tops=previous_tops)
-        self.assertAlmostEqual(ps.cutoffs[0], 0.092, places=12)
-        self.assertAlmostEqual(actual["cutoffHeight"], 0.092, places=12)
+        self.assertAlmostEqual(ps.cutoffs[0], 0.09201, places=12)
+        self.assertAlmostEqual(actual["cutoffHeight"], 0.09201, places=12)
         self.assertEqual(actual["stopMaterial"], "SiO2")
         self.assertEqual(actual["cutoffMode"], "material-aware")
-        self.assertAlmostEqual(actual["measuredStopTopHeight"], 0.095, places=12)
+        self.assertEqual(actual["stopHeightMethod"], "area-weighted-p90")
+        self.assertEqual(actual["stopHeightPercentile"], 0.9)
+        self.assertAlmostEqual(actual["stopHeight"], 0.09501, places=12)
+        self.assertAlmostEqual(actual["measuredStopTopHeight"], 0.09501, places=12)
+        self.assertAlmostEqual(actual["stopMaterialMedianTopHeight"], 0.03701, places=12)
         self.assertAlmostEqual(actual["overPolish"], 0.003, places=12)
+
+    def test_stop_height_prefers_a_large_upper_plateau(self):
+        # STI-like lower plateau with 55% of the area, ILD-like upper plateau
+        # with 45%: the median picks the lower one, the p90 must pick the upper.
+        tops = measure_material_tops(
+            {"points": [[-1.00, 0.036, 0.0], [-0.45, 0.036, 0.0],
+                        [0.45, 0.095, 0.0], [0.90, 0.095, 0.0]],
+             "lines": [[0, 1], [2, 3]], "cellData": {"MaterialIds": [30, 30]}}, False)
+        self.assertAlmostEqual(tops["SiO2"]["upFacingArea"], 1.0, places=12)
+        self.assertAlmostEqual(tops["SiO2"]["medianTopHeight"], 0.036, places=12)
+        self.assertAlmostEqual(tops["SiO2"]["p90TopHeight"], 0.095, places=12)
+        self.assertAlmostEqual(tops["SiO2"]["topHeight"], 0.095, places=12)
+        actual = apply_geometry_operation(
+            self.FakePS(), object(), {"dimension": 2},
+            {"id": "cmp_w_cmp", "model": "planarize", "stopMaterial": "SiO2", "overPolish": 0.0},
+            previous_tops=tops)
+        self.assertAlmostEqual(actual["cutoffHeight"], 0.095, places=12)
+
+    def test_stop_height_ignores_a_narrow_upper_sliver(self):
+        # A 4% tall sliver must not move the cut: p90 stays on the field.
+        tops = measure_material_tops(
+            {"points": [[-1.00, 0.036, 0.0], [-0.10, 0.036, 0.0],
+                        [0.10, 0.400, 0.0], [0.14, 0.400, 0.0]],
+             "lines": [[0, 1], [2, 3]], "cellData": {"MaterialIds": [30, 30]}}, False)
+        area = tops["SiO2"]["upFacingArea"]
+        self.assertAlmostEqual(area, 0.94, places=12)
+        self.assertAlmostEqual(tops["SiO2"]["topHeight"], 0.400, places=12)
+        self.assertAlmostEqual(tops["SiO2"]["medianTopHeight"], 0.036, places=12)
+        self.assertAlmostEqual(tops["SiO2"]["p90TopHeight"], 0.036, places=12)
+        actual = apply_geometry_operation(
+            self.FakePS(), object(), {"dimension": 2},
+            {"id": "cmp_w_cmp", "model": "planarize", "stopMaterial": "SiO2", "overPolish": 0.0},
+            previous_tops=tops)
+        self.assertAlmostEqual(actual["cutoffHeight"], 0.036, places=12)
+
+    def test_recorded_surface_without_p90_falls_back_to_the_median(self):
+        previous_tops = {"SiO2": {"topHeight": 0.097, "medianTopHeight": 0.095, "upFacingArea": 1.0,
+                                  "upFacingCellCount": 12}}
+        actual = apply_geometry_operation(
+            self.FakePS(), object(), {"dimension": 2},
+            {"id": "cmp_w_cmp", "model": "planarize", "stopMaterial": "SiO2", "overPolish": 0.0},
+            previous_tops=previous_tops)
+        self.assertAlmostEqual(actual["cutoffHeight"], 0.095, places=12)
+        self.assertIn("p90 unavailable", actual["stopHeightMethod"])
 
     def test_missing_stop_surface_fails_with_an_actionable_error(self):
         ps = self.FakePS()
@@ -283,6 +369,52 @@ class PlanarizeDerivationUnit(unittest.TestCase):
         current = {"Si3N4": {"topHeight": 0.0099, "medianTopHeight": 0.0099, "upFacingArea": 1.0,
                              "upFacingCellCount": 10}}
         self.assertIsNone(measure_step_change({"operation": "etch", "model": "isotropic"}, previous, current, 0.02))
+
+    def test_removal_uses_the_median_exposed_top_not_the_highest_point(self):
+        # Real ff22_spacer_etch numbers (run f6f5481fd1be123be6f90fa6): the SiN
+        # blanket on the gate tops drops 49.7 nm while the exposed surface that
+        # dominates the area only drops 12.4 nm. Reporting the highest-point
+        # delta would claim nearly 50 nm was removed.
+        previous = {"Si3N4": {"topHeight": 0.10600, "medianTopHeight": 0.04941, "p90TopHeight": 0.0750,
+                              "upFacingArea": 0.2566, "upFacingCellCount": 67302},
+                    "PolySi": {"topHeight": 0.09600, "medianTopHeight": 0.09600, "p90TopHeight": 0.096,
+                               "upFacingArea": 0.0660, "upFacingCellCount": 15583}}
+        current = {"Si3N4": {"topHeight": 0.05630, "medianTopHeight": 0.03700, "p90TopHeight": 0.0400,
+                             "upFacingArea": 0.0397, "upFacingCellCount": 12000},
+                   "PolySi": {"topHeight": 0.09445, "medianTopHeight": 0.09401, "p90TopHeight": 0.0943,
+                              "upFacingArea": 0.0627, "upFacingCellCount": 15000}}
+        removal = measure_step_change(
+            {"id": "ff22_spacer_etch", "operation": "etch", "model": "specialized",
+             "nativeModel": "ionBeam", "duration": 1.0}, previous, current, 0.004)["measuredRemoval"]
+        self.assertEqual(removal["material"], "Si3N4")
+        self.assertAlmostEqual(removal["removedThickness"], 0.01241, places=5)
+        self.assertAlmostEqual(removal["medianHeightBefore"], 0.04941, places=5)
+        self.assertAlmostEqual(removal["medianHeightAfter"], 0.03700, places=5)
+        self.assertAlmostEqual(removal["topHeightBefore"], 0.10600, places=5)
+        self.assertAlmostEqual(removal["topHeightAfter"], 0.05630, places=5)
+        self.assertAlmostEqual(removal["topHeightDelta"], -0.04970, places=5)
+        self.assertEqual(removal["thicknessBasis"], "area-weighted-median")
+        self.assertLess(removal["removedThickness"], 0.02)
+
+    def test_median_that_jumps_to_a_lower_patch_is_capped_by_the_highest_change(self):
+        # After a CMP the same material can keep only a low liner: its median
+        # surface jumps down much further than its topmost surface. The record
+        # must not claim that jump as removed thickness.
+        previous = {"TiN": {"topHeight": 0.09507, "medianTopHeight": 0.09506, "upFacingArea": 0.2368,
+                            "upFacingCellCount": 900},
+                    "W": {"topHeight": 0.16507, "medianTopHeight": 0.16506, "upFacingArea": 0.2428,
+                          "upFacingCellCount": 900}}
+        current = {"TiN": {"topHeight": 0.0920, "medianTopHeight": -0.5500, "upFacingArea": 0.0500,
+                           "upFacingCellCount": 90},
+                   "W": {"topHeight": 0.0920, "medianTopHeight": 0.0920, "upFacingArea": 0.0900,
+                         "upFacingCellCount": 120}}
+        removal = measure_step_change({"operation": "etch", "model": "planarize"}, previous, current, 0.004)
+        record = removal["measuredRemoval"]
+        self.assertEqual(record["material"], "W")
+        self.assertAlmostEqual(record["removedThickness"], 0.07306, places=5)
+        tin = next(row for row in record["materials"] if row["material"] == "TiN")
+        self.assertAlmostEqual(tin["removedThickness"], 0.00307, places=5)
+        self.assertIn("highest-top", tin["thicknessBasis"])
 
 
 class RunHarness(unittest.IsolatedAsyncioTestCase):
@@ -376,6 +508,43 @@ class MaterialAwareCmpWorkflow(RunHarness):
         self.assertNotIn("measuredRemoval", noop)
         self.assertNotIn("measuredAdded", noop)
         self.assertEqual(noop["materialTops"], after["materialTops"])
+
+
+class MaterialAwareCmpBimodalWorkflow(RunHarness):
+    async def test_cmp_stops_on_the_upper_plateau_when_the_lower_one_is_larger(self):
+        run_id, info = await self.run_project(cmp_bimodal_project())
+        self.assertEqual(info["stepTotal"], 5)
+
+        before = self.snapshot(run_id, "bimodal_w")
+        sio2 = before["materialTops"]["SiO2"]
+        # Bimodal: the lower plateau (0.0) carries more area than the upper
+        # (0.3), so the median is the wrong stop and the p90 is the right one.
+        self.assertAlmostEqual(sio2["medianTopHeight"], 0.0, delta=0.02)
+        self.assertAlmostEqual(sio2["p90TopHeight"], 0.3, delta=0.02)
+        self.assertLess(sio2["medianTopHeight"], 0.1)
+
+        after = self.snapshot(run_id, "bimodal_cmp")
+        execution = {row["stepId"]: row for row in info["actualExecution"]}["bimodal_cmp"]
+        parameters = execution["actualParameters"]
+        self.assertEqual(parameters["stopHeightMethod"], "area-weighted-p90")
+        self.assertEqual(parameters["stopHeightPercentile"], 0.9)
+        self.assertAlmostEqual(parameters["measuredStopTopHeight"], 0.3, delta=0.02)
+        self.assertAlmostEqual(parameters["cutoffHeight"], 0.3 - 0.003, delta=0.02)
+        # The old median-based rule would have cut at ~0.0 (0.037 in the real
+        # FinFET run); assert the step did not do that.
+        self.assertGreater(parameters["cutoffHeight"], 0.25)
+
+        # The overburden above the upper plateau is gone; W stays in the trench
+        # below it, so no up-facing W is left outside the 2.4 um opening.
+        for material in ("W", "TiN"):
+            outside = [segment for segment in up_facing_segments(after, material)
+                       if segment[0] < -1.22 or segment[1] > 1.22]
+            self.assertEqual(outside, [], f"{material} residue is still exposed on the field")
+        self.assertIn("W", after["materialTops"])
+        self.assertAlmostEqual(after["materialTops"]["W"]["topHeight"], 0.3 - 0.003, delta=0.02)
+
+        # The lower SiO2 plateau was not the cut target: it is still at ~0.0.
+        self.assertAlmostEqual(after["materialTops"]["SiO2"]["medianTopHeight"], 0.0, delta=0.03)
 
 
 class MaterialAwareCmp3DWorkflow(RunHarness):

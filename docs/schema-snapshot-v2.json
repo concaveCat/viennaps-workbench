@@ -126,6 +126,18 @@
           "title": "Mediantopheight",
           "type": "number"
         },
+        "p90TopHeight": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "P90topheight"
+        },
         "upFacingArea": {
           "minimum": 0,
           "title": "Upfacingarea",
@@ -177,6 +189,54 @@
           "default": null,
           "title": "Topheightafter"
         },
+        "medianHeightBefore": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Medianheightbefore"
+        },
+        "medianHeightAfter": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Medianheightafter"
+        },
+        "topHeightDelta": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Topheightdelta"
+        },
+        "medianHeightDelta": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Medianheightdelta"
+        },
         "removedThickness": {
           "anyOf": [
             {
@@ -201,6 +261,18 @@
           "default": null,
           "title": "Addedthickness"
         },
+        "thicknessBasis": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Thicknessbasis"
+        },
         "removedCompletely": {
           "default": false,
           "title": "Removedcompletely",
@@ -217,6 +289,18 @@
           ],
           "default": null,
           "title": "Remainingtopheight"
+        },
+        "materialAppeared": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Materialappeared"
         },
         "method": {
           "anyOf": [

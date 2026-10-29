@@ -26,6 +26,7 @@ class MaterialTop(StrictModel):
     """Exposed top of one material, measured on the snapshot surface mesh."""
     topHeight:Number
     medianTopHeight:Number
+    p90TopHeight:Number|None=None
     upFacingArea:Annotated[Number,Field(ge=0)]
     upFacingCellCount:Annotated[Integer,Field(ge=0)]
 
@@ -34,10 +35,16 @@ class MeasuredMaterialChange(StrictModel):
     material:str
     topHeightBefore:Number|None=None
     topHeightAfter:Number|None=None
+    medianHeightBefore:Number|None=None
+    medianHeightAfter:Number|None=None
+    topHeightDelta:Number|None=None
+    medianHeightDelta:Number|None=None
     removedThickness:Number|None=None
     addedThickness:Number|None=None
+    thicknessBasis:str|None=None
     removedCompletely:bool=False
     remainingTopHeight:Number|None=None
+    materialAppeared:bool|None=None
     method:str|None=None
     materials:list[dict]|None=None
 
