@@ -4,6 +4,7 @@ import { RunErrorDialog } from './RunErrorDialog';
 import { defaultView3D, snapshotDimension } from './types3d';
 import type { View3D } from './types3d';
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent, type PointerEvent, type RefObject } from 'react';
+import { createPortal } from 'react-dom';
 import { TopBar } from './app/TopBar';
 import { Rail } from './app/Rail';
 import { ContextPanel } from './app/ContextPanel';
@@ -24,8 +25,9 @@ import { RunInspector } from './inspector/RunInspector';
 
 type Units = { length: 'um'; time: 's'; rate: 'um/s'; angle: 'deg' };
 type Domain = { gridDelta: number; xExtent: number; xBoundary?: 'reflective' | 'periodic'; yExtent?: number; boundaryXY?: 'reflective' | 'periodic' };
-type Layer = { id: string; name: string; material: string; thickness: number; role: 'film' | 'mask' };
-type StackGeometry = { kind: 'stack'; substrateMaterial: string; baseHeight: number; layers: Layer[]; pattern: { kind: 'none' } | { kind: 'trench'; width: number; taperAngle: number } | { kind: 'hole'; radius: number; taperAngle: number } };
+type Layer = { id: string; name: string; material: string; thickness: number; role: 'film' | 'mask'; source?: 'gds-mask' };
+type GDSMaskPattern = { name: string; assetId: string; fileName: string; structure: string; layer: number; datatype: number; unitScale: number; position: [number, number, number]; baseHeight: number; height: number; material: string; retainedRegion: 'inside' | 'outside'; protectsEtch: boolean };
+type StackGeometry = { kind: 'stack'; substrateMaterial: string; baseHeight: number; layers: Layer[]; pattern: { kind: 'none' } | { kind: 'trench'; width: number; taperAngle: number } | { kind: 'hole'; radius: number; taperAngle: number } | { kind: 'gds' }; gdsMask?: GDSMaskPattern };
 type HoleGeometry = { kind: 'hole'; radius: number; depth: number; taperAngle: number; maskHeight: number; maskTaperAngle: number; substrateMaterial: string; maskMaterial?: string };
 type PlaneGeometry = { kind: 'plane'; height: number; substrateMaterial: string };
 type TrenchGeometry = { kind: 'trench'; width: number; depth: number; taperAngle: number; maskHeight: number; maskTaperAngle: number; substrateMaterial: string; maskMaterial?: string };
@@ -33,7 +35,7 @@ type FinGeometry = { kind: 'fin'; width: number; height: number; taperAngle: num
 type GDSLayerMapping = { layer: number; material: string; baseHeight?: number; height?: number; mask?: boolean };
 type GDSGeometry = { kind: 'gds'; assetId: string; fileName: string; structure: string; unitScale: number; position: [number, number, number]; layers: GDSLayerMapping[] };
 type Geometry = PlaneGeometry | TrenchGeometry | HoleGeometry | StackGeometry | FinGeometry | GDSGeometry;
-type GDSAsset = { assetId: string; fileName: string; structures: { name: string; layers: number[]; references: string[] }[]; units: { userUnitsPerDatabaseUnit: number; metersPerDatabaseUnit: number; micrometersPerNativeUserUnit: number }; fileSizeBytes: number };
+type GDSAsset = { assetId: string; fileName: string; structures: { name: string; layers: number[]; layerDatatypes?: [number, number][]; maskLayerDatatypes?: [number, number][]; references: string[] }[]; units: { userUnitsPerDatabaseUnit: number; metersPerDatabaseUnit: number; micrometersPerNativeUserUnit: number }; fileSizeBytes: number };
 type IonSpecies = { kind: 'ion'; label: string; sourcePower: number; thetaRMin: number; thetaRMax: number; minAngle: number; B_sp: number; meanEnergy: number; sigmaEnergy: number; thresholdEnergy: number; inflectAngle: number; n: number };
 type NeutralSpecies = { kind: 'neutral'; label: string; defaultStickingProbability: number; stickingProbabilityByMaterial: Record<string, number> };
 type ParticleSpecies = IonSpecies | NeutralSpecies;
@@ -62,7 +64,7 @@ type MaterialDefinition = { name: string; id: number; customId: number; color: s
 type Project = { schemaVersion: 1 | 2 | 3 | 4 | 5 | 6 | 7; name: string; dimension: 2 | 3; units: Units; domain: Domain; geometry: Geometry; steps: Step[]; solver: Solver; view?: ViewSettings; view3D?: View3D; continuationState?: DomainStateRef; materialDefinitions?: MaterialDefinition[]; outputSettings?: OutputSettings };
 type NativeArtifact = { kind: string; fileName: string; url: string; format: string; sizeBytes: number; sha256: string; levelSetIndex?: number; materialId?: number; association?: string; nativeUnit?: string | null; metadataLevel?: string };
 type Snapshot = {
-  schemaVersion: number; dimension?: number; surfaceBounds?: number[]; substrateMaterialId?: number; materialSurfaceStatus?: 'closed' | 'unavailable'; materialSurfaceError?: string; runId: string; stepId: string; stepName: string; stepIndex: number; axisMap: { x: number; h: number; z: number };
+  schemaVersion: number; dimension?: number; surfaceBounds?: number[]; substrateMaterialId?: number; runId: string; stepId: string; stepName: string; stepIndex: number; axisMap: { x: number; h: number; z: number };
   coordinateUnit: string; points: number[][]; lines?: number[][]; triangles?: number[][]; cellData: { materialIds: number[] };
   materials: Record<string, { name: string; color?: string; levelSetIndexes: number[]; sourceStepId: string | null }>;
   geometryReadback?: Record<string, unknown>;
@@ -70,7 +72,7 @@ type Snapshot = {
   sliceReadback?: { nativeOperation: string; axis: number; axisLabel: string; position: number; sourceDimension: number; outputDimension: number; viewerClipping: boolean; levelSetCount: number; materialIdsByLevelSetIndex: number[] };
   mesh: { vtk?: string; pointCount: number; lineCount?: number; triangleCount?: number }; gridDelta: number; materialIdsByLevelSetIndex: number[]; noOp: boolean;
 };
-type SnapshotRow = { stepId: string; name: string; stepIndex: number; snapshot: string; vtk?: string; pointCount: number; lineCount?: number; triangleCount?: number; materialIds: number[]; noOp?: boolean; geometryReadback?: Record<string, unknown>; sliceReadback?: Snapshot['sliceReadback']; nativeState?: DomainStateRef & { fileName: string } };
+type SnapshotRow = { stepId: string; name: string; stepIndex: number; snapshot: string; vtk: string; pointCount: number; lineCount?: number; triangleCount?: number; materialIds: number[]; noOp?: boolean; geometryReadback?: Record<string, unknown>; sliceReadback?: Snapshot['sliceReadback']; nativeState?: DomainStateRef & { fileName: string } };
 type RunSummary = { runId: string; kind: string; status: string; createdAt?: string; finishedAt?: string; requestedInputHash?: string; failureReason?: string };
 type RunTermination = { reason?: string | null; returnCode?: number | null; rssLimitMiB?: number | null; peakObservedRssBytes?: number | null };
 type IntermediateOutputRef = { stepId: string; fileName: string; url: string; format: string; pointCount: number | null; cellCounts: Record<string, number>; coordinateUnit: string | null; axisMap: Record<string, number> | null; fields: { name: string; association: 'pointData' | 'cellData'; components: number; tuples: number; nativeType?: string | null; nativeUnit: string | null; unitStatus?: string }[]; sizeBytes: number; sha256: string; associationPolicy?: string };
@@ -115,7 +117,7 @@ const defaultProject: Project = {
   ], pattern: { kind: 'trench', width: 2, taperAngle: 0 } },
   steps: [],
   outputSettings: { levelSets: false, levelSetMeshes: false, surfaceMeshVtk: false, volumeMesh: false, nativeMetadata: false },
-  solver: { timeStepRatio: 0.25, raysPerPoint: 256, cpuThreads: 1, random: { mode: 'fixed', seed: 314159 }, enginePreference: 'auto', timeoutSeconds: 120,
+  solver: { timeStepRatio: 0.25, raysPerPoint: 256, cpuThreads: 1, random: { mode: 'fixed', seed: 314159 }, enginePreference: 'auto', timeoutSeconds: 0,
     advection: { spatialScheme: 'ENGQUIST_OSHER_1ST_ORDER', temporalScheme: 'FORWARD_EULER', adaptiveTimeStepping: false, adaptiveTimeStepSubdivisions: 20, calculateIntermediateVelocities: false, checkDissipation: true, dissipationAlpha: 1, ignoreVoids: false, velocityOutput: false },
     rayTracing: { diskRadius: 0, ignoreFluxBoundaries: false, maxBoundaryHits: 1000, maxReflections: 4294967295, minNodeDistanceFactor: 0.05, normalizationType: 'SOURCE', smoothingNeighbors: 1 } },
   view: { panX: 0, panH: 0, zoom: 1, showGrid: true },
@@ -176,7 +178,7 @@ function materialCategoryLabel(value?: string): string {
 }
 function initialVisibleMaterialIds(catalog: MaterialCatalogItem[], geometry: Geometry, preferred: number[] = []): number[] {
   const usedNames = geometry.kind === 'stack'
-    ? [geometry.substrateMaterial, ...geometry.layers.map(layer => layer.material)]
+    ? [geometry.substrateMaterial, ...geometry.layers.map(layer => layer.material), ...(geometry.gdsMask ? [geometry.gdsMask.material] : [])]
     : geometry.kind === 'gds'
       ? geometry.layers.map(layer => layer.material)
       : [geometry.substrateMaterial, ...(geometry.kind === 'fin' ? [geometry.maskMaterial] : geometry.kind === 'trench' || geometry.kind === 'hole' ? [geometry.maskMaterial] : [])];
@@ -212,7 +214,7 @@ function geometryMaterialNames(geometry: Geometry): string[] {
   if (geometry.kind === 'gds') geometry.layers.forEach(layer => names.add(layer.material));
   else {
     names.add(geometry.substrateMaterial);
-    if (geometry.kind === 'stack') geometry.layers.forEach(layer => names.add(layer.material));
+    if (geometry.kind === 'stack') { geometry.layers.forEach(layer => names.add(layer.material)); if (geometry.gdsMask) names.add(geometry.gdsMask.material); }
     if ((geometry.kind === 'trench' || geometry.kind === 'hole' || geometry.kind === 'fin') && geometry.maskHeight > 0) names.add(geometry.maskMaterial ?? 'Mask');
   }
   return [...names].filter(Boolean).sort();
@@ -243,8 +245,20 @@ function promoteProjectToV7(source: Project): Project {
     schemaVersion: 7,
     steps: source.steps.map(step => step.model === 'directional' || step.model === 'multiParticle' || step.model === 'specialized' || isGeometryStep(step) ? step : { ...step, rateMode: step.rateMode ?? 'uniform' }),
     solver: { ...source.solver, enginePreference: 'auto', advection: { ...defaults.advection!, ...source.solver.advection }, rayTracing: { ...defaults.rayTracing!, ...source.solver.rayTracing } },
-    outputSettings: { ...structuredClone(defaultProject.outputSettings!), ...source.outputSettings },
+    outputSettings: source.outputSettings ?? { ...structuredClone(defaultProject.outputSettings!), volumeMesh: source.dimension === 3 },
   };
+}
+function normalizeGdsMaskLayer(source: Project): Project {
+  if (source.geometry.kind !== 'stack' || !source.geometry.gdsMask || source.geometry.layers.some(layer => layer.source === 'gds-mask')) return source;
+  const mask = source.geometry.gdsMask;
+  const id = `gds_mask_${crypto.randomUUID().replaceAll('-', '').slice(0, 12)}`;
+  const geometry: StackGeometry = {
+    ...source.geometry,
+    layers: [...source.geometry.layers, { id, name: mask.name, material: mask.material, thickness: mask.height, role: 'mask', source: 'gds-mask' }],
+    pattern: { kind: 'gds' },
+    gdsMask: { ...mask, baseHeight: source.geometry.baseHeight + source.geometry.layers.reduce((sum, layer) => sum + layer.thickness, 0) },
+  };
+  return { ...source, schemaVersion: 7, dimension: 3, domain: { ...source.domain, yExtent: source.domain.yExtent ?? source.domain.xExtent, boundaryXY: source.domain.boundaryXY ?? 'reflective' }, geometry };
 }
 function defaultDirection(dimension: 2 | 3): [number, number, number] {
   return dimension === 2 ? [0, -1, 0] : [0, 0, -1];
@@ -269,7 +283,7 @@ function configuredMaterialRates(project: Project, fallback: number): Record<str
   if (project.geometry.kind === 'gds') project.geometry.layers.forEach(layer => add(layer.material, layer.mask ?? false));
   else {
     add(project.geometry.substrateMaterial, false);
-    if (project.geometry.kind === 'stack') project.geometry.layers.forEach(layer => add(layer.material, layer.role === 'mask'));
+    if (project.geometry.kind === 'stack') { project.geometry.layers.filter(layer => layer.source !== 'gds-mask').forEach(layer => add(layer.material, layer.role === 'mask')); if (project.geometry.gdsMask?.protectsEtch) add(project.geometry.gdsMask.material, true); }
     else if (project.geometry.kind === 'trench' || project.geometry.kind === 'hole' || project.geometry.kind === 'fin') add(project.geometry.maskMaterial ?? 'Mask', true);
   }
   return Object.fromEntries([...roles].map(([name, role]) => [name, role.mask ? 0 : fallback]));
@@ -287,6 +301,39 @@ function gdsLayerIds(asset: GDSAsset, name: string): number[] {
     pending.push(...cell.references);
   }
   return [...layers].sort((a, b) => a - b);
+}
+function gdsPairs(asset: GDSAsset, name: string): [number, number][] {
+  const byName = new Map(asset.structures.map(item => [item.name, item]));
+  const pairs = new Set<string>(); const seen = new Set<string>(); const pending = [name];
+  while (pending.length) {
+    const current = pending.pop()!;
+    if (seen.has(current)) continue;
+    seen.add(current);
+    const cell = byName.get(current);
+    if (!cell) continue;
+    (cell.layerDatatypes ?? cell.layers.map(layer => [layer, 0] as [number, number])).forEach(([layer, datatype]) => pairs.add(`${layer}/${datatype}`));
+    pending.push(...cell.references);
+  }
+  return [...pairs].map(value => value.split('/').map(Number) as [number, number]).sort((a,b) => a[0]-b[0] || a[1]-b[1]);
+}
+function gdsMaskPairs(asset: GDSAsset, name: string): [number, number][] {
+  const byName = new Map(asset.structures.map(item => [item.name, item]));
+  const pairs = new Set<string>(); const seen = new Set<string>(); const pending = [name];
+  while (pending.length) {
+    const current = pending.pop()!;
+    if (seen.has(current)) continue;
+    seen.add(current);
+    const cell = byName.get(current);
+    if (!cell) continue;
+    (cell.maskLayerDatatypes ?? []).forEach(([layer, datatype]) => pairs.add(`${layer}/${datatype}`));
+    pending.push(...cell.references);
+  }
+  return [...pairs].map(value => value.split('/').map(Number) as [number, number]).sort((a,b) => a[0]-b[0] || a[1]-b[1]);
+}
+function gdsAssetIdFromProject(value: Project): string | null {
+  if (value.geometry.kind === 'gds') return value.geometry.assetId;
+  if (value.geometry.kind === 'stack') return value.geometry.gdsMask?.assetId ?? null;
+  return null;
 }
 const terminalStates = new Set(['succeeded', 'failed', 'timed_out', 'cancelled', 'interrupted']);
 const maxPackageBytes = 512 * 1024 * 1024;
@@ -565,6 +612,20 @@ export default function App() {
   const [deleteMaterialError, setDeleteMaterialError] = useState('');
   const [gdsAsset, setGdsAsset] = useState<GDSAsset | null>(null);
   const [gdsInspection, setGdsInspection] = useState<Record<string, unknown> | null>(null);
+  const [gdsImportOpen, setGdsImportOpen] = useState(false);
+  const [gdsImportPosition, setGdsImportPosition] = useState<{ top: number; left: number; side: 'right' | 'left' } | null>(null);
+  const [pendingGdsAsset, setPendingGdsAsset] = useState<GDSAsset | null>(null);
+  const [pendingGdsStructure, setPendingGdsStructure] = useState('');
+  const [pendingGdsLayerDatatype, setPendingGdsLayerDatatype] = useState('');
+  const [gdsImportMode, setGdsImportMode] = useState<'etch-mask' | 'material-geometry'>('etch-mask');
+  const [pendingMaskName, setPendingMaskName] = useState('GDS 刻蚀掩膜');
+  const [pendingMaskMaterial, setPendingMaskMaterial] = useState('Mask');
+  const [pendingMaskThickness, setPendingMaskThickness] = useState(0.3);
+  const [pendingGdsScale, setPendingGdsScale] = useState(1);
+  const [pendingMaskOffset, setPendingMaskOffset] = useState<[number, number]>([0, 0]);
+  const [pendingMaskPolarity, setPendingMaskPolarity] = useState<'inside' | 'outside'>('inside');
+  const [pendingProtectsEtch, setPendingProtectsEtch] = useState(true);
+  const [gdsImportError, setGdsImportError] = useState('');
   const [slicePosition, setSlicePosition] = useState(0);
   const [rateRowMaterial, setRateRowMaterial] = useState('');
   const [multiRateMaterial, setMultiRateMaterial] = useState('');
@@ -605,6 +666,8 @@ export default function App() {
   const panelResizeRef = useRef<{ panel: ResizablePanel; pointerX: number; width: number } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const gdsInputRef = useRef<HTMLInputElement>(null);
+  const gdsImportButtonRef = useRef<HTMLButtonElement>(null);
+  const gdsImportCardRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const cursorRef = useRef(0);
   const shownRunErrorRef = useRef<string | null>(null);
@@ -613,6 +676,26 @@ export default function App() {
   const comparisonSequence = useRef(0);
   const validationSequence = useRef(0);
   const polling = useRef(false);
+
+  useEffect(() => {
+    if (!gdsImportOpen) return undefined;
+    const updatePosition = () => {
+      const anchor = gdsImportButtonRef.current?.getBoundingClientRect();
+      if (!anchor) return;
+      const cardWidth = Math.min(360, Math.max(280, window.innerWidth - 24));
+      const openRight = anchor.right + 12 + cardWidth <= window.innerWidth - 12;
+      const left = openRight ? anchor.right + 12 : Math.max(12, anchor.left - cardWidth - 12);
+      const maxTop = Math.max(12, window.innerHeight - 480);
+      setGdsImportPosition({ top: Math.max(12, Math.min(anchor.top - 4, maxTop)), left, side: openRight ? 'right' : 'left' });
+    };
+    updatePosition();
+    window.addEventListener('resize', updatePosition);
+    window.addEventListener('scroll', updatePosition, true);
+    return () => {
+      window.removeEventListener('resize', updatePosition);
+      window.removeEventListener('scroll', updatePosition, true);
+    };
+  }, [gdsImportOpen]);
 
   useEffect(() => {
     const closeProjectMenusOnMobile = () => {
@@ -722,6 +805,17 @@ export default function App() {
   });
   const editGdsGeometry = (updater: (geometry: GDSGeometry) => GDSGeometry) => updateProject(previous =>
     previous.geometry.kind === 'gds' ? { ...previous, geometry: updater(previous.geometry) } : previous);
+  const syncGdsMaskLayer = (geometry: StackGeometry): StackGeometry => {
+    const index = geometry.layers.findIndex(layer => layer.source === 'gds-mask');
+    if (index < 0 || !geometry.gdsMask) return geometry;
+    const layer = geometry.layers[index];
+    const baseHeight = geometry.baseHeight + geometry.layers.slice(0, index).reduce((sum, item) => sum + item.thickness, 0);
+    return { ...geometry, gdsMask: { ...geometry.gdsMask, name: layer.name, material: layer.material, height: layer.thickness, baseHeight } };
+  };
+  const editStackGdsMask = (updater: (mask: GDSMaskPattern) => GDSMaskPattern) => updateProject(previous => {
+    if (previous.geometry.kind !== 'stack' || !previous.geometry.gdsMask) return previous;
+    return { ...previous, geometry: syncGdsMaskLayer({ ...previous.geometry, gdsMask: updater(previous.geometry.gdsMask) }) };
+  });
   const active = !!runInfo && !terminalStates.has(runInfo.status);
   const changeActivity = (next: Activity) => {
     setActivity(next);
@@ -1030,7 +1124,7 @@ export default function App() {
   };
 
   const uploadGdsFile = async (file: File) => {
-    setLoading(true); setNotice('');
+    setLoading(true); setNotice(''); setGdsImportError('');
     try {
       const response = await fetch(`/api/gds-assets?file_name=${encodeURIComponent(file.name)}`, {
         method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: file,
@@ -1041,23 +1135,154 @@ export default function App() {
         throw new Error(typeof detail === 'string' ? detail : `GDS 上传失败：HTTP ${response.status}`);
       }
       const asset = result as GDSAsset;
-      const structure = asset.structures[0]?.name;
-      if (!structure) throw new Error('GDS 文件不包含可用结构单元。');
-      const layerIds = gdsLayerIds(asset, structure);
-      if (!layerIds.length) throw new Error(`结构 ${structure} 没有可映射的图层。`);
-      const defaultMaterial = materials.find(item => item.name === 'SiO2')?.name ?? materials[0]?.name ?? 'Si';
-      const projectV7 = promoteProjectToV7(project);
-      const gdsGeometry: GDSGeometry = {
-        kind: 'gds', assetId: asset.assetId, fileName: asset.fileName, structure, unitScale: 1,
-        position: [0, 0, 0], layers: layerIds.slice(0, 64).map(layer => ({
-          layer, material: defaultMaterial,
-          ...(project.dimension === 3 ? { baseHeight: 0, height: Math.max(0.5, 2 * project.domain.gridDelta), mask: false } : {}),
-        })),
-      };
-      setGdsAsset(asset); setGdsInspection(null); setProject({ ...projectV7, geometry: gdsGeometry }); setProjectId(null);
-      setNotice(`已导入 ${file.name}。请选择结构、图层和材料，再运行 ViennaPS 原生预览。${layerIds.length > 64 ? ' 默认只选前 64 个图层，最多映射 64 层。' : ''}`);
-    } catch (error) { setNotice(prettyError(error)); }
+      const firstUsableStructure = asset.structures.find(item => gdsMaskPairs(asset, item.name).length > 0)?.name
+        ?? asset.structures.find(item => gdsLayerIds(asset, item.name).length > 0)?.name;
+      if (!firstUsableStructure) throw new Error('GDS 文件不包含可用的结构单元或图层。');
+      const firstPair = (gdsImportMode === 'etch-mask' ? gdsMaskPairs(asset, firstUsableStructure) : gdsPairs(asset, firstUsableStructure))[0];
+      setPendingGdsScale(1);
+      setPendingMaskOffset([0, 0]);
+      setPendingGdsAsset(asset);
+      setPendingGdsStructure(firstUsableStructure);
+      setPendingGdsLayerDatatype(firstPair ? `${firstPair[0]}/${firstPair[1]}` : '');
+      setGdsImportError('');
+      setNotice(gdsMaskPairs(asset, firstUsableStructure).length
+        ? '已读取 GDS 文件。掩膜列表只显示含闭合边界多边形的 layer/datatype 组合。'
+        : '已读取 GDS 文件，但没有发现闭合边界多边形；请切换到高级材料几何导入，或选择其他 GDS 文件。');
+    } catch (error) { setGdsImportError(prettyError(error)); }
     finally { setLoading(false); if (gdsInputRef.current) gdsInputRef.current.value = ''; }
+  };
+
+  const makeGdsMaskProject = (
+    baseProject: Project,
+    source: GDSGeometry,
+    pair: [number, number],
+    settings: { maskName: string; maskMaterial: string; maskThickness: number; polarity: 'inside' | 'outside'; protectsEtch: boolean },
+  ): Project => {
+    const existingStack = baseProject.geometry.kind === 'stack'
+      ? baseProject.geometry
+      : { kind: 'stack', substrateMaterial: 'Si', baseHeight: 0, layers: [], pattern: { kind: 'none' } } as StackGeometry;
+    const layers = existingStack.layers.filter(layer => layer.source !== 'gds-mask');
+    const maskLayer: Layer = {
+      id: `gds_mask_${crypto.randomUUID().replaceAll('-', '').slice(0, 12)}`,
+      name: settings.maskName.trim() || 'GDS 掩膜', material: settings.maskMaterial,
+      thickness: settings.maskThickness, role: 'mask', source: 'gds-mask',
+    };
+    const stack: StackGeometry = {
+      ...existingStack,
+      layers: [...layers, maskLayer],
+      pattern: { kind: 'gds' },
+      gdsMask: {
+        name: maskLayer.name,
+        assetId: source.assetId, fileName: source.fileName, structure: source.structure,
+        layer: pair[0], datatype: pair[1], unitScale: source.unitScale, position: source.position,
+        baseHeight: existingStack.baseHeight + layers.reduce((sum, layer) => sum + layer.thickness, 0),
+        height: maskLayer.thickness, material: maskLayer.material,
+        retainedRegion: settings.polarity, protectsEtch: settings.protectsEtch,
+      },
+    };
+    const next: Project = {
+      ...baseProject,
+      schemaVersion: 7,
+      dimension: 3,
+      domain: { ...baseProject.domain, yExtent: baseProject.domain.yExtent ?? baseProject.domain.xExtent, boundaryXY: baseProject.domain.boundaryXY ?? 'reflective' },
+      geometry: stack,
+      outputSettings: { ...(baseProject.outputSettings ?? defaultProject.outputSettings!), volumeMesh: true },
+      view3D: { ...structuredClone(defaultView3D), visibleMaterialIds: initialVisibleMaterialIds(materials, stack) },
+    };
+    delete next.view;
+    return next;
+  };
+
+  const importPendingGds = async () => {
+    if (!pendingGdsAsset || !pendingGdsStructure) return;
+    if (gdsImportMode === 'etch-mask' && project.dimension !== 3) {
+      setGdsImportError('GDS 掩膜刻蚀需要 3D 工程。请先将工程切换到 3D 模式，再导入掩膜。');
+      return;
+    }
+    const layerIds = gdsLayerIds(pendingGdsAsset, pendingGdsStructure);
+    if (!layerIds.length) {
+      setGdsImportError('所选结构没有可映射的图层，请换一个结构单元。');
+      return;
+    }
+    const defaultMaterial = materials.find(item => item.name === 'SiO2')?.name ?? materials[0]?.name ?? 'Si';
+    const projectV7 = promoteProjectToV7(project);
+    const gdsGeometry: GDSGeometry = {
+      kind: 'gds', assetId: pendingGdsAsset.assetId, fileName: pendingGdsAsset.fileName, structure: pendingGdsStructure,
+      position: gdsImportMode === 'etch-mask' ? [pendingMaskOffset[0], pendingMaskOffset[1], 0] : [0, 0, 0],
+      unitScale: gdsImportMode === 'etch-mask' ? pendingGdsScale : 1,
+      layers: layerIds.slice(0, 64).map(layer => ({
+        layer, material: defaultMaterial,
+        ...(project.dimension === 3 ? { baseHeight: 0, height: Math.max(0.5, 2 * project.domain.gridDelta), mask: false } : {}),
+      })),
+    };
+    let importedProject: Project = { ...projectV7, geometry: gdsGeometry };
+    let nativeMaskInspection: Record<string, unknown> | null = null;
+    if (gdsImportMode === 'etch-mask') {
+      const pair = gdsMaskPairs(pendingGdsAsset, pendingGdsStructure).find(([layer, datatype]) => `${layer}/${datatype}` === pendingGdsLayerDatatype);
+      if (!pair) {
+        setGdsImportError('请选择一个有效的 GDS 图层 / datatype 组合。');
+        return;
+      }
+      if (!pendingMaskName.trim() || !Number.isFinite(pendingGdsScale) || pendingGdsScale <= 0 || pendingGdsScale > 1_000_000
+          || !Number.isFinite(pendingMaskThickness) || pendingMaskThickness < 2 * project.domain.gridDelta || pendingMaskThickness > 100
+          || pendingMaskOffset.some(value => !Number.isFinite(value) || Math.abs(value) > 40)) {
+        setGdsImportError('请检查版图比例、偏移和掩膜厚度。掩膜厚度需至少跨越两个网格间距。');
+        return;
+      }
+      importedProject = makeGdsMaskProject(projectV7, gdsGeometry, pair, {
+        maskName: pendingMaskName,
+        maskMaterial: pendingMaskMaterial, maskThickness: pendingMaskThickness,
+        polarity: pendingMaskPolarity, protectsEtch: pendingProtectsEtch,
+      });
+    }
+    setLoading(true); setGdsImportError('');
+    try {
+      if (gdsImportMode === 'etch-mask') {
+        const pair = gdsMaskPairs(pendingGdsAsset, pendingGdsStructure).find(([layer, datatype]) => `${layer}/${datatype}` === pendingGdsLayerDatatype)!;
+        const result = await api<{ inspection: Record<string, unknown> }>(
+          `/api/gds-assets/${pendingGdsAsset.assetId}/inspect`, { method: 'POST', body: JSON.stringify({
+            structure: pendingGdsStructure, selectedLayers: [pair[0]], selectedLayerDatatypes: [[pair[0], pair[1]]],
+            dimension: 2, gridDelta: project.domain.gridDelta, xExtent: project.domain.xExtent,
+            boundary: 'reflective', unitScale: pendingGdsScale, position: pendingMaskOffset,
+          }) });
+        const selectedNativeLayers = result.inspection.selectedNativeLayers as number[] | undefined;
+        const pointCounts = result.inspection.levelSetPointCounts as Record<string, number> | undefined;
+        if (!selectedNativeLayers?.includes(pair[0]) || !Number.isFinite(pointCounts?.[String(pair[0])]) || Number(pointCounts?.[String(pair[0])]) <= 0) {
+          throw new Error(`Layer ${pair[0]} · datatype ${pair[1]} 没有生成可用的 ViennaPS 掩膜网格，请选择含闭合版图图形的组合。`);
+        }
+        nativeMaskInspection = result.inspection;
+      }
+      await api('/api/projects/validate', { method: 'POST', body: JSON.stringify(importedProject) });
+    } catch (error) {
+      const message = prettyError(error);
+      setGdsImportError(message.includes('native GDS layer readback') || message.includes('level-set')
+        ? `ViennaPS 无法从所选 layer/datatype 读取掩膜图形，请换一个含闭合版图图形的组合。${message}`
+        : message);
+      return;
+    } finally { setLoading(false); }
+    setGdsAsset(pendingGdsAsset); setGdsInspection(null); setProject(importedProject); setProjectId(null);
+    if (gdsImportMode === 'etch-mask') { setSelectedStep(importedProject.steps[0]?.id ?? null); setActivity('structure'); }
+    setGdsImportOpen(false); setPendingGdsAsset(null); setPendingGdsStructure(''); setGdsImportError('');
+    setPendingGdsLayerDatatype('');
+    setNotice(gdsImportMode === 'etch-mask'
+      ? `已导入 ${pendingGdsAsset.fileName} · ${pendingGdsStructure}，并将“${pendingMaskName.trim()}”加入“多层”顶层掩膜。ViennaPS 原生检查通过：所选掩膜网格点数 ${JSON.stringify(nativeMaskInspection?.levelSetPointCounts)}。${projectV7.geometry.kind === 'stack' ? '现有多层和工艺步骤已保留。' : '原工程没有多层结构，已建立最小 Si 基底；请在“多层”中确认基底并添加需要刻蚀的薄膜。'} 请生成结构预览并核对。`
+      : `已导入 ${pendingGdsAsset.fileName} · ${pendingGdsStructure}。请为可用图层指定材料，再运行 ViennaPS 原生预览。${layerIds.length > 64 ? ' 默认只选前 64 个图层，最多映射 64 层。' : ''}`);
+  };
+
+  const startGdsMaskTransfer = () => {
+    if (project.geometry.kind !== 'gds' || !gdsAsset) return;
+    const structure = project.geometry.structure;
+    const pair = gdsMaskPairs(gdsAsset, structure)[0] ?? gdsPairs(gdsAsset, structure)[0];
+    if (!pair) { setNotice('所选结构没有可用的 layer/datatype 图形。'); return; }
+    setPendingGdsAsset(gdsAsset);
+    setPendingGdsStructure(structure);
+    setPendingGdsScale(project.geometry.unitScale);
+    setPendingMaskOffset([project.geometry.position[0], project.geometry.position[1]]);
+    setPendingGdsLayerDatatype(`${pair[0]}/${pair[1]}`);
+    setGdsImportMode('etch-mask');
+    setGdsImportError('');
+    setGdsImportOpen(true);
+    setNotice('请选择 GDS 掩膜图层。导入后掩膜会作为“多层”的顶层图案；基底、薄膜和刻蚀步骤由当前项目设置。');
   };
 
   const inspectGds = async () => {
@@ -1084,9 +1309,10 @@ export default function App() {
     if (!savedSelection) return;
     try {
       const result = await api<{ id: string; project: Project }>(`/api/projects/${savedSelection}`);
-      const firstStep = result.project.steps[0] ?? null;
-      setProject(result.project); setProjectId(result.id); setSavedProjectJson(JSON.stringify(result.project)); setSelectedStep(firstStep?.id ?? null); setSelection(firstStep ? { kind: 'step', id: firstStep.id } : { kind: 'none' }); setActivity(firstStep ? 'recipe' : 'structure'); setMobilePanel(firstStep ? 'settings' : 'structure'); setInspectorOpen(true); setGdsInspection(null);
-      if (result.project.geometry.kind === 'gds') await loadGdsAsset(result.project.geometry.assetId); else setGdsAsset(null);
+      const loadedProject = normalizeGdsMaskLayer(result.project);
+      const firstStep = loadedProject.steps[0] ?? null;
+      setProject(loadedProject); setProjectId(result.id); setSavedProjectJson(JSON.stringify(loadedProject)); setSelectedStep(firstStep?.id ?? null); setSelection(firstStep ? { kind: 'step', id: firstStep.id } : { kind: 'none' }); setActivity(firstStep ? 'recipe' : 'structure'); setMobilePanel(firstStep ? 'settings' : 'structure'); setInspectorOpen(true); setGdsInspection(null);
+      const projectAsset = gdsAssetIdFromProject(loadedProject); if (projectAsset) await loadGdsAsset(projectAsset); else setGdsAsset(null);
       setNotice('项目已从本机工作台打开。');
     } catch (error) { setNotice(prettyError(error)); }
   };
@@ -1117,7 +1343,7 @@ export default function App() {
     const replayProject = replayData.normalizedProject;
     setProject(replayProject); setProjectId(null); setSelectedStep(null); setSelection({ kind: 'run', id: started.runId }); setActivity('results'); setMobilePanel('structure'); setInspectorOpen(true);
     setGdsInspection(null);
-    if (replayProject.geometry.kind === 'gds') await loadGdsAsset(replayProject.geometry.assetId); else setGdsAsset(null);
+    const replayAsset = gdsAssetIdFromProject(replayProject); if (replayAsset) await loadGdsAsset(replayAsset); else setGdsAsset(null);
     const replayKind = replayData.analysisMode === 'flux' ? 'flux' : replayData.analysisMode === 'slice' ? 'slice' : replayProject.steps.some(step => step.enabled) ? 'simulate' : 'preview';
     const initialInfo: RunInfo = { runId: started.runId, kind: replayKind, status: started.status, currentStepId: null, completedStepIds: [], elapsedSeconds: 0, requestedInputHash: started.requestedInputHash, stepTotal: replayKind === 'simulate' ? replayProject.steps.filter(step => step.enabled).length : 0, log: { cursor: 0, nextCursor: 0, truncated: false, text: '' }, snapshots: [] };
     setFluxResult(null); setFluxResultRunId(null);
@@ -1133,9 +1359,10 @@ export default function App() {
         const imported = await api<{ project: Project; replay?: unknown | null }>('/api/continuation-package/import', { method: 'POST', body: file, headers: { 'Content-Type': 'application/zip' } });
         if (imported.replay) await startReplay(imported.replay);
         else {
-          setProject(imported.project); setProjectId(null); setSelectedStep(null); setSelection({ kind: 'none' }); setActivity('structure'); setMobilePanel('structure'); setInspectorOpen(true); setGdsInspection(null);
-          if (imported.project.geometry.kind === 'gds') await loadGdsAsset(imported.project.geometry.assetId); else setGdsAsset(null);
-          setNotice(imported.project.geometry.kind === 'gds' ? 'GDS 项目包和源布局已校验并导入。' : 'ViennaPS Domain 状态包已校验并导入，可将该状态用作新工艺的起点。');
+          const importedProject = normalizeGdsMaskLayer(imported.project);
+          setProject(importedProject); setProjectId(null); setSelectedStep(null); setSelection({ kind: 'none' }); setActivity('structure'); setMobilePanel('structure'); setInspectorOpen(true); setGdsInspection(null);
+          const projectAsset = gdsAssetIdFromProject(importedProject); if (projectAsset) await loadGdsAsset(projectAsset); else setGdsAsset(null);
+          setNotice(projectAsset ? 'GDS 项目包和源布局已校验并导入。' : 'ViennaPS Domain 状态包已校验并导入，可将该状态用作新工艺的起点。');
         }
         return;
       }
@@ -1144,8 +1371,9 @@ export default function App() {
         await startReplay(parsed);
       } else {
         const valid = await api<{ normalizedProject: Project }>('/api/projects/validate', { method: 'POST', body: JSON.stringify(parsed) });
-        setProject(valid.normalizedProject); setProjectId(null); setSelectedStep(null); setSelection({ kind: 'none' }); setActivity('structure'); setMobilePanel('structure'); setInspectorOpen(true); setGdsInspection(null);
-        if (valid.normalizedProject.geometry.kind === 'gds') await loadGdsAsset(valid.normalizedProject.geometry.assetId); else setGdsAsset(null);
+        const importedProject = normalizeGdsMaskLayer(valid.normalizedProject);
+        setProject(importedProject); setProjectId(null); setSelectedStep(null); setSelection({ kind: 'none' }); setActivity('structure'); setMobilePanel('structure'); setInspectorOpen(true); setGdsInspection(null);
+        const projectAsset = gdsAssetIdFromProject(importedProject); if (projectAsset) await loadGdsAsset(projectAsset); else setGdsAsset(null);
         setNotice('项目 JSON 已导入。');
       }
     } catch (error) { setNotice(prettyError(error)); }
@@ -1435,41 +1663,48 @@ export default function App() {
   const editLayer = (id: string, patch: Partial<Layer>) => updateProject(previous => {
     if (previous.geometry.kind !== 'stack') return previous;
     const layers = previous.geometry.layers.map(layer => layer.id === id ? { ...layer, ...patch } : layer);
+    if (previous.geometry.pattern.kind === 'gds') return { ...previous, geometry: syncGdsMaskLayer({ ...previous.geometry, layers }) };
     if (previous.geometry.pattern.kind !== 'none' && layers.at(-1)?.role !== 'mask') setNotice('已关闭顶层图案，因为新的顶层不是掩膜层；已有层的材料和角色保持不变。');
-    return { ...previous, geometry: { ...previous.geometry, layers, pattern: previous.geometry.pattern.kind !== 'none' && layers.at(-1)?.role !== 'mask' ? { kind: 'none' } : previous.geometry.pattern } };
+    return { ...previous, geometry: syncGdsMaskLayer({ ...previous.geometry, layers, pattern: previous.geometry.pattern.kind !== 'none' && layers.at(-1)?.role !== 'mask' ? { kind: 'none' } : previous.geometry.pattern }) };
   });
   const addLayer = () => updateProject(previous => {
     if (previous.geometry.kind !== 'stack' || previous.geometry.layers.length >= 16) return previous;
     const oldLayers = previous.geometry.layers;
     const layers = [...oldLayers];
-    if (previous.geometry.pattern.kind !== 'none') setNotice('已关闭顶层图案，因为新增薄膜后顶层不再是原掩膜；已有层的材料和角色保持不变。');
-    layers.push({ id: `layer_${crypto.randomUUID().replaceAll('-', '').slice(0, 12)}`, name: `新层 ${oldLayers.length + 1}`, material: materials.find(m => m.name === 'SiO2')?.name ?? 'SiO2', thickness: Math.max(.6, 2 * previous.domain.gridDelta), role: 'film' });
-    return { ...previous, geometry: { ...previous.geometry, layers, pattern: { kind: 'none' } } };
+    const gdsIndex = layers.findIndex(layer => layer.source === 'gds-mask');
+    const newLayer = { id: `layer_${crypto.randomUUID().replaceAll('-', '').slice(0, 12)}`, name: `新层 ${oldLayers.length + 1}`, material: materials.find(m => m.name === 'SiO2')?.name ?? 'SiO2', thickness: Math.max(.6, 2 * previous.domain.gridDelta), role: 'film' as const };
+    if (gdsIndex >= 0) layers.splice(gdsIndex, 0, newLayer); else layers.push(newLayer);
+    if (previous.geometry.pattern.kind !== 'none' && previous.geometry.pattern.kind !== 'gds') setNotice('已关闭顶层图案，因为新增薄膜后顶层不再是原掩膜；已有层的材料和角色保持不变。');
+    return { ...previous, geometry: syncGdsMaskLayer({ ...previous.geometry, layers, pattern: previous.geometry.pattern.kind === 'gds' ? previous.geometry.pattern : { kind: 'none' } }) };
   });
   const removeLayer = (id: string) => updateProject(previous => {
     if (previous.geometry.kind !== 'stack') return previous;
+    const removingGdsMask = previous.geometry.layers.some(layer => layer.id === id && layer.source === 'gds-mask');
     const layers = previous.geometry.layers.filter(layer => layer.id !== id);
     const closePattern = previous.geometry.pattern.kind !== 'none' && (layers.at(-1)?.role !== 'mask' || !layers.length);
     if (closePattern) setNotice('已关闭顶层图案，因为删除层后顶层不再是掩膜层；其他已有层的材料和角色保持不变。');
-    return { ...previous, geometry: { ...previous.geometry, layers, pattern: closePattern ? { kind: 'none' } : previous.geometry.pattern } };
+    const geometry = { ...previous.geometry, layers, pattern: removingGdsMask || closePattern ? { kind: 'none' as const } : previous.geometry.pattern, ...(removingGdsMask ? { gdsMask: undefined } : {}) };
+    return { ...previous, geometry: syncGdsMaskLayer(geometry) };
   });
   const moveLayer = (id: string, offset: -1 | 1) => updateProject(previous => {
     if (previous.geometry.kind !== 'stack') return previous;
     const layers = [...previous.geometry.layers], index = layers.findIndex(layer => layer.id === id), target = index + offset;
     if (index < 0 || target < 0 || target >= layers.length) return previous;
+    const gdsIndex = layers.findIndex(layer => layer.source === 'gds-mask');
+    if (index === gdsIndex || (gdsIndex >= 0 && target >= gdsIndex)) return previous;
     [layers[index], layers[target]] = [layers[target], layers[index]];
     if (previous.geometry.pattern.kind !== 'none' && layers.at(-1)?.role !== 'mask') setNotice('已关闭顶层图案，因为换序后顶层不再是掩膜层；已有层的材料和角色保持不变。');
-    return { ...previous, geometry: { ...previous.geometry, layers, pattern: previous.geometry.pattern.kind !== 'none' && layers.at(-1)?.role !== 'mask' ? { kind: 'none' } : previous.geometry.pattern } };
+    return { ...previous, geometry: syncGdsMaskLayer({ ...previous.geometry, layers, pattern: previous.geometry.pattern.kind !== 'none' && previous.geometry.pattern.kind !== 'gds' && layers.at(-1)?.role !== 'mask' ? { kind: 'none' } : previous.geometry.pattern }) };
   });
   const copyLayer = (id: string) => updateProject(previous => {
     if (previous.geometry.kind !== 'stack' || previous.geometry.layers.length >= 16) return previous;
     const index = previous.geometry.layers.findIndex(layer => layer.id === id), original = previous.geometry.layers[index];
-    if (!original) return previous;
+    if (!original || original.source === 'gds-mask') return previous;
     const layers = [...previous.geometry.layers];
     layers.splice(index + 1, 0, { ...original, id: `layer_${crypto.randomUUID().replaceAll('-', '').slice(0, 12)}`, name: `${original.name} 副本` });
-    const closePattern = previous.geometry.pattern.kind !== 'none' && layers.at(-1)?.role !== 'mask';
+    const closePattern = previous.geometry.pattern.kind !== 'none' && previous.geometry.pattern.kind !== 'gds' && layers.at(-1)?.role !== 'mask';
     if (closePattern) setNotice('已关闭顶层图案，因为复制后顶层不再是掩膜层；已有层的材料和角色保持不变。');
-    return { ...previous, geometry: { ...previous.geometry, layers, pattern: closePattern ? { kind: 'none' } : previous.geometry.pattern } };
+    return { ...previous, geometry: syncGdsMaskLayer({ ...previous.geometry, layers, pattern: closePattern ? { kind: 'none' } : previous.geometry.pattern }) };
   });
 
   const loadServerRun = async (runId: string, preferLatest: boolean) => {
@@ -1506,7 +1741,7 @@ export default function App() {
     const next: Project = dimension === 2 ? structuredClone(defaultProject) : {
       ...structuredClone(defaultProject), name: '三维工艺项目', schemaVersion: 7, dimension: 3,
       domain: { gridDelta: .2, xExtent: 6, yExtent: 6, boundaryXY: 'reflective' },
-      outputSettings: structuredClone(defaultProject.outputSettings!),
+      outputSettings: { ...structuredClone(defaultProject.outputSettings!), volumeMesh: true },
       geometry: { kind: 'stack', substrateMaterial: 'Si', baseHeight: 0, layers: [
         { id: 'layer_sio2', name: 'SiO₂ 薄膜', material: 'SiO2', thickness: .6, role: 'film' },
         { id: 'layer_si3n4', name: 'Si₃N₄ 掩膜', material: 'Si3N4', thickness: .6, role: 'mask' },
@@ -1563,11 +1798,7 @@ export default function App() {
         dimension: 3,
         steps: convertedSteps,
         geometry,
-        outputSettings: {
-          ...structuredClone(defaultProject.outputSettings!),
-          ...source.outputSettings,
-          volumeMesh: source.outputSettings?.volumeMesh ?? false,
-        },
+        outputSettings: { ...(source.outputSettings ?? defaultProject.outputSettings!), volumeMesh: true },
         domain: { gridDelta: source.domain.gridDelta, xExtent: source.domain.xExtent, yExtent: source.domain.yExtent ?? source.domain.xExtent, boundaryXY: source.domain.boundaryXY ?? source.domain.xBoundary ?? 'reflective' },
         view3D: {
           ...(source.view3D ? structuredClone(source.view3D) : structuredClone(historyView3D)),
@@ -1887,14 +2118,142 @@ export default function App() {
               <button className={project.geometry.kind === 'trench' ? 'active' : ''} onClick={() => updateProject(previous => ({ ...previous, geometry: { kind: 'trench', width: 2, depth: 2.2, taperAngle: 0, maskHeight: 0, maskTaperAngle: 0, substrateMaterial: 'Si', maskMaterial: 'Mask' } }))}>沟槽</button>
               {project.dimension === 3 && <button className={project.geometry.kind === 'hole' ? 'active' : ''} onClick={() => updateProject(previous => ({ ...previous, geometry: { kind: 'hole', radius: 1, depth: 2, taperAngle: 0, maskHeight: 0, maskTaperAngle: 0, substrateMaterial: 'Si', maskMaterial: 'Mask' } }))}>圆孔</button>}
               <button className={project.geometry.kind === 'fin' ? 'active' : ''} onClick={() => updateProject(previous => ({ ...previous, geometry: { kind: 'fin', width: 0.8, height: 1.2, taperAngle: 0, maskHeight: 0, maskTaperAngle: 0, substrateMaterial: 'Si', maskMaterial: 'Mask', construction: 'boolean' } }))}>Fin</button>
-              <button className={project.geometry.kind === 'gds' ? 'active' : ''} onClick={() => gdsInputRef.current?.click()}>导入 GDS</button>
+              <button
+                ref={gdsImportButtonRef}
+                type="button"
+                className={gdsImportOpen || project.geometry.kind === 'gds' ? 'active' : ''}
+                aria-haspopup="dialog"
+                aria-expanded={gdsImportOpen}
+                aria-controls="gds-import-popover"
+                onClick={() => { setGdsImportError(''); setGdsImportOpen(open => !open); }}
+              >导入 GDS</button>
             </div>
             <input ref={gdsInputRef} type="file" accept=".gds,.gdsii,application/octet-stream" hidden onChange={event => { const file = event.target.files?.[0]; if (file) void uploadGdsFile(file); }} />
+            {gdsImportOpen && gdsImportPosition && createPortal(
+              <div
+                ref={gdsImportCardRef}
+                id="gds-import-popover"
+                role="dialog"
+                aria-label="导入 GDS 版图"
+                className={`gds-import-popover ${gdsImportPosition.side === 'left' ? 'opens-left' : ''}`}
+                style={{ top: gdsImportPosition.top, left: gdsImportPosition.left }}
+              >
+                <div className="gds-import-card-header">
+                  <div><strong>导入 GDS 版图</strong><span>选择单元和掩膜层，将其加入当前多层结构。</span></div>
+                  <button type="button" className="icon-button" aria-label="关闭 GDS 导入卡片" onClick={() => setGdsImportOpen(false)}>×</button>
+                </div>
+                <button type="button" className="button gds-import-file-button" disabled={loading} onClick={() => gdsInputRef.current?.click()}>
+                  {loading ? '正在读取文件…' : pendingGdsAsset ? '更换 GDS 文件' : '选择 GDS 文件'}
+                </button>
+                {pendingGdsAsset && <>
+                  <div className="gds-import-file-summary">
+                    <strong title={pendingGdsAsset.fileName}>{pendingGdsAsset.fileName}</strong>
+                    <span>{pendingGdsAsset.structures.length} 个结构单元 · {pendingGdsAsset.fileSizeBytes.toLocaleString()} 字节</span>
+                    <span>原生单位：1 user unit = {pendingGdsAsset.units.micrometersPerNativeUserUnit.toPrecision(5)} µm</span>
+                  </div>
+                  <div className="gds-import-mode" role="radiogroup" aria-label="GDS 导入用途">
+                    <label className={gdsImportMode === 'etch-mask' ? 'selected' : ''}>
+                      <input type="radio" name="gds-import-mode" value="etch-mask" checked={gdsImportMode === 'etch-mask'} onChange={() => {
+                        setGdsImportMode('etch-mask');
+                        if (pendingGdsAsset) {
+                          const structure = pendingGdsAsset.structures.find(item => gdsMaskPairs(pendingGdsAsset, item.name).length > 0)?.name ?? pendingGdsStructure;
+                          setPendingGdsStructure(structure);
+                          const pair = gdsMaskPairs(pendingGdsAsset, structure)[0];
+                          setPendingGdsLayerDatatype(pair ? `${pair[0]}/${pair[1]}` : '');
+                        }
+                      }} />
+                      <span><strong>作为刻蚀掩膜</strong><small>把所选图形加入当前多层结构的顶层。</small></span>
+                    </label>
+                    <label className={gdsImportMode === 'material-geometry' ? 'selected' : ''}>
+                      <input type="radio" name="gds-import-mode" value="material-geometry" checked={gdsImportMode === 'material-geometry'} onChange={() => {
+                        setGdsImportMode('material-geometry');
+                        if (pendingGdsAsset) {
+                          const pair = gdsPairs(pendingGdsAsset, pendingGdsStructure)[0];
+                          setPendingGdsLayerDatatype(pair ? `${pair[0]}/${pair[1]}` : '');
+                        }
+                      }} />
+                      <span><strong>导入为材料几何（高级）</strong><small>每个 GDS 图层都要指定仿真材料。</small></span>
+                    </label>
+                  </div>
+                  <label className="gds-import-field">
+                    <span>1 · 选择版图单元（Cell）</span>
+                    <select value={pendingGdsStructure} onChange={event => {
+                      const structure = event.target.value;
+                      const pair = (gdsImportMode === 'etch-mask' ? gdsMaskPairs(pendingGdsAsset, structure) : gdsPairs(pendingGdsAsset, structure))[0];
+                      setPendingGdsStructure(structure);
+                      setPendingGdsLayerDatatype(pair ? `${pair[0]}/${pair[1]}` : '');
+                      setGdsImportError('');
+                    }}>
+                      {pendingGdsAsset.structures.filter(item => gdsLayerIds(pendingGdsAsset, item.name).length > 0).map(item => <option key={item.name} value={item.name}>{item.name}</option>)}
+                    </select>
+                  </label>
+                  <div className="gds-import-layer-summary">
+                    {gdsLayerIds(pendingGdsAsset, pendingGdsStructure).length} 个图层 · {gdsImportMode === 'etch-mask' ? gdsMaskPairs(pendingGdsAsset, pendingGdsStructure).length : gdsPairs(pendingGdsAsset, pendingGdsStructure).length} 种{gdsImportMode === 'etch-mask' ? '闭合多边形掩膜' : 'layer/datatype'}组合
+                  </div>
+                  {gdsImportMode === 'etch-mask' && !gdsMaskPairs(pendingGdsAsset, pendingGdsStructure).length && <div className="gds-import-help">当前 Cell 没有闭合边界多边形可用作掩膜。可换 Cell 或切换到高级材料几何导入。</div>}
+                  {gdsImportMode === 'etch-mask' && <label className="gds-import-field">
+                    <span>2 · 作为掩膜的闭合 GDS 图层</span>
+                    <select value={pendingGdsLayerDatatype} onChange={event => { setPendingGdsLayerDatatype(event.target.value); setGdsImportError(''); }}>
+                      {gdsMaskPairs(pendingGdsAsset, pendingGdsStructure).length === 0 && <option value="">无闭合掩膜图形</option>}
+                      {gdsMaskPairs(pendingGdsAsset, pendingGdsStructure).map(([layer, datatype]) => <option key={`${layer}/${datatype}`} value={`${layer}/${datatype}`}>Layer {layer} · datatype {datatype}</option>)}
+                    </select>
+                  </label>}
+                  {gdsImportMode === 'etch-mask' && <>
+                    <div className="gds-import-section-heading"><span>3</span><div><strong>掩膜图层</strong><small>这些属性会填入“多层”中的新顶层掩膜；基底与薄膜保持当前项目设置。</small></div></div>
+                    <label className="gds-import-field"><span>掩膜名称</span><input type="text" maxLength={80} value={pendingMaskName} onChange={event => setPendingMaskName(event.target.value)} /></label>
+                    <div className="gds-import-data-grid">
+                      <label className="gds-import-field"><span>掩膜材料</span><select value={pendingMaskMaterial} onChange={event => setPendingMaskMaterial(event.target.value)}>{materials.map(item => <option key={item.id} value={item.name}>{item.name}</option>)}</select></label>
+                      <label className="gds-import-field"><span>掩膜厚度 · µm</span><input type="number" min={2 * project.domain.gridDelta} max="100" step="0.05" value={pendingMaskThickness} onChange={event => setPendingMaskThickness(Number(event.target.value))} /></label>
+                      <label className="gds-import-field"><span>额外尺寸比例（自动换算后 ×）</span><input type="number" min="0.000001" max="1000000" step="0.1" value={pendingGdsScale} onChange={event => setPendingGdsScale(Number(event.target.value))} /></label>
+                      <label className="gds-import-field"><span>GDS X 偏移 · µm</span><input type="number" min="-40" max="40" step="0.05" value={pendingMaskOffset[0]} onChange={event => setPendingMaskOffset([Number(event.target.value), pendingMaskOffset[1]])} /></label>
+                      <label className="gds-import-field"><span>GDS Y 偏移 · µm</span><input type="number" min="-40" max="40" step="0.05" value={pendingMaskOffset[1]} onChange={event => setPendingMaskOffset([Number(event.target.value), pendingMaskOffset[1]])} /></label>
+                    </div>
+                    <label className="gds-import-field"><span>保留版图区域</span><select value={pendingMaskPolarity} onChange={event => setPendingMaskPolarity(event.target.value as 'inside' | 'outside')}><option value="inside">GDS 图形内部</option><option value="outside">GDS 图形外部</option></select></label>
+                    <label className="gds-import-protection"><input type="checkbox" checked={pendingProtectsEtch} onChange={event => setPendingProtectsEtch(event.target.checked)} /><span><strong>刻蚀时保护掩膜材料</strong><small>关闭后，掩膜材料会按工艺步骤的材料速率参与刻蚀。</small></span></label>
+                    <div className="gds-import-help">沿用当前计算域和已有多层结构。若原工程只有裸 GDS，导入后会显示最小起始结构；请在“多层”中确认基底并添加所需薄膜，再到工艺步骤区设置刻蚀参数。</div>
+                  </>}
+                  <div className="gds-import-help">
+                    {gdsImportMode === 'etch-mask'
+                      ? '确认后只会把所选 GDS 图形作为一个顶层掩膜加入“多层”；已有基底、薄膜和工艺步骤会保留。导入前会运行 ViennaPS 原生图层检查。'
+                      : 'GDS 图层编号本身不代表材料；导入后需要把图层映射为硅、氧化物等仿真材料。'}
+                  </div>
+                </>}
+                {gdsImportError && <div className="gds-import-error" role="alert">{gdsImportError}</div>}
+                <div className="gds-import-card-actions">
+                  <button type="button" className="button" onClick={() => setGdsImportOpen(false)}>稍后</button>
+                  <button
+                    type="button"
+                    className="button primary"
+                    disabled={loading || !pendingGdsAsset || !gdsLayerIds(pendingGdsAsset, pendingGdsStructure).length || (gdsImportMode === 'etch-mask' && !gdsMaskPairs(pendingGdsAsset, pendingGdsStructure).length)}
+                    onClick={() => void importPendingGds()}
+                  >{loading ? '正在检查…' : '导入并准备预览'}</button>
+                </div>
+              </div>,
+              document.body,
+            )}
           </div>
           {project.geometry.kind === 'stack' ? <div className="field-grid one-column geometry-fields">
             <SelectField label="基底材料" value={project.geometry.substrateMaterial} options={materials.map(m => ({ value: m.name, label: m.name }))} onChange={value => updateProject(previous => previous.geometry.kind === 'stack' ? { ...previous, geometry: { ...previous.geometry, substrateMaterial: value } } : previous)} />
             <NumericField label="基底表面高度" unit="µm" value={project.geometry.baseHeight} onChange={value => updateProject(previous => previous.geometry.kind === 'stack' ? { ...previous, geometry: { ...previous.geometry, baseHeight: value } } : previous)} />
-            {project.geometry.layers.map((layer, index) => <div className="layer-card" key={layer.id}>
+            {project.geometry.layers.map((layer, index) => layer.source === 'gds-mask' && project.geometry.kind === 'stack' && project.geometry.gdsMask ? <div className="layer-card gds-mask-card" key={layer.id}>
+              <div className="section-heading gds-mask-section-heading"><div className="gds-mask-heading-copy"><span className="field-label">第 {index + 1} 层 · {layer.name}</span><span className="gds-mask-heading-hint">GDS 掩膜 · 顶层图案直接使用此版图图形</span></div><button type="button" className="button danger-quiet" onClick={() => removeLayer(layer.id)}>移除</button></div>
+              <label className="field"><span className="field-label">掩膜名称</span><input type="text" maxLength={80} value={layer.name} onChange={event => editLayer(layer.id, { name: event.target.value })} /></label>
+              <SelectField label="掩膜材料" value={layer.material} options={materials.map(item => ({ value: item.name, label: item.name }))} onChange={value => editLayer(layer.id, { material: value })} />
+              <NumericField label="掩膜厚度" unit="µm" value={layer.thickness} min={2 * project.domain.gridDelta} max={100} step=".05" onChange={value => editLayer(layer.id, { thickness: value })} />
+              {gdsAsset && <>
+                <SelectField label="版图结构" value={project.geometry.gdsMask.structure} options={gdsAsset.structures.filter(item => gdsMaskPairs(gdsAsset, item.name).length > 0).map(item => ({ value: item.name, label: item.name }))} onChange={value => {
+                  const pair = gdsMaskPairs(gdsAsset, value)[0]; if (!pair) return;
+                  editStackGdsMask(mask => ({ ...mask, structure: value, layer: pair[0], datatype: pair[1] }));
+                }} />
+                <SelectField label="GDS 掩膜图层 / datatype" value={`${project.geometry.gdsMask.layer}/${project.geometry.gdsMask.datatype}`} options={gdsMaskPairs(gdsAsset, project.geometry.gdsMask.structure).map(([gdsLayer, datatype]) => ({ value: `${gdsLayer}/${datatype}`, label: `Layer ${gdsLayer} · datatype ${datatype}` }))} onChange={value => { const [gdsLayer, datatype] = value.split('/').map(Number); editStackGdsMask(mask => ({ ...mask, layer: gdsLayer, datatype })); }} />
+                <NumericField label="版图尺寸比例" value={project.geometry.gdsMask.unitScale} min={.000001} max={1_000_000} step="0.1" onChange={value => editStackGdsMask(mask => ({ ...mask, unitScale: value }))} />
+                <SelectField label="保留图形区域" value={project.geometry.gdsMask.retainedRegion} options={[{ value: 'inside', label: 'GDS 图形内部' }, { value: 'outside', label: 'GDS 图形外部' }]} onChange={value => editStackGdsMask(mask => ({ ...mask, retainedRegion: value as 'inside' | 'outside' }))} />
+                <NumericField label="GDS X 偏移" unit="µm" value={project.geometry.gdsMask.position[0]} min={-40} max={40} step="0.05" onChange={value => editStackGdsMask(mask => { const position: [number, number, number] = [...mask.position]; position[0] = value; return { ...mask, position }; })} />
+                <NumericField label="GDS Y 偏移" unit="µm" value={project.geometry.gdsMask.position[1]} min={-40} max={40} step="0.05" onChange={value => editStackGdsMask(mask => { const position: [number, number, number] = [...mask.position]; position[1] = value; return { ...mask, position }; })} />
+                <label className="visibility-option"><input type="checkbox" checked={project.geometry.gdsMask.protectsEtch} onChange={event => editStackGdsMask(mask => ({ ...mask, protectsEtch: event.target.checked }))} /><span><strong>保护掩膜材料</strong><small>关闭后，掩膜材料按工艺步骤中的材料速率参与刻蚀。</small></span></label>
+                <div className="inline-note">来源：{project.geometry.gdsMask.fileName} · {project.geometry.gdsMask.layer}/{project.geometry.gdsMask.datatype}。掩膜底面自动贴合其下方多层的顶部。</div>
+              </>}
+            </div> : <div className="layer-card" key={layer.id}>
               <label className="field"><span className="field-label">第 {index + 1} 层名称</span><input type="text" value={layer.name} onChange={event => editLayer(layer.id, { name: event.target.value })} /></label>
               <SelectField label="材料" value={layer.material} options={materials.map(m => ({ value: m.name, label: m.name }))} onChange={value => editLayer(layer.id, { material: value })} />
               <NumericField label="厚度" unit="µm" value={layer.thickness} min={.01} max={100} step=".05" onChange={value => editLayer(layer.id, { thickness: value })} />
@@ -1902,10 +2261,11 @@ export default function App() {
               <div className="layer-actions"><button className="button" disabled={index === 0} onClick={() => moveLayer(layer.id, -1)}>↑</button><button className="button" disabled={index === layerCount - 1} onClick={() => moveLayer(layer.id, 1)}>↓</button><button className="button" onClick={() => copyLayer(layer.id)}>复制</button><button className="button danger-quiet" onClick={() => removeLayer(layer.id)}>删除</button></div>
             </div>)}
             <button className="button" disabled={project.geometry.layers.length >= 16} onClick={addLayer}>＋ 添加层</button>
-            <SelectField label="顶层图案" value={project.geometry.pattern.kind} options={[{ value: 'none', label: '无' }, { value: 'trench', label: '沟槽' }, ...(project.dimension === 3 ? [{ value: 'hole', label: '圆孔' }] : [])]} onChange={value => updateProject(previous => { if (previous.geometry.kind !== 'stack') return previous; const pattern: StackGeometry['pattern'] = value === 'trench' ? { kind: 'trench', width: 2, taperAngle: 0 } : value === 'hole' && previous.dimension === 3 ? { kind: 'hole', radius: 1, taperAngle: 0 } : { kind: 'none' }; return { ...previous, geometry: { ...previous.geometry, pattern } }; })} />
+            <SelectField label="顶层图案" value={project.geometry.pattern.kind} options={project.geometry.gdsMask ? [{ value: 'gds', label: 'GDS 掩膜图案' }] : [{ value: 'none', label: '无' }, { value: 'trench', label: '沟槽' }, ...(project.dimension === 3 ? [{ value: 'hole', label: '圆孔' }] : [])]} hint={project.geometry.gdsMask ? '由上方 GDS 掩膜层提供图案。' : undefined} onChange={value => updateProject(previous => { if (previous.geometry.kind !== 'stack' || previous.geometry.gdsMask) return previous; const pattern: StackGeometry['pattern'] = value === 'trench' ? { kind: 'trench', width: 2, taperAngle: 0 } : value === 'hole' && previous.dimension === 3 ? { kind: 'hole', radius: 1, taperAngle: 0 } : { kind: 'none' }; return { ...previous, geometry: { ...previous.geometry, pattern } }; })} />
             {project.geometry.pattern.kind === 'trench' && <NumericField label="沟槽宽度" unit="µm" value={project.geometry.pattern.width} min={.05} onChange={value => updatePattern({ width: value })} />}
             {project.geometry.pattern.kind === 'hole' && <NumericField label="孔半径" unit="µm" value={project.geometry.pattern.radius} min={.05} onChange={value => updatePattern({ radius: value })} />}
-            {project.geometry.pattern.kind !== 'none' && <NumericField label="图案锥角" unit="°" value={project.geometry.pattern.taperAngle} min={-45} max={45} onChange={value => updatePattern({ taperAngle: value })} />}
+            {(project.geometry.pattern.kind === 'trench' || project.geometry.pattern.kind === 'hole') && <NumericField label="图案锥角" unit="°" value={project.geometry.pattern.taperAngle} min={-45} max={45} onChange={value => updatePattern({ taperAngle: value })} />}
+            {project.geometry.gdsMask && <div className="inline-note">当前为 GDS 图形转移模式。运行前可先用“生成结构预览”检查掩膜、膜层和基底的相对位置。</div>}
           </div> : project.geometry.kind === 'gds' ? <div className="field-grid one-column geometry-fields gds-fields">
             <div className="gds-file-summary"><div><strong>{project.geometry.fileName}</strong><span>{gdsAsset ? `${gdsAsset.structures.length} 个结构单元 · ${gdsAvailableLayers.length} 个图层` : '正在读取布局…'}</span></div>
               <details><summary>文件与坐标信息</summary><div className="gds-file-details"><span>SHA-256：{project.geometry.assetId}</span>
@@ -1913,6 +2273,7 @@ export default function App() {
                 <span>ViennaPS 将 XY 映射为 {project.dimension === 2 ? 'x/h' : 'x/y'}；3D 图层高度沿 z。</span>
               </div></details>
             </div>
+            <button type="button" className="button primary" disabled={!gdsAsset || loading} onClick={startGdsMaskTransfer}>从此版图建立刻蚀流程…</button>
             <SelectField label="GDS 结构单元" value={project.geometry.structure} options={(gdsAsset?.structures ?? []).map(item => ({ value: item.name, label: item.name }))} onChange={value => {
               if (!gdsAsset) return;
               const ids = gdsLayerIds(gdsAsset, value); const material = materials.find(item => item.name === 'SiO2')?.name ?? materials[0]?.name ?? 'Si';
@@ -2097,19 +2458,19 @@ export default function App() {
               <label className="visibility-option"><input type="checkbox" checked={project.solver.rayTracing?.ignoreFluxBoundaries ?? false} onChange={event => editRayTracing('ignoreFluxBoundaries', event.target.checked)} /><span><strong>忽略通量边界</strong><small>传入 RayTracingParameters.ignoreFluxBoundaries</small></span></label>
             </details>}
             <NumericField label="CPU 线程数" value={project.solver.cpuThreads} min={capabilities?.resourcePolicy?.run?.cpuThreads?.minimum ?? 1} max={capabilities?.resourcePolicy?.run?.cpuThreads?.maximum ?? 1} step="1" disabled={!capabilities?.resourcePolicy?.run?.cpuThreads?.maximum} hint={capabilities?.resourcePolicy?.run?.cpuThreads ? `本机可用上限 ${capabilities.resourcePolicy.run.cpuThreads.maximum} 线程` : '正在读取本机 CPU 上限'} onChange={value => updateProject(previous => ({ ...previous, solver: { ...previous.solver, cpuThreads: Math.trunc(value) } }))} />
-            <NumericField label="运行超时" unit="s" value={project.solver.timeoutSeconds} min={1} max={600} step="1" onChange={value => updateProject(previous => ({ ...previous, solver: { ...previous.solver, timeoutSeconds: Math.trunc(value) } }))} />
+            <NumericField label="运行超时" unit="s" value={project.solver.timeoutSeconds} min={0} max={600} step="1" hint="0 表示不限制运行时长；用户可自行观察是否卡住。" onChange={value => updateProject(previous => ({ ...previous, solver: { ...previous.solver, timeoutSeconds: Math.trunc(value) } }))} />
           </div>
         <section className="panel-section output-settings-panel" aria-label="原生输出设置">
           <div className="section-heading"><div><span className="eyebrow">输出文件</span><h2>结果文件</h2></div></div>
           {project.schemaVersion < 7
-            ? <div className="not-applicable"><strong>扩展项目格式 7</strong><span>升级后可以选择额外的 ViennaPS 原生文件输出；查看器使用的表面快照数据仍会保存。</span><button className="button" onClick={() => setProject(promoteProjectToV7(project))}>升级并设置输出</button></div>
+            ? <div className="not-applicable"><strong>扩展项目格式 7</strong><span>升级后可以选择额外的 ViennaPS Domain 输出。查看器所需的表面网格始终保存。</span><button className="button" onClick={() => setProject(promoteProjectToV7(project))}>升级并设置输出</button></div>
             : <div className="field-grid one-column">
-              <label className="visibility-option"><input aria-label="输出原生表面 VTK" type="checkbox" checked={project.outputSettings?.surfaceMeshVtk ?? false} onChange={event => editOutputSetting('surfaceMeshVtk', event.target.checked)} /><span><strong>原生表面 VTK</strong><small>默认关闭；仅下载表面网格或交给 ParaView 等外部工具时启用，工作台预览使用快照数据</small></span></label>
               <label className="visibility-option"><input aria-label="输出原生 level-set" type="checkbox" checked={project.outputSettings?.levelSets ?? false} onChange={event => editOutputSetting('levelSets', event.target.checked)} /><span><strong>Level-set 数据</strong><small>保存 ViennaPS 每个 level set 的原生 .lvst 文件</small></span></label>
               <label className="visibility-option"><input aria-label="输出 level-set 网格" type="checkbox" checked={project.outputSettings?.levelSetMeshes ?? false} onChange={event => editOutputSetting('levelSetMeshes', event.target.checked)} /><span><strong>Level-set 网格</strong><small>按 level-set 分文件保存原生 VTP 网格</small></span></label>
-              {project.dimension === 3 && <label className="visibility-option"><input aria-label="输出体网格" type="checkbox" checked={project.outputSettings?.volumeMesh ?? false} onChange={event => editOutputSetting('volumeMesh', event.target.checked)} /><span><strong>保留完整体网格 / 截面填充</strong><small>普通表面模式直接显示 ViennaPS 原生表面；启用后保存 VTU 四面体，供线框与填充截面使用</small></span></label>}
+              <label className="visibility-option"><input aria-label="输出原生表面 VTK" type="checkbox" checked={project.outputSettings?.surfaceMeshVtk ?? false} onChange={event => editOutputSetting('surfaceMeshVtk', event.target.checked)} /><span><strong>原生表面 VTK</strong><small>默认关闭；仅下载表面网格或交给 ParaView 等外部工具时启用，工作台预览使用快照数据</small></span></label>
+              {project.dimension === 3 && <label className="visibility-option"><input aria-label="输出体网格" type="checkbox" checked={project.outputSettings?.volumeMesh ?? false} onChange={event => editOutputSetting('volumeMesh', event.target.checked)} /><span><strong>体网格 / 3D 体积预览</strong><small>使用 ViennaPS 原生 VTU 四面体；新建 3D 项目默认启用，会增加结果文件体积</small></span></label>}
               <label className="visibility-option"><input aria-label="输出 ViennaPS 元数据" type="checkbox" checked={project.outputSettings?.nativeMetadata ?? false} onChange={event => editOutputSetting('nativeMetadata', event.target.checked)} /><span><strong>Domain 元数据</strong><small>保留原生键和值；未声明的单位和点/单元关联保持未指定</small></span></label>
-              <div className="inline-note">查看器所需的表面快照数据始终保存；原生文件按需输出，附带 SHA-256、尺寸和 level-set 材料映射，可逐个下载或打包导出。</div>
+              <div className="inline-note">表面网格始终作为查看器结果保存；所选原生文件附带 SHA-256、尺寸和 level-set 材料映射，可逐个下载或打包导出。</div>
             </div>}
         </section>
         </section></SettingsPanel>}
@@ -2190,7 +2551,7 @@ export default function App() {
         </div>
                   {!!selectedSnapshot?.outputs?.length && <details className="solver-advanced native-artifact-list" onToggle={event => { if (event.currentTarget.open && selectedSnapshot?.outputs?.[0]) setSelection({ kind: 'artifact', key: selectedSnapshot.outputs[0].fileName }); }}><summary>ViennaPS 原生输出 · {selectedSnapshot.outputs.length} 个文件</summary>
             {selectedSnapshot.outputs.map(artifact => <div className="native-artifact-row" key={`${artifact.fileName}:${artifact.sha256}`}>
-              <span><strong>{artifact.kind === 'surfaceMesh' && artifact.association?.startsWith('closed ') ? '闭合材料壳面' : ({ surfaceMesh: '表面网格', levelSet: 'Level-set 数据', levelSetMesh: 'Level-set 网格', volumeMesh: '体网格', nativeMetadata: 'Domain 元数据' } as Record<string, string>)[artifact.kind] ?? artifact.kind}</strong>
+              <span><strong>{({ surfaceMesh: '表面网格', levelSet: 'Level-set 数据', levelSetMesh: 'Level-set 网格', volumeMesh: '体网格', nativeMetadata: 'Domain 元数据' } as Record<string, string>)[artifact.kind] ?? artifact.kind}</strong>
                 <small>{artifact.levelSetIndex !== undefined ? `Level-set ${artifact.levelSetIndex} · 材料 ID ${artifact.materialId} · ` : ''}{artifact.format} · {(artifact.sizeBytes / 1024).toFixed(1)} KiB</small></span>
               <a className="button" href={artifact.url} download={artifact.fileName.split('/').at(-1)} aria-label={`下载原生输出 ${artifact.fileName}`}>下载</a>
             </div>)}

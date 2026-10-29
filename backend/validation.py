@@ -311,10 +311,27 @@ def _validate_materials(project: ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 |
             add(layer["material"], role, f"geometry.layers[{i}].material")
     else:
         add(g["substrateMaterial"],"bulk","geometry.substrateMaterial")
+        if g["kind"] == "stack" and g.get("gdsMask"):
+            mask = g["gdsMask"]
+            try:
+                from . import storage
+                from .gds import GdsFormatError, parse_gds
+                library = parse_gds(storage.resolve_gds_asset(mask["assetId"]).read_bytes())
+                if (int(mask["layer"]), int(mask["datatype"])) not in set(library.effective_layer_datatypes(mask["structure"])):
+                    issues.append(FieldIssue("geometry.gdsMask", "selected GDS layer/datatype pair is not present in the selected structure"))
+                elif (any(row.get("source") == "gds-mask" for row in g["layers"])
+                      and (int(mask["layer"]), int(mask["datatype"])) not in set(library.effective_mask_layer_datatypes(mask["structure"]))):
+                    issues.append(FieldIssue("geometry.gdsMask", "selected GDS layer/datatype pair contains no closed boundary polygons and cannot be used as a mask"))
+            except (OSError, GdsFormatError, KeyError, ValueError) as exc:
+                issues.append(FieldIssue("geometry.gdsMask", f"GDS mask asset or structure is invalid: {exc}"))
+            add(mask["material"], "mask" if mask["protectsEtch"] and uniform_protection else "film", "geometry.gdsMask.material")
     if g["kind"] in ("trench","hole","fin"):
         if g.get("maskHeight",0)>0: add(g.get("maskMaterial","Mask"),"mask" if uniform_protection else "film","geometry.maskMaterial")
     if g["kind"]=="stack":
-        for i,layer in enumerate(g["layers"]): add(layer["material"],layer["role"] if uniform_protection else "film",f"geometry.layers[{i}].material")
+        for i,layer in enumerate(g["layers"]):
+            if layer.get("source") == "gds-mask":
+                continue
+            add(layer["material"],layer["role"] if uniform_protection else "film",f"geometry.layers[{i}].material")
     for i,step in enumerate(project.steps):
         if is_geometry_step(step) and step_value(step,"model")=="removeMaterial" and step_value(step,"material") not in names:
             issues.append(FieldIssue(f"steps[{i}].material",f"unknown or unavailable material {step_value(step,'material')!r}"))
@@ -371,6 +388,8 @@ def _geometry_material_names(geometry: dict[str, Any]) -> set[str]:
         names.add(str(geometry.get("substrateMaterial", "")))
         if kind == "stack":
             names.update(str(row["material"]) for row in geometry.get("layers", []))
+            if geometry.get("gdsMask"):
+                names.add(str(geometry["gdsMask"].get("material", "Mask")))
         if kind in {"trench", "hole", "fin"} and float(geometry.get("maskHeight", 0)) > 0:
             names.add(str(geometry.get("maskMaterial", "Mask")))
     names.discard("")
@@ -394,6 +413,9 @@ def gpu_project_signature(project: dict[str, Any], step: dict[str, Any]) -> dict
         if kind == "stack":
             for layer in geometry.get("layers", []):
                 add_role(layer.get("material"), str(layer.get("role", "film")))
+            if geometry.get("gdsMask"):
+                mask = geometry["gdsMask"]
+                add_role(mask.get("material"), "mask" if mask.get("protectsEtch") else "film")
         elif kind in {"trench", "hole", "fin"} and float(geometry.get("maskHeight", 0)) > 0:
             add_role(geometry.get("maskMaterial", "Mask"), "mask")
     parameters = step.get("nativeParameters", {}) or {}
@@ -582,7 +604,7 @@ def _validate_v3_geometry(project: ProjectV3) -> list[FieldIssue]:
         for i,layer in enumerate(g["layers"]):
             feature(layer["thickness"],f"geometry.layers[{i}].thickness")
         pattern=g["pattern"]
-        if pattern["kind"]=="none": return out
+        if pattern["kind"] in ("none", "gds"): return out
         if pattern["kind"]=="hole" and project.dimension==2:
             return out+[FieldIssue("geometry.pattern.kind","2D stacks do not support hole patterns")]
         size=pattern["width"] if pattern["kind"]=="trench" else 2*pattern["radius"]

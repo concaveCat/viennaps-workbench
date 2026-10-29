@@ -164,8 +164,10 @@ class Stage5Acceptance(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response[0], 201, response[2].decode("utf-8", errors="replace"))
         metadata = json_body(response)
         self.assertEqual(metadata["structures"], [
-            {"name": "CELL_A", "layers": [1], "references": []},
-            {"name": "CELL_B", "layers": [2], "references": []},
+            {"name": "CELL_A", "layers": [1], "layerDatatypes": [[1, 0]],
+             "maskLayerDatatypes": [[1, 0]], "references": []},
+            {"name": "CELL_B", "layers": [2], "layerDatatypes": [[2, 0]],
+             "maskLayerDatatypes": [[2, 0]], "references": []},
         ])
         self.assertEqual(metadata["assetId"], hashlib.sha256(FIXTURE.read_bytes()).hexdigest())
         return metadata["assetId"], metadata
@@ -349,9 +351,12 @@ class Stage5Acceptance(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(upload[0], 201, upload[2].decode("utf-8", errors="replace"))
         metadata = json_body(upload)
         self.assertEqual(metadata["structures"], [
-            {"name": "LEAF_A", "layers": [3], "references": []},
-            {"name": "UNRELATED", "layers": [3], "references": []},
-            {"name": "TOP", "layers": [], "references": ["LEAF_A"]},
+            {"name": "LEAF_A", "layers": [3], "layerDatatypes": [[3, 0]],
+             "maskLayerDatatypes": [[3, 0]], "references": []},
+            {"name": "UNRELATED", "layers": [3], "layerDatatypes": [[3, 0]],
+             "maskLayerDatatypes": [[3, 0]], "references": []},
+            {"name": "TOP", "layers": [], "layerDatatypes": [],
+             "maskLayerDatatypes": [], "references": ["LEAF_A"]},
         ])
         asset_id = metadata["assetId"]
         geometry = {"kind": "gds", "assetId": asset_id, "fileName": source.name,

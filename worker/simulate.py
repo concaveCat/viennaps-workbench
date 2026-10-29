@@ -30,6 +30,8 @@ from backend.rates import has_motion, is_geometry_step, uses_flux, signed_rates,
 from backend.models import normalized_geometry_v3, parse_project, project_structure_hash
 from backend.validation import fin_construction_decision
 from backend.gpu_devices import cuda_devices, resolve_gpu_device
+from worker.gds_mask import CONSTRUCTION as GDS_MASK_CONSTRUCTION
+from worker.gds_mask import build_aligned_gds_layer, build_aligned_gds_mask
 from worker.specialized import build_specialized_model
 MATERIAL_CATALOG = json.loads((ROOT / "docs" / "materials-catalog.json").read_text(encoding="utf-8"))
 MATERIAL_ROWS = MATERIAL_CATALOG["materials"]
@@ -971,9 +973,14 @@ def _stack_geometry(ps: Any, domain: Any, project: dict[str, Any]) -> None:
     height=float(g.get("baseHeight",0.0))
     for index,layer in enumerate(g["layers"]):
         height += float(layer["thickness"])
+        # A source-backed GDS mask is listed as a real top stack layer for
+        # editing and material bookkeeping, but its 3D shape is inserted from
+        # the selected GDS polygons below. Do not also create a full-area slab.
+        if layer.get("source") == "gds-mask":
+            continue
         ps.MakePlane(domain,height=height,material=material_handle(ps,layer["material"]),addToExisting=True).apply()
     pattern=g["pattern"]
-    if pattern["kind"]=="none": return
+    if pattern["kind"] in {"none", "gds"}: return
     top=g["layers"][-1]; top_thickness=float(top["thickness"])
     eps=float(project["domain"]["gridDelta"])*1e-3
     factory=ps.GeometryFactory(domain.getSetup(),"WorkbenchStackPattern")
@@ -985,6 +992,74 @@ def _stack_geometry(ps: Any, domain: Any, project: dict[str, Any]) -> None:
     else:
         stencil=factory.makeCylinderStencil(pos,float(pattern["radius"]),top_thickness+2*eps,angle)
     domain.applyBooleanOperation(stencil,ps.ls.BooleanOperationEnum.RELATIVE_COMPLEMENT,False)
+
+
+def _apply_gds_stack_mask(ps: Any, domain: Any, project: dict[str, Any], *,
+                          config: dict[str, Any] | None, run_dir: Path | None) -> dict[str, Any]:
+    """Insert one selected GDS layer/datatype as a mask over a 3D film stack."""
+    from backend.gds import parse_gds
+    mask = project["geometry"]["gdsMask"]
+    if config is None or run_dir is None:
+        raise RuntimeError("GDS mask transfer requires an isolated run input and artifact directory")
+    source = Path(config.get("gdsAssetPath", "")).resolve()
+    try:
+        source.relative_to(run_dir.resolve())
+    except ValueError as exc:
+        raise RuntimeError("GDS mask asset copy must remain inside the current run directory") from exc
+    if not source.is_file() or file_sha256(source) != mask["assetId"]:
+        raise RuntimeError("GDS mask asset is missing or does not match its SHA-256 reference")
+    library = parse_gds(source.read_bytes())
+    physical_scale = library.meters_per_database_unit / library.user_units_per_database_unit * 1_000_000
+    effective_scale = physical_scale * float(mask["unitScale"])
+    selected_bytes, transform = library.select_and_transform(
+        mask["structure"], unit_scale=effective_scale, position_um=mask["position"][:2],
+        selected_layers=[int(mask["layer"])],
+        selected_layer_datatypes=[(int(mask["layer"]), int(mask["datatype"]))])
+    filtered = run_dir / "gds-mask-selected.gds"
+    filtered.write_bytes(selected_bytes)
+    # Build the selected layout as a 2D material region first, then extrude it
+    # through the requested mask thickness along z.  GDSGeometry's native 3D
+    # layerToLevelSet is bounded by the current Domain top surface, so a mask
+    # positioned above an existing film stack silently disappears.  The 2D
+    # conversion plus ViennaLS Extrude preserves XY polygons and allows a real
+    # finite mask volume above the stack.
+    geometry = ps.d2.GDSGeometry(float(project["domain"]["gridDelta"]))
+    # The intermediate geometry only carries the selected polygons.  Its lateral
+    # boundaries are decoupled from the final simulation domain: regridding onto
+    # the real grid happens in build_aligned_gds_mask().
+    reflective = ps.BoundaryType.REFLECTIVE_BOUNDARY
+    geometry.setBoundaryConditions([reflective, reflective])
+    ps.d2.GDSReader(geometry, str(filtered)).apply()
+    layers = sorted(int(value) for value in geometry.getAllLayers())
+    if int(mask["layer"]) not in layers:
+        raise RuntimeError("selected GDS layer was not read by ViennaPS")
+    base_height = float(mask["baseHeight"]) + float(mask["position"][2])
+    planar_inside = geometry.layerToLevelSet(int(mask["layer"]), True)
+    aligned_mask, diagnostics = build_aligned_gds_mask(
+        ps, domain, planar_inside, base_height=base_height,
+        height=float(mask["height"]), retained_region=mask["retainedRegion"])
+    # The regridded mask is a complete finite body on the simulation grid, so it
+    # is unioned into the existing top level set (Si ∪ SiO₂ ∪ Mask) instead of
+    # replacing it.
+    domain.insertNextLevelSetAsMaterial(aligned_mask, material_handle(ps, mask["material"]), True)
+    transform.update({"selectedLayers": [int(mask["layer"])],
+                      "selectedLayerDatatypes": [[int(mask["layer"]), int(mask["datatype"])]],
+                      "selectedNativeLayers": [int(mask["layer"])],
+                      "dimension": 3, "layer": int(mask["layer"]), "datatype": int(mask["datatype"]),
+                      "retainedRegion": mask["retainedRegion"], "protectsEtch": bool(mask["protectsEtch"]),
+                      "baseHeight": base_height, "height": float(mask["height"]),
+                      "topHeight": base_height + float(mask["height"]),
+                      "extrusionAxis": 2,
+                      "material": mask["material"], "filteredFile": filtered.name,
+                      **diagnostics})
+    atomic_json(run_dir / "gds-mask-transform.json", transform)
+    native_geometry = ("viennaps.d2.GDSReader + GDSGeometry.layerToLevelSet + viennals.Extrude"
+                       " + viennals.BooleanOperation(INTERSECT,RELATIVE_COMPLEMENT)"
+                       " + viennals.ToSurfaceMesh + viennals.FromSurfaceMesh"
+                       " + viennals.BooleanOperation(RELATIVE_COMPLEMENT)"
+                       " + Domain.insertNextLevelSetAsMaterial(UNION)"
+                       f" [{GDS_MASK_CONSTRUCTION}]")
+    return {"nativeGeometry": native_geometry, **transform}
 
 
 def _boolean_fin_2d(ps: Any, domain: Any, geometry: dict[str, Any], material: Any,
@@ -1034,7 +1109,8 @@ def make_v3_geometry(ps: Any, domain: Any, project: dict[str,Any], *, config: di
         # its top interface, and subsequent planes add requested films.
         ps.MakePlane(domain,height=float(g.get("baseHeight",0.0)),material=material_handle(ps,g["substrateMaterial"]),addToExisting=False).apply()
         _stack_geometry(ps,domain,project)
-        return None
+        mask_readback = _apply_gds_stack_mask(ps, domain, project, config=config, run_dir=run_dir) if g.get("gdsMask") else None
+        return {"stack": True, "gdsMask": mask_readback} if mask_readback else None
     if g["kind"]=="fin":
         construction_decision = fin_construction_decision(project)
         construction = construction_decision["effective"]
@@ -1207,7 +1283,9 @@ def make_v3_geometry(ps: Any, domain: Any, project: dict[str,Any], *, config: di
                 raise RuntimeError(f"native GDS layer readback {selected_native_layers} differs from selected layers {sorted(selected_layers)}")
             for mapping in g["layers"]:
                 level_set = geometry.layerToLevelSet(int(mapping["layer"]), True)
-                domain.insertNextLevelSetAsMaterial(level_set, material_handle(ps, mapping["material"]), False)
+                # All GDS layers share this native grid; cumulative wrapping keeps
+                # LS_n = LS_(n-1) union layer_n instead of replacing lower layers.
+                domain.insertNextLevelSetAsMaterial(level_set, material_handle(ps, mapping["material"]), True)
         else:
             geometry = ps.d3.GDSGeometry(float(project["domain"]["gridDelta"]))
             lateral = ps.BoundaryType.REFLECTIVE_BOUNDARY if project["domain"]["boundaryXY"] == "reflective" else ps.BoundaryType.PERIODIC_BOUNDARY
@@ -1224,15 +1302,33 @@ def make_v3_geometry(ps: Any, domain: Any, project: dict[str,Any], *, config: di
             selected_native_layers = sorted(set(actual_layers) & set(selected_layers))
             if selected_native_layers != sorted(selected_layers):
                 raise RuntimeError(f"native GDS layer readback {selected_native_layers} differs from selected layers {sorted(selected_layers)}")
+            # The installed 3D layerToLevelSet follows the GDS library grid and
+            # returns an empty body for some valid base/height pairs.  Read the
+            # polygon interior with the 2D API once, then build every layer with
+            # explicit caps and the simulation boundary conditions.
+            planar_geometry = ps.d2.GDSGeometry(float(project["domain"]["gridDelta"]))
+            planar_geometry.setBoundaryConditions([lateral, lateral])
+            ps.d2.GDSReader(planar_geometry, str(selected_path)).apply()
+            layer_constructions = []
             for mapping in g["layers"]:
                 base_height = float(mapping["baseHeight"]) + float(g["position"][2])
-                level_set = geometry.layerToLevelSet(int(mapping["layer"]), base_height, float(mapping["height"]),
-                                                     bool(mapping.get("mask", False)), True)
-                domain.insertNextLevelSetAsMaterial(level_set, material_handle(ps, mapping["material"]), False)
+                planar = planar_geometry.layerToLevelSet(int(mapping["layer"]), True)
+                aligned, diagnostics = build_aligned_gds_layer(
+                    ps, domain, planar, base_height=base_height,
+                    height=float(mapping["height"]), mask_tone=bool(mapping.get("mask", False)))
+                domain.insertNextLevelSetAsMaterial(
+                    aligned, material_handle(ps, mapping["material"]), True)
+                layer_constructions.append({
+                    "layer": int(mapping["layer"]), "material": mapping["material"],
+                    "baseHeight": base_height, "height": float(mapping["height"]),
+                    "maskTone": bool(mapping.get("mask", False)), **diagnostics})
         transform.update({"sourceAssetId":g["assetId"],"selectedStructure":g["structure"],
                           "selectedLayers":selected_layers,"nativeLayers":actual_layers,
                           "selectedNativeLayers":selected_native_layers,
                           **support_metadata,
+                          **({"layerConstructions": layer_constructions,
+                              "construction": GDS_MASK_CONSTRUCTION}
+                             if project["dimension"] == 3 else {}),
                           "supportLayers":sorted(set(actual_layers) - set(selected_layers)),
                           "nativeUserUnitUm":physical_scale,"userUnitScaleAdjustment":float(g["unitScale"]),
                           "nativeBounds":[float(value) for value in geometry.getBounds()],
@@ -1241,8 +1337,13 @@ def make_v3_geometry(ps: Any, domain: Any, project: dict[str,Any], *, config: di
                           "layerMappings":g["layers"],"filteredFile":"gds-selected.gds",
                           "filteredFileSha256":hashlib.sha256(selected_bytes).hexdigest()})
         atomic_json(run_dir / "gds-transform.json", transform)
-        return {"nativeGeometry":"viennaps.GDSReader + GDSGeometry.layerToLevelSet",
-                **transform}
+        native_geometry = ("viennaps.GDSReader + GDSGeometry.layerToLevelSet"
+                           if project["dimension"] == 2 else
+                           "viennaps.d2.GDSReader + GDSGeometry.layerToLevelSet + viennals.Extrude"
+                           " + viennals.BooleanOperation(INTERSECT,RELATIVE_COMPLEMENT)"
+                           " + viennals.ToSurfaceMesh + viennals.FromSurfaceMesh"
+                           f" + Domain.insertNextLevelSetAsMaterial(UNION) [{GDS_MASK_CONSTRUCTION}]")
+        return {"nativeGeometry": native_geometry, **transform}
     if g["kind"]=="plane":
         ps.MakePlane(domain,height=float(g["height"]),material=material_handle(ps,g["substrateMaterial"]),addToExisting=False).apply()
     elif g["kind"]=="trench":
@@ -1259,7 +1360,10 @@ def protected_material_names(project: dict[str,Any], step: dict[str,Any] | None 
     if g["kind"] in ("trench","hole") and float(g.get("maskHeight",0))>0:
         return [g.get("maskMaterial","Mask")]
     if g["kind"]=="stack":
-        return list(dict.fromkeys(layer["material"] for layer in g["layers"] if layer["role"]=="mask"))
+        values = [layer["material"] for layer in g["layers"] if layer["role"]=="mask"]
+        if g.get("gdsMask", {}).get("protectsEtch"):
+            values.append(g["gdsMask"]["material"])
+        return list(dict.fromkeys(values))
     if g["kind"]=="gds":
         return list(dict.fromkeys(layer["material"] for layer in g["layers"] if layer.get("mask", False)))
     return []

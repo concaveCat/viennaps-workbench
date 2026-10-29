@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sys
 from importlib.metadata import version
 from pathlib import Path
@@ -25,11 +26,13 @@ def main() -> None:
         raise RuntimeError("GDS source does not match the requested SHA-256")
     library = parse_gds(raw)
     selected_layers = [int(value) for value in config["selectedLayers"]]
+    selected_layer_datatypes = config.get("selectedLayerDatatypes")
     native_um = library.meters_per_database_unit / library.user_units_per_database_unit * 1_000_000
     effective_scale = native_um * float(config["unitScale"])
     selected, transform = library.select_and_transform(
         config["structure"], unit_scale=effective_scale,
-        position_um=config["position"], selected_layers=selected_layers)
+        position_um=config["position"], selected_layers=selected_layers,
+        selected_layer_datatypes=selected_layer_datatypes)
     filtered_path = output_path.parent / "selected.gds"
     filtered_path.write_bytes(selected)
 
@@ -79,10 +82,11 @@ def main() -> None:
         geometry = ps.d2.GDSGeometry(delta)
         geometry.setBoundaryConditions([boundary, ps.BoundaryType.INFINITE_BOUNDARY])
         ps.d2.GDSReader(geometry, str(filtered_path)).apply()
-        native_bounds = [float(value) for value in geometry.getBounds()]
+        native_bounds_raw = [float(value) for value in geometry.getBounds()]
+        native_bounds = [value if math.isfinite(value) else None for value in native_bounds_raw]
         tolerance = max(1e-7, float(periodic_support.get("coordinateToleranceUm", 0.0)) * 1.1)
-        if periodic_support and (abs(native_bounds[0] + float(config["xExtent"]) / 2.0) > tolerance
-                                 or abs(native_bounds[1] - float(config["xExtent"]) / 2.0) > tolerance):
+        if periodic_support and (abs(native_bounds_raw[0] + float(config["xExtent"]) / 2.0) > tolerance
+                                 or abs(native_bounds_raw[1] - float(config["xExtent"]) / 2.0) > tolerance):
             raise RuntimeError("native periodic 2D GDS bounds do not match the requested x period")
         native_layers = sorted(int(value) for value in geometry.getAllLayers())
         level_sets = {str(layer): int(geometry.layerToLevelSet(layer, True).getNumberOfPoints()) for layer in selected_layers}
@@ -90,12 +94,13 @@ def main() -> None:
         geometry = ps.d3.GDSGeometry(delta)
         geometry.setBoundaryConditions([boundary, boundary, ps.BoundaryType.INFINITE_BOUNDARY])
         ps.d3.GDSReader(geometry, str(filtered_path)).apply()
-        native_bounds = [float(value) for value in geometry.getBounds()]
+        native_bounds_raw = [float(value) for value in geometry.getBounds()]
+        native_bounds = [value if math.isfinite(value) else None for value in native_bounds_raw]
         tolerance = max(1e-7, float(periodic_support.get("coordinateToleranceUm", 0.0)) * 1.1)
-        if periodic_support and (abs(native_bounds[0] + float(config["xExtent"]) / 2.0) > tolerance
-                                 or abs(native_bounds[1] - float(config["xExtent"]) / 2.0) > tolerance
-                                 or abs(native_bounds[2] + float(config["yExtent"]) / 2.0) > tolerance
-                                 or abs(native_bounds[3] - float(config["yExtent"]) / 2.0) > tolerance):
+        if periodic_support and (abs(native_bounds_raw[0] + float(config["xExtent"]) / 2.0) > tolerance
+                                 or abs(native_bounds_raw[1] - float(config["xExtent"]) / 2.0) > tolerance
+                                 or abs(native_bounds_raw[2] + float(config["yExtent"]) / 2.0) > tolerance
+                                 or abs(native_bounds_raw[3] - float(config["yExtent"]) / 2.0) > tolerance):
             raise RuntimeError("native periodic 3D GDS bounds do not match the requested XY periods")
         native_layers = sorted(int(value) for value in geometry.getAllLayers())
         level_sets = {}
@@ -117,7 +122,7 @@ def main() -> None:
         "selectedNativeLayers": selected_native_layers,
         "supportLayers": support_layers,
         "nativeStructureCount": int(geometry.getNumberOfStructures()),
-        "nativeBounds": [float(value) for value in geometry.getBounds()],
+        "nativeBounds": native_bounds,
         **periodic_support,
         "gridDelta": delta,
         "dimension": dimension,

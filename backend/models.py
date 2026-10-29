@@ -119,7 +119,7 @@ class Solver(StrictModel):
     cpuThreads: Annotated[Integer, Field(ge=1)]
     random: RandomSettings
     enginePreference: Literal["auto", "cpu", "gpu"]
-    timeoutSeconds: Annotated[Integer, Field(ge=1, le=600)]
+    timeoutSeconds: Annotated[Integer, Field(ge=0, le=600)] = 0
 
     @field_validator("cpuThreads")
     @classmethod
@@ -361,6 +361,7 @@ class StackLayer(StrictModel):
     material: str
     thickness: Annotated[Number, Field(gt=0)]
     role: Literal["film", "mask"]
+    source: Literal["gds-mask"] | None = None
 
 class StackPattern(StrictModel):
     kind: Literal["none", "trench", "hole"]
@@ -370,9 +371,9 @@ class StackPattern(StrictModel):
 
     @model_validator(mode="after")
     def pattern_shape(self):
-        expected={"kind"} if self.kind=="none" else {"kind","width","taperAngle"} if self.kind=="trench" else {"kind","radius","taperAngle"}
+        expected={"kind"} if self.kind in {"none", "gds"} else {"kind","width","taperAngle"} if self.kind=="trench" else {"kind","radius","taperAngle"}
         if self.model_fields_set!=expected:
-            if self.kind == "none": raise ValueError("none pattern has no dimensions")
+            if self.kind in {"none", "gds"}: raise ValueError(f"{self.kind} pattern has no dimensions")
             if self.kind == "trench": raise ValueError("trench pattern requires exactly width and taperAngle")
             raise ValueError("hole pattern requires exactly radius and taperAngle")
         if self.kind == "trench" and (self.width is None or self.taperAngle is None):
@@ -380,6 +381,9 @@ class StackPattern(StrictModel):
         if self.kind == "hole" and (self.radius is None or self.taperAngle is None):
             raise ValueError("hole pattern requires radius and taperAngle")
         return self
+
+class StackPatternV7(StackPattern):
+    kind: Literal["none", "trench", "hole", "gds"]
 
 class StackV3(StrictModel):
     kind: Literal["stack"]
@@ -395,6 +399,11 @@ class StackV3(StrictModel):
         if self.pattern.kind != "none" and (not self.layers or self.layers[-1].role != "mask"):
             raise ValueError("an opening requires the top layer to have role=mask")
         if not self.layers and self.pattern.kind != "none": raise ValueError("an empty stack only allows pattern none")
+        gds_layers = [index for index, layer in enumerate(self.layers) if layer.source == "gds-mask"]
+        if len(gds_layers) > 1 or (gds_layers and (gds_layers[0] != len(self.layers) - 1 or self.pattern.kind != "gds")):
+            raise ValueError("a GDS mask must be the unique top layer with top pattern gds")
+        if self.pattern.kind == "gds" and not gds_layers:
+            raise ValueError("top pattern gds requires a GDS mask layer")
         return self
 
 GeometryV3 = Annotated[Union[PlaneV3,TrenchV3,HoleV3,StackV3], Field(discriminator="kind")]
@@ -432,6 +441,28 @@ class GDSLayerV7(StrictModel):
     mask: bool | None = None
 
 
+class GDSMaskPatternV7(StrictModel):
+    """A GDS polygon layer used as a physical mask over an existing 3D stack."""
+    name: Annotated[str, Field(min_length=1, max_length=80)] = "GDS Mask"
+    assetId: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+    fileName: Annotated[str, Field(min_length=1, max_length=255, pattern=r"^[^/\\]+$")]
+    structure: Annotated[str, Field(min_length=1, max_length=512)]
+    layer: Annotated[Integer, Field(ge=0, le=65535)]
+    datatype: Annotated[Integer, Field(ge=0, le=32767)] = 0
+    unitScale: Annotated[Number, Field(gt=0, le=1000000)] = 1
+    position: Vector3 = [0, 0, 0]
+    baseHeight: Number = 1.2
+    height: Annotated[Number, Field(gt=0)] = 0.3
+    material: str = "Mask"
+    retainedRegion: Literal["inside", "outside"] = "inside"
+    protectsEtch: bool = True
+
+
+class StackV7(StackV3):
+    pattern: StackPatternV7
+    gdsMask: GDSMaskPatternV7 | None = None
+
+
 class GDSGeometryV7(StrictModel):
     kind: Literal["gds"]
     assetId: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
@@ -449,7 +480,7 @@ class GDSGeometryV7(StrictModel):
         return self
 
 
-GeometryV7 = Annotated[Union[PlaneV3,TrenchV3,HoleV3,StackV3,FinGeometryV7,GDSGeometryV7], Field(discriminator="kind")]
+GeometryV7 = Annotated[Union[PlaneV3,TrenchV3,HoleV3,StackV7,FinGeometryV7,GDSGeometryV7], Field(discriminator="kind")]
 
 
 def normalized_geometry_v3(project: object) -> dict:
@@ -814,7 +845,7 @@ class ProjectV6(StrictModel):
 
 
 class OutputSettingsV7(StrictModel):
-    """Optional native result artifacts; viewer snapshots are stored separately as JSON."""
+    """Native result artifacts; the surface mesh remains the viewer's required result."""
 
     levelSets: bool = False
     levelSetMeshes: bool = False
@@ -862,6 +893,23 @@ class ProjectV7(ProjectV6):
                         raise ValueError(f"3D GDS layer mapping {index} height must span at least two grid intervals")
                     if abs(row["baseHeight"] + geometry["position"][2]) / delta > 1_000_000:
                         raise ValueError(f"3D GDS layer mapping {index} base height exceeds the application coordinate budget")
+        elif geometry["kind"] == "stack" and geometry.get("gdsMask") is not None:
+            mask = geometry["gdsMask"]
+            if self.dimension != 3:
+                raise ValueError("GDS mask transfer requires a 3D stack project")
+            gds_layers = [row for row in geometry["layers"] if row.get("source") == "gds-mask"]
+            if gds_layers:
+                layer = gds_layers[0]
+                if geometry["pattern"]["kind"] != "gds":
+                    raise ValueError("a GDS mask layer requires top pattern gds")
+                if layer["name"] != mask["name"] or layer["material"] != mask["material"] or abs(layer["thickness"] - mask["height"]) > 1e-9:
+                    raise ValueError("GDS mask metadata must match its top stack layer")
+            elif geometry["pattern"]["kind"] != "none":
+                raise ValueError("legacy GDS masks cannot be combined with a built-in stack pattern")
+            if mask["height"] < 2 * delta:
+                raise ValueError("GDS mask height must span at least two grid intervals")
+            if abs(mask["baseHeight"] + mask["position"][2]) / delta > 1_000_000:
+                raise ValueError("GDS mask base height exceeds the application coordinate budget")
         if self.dimension == 2 and self.outputSettings is not None and self.outputSettings.volumeMesh:
             raise ValueError("native volume mesh output is only available for 3D projects")
         return self
