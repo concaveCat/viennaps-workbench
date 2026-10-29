@@ -26,7 +26,17 @@ var/listen-port.json
 runtime-patched/
 
 # 验收证据与重构快照（体积大、可重新生成；文件仍保留在工作目录中）
+# 例外：以下能力矩阵是运行时的准入数据，必须随仓库分发。
 docs/*-evidence/
+!docs/stage7-evidence/
+docs/stage7-evidence/*
+!docs/stage7-evidence/capability-matrix.json
+!docs/stage8-evidence/
+docs/stage8-evidence/*
+!docs/stage8-evidence/capability-matrix.json
+!docs/stage9-evidence/
+docs/stage9-evidence/*
+!docs/stage9-evidence/gpu-capability-matrix.json
 docs/refactor-baseline/
 docs/refactor-after/
 
