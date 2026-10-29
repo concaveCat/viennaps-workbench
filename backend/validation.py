@@ -396,6 +396,31 @@ def _geometry_material_names(geometry: dict[str, Any]) -> set[str]:
     return names
 
 
+def _materials_available_by_step(project: Any) -> list[tuple[set[str], set[str]]]:
+    """Return the materials present when each step starts, in execution order.
+
+    The first set is what actually exists: initial geometry materials plus the
+    ``depositMaterial`` of **enabled** earlier deposition steps, mirroring the
+    worker's ``duplicateTopLevelSet``. The second set is the same chain with
+    disabled depositions included; a disabled step is an inactive draft, so its
+    tables must not invalidate a project that is saved or previewed before the
+    step (and its predecessors) are switched on.
+    """
+    initial = _geometry_material_names(project.geometry)
+    executed = set(initial)
+    planned = set(initial)
+    per_step: list[tuple[set[str], set[str]]] = []
+    for step in project.steps:
+        per_step.append((set(executed), set(planned)))
+        if step_value(step, "operation") == "deposit":
+            name = step_value(step, "depositMaterial")
+            if isinstance(name, str) and name:
+                planned.add(name)
+                if step_value(step, "enabled"):
+                    executed.add(name)
+    return per_step
+
+
 def gpu_project_signature(project: dict[str, Any], step: dict[str, Any]) -> dict[str, Any]:
     """Return the geometry/material scope represented by a GPU evidence row."""
     geometry = project.get("geometry", {})
@@ -487,12 +512,19 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
     except (OSError, ValueError, KeyError, TypeError):
         pass
     geometry_names = _geometry_material_names(project.geometry)
+    available_by_step = _materials_available_by_step(project)
     for index, step in enumerate(project.steps):
         if step.model != "specialized":
             continue
         spec = model_spec(step.nativeModel)
         if spec is None:
             continue
+        # Material tables describe the stack the process sees: the initial
+        # geometry plus everything earlier enabled deposition steps added.
+        # A disabled draft step is checked against the same chain with disabled
+        # depositions included so previews and saved drafts stay valid.
+        executed_names, planned_names = available_by_step[index]
+        available_names = executed_names if step.enabled else planned_names
         prefix = f"steps[{index}].nativeParameters"
         params = step.nativeParameters
         for field in spec["fields"]:
@@ -517,8 +549,8 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
                     continue
                 if not isinstance(value, str) or value not in material_names:
                     issues.append(FieldIssue(path, f"must name a material from the installed catalog: {value!r}"))
-                elif kind == "material" and value not in geometry_names and step.nativeModel not in {"selectiveEpitaxy"}:
-                    issues.append(FieldIssue(path, f"material {value!r} is not present in the initial geometry"))
+                elif kind == "material" and value not in available_names and step.nativeModel not in {"selectiveEpitaxy"}:
+                    issues.append(FieldIssue(path, f"material {value!r} is not present in the geometry available at this step"))
             elif kind == "text":
                 if not isinstance(value, str) or not value or len(value) > 80 or any(ord(char) < 32 for char in value):
                     issues.append(FieldIssue(path, "must be nonempty text of at most 80 printable characters"))
@@ -548,19 +580,21 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
 
         if step.nativeModel in {"wetEtch", "selectiveEpitaxy"}:
             table = params.get("materialRates", {})
-            required = geometry_names if step.nativeModel == "wetEtch" else {"Si", "SiGe"}
+            required = available_names if step.nativeModel == "wetEtch" else {"Si", "SiGe"}
             if set(table) != required:
                 issues.append(FieldIssue(f"{prefix}.materialRates", f"must explicitly configure exactly these native material rates: {sorted(required)}"))
             if step.nativeModel == "selectiveEpitaxy" and isinstance(table, dict) and float(table.get("SiGe", 0.0)) <= 0.0:
                 issues.append(FieldIssue(f"{prefix}.materialRates.SiGe", "must be positive so the native top material is recognized as an epitaxy material"))
         if step.nativeModel == "fluorocarbon":
-            required = geometry_names | {"Polymer", "Mask"}
+            required = available_names | {"Polymer", "Mask"}
             if set(params.get("materialParametersByMaterial", {})) != required:
-                issues.append(FieldIssue(f"{prefix}.materialParametersByMaterial", f"native FluorocarbonEtching requires a parameter row for every geometry material and Polymer: {sorted(required)}"))
+                issues.append(FieldIssue(f"{prefix}.materialParametersByMaterial", f"native FluorocarbonEtching requires a parameter row for every material present at this step and Polymer: {sorted(required)}"))
         if step.nativeModel == "ionBeam":
             table = params.get("materialPlaneWaferRateByMaterial", {})
-            if isinstance(table, dict) and set(table) - geometry_names:
-                issues.append(FieldIssue(f"{prefix}.materialPlaneWaferRateByMaterial", "may only reference materials present in the initial geometry"))
+            if isinstance(table, dict):
+                unavailable = sorted(set(table) - available_names)
+                if unavailable:
+                    issues.append(FieldIssue(f"{prefix}.materialPlaneWaferRateByMaterial", f"may only reference materials available at this step (initial geometry plus earlier enabled deposition steps); not present: {unavailable}"))
         if step.nativeModel in {"sf6o2", "cf4o2", "hbro2", "sf6c4f8"} and geometry_names & custom_names:
             issues.append(FieldIssue(f"steps[{index}].nativeModel", "the installed built-in plasma model has no verified parameters for custom materials"))
         if step.nativeModel == "oxideRegrowth" and not {"SiO2", "Si3N4"}.issubset(geometry_names):
