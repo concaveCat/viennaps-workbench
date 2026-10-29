@@ -88,7 +88,8 @@ Requests with a non-local Host or a cross-origin Origin are rejected. There is n
 CORS allowance. JSON project, replay, and run request bodies have no fixed
 byte-size cap. Run creation snapshots the normalized body into the run directory
 before returning; later edits cannot change it. GDS uploads retain a 64 MiB cap,
-and continuation packages retain a 512 MiB expanded archive cap.
+and continuation packages retain the effective artifact/archive cap
+(`WORKBENCH_MAX_ARTIFACT_MIB`, default 4096 MiB).
 
 ### Health and capabilities
 
@@ -101,7 +102,11 @@ import ViennaPS or initialize CUDA.
 ```
 
 `GET /api/capabilities` returns the versioned `docs/capabilities.json` and
-`docs/resource-policy.json` content. This host has verified 2D single-particle
+`docs/resource-policy.json` content. The resource policy is updated in place
+with the effective runtime limits; an additive `runtimeLimits` object reports
+`artifactLimitBytes`, `artifactLimitMiB`, the `WORKBENCH_*` environment
+variables, defaults, minimums (`maxMiB: null` means no upper bound), and whether
+each value came from `env` or `default`. This host has verified 2D single-particle
 GPU_DISK etch and deposition. `auto` maps to CPU_DISK; explicit GPU preference maps
 to GPU_DISK and never silently falls back. Other GPU flux engines are not exposed.
 
@@ -171,7 +176,8 @@ envelope.
 containing the project and replay project, manifest, combined run log, and each
 independently saved VTK/JSON snapshot.
 The service includes only an explicit file allowlist and refuses an archive over
-512 MiB; it does not stage a second complete archive on disk.
+the effective artifact cap (`WORKBENCH_MAX_ARTIFACT_MIB`, default 4096 MiB); it
+does not stage a second complete archive on disk.
 
 ## Error handling and lifecycle states
 

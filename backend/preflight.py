@@ -1,10 +1,11 @@
 """Conservative artifact-footprint preflight for a normalized project.
 
-The supervisor enforces a hard 512 MiB cap on one run directory
-(``backend.supervisor.ARTIFACT_LIMIT`` / ``backend.storage.check_artifact_budget``).
-A long run that only reaches that cap while its final snapshot is materialized
-is expensive to discover: the user waits for the simulation and then gets a 413
-from the download route or a failed snapshot read.
+The supervisor and worker enforce a hard per-run artifact cap
+(``backend.runtime_limits.artifact_limit_bytes``, default 4096 MiB, configured
+with ``WORKBENCH_MAX_ARTIFACT_MIB``). A long run that only reaches that cap
+while its final snapshot is materialized is expensive to discover: the user
+waits for the simulation and then gets a 413 from the download route or a
+failed snapshot read.
 
 This module estimates that footprint *before* the worker starts. It is a
 heuristic, not a measurement. The coefficients were fitted to completed runs in
@@ -51,10 +52,10 @@ import math
 import os
 from typing import Any
 
+from .runtime_limits import artifact_limit_bytes
+
 MIB = 1024 * 1024
 
-#: Hard application cap enforced by supervisor/storage. Do not change here.
-ARTIFACT_CAP_BYTES = 512 * MIB
 #: Allow the run, but tell the user it is in the upper quarter of the cap.
 WARNING_FRACTION = 0.75
 #: Reject before the worker starts above this fraction of the cap.
@@ -62,6 +63,15 @@ REJECT_FRACTION = 1.0
 #: Multiplier applied to the raw fit. The local calibration residuals are
 #: within roughly +/-20 %; this keeps a borderline run on the safe side.
 SAFETY_FACTOR = 1.20
+
+
+def __getattr__(name: str) -> Any:
+    # Backwards compatibility for callers that read the old module constant.
+    # Resolve it from the environment on every access instead of freezing the
+    # value at import time.
+    if name == "ARTIFACT_CAP_BYTES":
+        return artifact_limit_bytes()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # Bytes per lateral grid cell for the native state of step i:
 #   state_i = cells * state_geometry_factor * (160 + 18 * i)
@@ -338,7 +348,8 @@ def estimate_artifacts(project: dict[str, Any], *, kind: str = "simulate",
     estimated_bytes = int(round(raw_primary * SAFETY_FACTOR))
     archive_bytes = int(round(raw_archive * SAFETY_FACTOR))
     confidence = _confidence(project)
-    utilization = estimated_bytes / ARTIFACT_CAP_BYTES
+    cap_bytes = artifact_limit_bytes()
+    utilization = estimated_bytes / cap_bytes
 
     risk = "ok"
     downgraded = False
@@ -355,7 +366,7 @@ def estimate_artifacts(project: dict[str, Any], *, kind: str = "simulate",
     # not to the ZIP. A ZIP of every materialized snapshot may still be refused
     # with 413 even for an allowed run, so surface it separately instead of
     # turning an otherwise normal run into a warning.
-    archive_risk = "warning" if archive_bytes > ARTIFACT_CAP_BYTES else "ok"
+    archive_risk = "warning" if archive_bytes > cap_bytes else "ok"
 
     contributors = [
         {"kind": "nativeStates", "bytes": int(round(state_bytes * SAFETY_FACTOR)),
@@ -383,8 +394,8 @@ def estimate_artifacts(project: dict[str, Any], *, kind: str = "simulate",
         "estimatedMiB": round(estimated_bytes / MIB, 1),
         "archiveEstimateBytes": archive_bytes,
         "archiveEstimateMiB": round(archive_bytes / MIB, 1),
-        "capBytes": ARTIFACT_CAP_BYTES,
-        "capMiB": ARTIFACT_CAP_BYTES // MIB,
+        "capBytes": cap_bytes,
+        "capMiB": cap_bytes // MIB,
         "utilization": round(utilization, 3),
         "risk": risk,
         "archiveRisk": archive_risk,

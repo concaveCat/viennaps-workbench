@@ -224,6 +224,11 @@ curl -s http://127.0.0.1:8789/api/projects
 | `VIENNAPS_WORKBENCH_PROFILE` | 开 | 设为 `0` 关闭分段计时事件 |
 | `VIENNAPS_WORKBENCH_LAZY_SNAPSHOTS` | 开 | 设为 `0` 时步骤快照在运行结束时立即写出，而不是首次读取时生成 |
 | `VIENNAPS_WORKBENCH_GPU_CONTEXT_REUSE` | 开 | 设为 `0` 时在连续 GPU 步骤之间销毁 CUDA/OptiX context |
+| `WORKBENCH_MAX_ARTIFACT_MIB` | `4096` | 单次运行的产物与归档/包上限（MiB，最小 64，无上限） |
+| `WORKBENCH_MAX_DATA_GIB` | `10` | 应用数据总量上限（GiB，最小 1，无上限） |
+| `WORKBENCH_MIN_FREE_GIB` | `20` | 接受新数据前要求的剩余磁盘空间（GiB，最小 0） |
+| `WORKBENCH_RSS_LIMIT_MIB` | `8192` | 受监督运行的进程组 RSS 软监视阈值（MiB，最小 512） |
+| `WORKBENCH_MAX_LOG_MIB` | `4` | 单次运行标准输出/错误合计上限（MiB，最小 1） |
 | `VIENNAPS_DEBUG_NATIVE_CALLBACKS` | 未设置 | 输出详细的原生回调日志 |
 | `WORKBENCH_HOST_VERIFY_SCRIPT` | 未设置 | `scripts/finalize-host.py` 可选调用的宿主自检脚本 |
 
@@ -232,10 +237,17 @@ curl -s http://127.0.0.1:8789/api/projects
 - 每个服务实例**只允许一个活动运行**；再次提交返回 `409`。
 - 运行在独立的会话/进程组中执行，并按进程组整体终止。
 - 墙钟超时：每个项目 1–600 s（策略默认 120 s）。
-- 每 200 ms 采样一次 RSS，超过 2048 MiB 时终止子进程。这是软性监视，不是硬性
-  cgroup 上限，也不统计 CUDA 显存。
-- 单次运行的标准输出/错误合计上限 4 MiB；产物上限 512 MiB。
-- 应用数据上限 10 GiB；文件系统剩余空间低于 20 GiB 时拒绝启动运行。
+- 每 200 ms 采样一次 RSS，默认超过 8192 MiB 时终止子进程
+  （`WORKBENCH_RSS_LIMIT_MIB`，最小 512）。这是软性监视，不是硬性 cgroup
+  上限，也不统计 CUDA 显存。
+- 单次运行的标准输出/错误合计默认上限 4 MiB（`WORKBENCH_MAX_LOG_MIB`，最小 1）；
+  产物上限默认 4 GiB（`WORKBENCH_MAX_ARTIFACT_MIB`，最小 64 MiB，无上限）。
+  预检、快照物化与 ZIP 包使用同一个上限。
+- 应用数据默认上限 10 GiB（`WORKBENCH_MAX_DATA_GIB`，最小 1）；文件系统剩余
+  空间默认低于 20 GiB 时拒绝启动运行（`WORKBENCH_MIN_FREE_GIB`，最小 0）。
+  调大产物上限不会绕过这两个保护。
+- `GET /api/capabilities` 返回每个限制的有效值、默认值、最小值，以及取值来自
+  环境变量还是默认值。
 - 上传的 GDS 请求体上限 64 MiB。
 - 服务不会操作其他进程：启动/停止依赖保存的 PID 与进程启动 tick，因此 PID 被
   复用时也不会误杀。
@@ -272,7 +284,7 @@ cd frontend && npm run typecheck && npm run build
 | `ModuleNotFoundError: viennaps` | `.venv` 未使用 `--system-site-packages`，或该 Python 未安装 ViennaPS。 |
 | GPU 运行被拒绝或 `gpuAvailable()` 为 false | 检查 `nvidia-smi`、ViennaPS 的 CUDA 构建，以及 `GET /api/gpu-devices`。仅开放 `docs/stage9-evidence/gpu-capability-matrix.json` 中记录过的 `GPU_DISK` 组合。 |
 | `request Host must be the active loopback address` | 使用 `127.0.0.1:<端口>` 或 `localhost:<端口>`；反向代理与自定义域名会被有意拒绝。 |
-| 运行因 `run artifact size exceeded` 停止 | 单步产物超过 512 MiB；降低网格分辨率、射线数或输出频率。 |
+| 运行因 `run artifact size exceeded` 停止 | 单步产物超过有效上限（默认 4 GiB，可用 `WORKBENCH_MAX_ARTIFACT_MIB` 调整）；降低网格分辨率、射线数或输出频率。 |
 
 ## 仓库结构
 

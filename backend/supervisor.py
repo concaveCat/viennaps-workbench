@@ -27,6 +27,7 @@ from .validation import (GPU_MULTIPARTICLE_FLUX_STRATEGY, GPU_MULTIPARTICLE_SPLI
                          gpu_project_signature)
 from .native_build import configured_runtime
 from .rates import uses_flux
+from .runtime_limits import max_log_bytes, max_log_mib, rss_limit_mib
 from .gpu_devices import cuda_devices, resolve_gpu_device
 
 
@@ -34,11 +35,21 @@ ROOT = storage.ROOT
 PYTHON = ROOT / ".venv" / "bin" / "python"
 GUARD = ROOT / "scripts" / "bounded_child.py"
 WORKER = ROOT / "worker" / "simulate.py"
-RSS_MIB = 8192
-LOG_LIMIT = 4 * 1024 * 1024
-ARTIFACT_LIMIT = 512 * 1024 * 1024
 TERMINAL = {"succeeded", "failed", "timed_out", "cancelled", "interrupted"}
 ACTIVE = {"pending", "running", "cancelling"}
+
+
+def child_command(run_dir: Path, timeout: int) -> list[str]:
+    """Build the bounded-child command for one supervised worker run."""
+    return [
+        str(PYTHON), str(GUARD), "--cwd", str(ROOT), "--record", str(run_dir / "child-record.json"),
+        "--log-path", str(run_dir / "run.log"),
+        "--ready-file", str(run_dir / ".guard-ready"),
+        "--parent-pid", str(os.getpid()),
+        "--timeout-seconds", str(timeout), "--max-rss-mib", str(rss_limit_mib()),
+        "--max-log-bytes", str(max_log_bytes()),
+        "--terminate-grace-seconds", "5", "--", str(PYTHON), str(WORKER), str(run_dir / "input.json"), str(run_dir),
+    ]
 
 
 def now_iso() -> str:
@@ -482,15 +493,8 @@ class Supervisor:
             manifest = storage.read_json(run_dir / "manifest.json")
             project = manifest["normalizedProject"]
             timeout = int(project["solver"].get("timeoutSeconds") or 0)
+            cmd = child_command(run_dir, timeout)
             ready_path = run_dir / ".guard-ready"
-            cmd = [
-                str(PYTHON), str(GUARD), "--cwd", str(ROOT), "--record", str(run_dir / "child-record.json"),
-                "--log-path", str(run_dir / "run.log"),
-                "--ready-file", str(ready_path),
-                "--parent-pid", str(os.getpid()),
-                "--timeout-seconds", str(timeout), "--max-rss-mib", str(RSS_MIB), "--max-log-bytes", str(LOG_LIMIT),
-                "--terminate-grace-seconds", "5", "--", str(PYTHON), str(WORKER), str(run_dir / "input.json"), str(run_dir),
-            ]
             worker_env = os.environ.copy()
             expected_fingerprint = manifest.get("nativeEngineFingerprint")
             if expected_fingerprint:
@@ -645,9 +649,9 @@ class Supervisor:
         elif reason == "supervisor_cancelled" or handle.cancel_event.is_set():
             self._finish(handle, "cancelled", failure="run cancelled by the user or server shutdown", childRecord=child_record)
         elif reason == "rss_limit":
-            self._finish(handle, "failed", failure=f"observed process-group RSS exceeded the {RSS_MIB} MiB termination threshold", childRecord=child_record)
+            self._finish(handle, "failed", failure=f"observed process-group RSS exceeded the {rss_limit_mib()} MiB termination threshold", childRecord=child_record)
         elif reason == "log_limit":
-            self._finish(handle, "failed", failure="combined stdout/stderr exceeded the 4 MiB log cap", childRecord=child_record)
+            self._finish(handle, "failed", failure=f"combined stdout/stderr exceeded the {max_log_mib()} MiB log cap", childRecord=child_record)
         elif reason == "orphaned_child":
             self._finish(handle, "failed", failure="worker left a process in its owned process group", childRecord=child_record)
         else:
@@ -747,7 +751,7 @@ class Supervisor:
                 "peakObservedRssBytes": child_record.get("peakObservedRssBytes"),
             }
         except (OSError, ValueError):
-            was_truncated = log_size >= LOG_LIMIT
+            was_truncated = log_size >= max_log_bytes()
             termination = None
         return {
             "runId": run_id,
