@@ -1954,8 +1954,107 @@ def _event_path(step: dict[str, Any]) -> str:
     return str(step["id"])
 
 
+def _gds_boolean_operand(ps: Any, domain: Any, project: dict[str, Any], step: dict[str, Any], *,
+                         config: dict[str, Any] | None, run_dir: Path | None) -> tuple[Any, dict[str, Any]]:
+    """Build one GDS layer/datatype as a real 3D boolean operand.
+
+    The operand is the selected polygon interior extruded through the requested
+    z range and regridded onto the simulation grid by the same production helper
+    used for stack masks. The project's geometry asset is re-read in place; no
+    new upload path exists, and the placement/unit scale of the geometry is
+    composed with the step's offset so a zero step position is aligned.
+
+    Every failure is explicit: a missing asset, a layer/datatype that is absent
+    or open, an empty mask and an empty boolean result all raise instead of
+    degrading to a box operand or a no-op.
+    """
+    from backend.gds import parse_gds
+    mask = step["gdsMask"]
+    geometry = project["geometry"]
+    if config is None or run_dir is None:
+        raise RuntimeError("GDS boolean requires an isolated run input and artifact directory")
+    source = Path(config.get("gdsAssetPath", "")).resolve()
+    try:
+        source.relative_to(run_dir.resolve())
+    except ValueError as exc:
+        raise RuntimeError("GDS boolean asset copy must remain inside the current run directory") from exc
+    if not source.is_file() or file_sha256(source) != geometry["assetId"]:
+        raise RuntimeError("GDS boolean asset is missing or does not match the geometry's SHA-256 reference")
+    library = parse_gds(source.read_bytes())
+    structure = str(geometry["structure"])
+    pair = (int(mask["layer"]), int(mask["datatype"]))
+    if pair not in set(library.effective_layer_datatypes(structure)):
+        raise RuntimeError(f"GDS boolean layer/datatype {pair[0]}/{pair[1]} is not present in structure {structure!r}")
+    if pair not in set(library.effective_mask_layer_datatypes(structure)):
+        raise RuntimeError(f"GDS boolean layer/datatype {pair[0]}/{pair[1]} contains no closed boundary polygons")
+    delta = float(project["domain"]["gridDelta"])
+    physical_scale = library.meters_per_database_unit / library.user_units_per_database_unit * 1_000_000
+    unit_scale = float(geometry["unitScale"]) * float(mask["unitScale"])
+    position = [float(geometry["position"][0]) + float(mask["position"][0]),
+                float(geometry["position"][1]) + float(mask["position"][1])]
+    selected_bytes, transform = library.select_and_transform(
+        structure, unit_scale=physical_scale * unit_scale, position_um=position,
+        selected_layers=[pair[0]], selected_layer_datatypes=[pair])
+    filtered = run_dir / f"gds-boolean-{step['id']}-selected.gds"
+    filtered.write_bytes(selected_bytes)
+    reflective = ps.BoundaryType.REFLECTIVE_BOUNDARY
+    planar_geometry = ps.d2.GDSGeometry(delta)
+    planar_geometry.setBoundaryConditions([reflective, reflective])
+    ps.d2.GDSReader(planar_geometry, str(filtered)).apply()
+    if pair[0] not in {int(value) for value in planar_geometry.getAllLayers()}:
+        raise RuntimeError(f"GDS boolean layer/datatype {pair[0]}/{pair[1]} was not read by ViennaPS")
+    planar = planar_geometry.layerToLevelSet(pair[0], True)
+    planar_padding = 0.0
+    if planar_point_count(planar) == 0:
+        # Same native frame defect as the geometry builder: a polygon that fills
+        # the filtered GDS bounds has no inside/outside pair. One extra cell of
+        # frame recovers its real interior instead of inventing geometry.
+        planar_padding = delta
+        padded = ps.d2.GDSGeometry(delta)
+        padded.setBoundaryConditions([reflective, reflective])
+        padded.setBoundaryPadding(planar_padding, planar_padding)
+        ps.d2.GDSReader(padded, str(filtered)).apply()
+        planar = padded.layerToLevelSet(pair[0], True)
+        if planar_point_count(planar) == 0:
+            raise RuntimeError(
+                f"GDS boolean layer/datatype {pair[0]}/{pair[1]} has no usable polygon interior "
+                "inside the filtered layout bounds; reduce gridDelta or adjust the layout")
+    # The step's baseHeight is relative to the geometry frame, so the geometry's
+    # z placement is added as well; this keeps a zero step position aligned with
+    # the mapped 3D layers.
+    base_height = float(mask["baseHeight"]) + float(mask["position"][2]) + float(geometry["position"][2])
+    height = float(mask["height"])
+    operand, diagnostics = build_aligned_gds_mask(
+        ps, domain, planar, base_height=base_height, height=height,
+        retained_region=str(mask["retainedRegion"]), layer=pair[0])
+    transform.update({
+        "sourceAssetId": geometry["assetId"], "selectedStructure": structure,
+        "selectedLayers": [pair[0]], "selectedLayerDatatypes": [[pair[0], pair[1]]],
+        "selectedNativeLayers": [pair[0]], "dimension": 3,
+        "layer": pair[0], "datatype": pair[1],
+        "requestedLayerDatatype": [int(mask["layer"]), int(mask["datatype"])],
+        "unitScale": unit_scale, "geometryUnitScale": float(geometry["unitScale"]),
+        "stepUnitScale": float(mask["unitScale"]),
+        "stepPositionUm": [float(value) for value in mask["position"]],
+        "composedPositionUm": position, "actualPositionUm": transform.get("actualPositionUm"),
+        "geometryZOffset": float(geometry["position"][2]),
+        "retainedRegion": str(mask["retainedRegion"]),
+        "baseHeight": base_height,
+        "requestedBaseHeight": float(mask["baseHeight"]),
+        "height": height, "topHeight": base_height + height,
+        "extrusionAxis": 2, "planarGridPadding": planar_padding,
+        "filteredFile": filtered.name,
+        "filteredFileSha256": hashlib.sha256(selected_bytes).hexdigest(),
+        **diagnostics,
+    })
+    atomic_json(run_dir / f"gds-boolean-{step['id']}.json", transform)
+    return operand, transform
+
+
 def apply_geometry_operation(ps: Any, domain: Any, project: dict[str, Any], step: dict[str, Any],
-                             previous_tops: dict[str, Any] | None = None) -> dict[str, Any]:
+                             previous_tops: dict[str, Any] | None = None, *,
+                             config: dict[str, Any] | None = None,
+                             run_dir: Path | None = None) -> dict[str, Any]:
     model = step["model"]
     if model == "removeMaterial":
         material = material_handle(ps, step["material"])
@@ -2021,6 +2120,34 @@ def apply_geometry_operation(ps: Any, domain: Any, project: dict[str, Any], step
                 "operand": "box", "position": position, "width": width, "height": height,
                 "depth": float(step["depth"]) if project["dimension"] == 3 else None,
                 "angle": angle, "applyToAll": bool(step["applyToAll"]), "nativeBooleanEnum": enum_name}
+    if model == "gdsBoolean":
+        if project["dimension"] != 3 or project["geometry"]["kind"] != "gds":
+            raise RuntimeError("GDS boolean requires a 3D project whose geometry.kind is gds")
+        operand, transform = _gds_boolean_operand(ps, domain, project, step, config=config, run_dir=run_dir)
+        enum_name = {"union": "UNION", "intersection": "INTERSECT", "difference": "RELATIVE_COMPLEMENT"}[step["booleanOperation"]]
+        operation = getattr(ps.ls.BooleanOperationEnum, enum_name)
+        apply_to_all = bool(step["applyToAll"])
+        domain.applyBooleanOperation(operand, operation, apply_to_all)
+        remaining = [int(level_set.getNumberOfPoints()) for level_set in domain.getLevelSets()]
+        if not remaining or any(points == 0 for points in remaining):
+            # A boolean that erases a level set is not a usable pattern: fail
+            # loudly rather than saving a structure with a vanished material.
+            raise RuntimeError(
+                "GDS boolean operand erased a material level set; adjust the mask region, "
+                f"retained region or operation (level-set point counts: {remaining})")
+        return {"geometryOperation": "gdsBoolean", "booleanOperation": step["booleanOperation"],
+                "operand": "gds-mask", "nativeBooleanEnum": enum_name,
+                "applyToAll": apply_to_all,
+                "mask": {"layer": transform["layer"], "datatype": transform["datatype"],
+                         "retainedRegion": transform["retainedRegion"],
+                         "baseHeight": transform["baseHeight"], "height": transform["height"],
+                         "topHeight": transform["topHeight"],
+                         "position": transform["stepPositionUm"]},
+                "assetId": transform["sourceAssetId"], "structure": transform["selectedStructure"],
+                "unitScale": transform["unitScale"],
+                "levelSetPointCountsAfter": remaining,
+                "nativeOperandConstruction": transform["construction"],
+                "maskDiagnostics": transform}
     raise RuntimeError(f"unsupported geometry operation {model!r}")
 
 
@@ -2464,7 +2591,8 @@ def execute(input_path: Path, run_dir: Path) -> None:
         if geometry_step:
             previous_tops = snapshots[-1].get("materialTops")
             actual_parameters = apply_geometry_operation(ps, domain, project, step,
-                                                         previous_tops=previous_tops)
+                                                         previous_tops=previous_tops,
+                                                         config=config, run_dir=run_dir)
             event(run_dir, {"type": "step-configured", "stepId": step["id"], "operation": step["model"], "model": step["model"],
                             "noOp": False, "actualEngine": "not-applicable", "engineSelectionReason": "native geometry operation; no process engine or physical duration",
                             "actualSeed": None, "actualParameters": actual_parameters})

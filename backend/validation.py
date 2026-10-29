@@ -180,6 +180,7 @@ def validate_project(payload: Any, *, kind: str = "project") -> tuple[Project, l
     if project.schemaVersion in (3,4,5,6,7):
         issues.extend(_validate_materials(project))
         warnings.extend(_planarize_warnings(project))
+        warnings.extend(_gds_boolean_warnings(project))
         if project.schemaVersion == 7:
             issues.extend(_validate_specialized_steps(project))
         if project.dimension == 3:
@@ -298,6 +299,27 @@ def _planarize_warnings(project: Any) -> list[str]:
     return warnings
 
 
+def _gds_boolean_warnings(project: Any) -> list[str]:
+    """State what a GDS boolean does not model.
+
+    The operand is a straight extrusion of the selected polygons, applied by the
+    native ``Domain.applyBooleanOperation``. That is real mask geometry, but it
+    is not lithography: no resist, no optical proximity/bias, no sidewall angle,
+    and no material selectivity. Callers should not read it as a patterned etch.
+    """
+    warnings: list[str] = []
+    for index, step in enumerate(project.steps):
+        if not is_geometry_step(step) or step_value(step, "model") != "gdsBoolean":
+            continue
+        mask = step_value(step, "gdsMask") or {}
+        warnings.append(
+            f"steps[{index}]: GDS 布尔步骤使用图层 {step_value(mask, 'layer')}/{step_value(mask, 'datatype', 0)} 的"
+            f"多边形竖直拉伸体作为原生布尔操作数（retainedRegion={step_value(mask, 'retainedRegion', 'inside')}）。"
+            "它只改变几何：不包含光刻胶、光学邻近/偏置、侧壁角或材料选择比，也不等同于带掩膜的刻蚀。"
+            "真正的接触孔/M0 图形化仍需后续选择性刻蚀或沉积步骤。")
+    return warnings
+
+
 def _validate_materials(project: ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 | ProjectV7) -> list[FieldIssue]:
     try:
         from .materials import material_catalog
@@ -330,6 +352,24 @@ def _validate_materials(project: ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 |
             selected_layers = {int(row["layer"]) for row in g["layers"]}
             if selected_layers - available_layers:
                 issues.append(FieldIssue("geometry.layers", "selected layer IDs are not present in the selected GDS structure"))
+            # A GDS boolean step re-reads this same asset, so its layer/datatype
+            # must exist too. Mask operands also need closed polygons: an open
+            # path would extrude to an empty body and fail at run time.
+            available_pairs = set(library.effective_layer_datatypes(g["structure"]))
+            mask_pairs = set(library.effective_mask_layer_datatypes(g["structure"]))
+            for step_index, step in enumerate(project.steps):
+                if not is_geometry_step(step) or step_value(step, "model") != "gdsBoolean":
+                    continue
+                mask = step_value(step, "gdsMask") or {}
+                pair = (int(step_value(mask, "layer")), int(step_value(mask, "datatype", 0)))
+                if pair not in available_pairs:
+                    issues.append(FieldIssue(
+                        f"steps[{step_index}].gdsMask",
+                        f"layer/datatype {pair[0]}/{pair[1]} is not present in GDS structure {g['structure']!r}"))
+                elif pair not in mask_pairs:
+                    issues.append(FieldIssue(
+                        f"steps[{step_index}].gdsMask",
+                        f"layer/datatype {pair[0]}/{pair[1]} contains no closed boundary polygons and cannot form a mask operand"))
         except FileNotFoundError:
             issues.append(FieldIssue("geometry.assetId", "GDS file is unavailable or its SHA-256 does not match; reimport the project package"))
         except (OSError, GdsFormatError, KeyError) as exc:
