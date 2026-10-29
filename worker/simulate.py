@@ -31,7 +31,7 @@ from backend.models import normalized_geometry_v3, parse_project, project_struct
 from backend.validation import fin_construction_decision
 from backend.gpu_devices import cuda_devices, resolve_gpu_device
 from worker.gds_mask import CONSTRUCTION as GDS_MASK_CONSTRUCTION
-from worker.gds_mask import build_aligned_gds_layer, build_aligned_gds_mask
+from worker.gds_mask import build_aligned_gds_layer, build_aligned_gds_mask, planar_point_count
 from worker.specialized import build_specialized_model
 MATERIAL_CATALOG = json.loads((ROOT / "docs" / "materials-catalog.json").read_text(encoding="utf-8"))
 MATERIAL_ROWS = MATERIAL_CATALOG["materials"]
@@ -1037,7 +1037,8 @@ def _apply_gds_stack_mask(ps: Any, domain: Any, project: dict[str, Any], *,
     planar_inside = geometry.layerToLevelSet(int(mask["layer"]), True)
     aligned_mask, diagnostics = build_aligned_gds_mask(
         ps, domain, planar_inside, base_height=base_height,
-        height=float(mask["height"]), retained_region=mask["retainedRegion"])
+        height=float(mask["height"]), retained_region=mask["retainedRegion"],
+        layer=int(mask["layer"]))
     # The regridded mask is a complete finite body on the simulation grid, so it
     # is unioned into the existing top level set (Si ∪ SiO₂ ∪ Mask) instead of
     # replacing it.
@@ -1281,8 +1282,31 @@ def make_v3_geometry(ps: Any, domain: Any, project: dict[str,Any], *, config: di
             selected_native_layers = sorted(set(actual_layers) & set(selected_layers))
             if selected_native_layers != sorted(selected_layers):
                 raise RuntimeError(f"native GDS layer readback {selected_native_layers} differs from selected layers {sorted(selected_layers)}")
+            delta = float(project["domain"]["gridDelta"])
+            planars = {int(mapping["layer"]): geometry.layerToLevelSet(
+                int(mapping["layer"]), True) for mapping in g["layers"]}
+            planar_padding = 0.0
+            if any(planar_point_count(planar) == 0 for planar in planars.values()):
+                # Same native frame defect as the 3D branch: a polygon that fills
+                # the GDS bounds has no zero crossing, so its interior reads back
+                # empty instead of covering the cell.  One cell of extra frame
+                # makes the native rasterizer report the real polygon interior.
+                planar_padding = delta
+                padded = ps.d2.GDSGeometry(delta)
+                padded.setBoundaryConditions([lateral, ps.BoundaryType.INFINITE_BOUNDARY])
+                padded.setBoundaryPadding(planar_padding, planar_padding)
+                ps.d2.GDSReader(padded, str(selected_path)).apply()
+                planars = {int(mapping["layer"]): padded.layerToLevelSet(
+                    int(mapping["layer"]), True) for mapping in g["layers"]}
+                still_empty = sorted(layer for layer, planar in planars.items()
+                                     if planar_point_count(planar) == 0)
+                if still_empty:
+                    raise RuntimeError(
+                        "GDS 图层 " + ", ".join(str(layer) for layer in still_empty)
+                        + " 在当前 GDS 边界内没有可用的多边形内部（多边形退化或小于网格间距），"
+                        "无法构造实体。请检查这些图层的多边形，或减小 gridDelta 后重试。")
             for mapping in g["layers"]:
-                level_set = geometry.layerToLevelSet(int(mapping["layer"]), True)
+                level_set = planars[int(mapping["layer"])]
                 # All GDS layers share this native grid; cumulative wrapping keeps
                 # LS_n = LS_(n-1) union layer_n instead of replacing lower layers.
                 domain.insertNextLevelSetAsMaterial(level_set, material_handle(ps, mapping["material"]), True)
@@ -1304,24 +1328,54 @@ def make_v3_geometry(ps: Any, domain: Any, project: dict[str,Any], *, config: di
                 raise RuntimeError(f"native GDS layer readback {selected_native_layers} differs from selected layers {sorted(selected_layers)}")
             # The installed 3D layerToLevelSet follows the GDS library grid and
             # returns an empty body for some valid base/height pairs.  Read the
-            # polygon interior with the 2D API once, then build every layer with
+            # polygon interior with the 2D API first, then build every layer with
             # explicit caps and the simulation boundary conditions.
-            planar_geometry = ps.d2.GDSGeometry(float(project["domain"]["gridDelta"]))
+            delta = float(project["domain"]["gridDelta"])
+            planar_geometry = ps.d2.GDSGeometry(delta)
             planar_geometry.setBoundaryConditions([lateral, lateral])
             ps.d2.GDSReader(planar_geometry, str(selected_path)).apply()
+            planars = {int(mapping["layer"]): planar_geometry.layerToLevelSet(
+                int(mapping["layer"]), True) for mapping in g["layers"]}
+            planar_padding = 0.0
+            empty_layers = sorted(layer for layer, planar in planars.items()
+                                  if planar_point_count(planar) == 0)
+            if empty_layers:
+                # A polygon that fills the GDS bounds is clipped to the library
+                # frame, so the native rasterizer finds no inside/outside pair
+                # and returns an empty level set; extruding that field crashes
+                # ViennaLS.  Widen the read frame by one grid cell: the native
+                # rasterizer then reports the polygon's real interior, so no
+                # geometry is invented.  Layers whose interior is already
+                # readable are rebuilt on the same widened frame.
+                planar_padding = delta
+                padded = ps.d2.GDSGeometry(delta)
+                padded.setBoundaryConditions([lateral, lateral])
+                padded.setBoundaryPadding(planar_padding, planar_padding)
+                ps.d2.GDSReader(padded, str(selected_path)).apply()
+                planars = {int(mapping["layer"]): padded.layerToLevelSet(
+                    int(mapping["layer"]), True) for mapping in g["layers"]}
+                still_empty = sorted(layer for layer, planar in planars.items()
+                                     if planar_point_count(planar) == 0)
+                if still_empty:
+                    raise RuntimeError(
+                        "GDS 图层 " + ", ".join(str(layer) for layer in still_empty)
+                        + " 在当前 GDS 边界内没有可用的多边形内部（多边形退化或小于网格间距），"
+                        "无法构造实体。请检查这些图层的多边形，或减小 gridDelta 后重试。")
             layer_constructions = []
             for mapping in g["layers"]:
+                layer = int(mapping["layer"])
                 base_height = float(mapping["baseHeight"]) + float(g["position"][2])
-                planar = planar_geometry.layerToLevelSet(int(mapping["layer"]), True)
                 aligned, diagnostics = build_aligned_gds_layer(
-                    ps, domain, planar, base_height=base_height,
-                    height=float(mapping["height"]), mask_tone=bool(mapping.get("mask", False)))
+                    ps, domain, planars[layer], base_height=base_height,
+                    height=float(mapping["height"]), mask_tone=bool(mapping.get("mask", False)),
+                    layer=layer)
                 domain.insertNextLevelSetAsMaterial(
                     aligned, material_handle(ps, mapping["material"]), True)
                 layer_constructions.append({
-                    "layer": int(mapping["layer"]), "material": mapping["material"],
+                    "layer": layer, "material": mapping["material"],
                     "baseHeight": base_height, "height": float(mapping["height"]),
-                    "maskTone": bool(mapping.get("mask", False)), **diagnostics})
+                    "maskTone": bool(mapping.get("mask", False)),
+                    "planarGridPadding": planar_padding, **diagnostics})
         transform.update({"sourceAssetId":g["assetId"],"selectedStructure":g["structure"],
                           "selectedLayers":selected_layers,"nativeLayers":actual_layers,
                           "selectedNativeLayers":selected_native_layers,
@@ -1330,6 +1384,7 @@ def make_v3_geometry(ps: Any, domain: Any, project: dict[str,Any], *, config: di
                               "construction": GDS_MASK_CONSTRUCTION}
                              if project["dimension"] == 3 else {}),
                           "supportLayers":sorted(set(actual_layers) - set(selected_layers)),
+                          "planarGridPadding":planar_padding,
                           "nativeUserUnitUm":physical_scale,"userUnitScaleAdjustment":float(g["unitScale"]),
                           "nativeBounds":[float(value) for value in geometry.getBounds()],
                           "dimension":project["dimension"],
