@@ -23,7 +23,7 @@ The same values are published under `run.artifactPreflight` in
 ```json
 {
   "valid": true,
-  "warnings": ["... existing warnings ...", "Artifact preflight estimates ..."],
+  "warnings": ["... existing warnings ...", "运行产物预检估算本次运行约 ..."],
   "normalizedProject": {},
   "artifactEstimate": { "...": "..." }
 }
@@ -36,7 +36,7 @@ an `artifactWarning` string in the warning band. Above the cap it returns 422:
 {
   "detail": {
     "code": "artifact-budget-preflight",
-    "message": "Artifact preflight estimates 684 MiB (134% of the 512 MiB run cap), above the cap. ...",
+    "message": "运行产物预检估算本次运行约 684 MiB（占 512 MiB 上限的 134%），已超过上限。...",
     "estimatedBytes": 717053952,
     "capBytes": 536870912,
     "suggestions": ["..."],

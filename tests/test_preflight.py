@@ -53,11 +53,16 @@ class EstimatorCalibration(unittest.TestCase):
         self.assertEqual(estimate["confidence"], "high")
         self.assertTrue(preflight.should_reject(estimate))
         self.assertGreater(estimate["estimatedBytes"], preflight.ARTIFACT_CAP_BYTES)
-        # Calibrated at 628 MiB on disk; the fit is deliberately a little high.
+        # Calibrated at 599 MiB on disk; the fit is deliberately a little high.
         self.assertGreater(estimate["estimatedMiB"], 600)
         self.assertLess(estimate["estimatedMiB"], 800)
         kinds = {row["kind"] for row in estimate["contributors"]}
         self.assertTrue({"nativeStates", "initialSnapshot", "stepSnapshots"} <= kinds)
+        message = preflight.warning_message(estimate)
+        self.assertIn("产物预检", message)
+        self.assertIn("建议：", message)
+        self.assertIn("gridDelta", message)
+        self.assertNotIn("Suggestions", message)
 
     def test_near_cap_shape_warns_but_is_allowed(self) -> None:
         estimate = preflight.estimate_artifacts(
@@ -68,7 +73,7 @@ class EstimatorCalibration(unittest.TestCase):
         self.assertGreaterEqual(estimate["utilization"], 0.75)
         self.assertLessEqual(estimate["utilization"], 1.0)
         self.assertTrue(preflight.warning_message(estimate))
-        self.assertIn("Artifact preflight", preflight.warning_message(estimate))
+        self.assertIn("产物预检", preflight.warning_message(estimate))
 
     def test_normal_real_shape_is_unchanged(self) -> None:
         estimate = preflight.estimate_artifacts(normalized(finfet(enabled_steps=11)))
@@ -130,7 +135,7 @@ class EstimatorCalibration(unittest.TestCase):
         self.assertEqual(estimate["confidence"], "low")
         self.assertEqual(estimate["risk"], "warning")
         self.assertTrue(estimate["rejectionDowngraded"])
-        self.assertIn("uncalibrated", preflight.warning_message(estimate))
+        self.assertIn("未校准", preflight.warning_message(estimate))
 
     def test_thresholds_match_the_published_resource_policy(self) -> None:
         policy = json.loads((ROOT / "docs" / "resource-policy.json").read_text(encoding="utf-8"))
@@ -171,14 +176,14 @@ class PreflightApiContract(unittest.IsolatedAsyncioTestCase):
         self.assertIn("requestedInputHash", body)
         self.assertIn("artifactEstimate", body)
         self.assertEqual(body["artifactEstimate"]["risk"], "warning")
-        self.assertTrue(any("Artifact preflight" in warning for warning in body["warnings"]))
+        self.assertTrue(any("产物预检" in warning for warning in body["warnings"]))
 
     async def test_validate_normal_project_has_no_new_warning(self) -> None:
         status, body = await self.validate(finfet(enabled_steps=11))
         self.assertEqual(status, 200, body)
         self.assertTrue(body["valid"])
         self.assertEqual(body["artifactEstimate"]["risk"], "ok")
-        self.assertFalse(any("Artifact preflight" in warning for warning in body["warnings"]))
+        self.assertFalse(any("产物预检" in warning for warning in body["warnings"]))
 
     async def test_run_rejects_incident_shape_before_the_worker_starts(self) -> None:
         with patch("backend.storage.resolve_gds_asset", return_value=FINFET_GDS), \
@@ -206,7 +211,7 @@ class PreflightApiContract(unittest.IsolatedAsyncioTestCase):
         body = json_body(response)
         self.assertEqual(body["runId"], fake["runId"])
         self.assertIn("artifactWarning", body)
-        self.assertIn("Artifact preflight", body["artifactWarning"])
+        self.assertIn("产物预检", body["artifactWarning"])
         self.assertEqual(body["artifactEstimate"]["risk"], "warning")
 
     async def test_run_leaves_normal_projects_unchanged(self) -> None:

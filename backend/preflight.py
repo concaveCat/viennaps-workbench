@@ -259,25 +259,25 @@ def _suggestions(project: dict[str, Any], estimate: dict[str, Any]) -> list[str]
         factor = math.sqrt(util / 0.9) if dimension == 3 else util / 0.9
         if factor > 1.01:
             suggestions.append(
-                f"increase gridDelta from {delta:g} to at least {delta * factor:.4g} um"
+                f"将 gridDelta 从 {delta:g} 提高到至少 {delta * factor:.4g} um"
             )
     if len(enabled) > 1 and util > WARNING_FRACTION:
         # State and snapshot totals grow roughly quadratically with step count.
         keep = int(len(enabled) * math.sqrt(0.9 / max(util, 1e-9)))
         disable = max(1, len(enabled) - max(1, keep))
         suggestions.append(
-            f"disable or combine at least {disable} of the {len(enabled)} enabled steps"
+            f"禁用或合并至少 {disable} 个（共 {len(enabled)} 个）已启用步骤"
         )
     optional = sorted(key for key, value in settings.items() if value)
     if optional:
-        suggestions.append("disable optional outputs: " + ", ".join(optional))
+        suggestions.append("禁用可选输出：" + "、".join(optional))
     if dimension == 3 and util > WARNING_FRACTION:
-        suggestions.append("shrink xExtent/yExtent (currently "
-                           f"{domain.get('xExtent')} x {domain.get('yExtent')} um)")
+        suggestions.append("缩小 xExtent/yExtent（当前 "
+                           f"{domain.get('xExtent')} x {domain.get('yExtent')} um）")
     if estimate["archiveEstimateBytes"] > cap and estimate["estimatedBytes"] <= cap:
-        suggestions.append("avoid downloading every step snapshot at once; the combined ZIP is over the cap")
+        suggestions.append("避免一次下载全部步骤快照；合并后的 ZIP 已超过上限")
     if not suggestions:
-        suggestions.append("no change required; the estimate is below the warning threshold")
+        suggestions.append("无需调整；估算值低于警告阈值")
     return suggestions
 
 
@@ -359,22 +359,22 @@ def estimate_artifacts(project: dict[str, Any], *, kind: str = "simulate",
 
     contributors = [
         {"kind": "nativeStates", "bytes": int(round(state_bytes * SAFETY_FACTOR)),
-         "detail": f"{step_count} native .vpsd state(s) at {cells:,.0f} lateral cells"},
+         "detail": f"{step_count} 个原生 .vpsd 状态，横向网格 {cells:,.0f} 个"},
         {"kind": "initialSnapshot", "bytes": int(round(initial_snapshot_bytes * SAFETY_FACTOR)),
-         "detail": "eager initial surface snapshot"},
+         "detail": "立即写入的初始表面快照"},
         {"kind": "stepSnapshots", "bytes": int(round((snapshot_bytes - initial_snapshot_bytes) * SAFETY_FACTOR)),
-         "detail": ("largest deferred snapshot (materialized on first read)" if lazy_snapshots
-                    else "all eager step snapshots")},
+         "detail": ("首次读取时物化的最大延迟快照" if lazy_snapshots
+                    else "全部立即写入的步骤快照")},
     ]
     if optional_bytes:
         contributors.append({
             "kind": "optionalOutputs", "bytes": int(round(optional_bytes * SAFETY_FACTOR)),
-            "detail": ", ".join(optional_kinds),
+            "detail": "、".join(optional_kinds),
         })
     if archive_risk == "warning":
         contributors.append({
             "kind": "archiveAllSnapshots", "bytes": archive_bytes,
-            "detail": "downloading the ZIP materializes every deferred snapshot",
+            "detail": "下载 ZIP 会物化所有延迟快照",
         })
 
     estimate = {
@@ -412,27 +412,26 @@ def warning_message(estimate: dict[str, Any]) -> str | None:
     utilization = estimate.get("utilization", 0.0)
     percent = int(round(utilization * 100))
     if estimate.get("risk") == "reject":
-        prefix = (f"Artifact preflight estimates {estimate['estimatedMiB']:.0f} MiB "
-                  f"({percent}% of the {estimate['capMiB']} MiB run cap), above the cap. "
-                  "POST /api/runs will reject this project before the worker starts.")
+        prefix = (f"运行产物预检估算本次运行约 {estimate['estimatedMiB']:.0f} MiB"
+                  f"（占 {estimate['capMiB']} MiB 上限的 {percent}%），已超过上限。"
+                  "POST /api/runs 会在工作进程启动前拒绝该项目。")
     elif estimate.get("rejectionDowngraded"):
-        prefix = (f"Artifact preflight estimates {estimate['estimatedMiB']:.0f} MiB "
-                  f"({percent}% of the {estimate['capMiB']} MiB run cap), above the cap. "
-                  "This configuration uses an uncalibrated output mode; the run is allowed "
-                  "with a warning instead of being rejected.")
+        prefix = (f"运行产物预检估算本次运行约 {estimate['estimatedMiB']:.0f} MiB"
+                  f"（占 {estimate['capMiB']} MiB 上限的 {percent}%），已超过上限。"
+                  "该配置使用未校准的输出模式，因此仅给出警告，不会拒绝运行。")
     else:
-        prefix = (f"Artifact preflight estimates {estimate['estimatedMiB']:.0f} MiB "
-                  f"({percent}% of the {estimate['capMiB']} MiB run cap).")
+        prefix = (f"运行产物预检估算本次运行约 {estimate['estimatedMiB']:.0f} MiB"
+                  f"（占 {estimate['capMiB']} MiB 上限的 {percent}%）。")
     details = []
     if estimate.get("archiveEstimateBytes", 0) > estimate.get("capBytes", 0):
         details.append(
-            f"Downloading every step snapshot is estimated at "
-            f"{estimate['archiveEstimateMiB']:.0f} MiB and may be refused with HTTP 413."
+            f"若物化并下载全部步骤快照，预计约 "
+            f"{estimate['archiveEstimateMiB']:.0f} MiB，下载可能返回 HTTP 413。"
         )
     suggestions = estimate.get("suggestions") or []
     if suggestions:
-        details.append("Suggestions: " + "; ".join(suggestions) + ".")
-    return " ".join([prefix, *details])
+        details.append("建议：" + "；".join(suggestions) + "。")
+    return "".join([prefix, *details])
 
 
 def rejection_detail(estimate: dict[str, Any]) -> dict[str, Any]:
