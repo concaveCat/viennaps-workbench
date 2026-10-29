@@ -188,6 +188,12 @@ function initialVisibleMaterialIds(catalog: MaterialCatalogItem[], geometry: Geo
 }
 const SPECIALIZED_FLUX_MODELS = new Set(['sf6o2', 'cf4o2', 'hbro2', 'sf6c4f8', 'fluorocarbon', 'ionBeam', 'teosDeposition', 'teospecvd', 'ald', 'neutralTransport']);
 const NATIVE_MAKEFIN_SIGSEGV_MODELS = new Set(['sf6o2', 'hbro2', 'sf6c4f8', 'neutralTransport']);
+// Mirrors backend.models.MIN_DOMAIN_EXTENT_3D: a 22 nm FinFET cell is only
+// 0.48 x 0.50 um, so the old 1 um 3D floor blocked real layouts. The 2D domain
+// keeps its 1 um contract. Domain3D also requires at least two grid intervals
+// per lateral axis, so the UI floor follows gridDelta.
+const MIN_DOMAIN_EXTENT_3D = 0.1;
+const minThreeDExtent = (gridDelta: number) => Math.max(MIN_DOMAIN_EXTENT_3D, 2 * gridDelta);
 function hasMotion(step: Step): boolean {
   if (isGeometryStep(step)) return false;
   if (step.model === 'specialized') return true;
@@ -2106,8 +2112,8 @@ export default function App() {
           </div>}
           <div className="field-grid one-column">
             <NumericField label="网格间距" unit="µm" value={project.domain.gridDelta} max={0.5} onChange={value => updateProject(previous => ({ ...previous, domain: { ...previous.domain, gridDelta: value } }))} />
-            <NumericField label="x 横向总宽度" unit="µm" value={project.domain.xExtent} min={1} max={40} step="0.1" onChange={value => updateProject(previous => ({ ...previous, domain: { ...previous.domain, xExtent: value } }))} />
-            {project.dimension === 3 && <NumericField label="y 横向总宽度" unit="µm" value={project.domain.yExtent ?? 6} min={1} max={40} step=".2" onChange={value => updateProject(previous => ({ ...previous, domain: { ...previous.domain, yExtent: value } }))} />}
+            <NumericField label="x 横向总宽度" unit="µm" value={project.domain.xExtent} min={project.dimension === 3 ? minThreeDExtent(project.domain.gridDelta) : 1} max={40} step="0.1" hint={project.dimension === 3 ? '至少 2 个网格间距' : undefined} onChange={value => updateProject(previous => ({ ...previous, domain: { ...previous.domain, xExtent: value } }))} />
+            {project.dimension === 3 && <NumericField label="y 横向总宽度" unit="µm" value={project.domain.yExtent ?? 6} min={minThreeDExtent(project.domain.gridDelta)} max={40} step=".2" hint="至少 2 个网格间距" onChange={value => updateProject(previous => ({ ...previous, domain: { ...previous.domain, yExtent: value } }))} />}
             <SelectField label="横向边界" value={project.dimension === 3 ? project.domain.boundaryXY ?? 'reflective' : project.domain.xBoundary ?? 'reflective'} options={[{ value: 'reflective', label: '反射' }, { value: 'periodic', label: '周期' }]} onChange={value => updateProject(previous => ({ ...previous, domain: previous.dimension === 3 ? { ...previous.domain, boundaryXY: value as 'reflective' | 'periodic' } : { ...previous.domain, xBoundary: value as Domain['xBoundary'] } }))} />
           </div>
           <div className="structure-select">

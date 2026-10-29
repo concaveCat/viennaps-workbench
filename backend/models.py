@@ -8,7 +8,7 @@ import hashlib
 import json
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationError, field_validator, model_validator
 from .materials import MaterialDefinition
 from .runtime_limits import available_cpu_threads
 
@@ -41,6 +41,14 @@ class Units(StrictModel):
     time: Literal["s"]
     rate: Literal["um/s"]
     angle: Literal["deg"]
+
+
+# Minimum lateral 3D domain size in um. A domain must hold real structure
+# (a 22 nm FinFET cell is 0.48 x 0.50 um), so the historical 1 um floor was an
+# arbitrary UI limit, not a native requirement. 0.1 um still rejects a
+# degenerate or zero-sized domain, and ``Domain3D`` additionally requires two
+# grid intervals per axis below.
+MIN_DOMAIN_EXTENT_3D = 0.1
 
 
 class Domain(StrictModel):
@@ -194,9 +202,44 @@ class ProjectV1(StrictModel):
 
 class Domain3D(StrictModel):
     gridDelta: Annotated[Number, Field(gt=0, le=0.5)]
-    xExtent: Annotated[Number, Field(ge=1, le=40)]
-    yExtent: Annotated[Number, Field(ge=1, le=40)]
+    xExtent: Annotated[Number, Field(ge=MIN_DOMAIN_EXTENT_3D, le=40)]
+    yExtent: Annotated[Number, Field(ge=MIN_DOMAIN_EXTENT_3D, le=40)]
     boundaryXY: Literal["reflective", "periodic"]
+
+    @model_validator(mode="after")
+    def lateral_extent_spans_two_cells(self) -> "Domain3D":
+        # Native mesh construction needs at least two cells per axis; keeping
+        # the absolute floor low is only safe together with this check.
+        minimum = 2 * float(self.gridDelta)
+        smallest = min(float(self.xExtent), float(self.yExtent))
+        if smallest < minimum:
+            raise ValueError(f"xExtent and yExtent must span at least two grid intervals "
+                             f"({minimum:g} um for gridDelta={float(self.gridDelta):g})")
+        return self
+
+
+def _select_dimension_domain(data: Any, model_class: type[BaseModel]) -> Any:
+    """Validate ``domain`` against the branch selected by ``dimension``.
+
+    ``domain`` is declared as ``Domain | Domain3D``. A plain union reports the
+    errors of both branches, so a 3D payload also complains about missing 2D
+    ``xBoundary``/``boundaryXY`` fields, which is noise for the caller. The
+    branch is picked before validation from the declared dimension; the public
+    JSON schema keeps the union and unchanged field names.
+    """
+    if isinstance(data, dict) and isinstance(data.get("domain"), dict):
+        dimension = data.get("dimension")
+        model = Domain3D if type(dimension) is int and dimension == 3 else (
+            Domain if type(dimension) is int and dimension == 2 else None)
+        if model is not None:
+            try:
+                return {**data, "domain": model.model_validate(data["domain"])}
+            except ValidationError as exc:
+                raise ValidationError.from_exception_data(
+                    model_class.__name__,
+                    [{**error, "loc": ("domain",) + tuple(error["loc"])} for error in exc.errors()],
+                ) from None
+    return data
 
 
 class HoleGeometry(StrictModel):
@@ -299,6 +342,11 @@ class ProjectV3(StrictModel):
     view: View | None = None
     view3D: View3DV3 | None = None
     materialDefinitions: Annotated[list[MaterialDefinition], Field(max_length=64)] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def select_dimension_domain(cls, data):
+        return _select_dimension_domain(data, cls)
 
     @model_validator(mode="after")
     def version3_shape(self):
@@ -570,6 +618,11 @@ class ProjectV4(StrictModel):
     view3D: View3DV3 | None = None
     materialDefinitions: Annotated[list[MaterialDefinition], Field(max_length=64)] | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def select_dimension_domain(cls, data):
+        return _select_dimension_domain(data, cls)
+
     @model_validator(mode="after")
     def version4_shape(self):
         if self.dimension == 2 and (self.view is None or self.view3D is not None or not isinstance(self.domain,Domain)):
@@ -804,6 +857,11 @@ class ProjectV6(StrictModel):
     continuationState: DomainStateRef | None = None
     materialDefinitions: Annotated[list[MaterialDefinition], Field(max_length=64)] | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def select_dimension_domain(cls, data):
+        return _select_dimension_domain(data, cls)
+
     @model_validator(mode="after")
     def version6_shape(self):
         if self.dimension == 2 and (self.view is None or self.view3D is not None or not isinstance(self.domain, Domain)):
@@ -927,6 +985,11 @@ class ProjectV5(StrictModel):
     view: View | None = None
     view3D: View3DV3 | None = None
     materialDefinitions: Annotated[list[MaterialDefinition], Field(max_length=64)] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def select_dimension_domain(cls, data):
+        return _select_dimension_domain(data, cls)
 
     @model_validator(mode="after")
     def version5_shape(self):

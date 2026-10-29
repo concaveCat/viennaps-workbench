@@ -125,13 +125,13 @@
           "type": "number"
         },
         "xExtent": {
-          "ge": 1,
+          "ge": 0.1,
           "le": 40,
           "title": "Xextent",
           "type": "number"
         },
         "yExtent": {
-          "ge": 1,
+          "ge": 0.1,
           "le": 40,
           "title": "Yextent",
           "type": "number"
