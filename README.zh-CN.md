@@ -222,6 +222,7 @@ curl -s http://127.0.0.1:8789/api/projects
 | `VIENNAPS_PATCHED_RUNTIME_HISTORY_DIR` | 未设置 | 补丁运行时的版本归档 |
 | `WORKBENCH_GPU_TEST` | 未设置 | 设为 `1` 启用 GPU 集成测试 |
 | `VIENNAPS_WORKBENCH_PROFILE` | 开 | 设为 `0` 关闭分段计时事件 |
+| `VIENNAPS_WORKBENCH_LAZY_SNAPSHOTS` | 开 | 设为 `0` 时步骤快照在运行结束时立即写出，而不是首次读取时生成 |
 | `VIENNAPS_WORKBENCH_GPU_CONTEXT_REUSE` | 开 | 设为 `0` 时在连续 GPU 步骤之间销毁 CUDA/OptiX context |
 | `VIENNAPS_DEBUG_NATIVE_CALLBACKS` | 未设置 | 输出详细的原生回调日志 |
 | `WORKBENCH_HOST_VERIFY_SCRIPT` | 未设置 | `scripts/finalize-host.py` 可选调用的宿主自检脚本 |

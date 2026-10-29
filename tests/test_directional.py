@@ -11,6 +11,7 @@ import zipfile
 import io
 from pathlib import Path
 
+from backend import snapshots as snapshot_store
 from backend import storage
 from backend.hashing import requested_input_hash
 from backend.main import app
@@ -201,6 +202,7 @@ class DirectionalWorkflow(unittest.IsolatedAsyncioTestCase):
                 record = info["actualExecution"][0]
                 self.assertEqual(record["actualParameters"]["calculateVisibility"], visibility)
                 self.assertEqual(record["actualParameters"]["maskMaterials"], ["Mask"])
+                snapshot_store.ensure_materialized(storage.run_path(run_id), info["snapshots"][-1]["stepId"])
                 outputs[visibility] = storage.read_json(storage.run_path(run_id) / info["snapshots"][-1]["snapshot"])
             key = "lines" if dimension == 2 else "triangles"
             self.assertNotEqual(outputs[True][key], outputs[False][key], f"visibility toggle did not affect {dimension}D geometry")
