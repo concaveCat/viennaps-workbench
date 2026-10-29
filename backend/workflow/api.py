@@ -70,6 +70,7 @@ class RouteSummaryV1(StrictModel):
     headAttemptId: str
     stepCount: Annotated[int, Field(ge=0)]
     attemptCount: Annotated[int, Field(ge=0)]
+    legacyUnverified: bool = False
     updatedAt: str
 
 

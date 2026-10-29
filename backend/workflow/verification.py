@@ -57,6 +57,8 @@ def verify_route_plan_compiles(
     closes the gap between two independently supplied compatibility summaries.
     """
 
+    if plan.route.legacyUnverified:
+        raise ValueError("legacy unverified route cannot be used for execution")
     attempts = {attempt.attemptId: attempt for attempt in plan.attempts}
     segments = {segment.segmentId: segment for segment in plan.segments}
     reuse_by_attempt: dict[str, list] = {attempt.attemptId: [] for attempt in plan.attempts}

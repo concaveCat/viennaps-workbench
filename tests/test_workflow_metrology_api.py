@@ -11,6 +11,7 @@ os.environ.setdefault("WORKBENCH_PORT", "8767")
 from backend import storage  # noqa: E402
 from backend.main import app  # noqa: E402
 from backend.workflow.api import get_store  # noqa: E402
+from backend.workflow.store import SCHEMA_VERSION  # noqa: E402
 from tests.test_api_integration import asgi_request, json_body  # noqa: E402
 from tests.test_workflow_metrology import REAL_SNAPSHOT, trench  # noqa: E402
 
@@ -182,7 +183,7 @@ class MetrologyApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertRegex(body["sourceSnapshotHash"], r"^[a-f0-9]{64}$")
 
     async def test_store_schema_version_is_explicit(self):
-        self.assertEqual(get_store().schema_version(), "2")
+        self.assertEqual(get_store().schema_version(), SCHEMA_VERSION)
 
 
 if __name__ == "__main__":

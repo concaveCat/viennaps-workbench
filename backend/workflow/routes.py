@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import Field, model_validator
 
@@ -42,6 +42,7 @@ class RouteV1(StrictModel):
     flowId: Id
     name: Annotated[str, Field(min_length=1, max_length=80)]
     headAttemptId: Id
+    legacyUnverified: bool = False
 
 
 class AttemptV1(StrictModel):
@@ -59,6 +60,7 @@ class AttemptV1(StrictModel):
     runSeed: Annotated[int, Field(ge=0, le=4294967295)]
     flowDigest: Hash64
     status: Status = "planned"
+    legacyCompatibility: dict[str, Any] | None = None
 
 
 class SegmentV1(StrictModel):
@@ -102,6 +104,7 @@ class SegmentReuseV1(StrictModel):
     fromStepId: StepId
     toStepId: StepId
     compatibility: PrefixCompatibilityV1
+    legacyCompatibility: dict[str, Any] | None = None
 
 
 class SegmentRefV1(StrictModel):
@@ -227,11 +230,13 @@ def _check_reuse(
         key=lambda item: index[item.fromStepId],
     )
     if not entries:
-        if attempt.prefixCompatibility is not None:
+        if attempt.prefixCompatibility is not None and not plan.route.legacyUnverified:
             raise ValueError(f"attempt {attempt.attemptId!r} declares prefix compatibility without reuse")
         return None
-    if attempt.startAfterStepId is None or attempt.prefixCompatibility is None:
-        raise ValueError(f"attempt {attempt.attemptId!r} reuses a prefix without a base checkpoint or compatibility")
+    if attempt.startAfterStepId is None:
+        raise ValueError(f"attempt {attempt.attemptId!r} reuses a prefix without a base checkpoint")
+    if attempt.prefixCompatibility is None and not plan.route.legacyUnverified:
+        raise ValueError(f"attempt {attempt.attemptId!r} reuses a prefix without compatibility")
     expected = 0
     for entry in entries:
         if entry.fromStepId not in index or entry.toStepId not in index:
@@ -252,13 +257,14 @@ def _check_reuse(
         source_start, source_end = _range_for(source.startAfterStepId, source.throughStepId, index)
         if source_start != from_index or source_end != to_index:
             raise ValueError(f"reuse {entry.reuseId!r} range does not match the source segment")
-        if entry.compatibility != attempt.prefixCompatibility:
+        if not plan.route.legacyUnverified and entry.compatibility != attempt.prefixCompatibility:
             raise ValueError(f"reuse {entry.reuseId!r} compatibility does not match the attempt")
         expected = to_index + 1
     if expected != start:
         raise ValueError(f"reuse prefix for {attempt.attemptId!r} does not end at startAfterStepId")
-    if attempt.prefixCompatibility.stepIds != plan.stepOrder[:start]:
-        raise ValueError(f"attempt {attempt.attemptId!r} prefixCompatibility stepIds do not match the reused prefix")
+    if not plan.route.legacyUnverified and attempt.prefixCompatibility is not None:
+        if attempt.prefixCompatibility.stepIds != plan.stepOrder[:start]:
+            raise ValueError(f"attempt {attempt.attemptId!r} prefixCompatibility stepIds do not match the reused prefix")
     return entries[-1].reusedFromSegmentId
 
 

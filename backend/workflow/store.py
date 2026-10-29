@@ -24,10 +24,10 @@ from .routes import (
     SegmentV1,
     materialize_attempt,
 )
-from .verification import verify_route_plan_compiles
+from .verification import prefix_compatibility, verify_route_plan_compiles
 
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 
 
 class WorkflowError(Exception):
@@ -63,7 +63,7 @@ class WorkflowStore:
                     row = preflight.execute(
                         "SELECT value FROM schema_meta WHERE key = 'schema_version'"
                     ).fetchone()
-                    if row is not None and row[0] not in {"1", SCHEMA_VERSION}:
+                    if row is not None and row[0] not in {"1", "2", SCHEMA_VERSION}:
                         raise RuntimeError(
                             f"unsupported workflow schema version {row[0]!r}; "
                             f"expected {SCHEMA_VERSION!r}"
@@ -83,6 +83,7 @@ class WorkflowStore:
                     name TEXT NOT NULL,
                     head_attempt_id TEXT NOT NULL,
                     step_order_json TEXT NOT NULL,
+                    legacy_unverified INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -102,6 +103,7 @@ class WorkflowStore:
                     run_seed INTEGER NOT NULL,
                     flow_digest TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    legacy_compatibility_json TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -131,6 +133,7 @@ class WorkflowStore:
                     from_step_id TEXT NOT NULL,
                     to_step_id TEXT NOT NULL,
                     compatibility_json TEXT NOT NULL,
+                    legacy_compatibility_json TEXT,
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS metrics (
@@ -179,6 +182,18 @@ class WorkflowStore:
                 );
                 """
             )
+            route_columns = {row[1] for row in connection.execute("PRAGMA table_info(routes)")}
+            if "legacy_unverified" not in route_columns:
+                connection.execute("ALTER TABLE routes ADD COLUMN legacy_unverified INTEGER NOT NULL DEFAULT 0")
+            attempt_columns = {row[1] for row in connection.execute("PRAGMA table_info(attempts)")}
+            if "request_hash" not in attempt_columns:
+                connection.execute("ALTER TABLE attempts ADD COLUMN request_hash TEXT NOT NULL DEFAULT ''")
+            if "legacy_compatibility_json" not in attempt_columns:
+                connection.execute("ALTER TABLE attempts ADD COLUMN legacy_compatibility_json TEXT")
+            reuse_columns = {row[1] for row in connection.execute("PRAGMA table_info(reuse)")}
+            if "legacy_compatibility_json" not in reuse_columns:
+                connection.execute("ALTER TABLE reuse ADD COLUMN legacy_compatibility_json TEXT")
+
             version_row = connection.execute(
                 "SELECT value FROM schema_meta WHERE key = 'schema_version'"
             ).fetchone()
@@ -187,7 +202,8 @@ class WorkflowStore:
                     "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?)",
                     (SCHEMA_VERSION,),
                 )
-            elif version_row["value"] == "1":
+            elif version_row["value"] in {"1", "2"}:
+                self._migrate_legacy_compatibility(connection)
                 connection.execute(
                     "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
                     (SCHEMA_VERSION,),
@@ -197,9 +213,106 @@ class WorkflowStore:
                     f"unsupported workflow schema version {version_row['value']!r}; "
                     f"expected {SCHEMA_VERSION!r}"
                 )
-            attempt_columns = {row[1] for row in connection.execute("PRAGMA table_info(attempts)")}
-            if "request_hash" not in attempt_columns:
-                connection.execute("ALTER TABLE attempts ADD COLUMN request_hash TEXT NOT NULL DEFAULT ''")
+
+    def _migrate_legacy_compatibility(self, connection: sqlite3.Connection) -> None:
+        """Repair v2 prefix summaries from saved compiles; otherwise mark legacy."""
+
+        route_rows = connection.execute("SELECT route_id FROM routes").fetchall()
+        for route_row in route_rows:
+            route_id = route_row["route_id"]
+            attempts = connection.execute(
+                "SELECT * FROM attempts WHERE route_id = ?", (route_id,)
+            ).fetchall()
+            segments = connection.execute(
+                "SELECT * FROM segments WHERE attempt_id IN (SELECT attempt_id FROM attempts WHERE route_id = ?)",
+                (route_id,),
+            ).fetchall()
+            reuse = connection.execute(
+                "SELECT * FROM reuse WHERE attempt_id IN (SELECT attempt_id FROM attempts WHERE route_id = ?)",
+                (route_id,),
+            ).fetchall()
+            attempts_by_id = {row["attempt_id"]: row for row in attempts}
+            segments_by_id = {row["segment_id"]: row for row in segments}
+            legacy = False
+
+            for attempt in attempts:
+                raw = attempt["prefix_compatibility_json"]
+                if raw is None:
+                    continue
+                old = json.loads(raw)
+                if "solverDigest" in old:
+                    continue
+                candidate = None
+                compile_row = connection.execute(
+                    "SELECT envelope_json FROM compiles WHERE compile_id = ?",
+                    (attempt["compile_id"],),
+                ).fetchone()
+                if compile_row is not None:
+                    try:
+                        compiled = CompiledWorkflowV1.model_validate(json.loads(compile_row["envelope_json"]))
+                        candidate = prefix_compatibility(compiled, old["stepIds"], attempt["run_seed"]).model_dump(mode="json", exclude_none=True)
+                    except (ValueError, KeyError, TypeError):
+                        candidate = None
+                if candidate is not None and all(
+                    old.get(key) == candidate.get(key)
+                    for key in ("geometryBindingHash", "seedPolicy", "runSeed", "stepIds", "resolvedStepDigest")
+                ):
+                    connection.execute(
+                        "UPDATE attempts SET prefix_compatibility_json = ?, legacy_compatibility_json = NULL WHERE attempt_id = ?",
+                        (self._dump(candidate), attempt["attempt_id"]),
+                    )
+                else:
+                    legacy = True
+                    old.setdefault("prefixDigest", "0" * 64)
+                    old["solverDigest"] = "0" * 64
+                    connection.execute(
+                        "UPDATE attempts SET prefix_compatibility_json = ?, legacy_compatibility_json = ? WHERE attempt_id = ?",
+                        (self._dump(old), raw, attempt["attempt_id"]),
+                    )
+
+            for item in reuse:
+                raw = item["compatibility_json"]
+                if raw is None:
+                    continue
+                old = json.loads(raw)
+                if "solverDigest" in old:
+                    continue
+                source = segments_by_id.get(item["reused_from_segment_id"])
+                source_attempt = None if source is None else attempts_by_id.get(source["attempt_id"])
+                candidate = None
+                if source is not None and source_attempt is not None:
+                    compile_row = connection.execute(
+                        "SELECT envelope_json FROM compiles WHERE compile_id = ?",
+                        (source["source_compile_id"],),
+                    ).fetchone()
+                    if compile_row is not None:
+                        try:
+                            compiled = CompiledWorkflowV1.model_validate(json.loads(compile_row["envelope_json"]))
+                            candidate = prefix_compatibility(compiled, old["stepIds"], source_attempt["run_seed"]).model_dump(mode="json", exclude_none=True)
+                        except (ValueError, KeyError, TypeError):
+                            candidate = None
+                if candidate is not None and all(
+                    old.get(key) == candidate.get(key)
+                    for key in ("geometryBindingHash", "seedPolicy", "runSeed", "stepIds", "resolvedStepDigest")
+                ):
+                    connection.execute(
+                        "UPDATE reuse SET compatibility_json = ?, legacy_compatibility_json = NULL WHERE reuse_id = ?",
+                        (self._dump(candidate), item["reuse_id"]),
+                    )
+                else:
+                    legacy = True
+                    old.setdefault("prefixDigest", "0" * 64)
+                    old["solverDigest"] = "0" * 64
+                    connection.execute(
+                        "UPDATE reuse SET compatibility_json = ?, legacy_compatibility_json = ? WHERE reuse_id = ?",
+                        (self._dump(old), raw, item["reuse_id"]),
+                    )
+
+            if legacy:
+                connection.execute(
+                    "UPDATE routes SET legacy_unverified = 1 WHERE route_id = ?",
+                    (route_id,),
+                )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30.0)
@@ -237,6 +350,7 @@ class WorkflowStore:
             "runSeed": row["run_seed"],
             "flowDigest": row["flow_digest"],
             "status": row["status"],
+            "legacyCompatibility": WorkflowStore._load(row["legacy_compatibility_json"]),
         }
 
     @staticmethod
@@ -268,6 +382,7 @@ class WorkflowStore:
             "fromStepId": row["from_step_id"],
             "toStepId": row["to_step_id"],
             "compatibility": WorkflowStore._load(row["compatibility_json"]),
+            "legacyCompatibility": WorkflowStore._load(row["legacy_compatibility_json"]),
         }
 
     def register_compile(self, compiled: CompiledWorkflowV1) -> CompiledWorkflowV1:
@@ -567,9 +682,10 @@ class WorkflowStore:
         try:
             with self._connect() as connection:
                 connection.execute(
-                    "INSERT INTO routes (route_id, flow_id, name, head_attempt_id, step_order_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO routes (route_id, flow_id, name, head_attempt_id, step_order_json, legacy_unverified, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (payload["route"]["routeId"], payload["route"]["flowId"], payload["route"]["name"],
-                     payload["route"]["headAttemptId"], self._dump(payload["stepOrder"]), now, now),
+                     payload["route"]["headAttemptId"], self._dump(payload["stepOrder"]),
+                     1 if payload["route"].get("legacyUnverified", False) else 0, now, now),
                 )
                 self._insert_attempts(connection, payload["attempts"], now)
                 self._insert_segments(connection, payload["segments"], now)
@@ -594,8 +710,8 @@ class WorkflowStore:
                     attempt_id, route_id, parent_attempt_id, compile_id, submission_key,
                     request_hash, base_checkpoint_json, start_after_step_id, through_step_id,
                     changed_step_ids_json, prefix_compatibility_json, seed_policy,
-                    run_seed, flow_digest, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    run_seed, flow_digest, status, legacy_compatibility_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     attempt["attemptId"], attempt["routeId"], attempt.get("parentAttemptId"),
@@ -605,7 +721,8 @@ class WorkflowStore:
                     self._dump(attempt.get("changedStepIds", [])),
                     self._dump(attempt["prefixCompatibility"]) if attempt.get("prefixCompatibility") is not None else None,
                     attempt["seedPolicy"], attempt["runSeed"], attempt["flowDigest"],
-                    attempt["status"], now, now,
+                    attempt["status"], self._dump(attempt["legacyCompatibility"]) if attempt.get("legacyCompatibility") is not None else None,
+                    now, now,
                 ),
             )
 
@@ -639,13 +756,15 @@ class WorkflowStore:
                 """
                 INSERT INTO reuse (
                     reuse_id, attempt_id, reused_from_segment_id,
-                    from_step_id, to_step_id, compatibility_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    from_step_id, to_step_id, compatibility_json, legacy_compatibility_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item["reuseId"], item["attemptId"], item["reusedFromSegmentId"],
                     item["fromStepId"], item["toStepId"],
-                    self._dump(item["compatibility"]), now,
+                    self._dump(item["compatibility"]),
+                    self._dump(item["legacyCompatibility"]) if item.get("legacyCompatibility") is not None else None,
+                    now,
                 ),
             )
 
@@ -658,7 +777,7 @@ class WorkflowStore:
             rows = connection.execute(
                 """
                 SELECT r.route_id, r.flow_id, r.name, r.head_attempt_id,
-                       r.step_order_json, r.updated_at,
+                       r.step_order_json, r.legacy_unverified, r.updated_at,
                        (SELECT COUNT(*) FROM attempts a WHERE a.route_id = r.route_id) AS attempt_count
                 FROM routes r ORDER BY r.updated_at DESC
                 """
@@ -671,6 +790,7 @@ class WorkflowStore:
                 "headAttemptId": row["head_attempt_id"],
                 "stepCount": len(self._load(row["step_order_json"])),
                 "attemptCount": row["attempt_count"],
+                "legacyUnverified": bool(row["legacy_unverified"]),
                 "updatedAt": row["updated_at"],
             }
             for row in rows
@@ -700,6 +820,7 @@ class WorkflowStore:
                     "flowId": route["flow_id"],
                     "name": route["name"],
                     "headAttemptId": route["head_attempt_id"],
+                    "legacyUnverified": bool(route["legacy_unverified"]),
                 },
                 "stepOrder": self._load(route["step_order_json"]),
                 "attempts": [self._attempt_payload(row) for row in attempts],
