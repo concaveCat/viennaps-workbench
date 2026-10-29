@@ -251,3 +251,27 @@ isotropic 或 level-set 速率模型**（无随机射线输运、无遮挡/黏�
 射线成本能省掉（5.11 → 1.21 s），但"0.5 s"还需要同时放宽网格（0.03 µm → 更粗）
 或缩小计算域。建议在 UI 上明确区分"预览（isotropic，秒级）"与
 "精确（singleParticle/rays，数秒）"两种模式，而不是承诺单步 0.5 s。
+
+## 11. 后续两项工程优化（2026-10-29 晚）
+
+**(a) 设备证据去重**：worker 原本无条件调用 `cuda_devices()`（实测 0.27 s 热 / 0.75 s 冷）
+重新枚举 GPU，而 supervisor 已把 `selectedGpuDevice` 写进配置。现在直接复用该设备构造
+inventory，`cuda_runtime_readback` 仍做 PCI/UUID 校验；`nvidia_gpu_sample` 改为每次 run
+一次。commit `c427e01`。
+
+**(b) 步骤快照按需物化**：run 关键路径只写 `<step>.meta.json` + `state-<step>.vpsd`，
+首次访问快照接口/下载包时由 `worker/materialize_snapshot.py` 在 bounded child 中从
+`.vpsd` 重建并缓存；初始快照仍立即写。`VIENNAPS_WORKBENCH_LAZY_SNAPSHOTS=0` 可回退。
+
+| 指标 | 立即写出 | 按需物化 |
+|---|---:|---:|
+| 步骤快照阶段（worker 内） | 1.148 s | **0.774 s** |
+| 首次 GET（93k 点 / 7.4 MB） | — | 1.71 s |
+| 缓存后 GET | 0.19 s | 0.235 s |
+| 物化 JSON 与直接写出 | — | **逐字节相同**（SHA-256 `06b62c72…`） |
+
+端到端（正式服务，run `1f36798266b460f41ff7de62`）：succeeded 8.799 s，apply 5.373 s，
+步骤快照阶段 0.774 s；`GET /snapshots/step_…` 首次 1.71 s、第二次 0.235 s。
+全量套件仍为 102 项 / 99 通过 / 3 条已知红灯 / 4 跳过。
+
+未做：常驻 worker（B1 fork 只值约 0.3 s，收益最低、改进程模型风险最高）。
