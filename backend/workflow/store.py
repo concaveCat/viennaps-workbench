@@ -183,6 +183,10 @@ class WorkflowStore:
                 CREATE INDEX IF NOT EXISTS attempts_route_idx ON attempts(route_id);
                 CREATE INDEX IF NOT EXISTS segments_attempt_idx ON segments(attempt_id);
                 CREATE INDEX IF NOT EXISTS reuse_attempt_idx ON reuse(attempt_id);
+                CREATE TABLE IF NOT EXISTS artifact_pins (
+                    artifact_id TEXT PRIMARY KEY,
+                    pinned_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS measurement_verifications (
                     verification_id TEXT PRIMARY KEY,
                     measurement_id TEXT NOT NULL,
@@ -1202,6 +1206,33 @@ class WorkflowStore:
     def materialize(self, route_id: str, attempt_id: str) -> list[SegmentRefV1]:
         plan = self.get_plan(route_id)
         return materialize_attempt(plan, attempt_id)
+
+    def gc_dry_run(self) -> dict[str, Any]:
+        from .. import storage
+
+        with self._connect() as connection:
+            segment_runs = {row["run_id"] for row in connection.execute("SELECT run_id FROM segments WHERE run_id IS NOT NULL")}
+            measurement_runs = {row["source_run_id"] for row in connection.execute("SELECT source_run_id FROM measurements WHERE source_run_id IS NOT NULL")}
+            pins = {row["artifact_id"] for row in connection.execute("SELECT artifact_id FROM artifact_pins")}
+        referenced = segment_runs | measurement_runs | pins
+        candidates = []
+        for path in sorted(storage.RUNS.iterdir()) if storage.RUNS.is_dir() else []:
+            if not path.is_dir() or path.name in referenced:
+                continue
+            size = sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+            candidates.append({"artifactId": path.name, "bytes": size})
+        return {"referenced": sorted(referenced), "candidates": candidates, "bytesReclaimable": sum(item["bytes"] for item in candidates)}
+
+    def pin_artifact(self, artifact_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO artifact_pins (artifact_id, pinned_at) VALUES (?, ?)",
+                (artifact_id, self._now()),
+            )
+
+    def unpin_artifact(self, artifact_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM artifact_pins WHERE artifact_id = ?", (artifact_id,))
 
     def mark_segment_started(self, segment_id: str, run_id: str, segment_project_hash: str) -> None:
         now = self._now()

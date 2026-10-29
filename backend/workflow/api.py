@@ -12,6 +12,7 @@ from pydantic import Field, ValidationError
 from .. import storage
 from ..models import StrictModel
 from .metrology import MeasurementResultV1, MetrologyRecipeV1, MetricDefinitionV1
+from .equivalence import ComparisonProtocolV1, EquivalenceResultV1, compare_snapshots
 from .execution import execute_segment
 from .models import CompiledWorkflowV1
 from .provenance import ProvenanceVerificationV1, VerificationRecordV1
@@ -119,6 +120,18 @@ class SegmentExecutionResponse(StrictModel):
     runId: str
 
 
+class EquivalenceCheckRequest(StrictModel):
+    protocol: ComparisonProtocolV1
+    left: dict
+    right: dict
+
+
+class GcDryRunResponse(StrictModel):
+    referenced: list[str]
+    candidates: list[dict]
+    bytesReclaimable: int
+
+
 @lru_cache(maxsize=8)
 def _store_for(var: str) -> WorkflowStore:
     store = WorkflowStore(Path(var) / "workflow" / "workflow.sqlite3")
@@ -148,6 +161,28 @@ def _call(operation):
         return operation()
     except (WorkflowError, ValidationError) as exc:
         raise _http_error(exc) from exc
+
+
+@router.post("/gc/dry-run", response_model=GcDryRunResponse)
+async def gc_dry_run() -> GcDryRunResponse:
+    return GcDryRunResponse.model_validate(_call(get_store().gc_dry_run))
+
+
+@router.post("/artifacts/{artifact_id}/pin", response_model=dict)
+async def pin_artifact(artifact_id: str) -> dict:
+    _call(lambda: get_store().pin_artifact(artifact_id))
+    return {"artifactId": artifact_id, "pinned": True}
+
+
+@router.post("/artifacts/{artifact_id}/unpin", response_model=dict)
+async def unpin_artifact(artifact_id: str) -> dict:
+    _call(lambda: get_store().unpin_artifact(artifact_id))
+    return {"artifactId": artifact_id, "pinned": False}
+
+
+@router.post("/equivalence/check", response_model=EquivalenceResultV1)
+async def equivalence_check(request: EquivalenceCheckRequest) -> EquivalenceResultV1:
+    return _call(lambda: compare_snapshots(request.protocol, request.left, request.right))
 
 
 @router.post("/metrics", response_model=MetricDefinitionV1, status_code=201)
