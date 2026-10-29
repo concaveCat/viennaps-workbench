@@ -1,0 +1,1008 @@
+"""Application resource checks layered on top of the frozen JSON schema."""
+
+from __future__ import annotations
+
+import math
+import json
+from importlib.metadata import PackageNotFoundError, version
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from pydantic import ValidationError
+
+from .models import Domain3D, Project, ProjectV3, ProjectV4, ProjectV5, ProjectV6, ProjectV7, parse_project
+from .materials import attach_and_reconcile_project_materials
+from .rates import has_motion, is_geometry_step, uses_flux, value as step_value
+from .specialized_models import FLUOROCARBON_MATERIAL_DEFAULTS, model_spec
+from .runtime_limits import available_cpu_threads
+
+
+# These ViennaPS 4.6.2 combinations either SIGSEGV or produce different final
+# meshes from the independent product sequence when paired with native
+# d2/d3.MakeFin. Keep old project data intact, but resolve those runs through
+# the independently verified Boolean construction.
+NATIVE_MAKEFIN_SIGSEGV_MODELS = frozenset({"sf6o2", "hbro2", "sf6c4f8", "neutralTransport"})
+GPU_MULTIPARTICLE_SPLIT_STRATEGY = "symmetric-operator-splitting-v1"
+GPU_MULTIPARTICLE_FLUX_STRATEGY = "per-species-native-mesh-merge-v1"
+GPU_MULTIPARTICLE_NATIVE_STRATEGY = "native-multi-ion-v1"
+GPU_MULTIPARTICLE_NATIVE_FLUX_STRATEGY = "native-multi-ion-flux-v1"
+
+
+def fin_construction_decision(project: dict[str, Any]) -> dict[str, Any]:
+    geometry = project.get("geometry", {})
+    requested = str(geometry.get("construction", "native")) if geometry.get("kind") == "fin" else "native"
+    enabled_models = {
+        str(step.get("nativeModel"))
+        for step in project.get("steps", [])
+        if step.get("enabled") and step.get("model") == "specialized"
+        and step.get("nativeModel") in NATIVE_MAKEFIN_SIGSEGV_MODELS
+    }
+    makefin_fallback_models = sorted(enabled_models) if requested == "native" else []
+    domain = project.get("domain", {})
+    boundary = domain.get("boundaryXY", domain.get("xBoundary", "reflective"))
+    periodic_3d_fin = (project.get("dimension") == 3 and geometry.get("kind") == "fin"
+                       and boundary == "periodic")
+    generic_masked_models = sorted({
+        str(step.get("model")) for step in project.get("steps", [])
+        if step.get("enabled") and step.get("model") in {"singleParticle", "multiParticle"}
+    }) if (project.get("dimension") == 3 and geometry.get("kind") == "fin"
+           and float(geometry.get("maskHeight", 0)) > 0) else []
+    periodic_masked_generic_models = generic_masked_models if periodic_3d_fin else []
+    generic_construction_fallback_models = (generic_masked_models if requested == "native" else [])
+    extrusion_fallback_models = sorted(enabled_models | set(periodic_masked_generic_models)) if (
+        periodic_3d_fin and geometry.get("extrusion") is not None
+    ) else []
+    periodic_masked_fallback = bool(generic_construction_fallback_models and periodic_3d_fin)
+    effective = "boolean" if makefin_fallback_models else requested
+    if generic_construction_fallback_models:
+        effective = "boolean"
+    extrusion_route = ("direct-stencil" if extrusion_fallback_models else "d2-extrude") \
+        if geometry.get("extrusion") is not None else "direct"
+    return {"requested": requested, "effective": effective,
+            "fallbackModels": makefin_fallback_models,
+            "constructionFallbackModels": sorted(set(makefin_fallback_models) | set(generic_construction_fallback_models)),
+            "constructionFallbackReason": ("native-makefin-sigsegv" if makefin_fallback_models else
+                                            "periodic-masked-fin-geometry" if periodic_masked_fallback else
+                                            "masked-3d-fin-generic-process" if generic_construction_fallback_models else None),
+            "extrusionRoute": extrusion_route,
+            "extrusionFallbackModels": extrusion_fallback_models}
+
+
+@dataclass(frozen=True)
+class FieldIssue:
+    path: str
+    message: str
+
+
+class ProjectInputError(ValueError):
+    def __init__(self, issues: list[FieldIssue]):
+        self.issues = issues
+        super().__init__("; ".join(f"{item.path}: {item.message}" for item in issues))
+
+
+def gpu_disk_verified() -> bool:
+    capability_path = Path(__file__).resolve().parents[1] / "docs" / "capabilities.json"
+    try:
+        capabilities = json.loads(capability_path.read_text(encoding="utf-8"))
+        gpu = capabilities.get("engines", {}).get("gpu", {})
+        return gpu.get("status") == "verified-host" and gpu.get("exposed") is True and gpu.get("engine") == "GPU_DISK"
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def _path(parts: tuple[Any, ...]) -> str:
+    text = ""
+    for part in parts:
+        if isinstance(part, int):
+            text += f"[{part}]"
+        elif text:
+            text += f".{part}"
+        else:
+            text = str(part)
+    return text or "$"
+
+
+def _parse(payload: Any) -> Project:
+    if isinstance(payload,dict) and (type(payload.get("schemaVersion")) is not int or payload.get("schemaVersion") not in (1,2,3,4,5,6,7)):
+        raise ProjectInputError([FieldIssue("schemaVersion","supported schema versions are 1 (2D), 2 (3D), 3, 4, 5, 6 and 7")])
+    try:
+        return parse_project(payload)
+    except ValidationError as exc:
+        issues = []
+        for error in exc.errors():
+            path = _path(tuple(error["loc"]))
+            if path == "$" and "step IDs" in str(error["msg"]):
+                path = "steps"
+            issues.append(FieldIssue(path, str(error["msg"])))
+        raise ProjectInputError(issues) from exc
+
+
+def known_native_failure(dimension: int, model: str, operation: str, boundary: str,
+                        geometry_kind: str | None, engine: str | None = None) -> dict[str, Any] | None:
+    """Return an exact installed-version native crash record, if one is measured."""
+    if geometry_kind != "gds":
+        return None
+    try:
+        installed_version = version("viennaps")
+        matrix_path = Path(__file__).resolve().parents[1] / "docs" / "stage9-evidence" / "gpu-capability-matrix.json"
+        failures = json.loads(matrix_path.read_text()).get("knownNativeFailures", [])
+    except (OSError, ValueError, PackageNotFoundError, AttributeError, TypeError):
+        return None
+    for failure in failures:
+        if not all(failure.get(key) == value for key, value in {
+            "dimension": dimension, "model": model, "operation": operation,
+            "boundaryXY": boundary, "geometryKind": geometry_kind,
+            "engineVersion": installed_version,
+        }.items()):
+            continue
+        engines = failure.get("engines", [])
+        if engine is None or engine in engines:
+            return failure
+    return None
+
+
+def known_engine_limitation(dimension: int, model: str, engine: str,
+                            step: dict[str, Any]) -> dict[str, Any] | None:
+    """Return a measured installed-engine species limit for this step."""
+    if model != "multiParticle" or engine != "GPU_DISK":
+        return None
+    ion_count = sum(1 for species in step.get("species", []) if species.get("kind") == "ion")
+    if ion_count <= 1:
+        return None
+    try:
+        installed_version = version("viennaps")
+        matrix_path = Path(__file__).resolve().parents[1] / "docs" / "stage9-evidence" / "gpu-capability-matrix.json"
+        limitations = json.loads(matrix_path.read_text()).get("knownEngineLimitations", [])
+    except (OSError, ValueError, PackageNotFoundError, AttributeError, TypeError):
+        return None
+    return next((row for row in limitations if row.get("model") == model
+                 and row.get("engine") == engine and row.get("engineVersion") == installed_version
+                 and dimension in row.get("dimensions", []) and ion_count > row.get("maxIonSpecies", 0)), None)
+
+
+def validate_project(payload: Any, *, kind: str = "project") -> tuple[Project, list[str]]:
+    project = _parse(payload)
+    issues: list[FieldIssue] = []
+    warnings: list[str] = []
+
+    if project.schemaVersion in (3, 4, 5, 6, 7):
+        try:
+            attach_and_reconcile_project_materials(project)
+        except (ValueError, OSError) as exc:
+            issues.append(FieldIssue("materialDefinitions", str(exc)))
+
+    if kind == "simulate" and not any(step.get("enabled") if isinstance(step, dict) else step.enabled for step in project.steps):
+        issues.append(FieldIssue("steps", "simulate requires at least one enabled process step"))
+
+    delta = project.domain.gridDelta
+    extent = project.domain.xExtent
+    if project.schemaVersion in (3,4,5,6,7):
+        issues.extend(_validate_materials(project))
+        if project.schemaVersion == 7:
+            issues.extend(_validate_specialized_steps(project))
+        if project.dimension == 3:
+            issues.extend(_validate_v3_3d_geometry(project))
+        else:
+            issues.extend(_validate_v3_2d_geometry(project))
+        if project.solver.cpuThreads > available_cpu_threads():
+            issues.append(FieldIssue("solver.cpuThreads", "thread count exceeds available CPU threads"))
+        normalized=project.model_dump(mode="json",exclude_none=True)
+        boundary=normalized["domain"].get("boundaryXY",normalized["domain"].get("xBoundary"))
+        for i,step in enumerate(project.steps):
+            step_dict=step.model_dump(mode="json",exclude_none=True) if not isinstance(step,dict) else step
+            if project.schemaVersion == 7 and step_value(step, "model") == "specialized":
+                # Specialized models have their own per-model CPU/GPU matrix;
+                # do not skip this exact gate with the generic particle path.
+                model_key = f"specialized:{step_value(step, 'nativeModel')}"
+                installed_model = model_spec(step_value(step, "nativeModel"))
+                native_engine = select_engine(normalized, step_dict) if installed_model and installed_model["usesFlux"] else "not-applicable"
+                native_failure = known_native_failure(
+                    project.dimension, model_key, step_value(step, "operation"), boundary,
+                    normalized.get("geometry", {}).get("kind"), native_engine)
+                if step_value(step, "enabled") and native_failure and not native_engine.startswith("GPU_"):
+                    message = (f"installed ViennaPS {native_failure['engineVersion']} reproduces a native Process.apply SIGSEGV on {native_engine} for this GDS/boundary combination; the measured failure also occurs on CPU_DISK and GPU_DISK")
+                    if kind == "simulate":
+                        issues.append(FieldIssue(f"steps[{i}].nativeModel", message))
+                    else:
+                        warnings.append(f"steps[{i}].nativeModel: {message}")
+                    continue
+                signature = gpu_project_signature(normalized, step_dict)
+                if step_value(step, "enabled") and (native_engine == "unavailable" or
+                        (not native_engine.startswith("GPU_") and not capability_verified(
+                            project.dimension, model_key, step_value(step, "operation"), boundary,
+                            native_engine, schema_version=project.schemaVersion, **signature))):
+                    issues.append(FieldIssue(f"steps[{i}].nativeModel", f"this native model/dimension/operation/boundary {native_engine} combination has not passed direct-reference acceptance"))
+                continue
+            if step_value(step,"enabled") and (uses_flux(step) if project.schemaVersion in (4,5,6,7) else step_value(step,"model")=="singleParticle" and step_value(step,"rateMagnitude")>0):
+                engine=select_engine(normalized,step_dict)
+                signature = gpu_project_signature(normalized, step_dict)
+                if engine=="unavailable" or (not engine.startswith("GPU_") and not capability_verified(
+                        project.dimension,step_value(step,"model"),step_value(step,"operation"),boundary,engine,
+                        schema_version=project.schemaVersion, **signature)):
+                    limitation = known_engine_limitation(project.dimension, step_value(step, "model"),
+                                                         "GPU_DISK", step_dict)
+                    if limitation and project.solver.enginePreference == "gpu":
+                        message = (f"installed ViennaPS {limitation['engineVersion']} GPU MultiParticle binding only converts {limitation['maxIonSpecies']} ion particle type; additional ion species are ignored. The Workbench split route uses representative solver coverage and still requires an accepted geometry/material class and supported species/rate callback signature. CPU_DISK remains available for this configuration")
+                        if kind == "simulate":
+                            issues.append(FieldIssue(f"steps[{i}].species", message))
+                        else:
+                            warnings.append(f"steps[{i}].species: {message}")
+                    else:
+                        issues.append(FieldIssue(f"steps[{i}].model","no verified engine combination for this schema, operation and boundary"))
+        if issues:
+            raise ProjectInputError(issues)
+        return project, warnings
+    if project.dimension == 3:
+        return validate_3d(project, kind=kind)
+    if project.solver.cpuThreads > available_cpu_threads():
+        issues.append(FieldIssue("solver.cpuThreads", "thread count exceeds available CPU threads"))
+
+    trench = project.geometry if project.geometry.kind == "trench" else None
+    if trench:
+        bottom = trench.width - 2.0 * trench.depth * math.tan(math.radians(trench.taperAngle))
+        mask_half_spread = trench.maskHeight * abs(math.tan(math.radians(trench.maskTaperAngle)))
+        narrowest_mask_opening = trench.width - 2.0 * mask_half_spread
+        widest_mask_opening = trench.width + 2.0 * mask_half_spread
+        if bottom <= 0:
+            issues.append(FieldIssue("geometry.taperAngle", "taper produces a non-positive trench bottom width"))
+        elif bottom < 2 * delta:
+            issues.append(FieldIssue("geometry.taperAngle", "tapered bottom must span at least two grid intervals"))
+        elif bottom < 5 * delta:
+            warnings.append("Tapered trench bottom is represented by fewer than five grid intervals.")
+        if trench.maskHeight > 0 and narrowest_mask_opening <= 0:
+            issues.append(FieldIssue("geometry.maskTaperAngle", "mask taper closes or self-intersects the trench opening"))
+        if trench.width >= extent or bottom >= extent or (trench.maskHeight > 0 and widest_mask_opening >= extent):
+            issues.append(FieldIssue("geometry.width", "trench opening and bottom must fit within the horizontal domain"))
+        if trench.maskHeight > 0 and 0 < narrowest_mask_opening < 5 * delta:
+            warnings.append("The narrow mask opening spans fewer than five grid intervals.")
+        features = [("geometry.width", trench.width), ("geometry.depth", trench.depth)]
+        if trench.maskHeight > 0:
+            features.append(("geometry.maskHeight", trench.maskHeight))
+        for path, size in features:
+            cells = size / delta
+            if cells < 2:
+                issues.append(FieldIssue(path, "positive geometry features must span at least two grid intervals"))
+            elif cells < 5:
+                warnings.append(f"{path} spans fewer than five grid intervals; geometric precision may be limited.")
+
+    if issues:
+        raise ProjectInputError(issues)
+    return project, warnings
+
+
+def _validate_materials(project: ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 | ProjectV7) -> list[FieldIssue]:
+    try:
+        from .materials import material_catalog
+        catalog=material_catalog()
+        names={row["name"] for row in catalog["materials"]}
+    except (OSError,ValueError,KeyError,TypeError):
+        return [FieldIssue("$", "verified material catalog is unavailable")]
+    ids={int(row["id"]) for row in catalog["materials"]}
+    if project.dimension==3:
+        for value in project.view3D.visibleMaterialIds:
+            if value not in ids: issues_view=[FieldIssue("view3D.visibleMaterialIds",f"unknown native material ID {value}")]; break
+        else: issues_view=[]
+        if any(key not in {str(value) for value in ids} for key in project.view3D.opacityByMaterial):
+            issues_view.append(FieldIssue("view3D.opacityByMaterial","opacity keys must be native material IDs from /api/materials"))
+    else: issues_view=[]
+    g=project.geometry; roles: dict[str,set[str]]={}
+    def add(name,role,path):
+        if name not in names: issues.append(FieldIssue(path,f"unknown or unavailable material {name!r}; choose a material from /api/materials"))
+        roles.setdefault(name,set()).add(role)
+    issues=list(issues_view)
+    uniform_protection=project.schemaVersion<4 or any(step_value(step,"rateMode","uniform")=="uniform" for step in project.steps)
+    if g["kind"] == "gds":
+        from . import storage
+        from .gds import GdsFormatError, parse_gds
+        try:
+            source = storage.resolve_gds_asset(g["assetId"])
+            library = parse_gds(source.read_bytes())
+            available_layers = set(library.effective_layers(g["structure"]))
+            selected_layers = {int(row["layer"]) for row in g["layers"]}
+            if selected_layers - available_layers:
+                issues.append(FieldIssue("geometry.layers", "selected layer IDs are not present in the selected GDS structure"))
+        except FileNotFoundError:
+            issues.append(FieldIssue("geometry.assetId", "GDS file is unavailable or its SHA-256 does not match; reimport the project package"))
+        except (OSError, GdsFormatError, KeyError) as exc:
+            issues.append(FieldIssue("geometry", f"GDS structure selection is invalid: {exc}"))
+        for i, layer in enumerate(g["layers"]):
+            role = "mask" if layer.get("mask") and uniform_protection else "film"
+            add(layer["material"], role, f"geometry.layers[{i}].material")
+    else:
+        add(g["substrateMaterial"],"bulk","geometry.substrateMaterial")
+    if g["kind"] in ("trench","hole","fin"):
+        if g.get("maskHeight",0)>0: add(g.get("maskMaterial","Mask"),"mask" if uniform_protection else "film","geometry.maskMaterial")
+    if g["kind"]=="stack":
+        for i,layer in enumerate(g["layers"]): add(layer["material"],layer["role"] if uniform_protection else "film",f"geometry.layers[{i}].material")
+    for i,step in enumerate(project.steps):
+        if is_geometry_step(step) and step_value(step,"model")=="removeMaterial" and step_value(step,"material") not in names:
+            issues.append(FieldIssue(f"steps[{i}].material",f"unknown or unavailable material {step_value(step,'material')!r}"))
+        if is_geometry_step(step) and step_value(step,"model")=="planarize":
+            if abs(float(step_value(step,"cutoffHeight")))/project.domain.gridDelta>1_000_000:
+                issues.append(FieldIssue(f"steps[{i}].cutoffHeight","cutoff height exceeds the application coordinate budget"))
+        if is_geometry_step(step) and step_value(step,"model")=="boolean":
+            position=step_value(step,"position"); width=float(step_value(step,"width")); height=float(step_value(step,"height")); depth=step_value(step,"depth")
+            if width<2*project.domain.gridDelta-1e-12 or height<2*project.domain.gridDelta-1e-12 or (project.dimension==3 and float(depth)<2*project.domain.gridDelta-1e-12):
+                issues.append(FieldIssue(f"steps[{i}]","boolean box dimensions must span at least two grid intervals"))
+            if abs(float(position[0]))>project.domain.xExtent/2+width/2:
+                issues.append(FieldIssue(f"steps[{i}].position","boolean box must intersect the x domain"))
+            if project.dimension==3 and abs(float(position[1]))>project.domain.yExtent/2+float(depth)/2:
+                issues.append(FieldIssue(f"steps[{i}].position","boolean box must intersect the y domain"))
+            if any(abs(float(value))/project.domain.gridDelta>1_000_000 for value in position):
+                issues.append(FieldIssue(f"steps[{i}].position","boolean position exceeds the application coordinate budget"))
+        if step_value(step,"model")=="multiParticle":
+            rate_table=step_value(step,"rateCoefficients") or {}
+            for name in (rate_table.get("byMaterial",{}) if isinstance(rate_table,dict) else rate_table.byMaterial):
+                if name not in names:
+                    issues.append(FieldIssue(f"steps[{i}].rateCoefficients.byMaterial.{name}",f"unknown or unavailable material {name!r}"))
+            for species_index,species in enumerate(step_value(step,"species",[]) or []):
+                species_kind=step_value(species,"kind")
+                if species_kind=="neutral":
+                    sticking=step_value(species,"stickingProbabilityByMaterial",{}) or {}
+                    for name in sticking:
+                        if name not in names:
+                            issues.append(FieldIssue(f"steps[{i}].species[{species_index}].stickingProbabilityByMaterial.{name}",f"unknown or unavailable material {name!r}"))
+        if step_value(step,"operation")=="deposit":
+            name=step_value(step,"depositMaterial")
+            if name not in names: issues.append(FieldIssue(f"steps[{i}].depositMaterial", f"unknown or unavailable material {name!r}"))
+            if step_value(step,"enabled") and has_motion(step):
+                roles.setdefault(name,set()).add("film")
+        if project.schemaVersion in (4,5,6,7) and step_value(step,"rateMode") == "material":
+            for name in (step_value(step,"materialRates") or {}):
+                if name not in names: issues.append(FieldIssue(f"steps[{i}].materialRates.{name}",f"unknown or unavailable material {name!r}"))
+            reference=step_value(step,"selectivityReference")
+            if reference is not None and reference not in names:
+                issues.append(FieldIssue(f"steps[{i}].selectivityReference",f"unknown reference material {reference!r}"))
+    for material,material_roles in roles.items():
+        if "mask" in material_roles and len(material_roles)>1:
+            issues.append(FieldIssue("geometry",f"material {material!r} is used as both mask and non-mask; native material IDs cannot distinguish these roles"))
+    if any("mask" in roles.get(name,set()) and step_value(step,"rateMode","uniform")=="uniform" and step_value(step,"operation")=="deposit" and step_value(step,"depositMaterial")==name and step_value(step,"enabled") and has_motion(step) for name in roles for step in project.steps):
+        issues.append(FieldIssue("steps", "nonzero deposition onto a protected mask material is unsupported by the current simplified model"))
+    return issues
+
+
+def _geometry_material_names(geometry: dict[str, Any]) -> set[str]:
+    names: set[str] = set()
+    kind = geometry.get("kind")
+    if kind == "gds":
+        names.update(str(row["material"]) for row in geometry.get("layers", []))
+    else:
+        names.add(str(geometry.get("substrateMaterial", "")))
+        if kind == "stack":
+            names.update(str(row["material"]) for row in geometry.get("layers", []))
+        if kind in {"trench", "hole", "fin"} and float(geometry.get("maskHeight", 0)) > 0:
+            names.add(str(geometry.get("maskMaterial", "Mask")))
+    names.discard("")
+    return names
+
+
+def gpu_project_signature(project: dict[str, Any], step: dict[str, Any]) -> dict[str, Any]:
+    """Return the geometry/material scope represented by a GPU evidence row."""
+    geometry = project.get("geometry", {})
+    names = _geometry_material_names(geometry)
+    roles: dict[str, set[str]] = {}
+    def add_role(name: Any, role: str) -> None:
+        if name:
+            roles.setdefault(str(name), set()).add(role)
+    kind = geometry.get("kind")
+    if kind == "gds":
+        for layer in geometry.get("layers", []):
+            add_role(layer.get("material"), "mask" if layer.get("mask") else "film")
+    else:
+        add_role(geometry.get("substrateMaterial"), "bulk")
+        if kind == "stack":
+            for layer in geometry.get("layers", []):
+                add_role(layer.get("material"), str(layer.get("role", "film")))
+        elif kind in {"trench", "hole", "fin"} and float(geometry.get("maskHeight", 0)) > 0:
+            add_role(geometry.get("maskMaterial", "Mask"), "mask")
+    parameters = step.get("nativeParameters", {}) or {}
+    for key in ("materialRates", "materialParametersByMaterial", "materialPlaneWaferRateByMaterial"):
+        rows = parameters.get(key, {}) or {}
+        if isinstance(rows, dict):
+            names.update(str(name) for name in rows)
+    rates = step.get("materialRates", {}) or {}
+    if isinstance(rates, dict):
+        names.update(str(name) for name in rates)
+    relation = step.get("rateCoefficients", {}) or {}
+    if isinstance(relation, dict):
+        names.update(str(name) for name in (relation.get("byMaterial", {}) or {}))
+    for species in step.get("species", []) or []:
+        names.update(str(name) for name in (species.get("stickingProbabilityByMaterial", {}) or {}))
+    bindings = {}
+    if step.get("depositMaterial"):
+        bindings["depositMaterial"] = str(step["depositMaterial"])
+    for key in ("maskMaterial", "siliconMaterial", "oxideMaterial", "etchFrontMaterial"):
+        value = parameters.get(key)
+        if isinstance(value, str) and value:
+            bindings[key] = value
+    names.update(bindings.values())
+    pattern = geometry.get("pattern", {}) if geometry.get("kind") == "stack" else {}
+    species_signature = None
+    if step.get("model") == "multiParticle":
+        # GPU evidence must cover the exact installed particle combination.
+        # Species count/kind and their model parameters change native process
+        # setup, while the rate tables and sticking map change its callback.
+        species_signature = {
+            "species": step.get("species", []),
+            "rateCoefficients": step.get("rateCoefficients", {}),
+        }
+    solver = project.get("solver", {})
+    domain = project.get("domain", {})
+    solver_profile = {
+        "gridDelta": float(domain["gridDelta"]),
+        "timeStepRatio": float(solver["timeStepRatio"]),
+        "raysPerPoint": int(solver["raysPerPoint"]),
+        "randomMode": str((solver.get("random") or {}).get("mode", "fixed")),
+        "advection": solver.get("advection"),
+        "rayTracing": solver.get("rayTracing"),
+    }
+    return {
+        "geometry_kind": str(geometry.get("kind", "")),
+        "pattern_kind": str(pattern.get("kind", "none")) if geometry.get("kind") == "stack" else None,
+        "fin_extrusion_mode": ("extruded" if geometry.get("extrusion") is not None else "direct")
+        if geometry.get("kind") == "fin" else None,
+        "fin_construction": fin_construction_decision(project)["effective"] if geometry.get("kind") == "fin" else None,
+        "gds_mapping_count": len(geometry.get("layers", [])) if geometry.get("kind") == "gds" else None,
+        "gds_has_3d_mask": (project.get("dimension") == 3 and any(
+            bool(layer.get("mask", False)) for layer in geometry.get("layers", [])))
+            if geometry.get("kind") == "gds" else False,
+        "materials": sorted(names),
+        "material_roles": {name: sorted(value) for name, value in sorted(roles.items())},
+        "material_bindings": dict(sorted(bindings.items())),
+        "species_signature": species_signature,
+        "solver_profile": solver_profile,
+    }
+
+
+def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
+    issues: list[FieldIssue] = []
+    material_names = {row["name"] for row in _catalog_names()}
+    custom_names: set[str] = set()
+    try:
+        from .materials import material_catalog
+        custom_names = {row["name"] for row in material_catalog()["materials"] if row.get("isCustom")}
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    geometry_names = _geometry_material_names(project.geometry)
+    for index, step in enumerate(project.steps):
+        if step.model != "specialized":
+            continue
+        spec = model_spec(step.nativeModel)
+        if spec is None:
+            continue
+        prefix = f"steps[{index}].nativeParameters"
+        params = step.nativeParameters
+        for field in spec["fields"]:
+            key = field["key"]
+            path = f"{prefix}.{key}"
+            value = params.get(key)
+            kind = field["kind"]
+            if kind == "number":
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                    issues.append(FieldIssue(path, "must be a finite JSON number"))
+                elif not float(field["minimum"]) <= float(value) <= float(field["maximum"]):
+                    issues.append(FieldIssue(path, f"must be between {field['minimum']} and {field['maximum']}"))
+            elif kind == "boolean":
+                if type(value) is not bool:
+                    issues.append(FieldIssue(path, "must be a JSON boolean"))
+            elif kind == "enum":
+                allowed = {row["value"] for row in field["options"]}
+                if value not in allowed:
+                    issues.append(FieldIssue(path, f"must be one of {sorted(allowed)}"))
+            elif kind in {"material", "materialOptional"}:
+                if kind == "materialOptional" and value == "":
+                    continue
+                if not isinstance(value, str) or value not in material_names:
+                    issues.append(FieldIssue(path, f"must name a material from the installed catalog: {value!r}"))
+                elif kind == "material" and value not in geometry_names and step.nativeModel not in {"selectiveEpitaxy"}:
+                    issues.append(FieldIssue(path, f"material {value!r} is not present in the initial geometry"))
+            elif kind == "text":
+                if not isinstance(value, str) or not value or len(value) > 80 or any(ord(char) < 32 for char in value):
+                    issues.append(FieldIssue(path, "must be nonempty text of at most 80 printable characters"))
+            elif kind == "vector3":
+                if not isinstance(value, list) or len(value) != 3 or any(
+                    isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(float(item)) for item in value
+                ):
+                    issues.append(FieldIssue(path, "must contain exactly three finite numbers"))
+            elif kind in {"materialRates", "fluorocarbonMaterials"}:
+                if not isinstance(value, dict):
+                    issues.append(FieldIssue(path, "must be a material-keyed table"))
+                    continue
+                for name, entry in value.items():
+                    if name not in material_names and name != "Polymer":
+                        issues.append(FieldIssue(f"{path}.{name}", f"unknown or unavailable material {name!r}"))
+                    if kind == "materialRates":
+                        if isinstance(entry, bool) or not isinstance(entry, (int, float)) or not math.isfinite(float(entry)) or not field["minimum"] <= float(entry) <= field["maximum"]:
+                            issues.append(FieldIssue(f"{path}.{name}", "material rate must be finite and within the displayed range"))
+                    else:
+                        expected = set(field["defaults"])
+                        if not isinstance(entry, dict) or set(entry) != expected:
+                            issues.append(FieldIssue(f"{path}.{name}", f"must contain exactly {sorted(expected)}"))
+                            continue
+                        for subkey, subvalue in entry.items():
+                            if isinstance(subvalue, bool) or not isinstance(subvalue, (int, float)) or not math.isfinite(float(subvalue)) or not field["minimum"] <= float(subvalue) <= field["maximum"]:
+                                issues.append(FieldIssue(f"{path}.{name}.{subkey}", "must be a finite number within the displayed range"))
+
+        if step.nativeModel in {"wetEtch", "selectiveEpitaxy"}:
+            table = params.get("materialRates", {})
+            required = geometry_names if step.nativeModel == "wetEtch" else {"Si", "SiGe"}
+            if set(table) != required:
+                issues.append(FieldIssue(f"{prefix}.materialRates", f"must explicitly configure exactly these native material rates: {sorted(required)}"))
+            if step.nativeModel == "selectiveEpitaxy" and isinstance(table, dict) and float(table.get("SiGe", 0.0)) <= 0.0:
+                issues.append(FieldIssue(f"{prefix}.materialRates.SiGe", "must be positive so the native top material is recognized as an epitaxy material"))
+        if step.nativeModel == "fluorocarbon":
+            required = geometry_names | {"Polymer", "Mask"}
+            if set(params.get("materialParametersByMaterial", {})) != required:
+                issues.append(FieldIssue(f"{prefix}.materialParametersByMaterial", f"native FluorocarbonEtching requires a parameter row for every geometry material and Polymer: {sorted(required)}"))
+        if step.nativeModel == "ionBeam":
+            table = params.get("materialPlaneWaferRateByMaterial", {})
+            if isinstance(table, dict) and set(table) - geometry_names:
+                issues.append(FieldIssue(f"{prefix}.materialPlaneWaferRateByMaterial", "may only reference materials present in the initial geometry"))
+        if step.nativeModel in {"sf6o2", "cf4o2", "hbro2", "sf6c4f8"} and geometry_names & custom_names:
+            issues.append(FieldIssue(f"steps[{index}].nativeModel", "the installed built-in plasma model has no verified parameters for custom materials"))
+        if step.nativeModel == "oxideRegrowth" and not {"SiO2", "Si3N4"}.issubset(geometry_names):
+            issues.append(FieldIssue(f"steps[{index}].nativeModel", "OxideRegrowth requires native SiO2 and Si3N4 materials in the geometry"))
+        if step.nativeModel == "oxideRegrowth" and (project.geometry.get("kind") != "stack" or
+                project.geometry.get("pattern", {}).get("kind") != "none"):
+            issues.append(FieldIssue(f"steps[{index}].nativeModel", "installed OxideRegrowth is verified only on a flat stack with top-layer pattern set to none; patterned or non-stack domains can crash ViennaPS 4.6.2"))
+        if step.nativeModel == "selectiveEpitaxy" and custom_names & geometry_names:
+            issues.append(FieldIssue(f"steps[{index}].nativeModel", "SelectiveEpitaxy has only been verified with installed native epitaxy materials"))
+    return issues
+
+
+def _catalog_names() -> list[dict[str, Any]]:
+    from .materials import material_catalog
+    return material_catalog()["materials"]
+
+
+def _validate_v3_geometry(project: ProjectV3) -> list[FieldIssue]:
+    g=project.geometry; d=project.domain; out=[]; delta=d.gridDelta
+    def feature(value,path):
+        if value < 2*delta-1e-12:
+            out.append(FieldIssue(path,"positive features must span at least two grid intervals"))
+    if project.dimension==2 and g["kind"]=="hole":
+        return [FieldIssue("geometry.kind","hole is only supported in 3D")]
+    if g["kind"]=="plane":
+        if abs(g["height"])/delta>1_000_000:
+            out.append(FieldIssue("geometry.height","height exceeds the application coordinate budget"))
+        return out
+    if g["kind"]=="fin":
+        if g["width"] >= d.xExtent:
+            out.append(FieldIssue("geometry.width", "fin width must fit inside the lateral domain"))
+        return out
+    if g["kind"]=="gds":
+        for axis, value in enumerate(g["position"]):
+            if abs(float(value))/delta>1_000_000:
+                out.append(FieldIssue(f"geometry.position[{axis}]", "GDS placement exceeds the application coordinate budget"))
+        return out
+    if g["kind"]=="stack":
+        if abs(g["baseHeight"])/delta>1_000_000:
+            out.append(FieldIssue("geometry.baseHeight","base height exceeds the application coordinate budget"))
+        for i,layer in enumerate(g["layers"]):
+            feature(layer["thickness"],f"geometry.layers[{i}].thickness")
+        pattern=g["pattern"]
+        if pattern["kind"]=="none": return out
+        if pattern["kind"]=="hole" and project.dimension==2:
+            return out+[FieldIssue("geometry.pattern.kind","2D stacks do not support hole patterns")]
+        size=pattern["width"] if pattern["kind"]=="trench" else 2*pattern["radius"]
+        change=2*g["layers"][-1]["thickness"]*math.tan(math.radians(pattern["taperAngle"]))
+        feature(min(size,size-change),"geometry.pattern")
+        limit=d.xExtent if pattern["kind"]=="trench" else min(d.xExtent,d.yExtent)
+        if max(size,size-change)>=limit:
+            out.append(FieldIssue("geometry.pattern","pattern and tapered opening must fit inside the lateral domain"))
+        return out
+    size=g["width"] if g["kind"]=="trench" else 2*g["radius"]
+    bottom=size-2*g["depth"]*math.tan(math.radians(g["taperAngle"]))
+    mask_spread=2*g["maskHeight"]*abs(math.tan(math.radians(g["maskTaperAngle"])))
+    feature(size,"geometry.width" if g["kind"]=="trench" else "geometry.radius")
+    feature(g["depth"],"geometry.depth")
+    feature(bottom,"geometry.taperAngle")
+    if g["maskHeight"]>0:
+        feature(g["maskHeight"],"geometry.maskHeight")
+        feature(size-mask_spread,"geometry.maskTaperAngle")
+    limit=d.xExtent if g["kind"]=="trench" else min(d.xExtent,d.yExtent)
+    if max(size,bottom,size+mask_spread)>=limit:
+        out.append(FieldIssue("geometry","structure must fit inside the lateral domain"))
+    return out
+
+
+def _validate_v3_2d_geometry(project: ProjectV3) -> list[FieldIssue]:
+    if isinstance(project.domain,Domain3D): return [FieldIssue("domain","2D projects require the 2D domain")]
+    return _validate_v3_geometry(project)
+
+
+def _validate_v3_3d_geometry(project: ProjectV3) -> list[FieldIssue]:
+    if not isinstance(project.domain,Domain3D): return [FieldIssue("domain","3D projects require the 3D domain")]
+    return _validate_v3_geometry(project)
+
+
+def _gpu_material_scope_matches(scope: dict[str, Any], materials: list[str] | None,
+                               material_roles: dict[str, list[str]] | None,
+                               material_bindings: dict[str, str] | None,
+                               geometry_kind: str | None, operation: str,
+                               boundary: str) -> bool:
+    if (scope.get("kind") != "viennaps-native-material-registry-v1"
+            or scope.get("engineVersion") != "4.6.2"
+            or boundary not in scope.get("boundaries", [])):
+        return False
+    if materials is None or material_roles is None or material_bindings is None or geometry_kind is None:
+        return False
+    allowed_roles = scope.get("roleKindsByGeometry", {}).get(geometry_kind, [])
+    actual_roles = sorted({role for roles in material_roles.values() for role in roles})
+    if actual_roles not in allowed_roles:
+        return False
+    expected_bindings = scope.get("bindingKeysByOperation", {}).get(operation)
+    if expected_bindings is None or sorted(material_bindings) != sorted(expected_bindings):
+        return False
+    expected_binding_values = scope.get("bindingValuesByOperation", {})
+    binding_roles = scope.get("bindingRolesByOperation", {}).get(operation, {})
+    if operation in expected_binding_values:
+        static_bindings = {key: value for key, value in material_bindings.items() if key not in binding_roles}
+        if static_bindings != expected_binding_values[operation]:
+            return False
+    for key, role in binding_roles.items():
+        if key not in material_bindings or not isinstance(role, str) or not role:
+            return False
+        role_names = {name for name, roles in material_roles.items() if role in roles}
+        if material_bindings[key] not in role_names:
+            return False
+    catalog = _catalog_names()
+    by_name = {str(row["name"]): row for row in catalog}
+    builtin_ids = {int(value) for value in scope.get("builtInLegacyIds", [])}
+    custom_range = scope.get("customLegacyIdRange", [])
+    if (len(custom_range) != 2 or int(custom_range[0]) != 177 or int(custom_range[1]) != 240
+            or not builtin_ids):
+        return False
+    intrinsic_materials = set(scope.get("intrinsicMaterials", []))
+    seen_ids: set[int] = set()
+    for name in materials:
+        if name in intrinsic_materials:
+            continue
+        row = by_name.get(name)
+        if row is None:
+            return False
+        native_id = int(row["id"])
+        if native_id in seen_ids:
+            return False
+        seen_ids.add(native_id)
+        if row.get("isCustom"):
+            if not int(custom_range[0]) <= native_id <= int(custom_range[1]):
+                return False
+        elif native_id not in builtin_ids:
+            return False
+    if not set(material_roles).issubset(materials):
+        return False
+    if not set(material_bindings.values()).issubset(materials):
+        return False
+    allowed_sets = scope.get("allowedMaterialSets")
+    if allowed_sets is not None:
+        if (not isinstance(allowed_sets, list) or not allowed_sets
+                or any(not isinstance(names, list) or not names or len(names) != len(set(names))
+                       or any(not isinstance(name, str) or not name for name in names)
+                       for names in allowed_sets)):
+            return False
+        allowed = {tuple(sorted(names)) for names in allowed_sets}
+        if tuple(sorted(set(materials))) not in allowed:
+            return False
+    role_ids = scope.get("materialLegacyIdsByRoleByGeometry", {}).get(geometry_kind, {})
+    for name, roles in material_roles.items():
+        if not roles:
+            return False
+        row = by_name.get(name)
+        if row is None:
+            # Intrinsic ViennaPS process materials such as Polymer are not
+            # selectable geometry materials and must not acquire a geometry role.
+            if name in intrinsic_materials:
+                return False
+            continue
+        native_id = int(row["id"])
+        for role in roles:
+            allowed_ids = role_ids.get(role)
+            if allowed_ids is not None and native_id not in {int(value) for value in allowed_ids}:
+                return False
+    return True
+
+
+def _gpu_species_table_scope_matches(baseline: dict[str, Any] | None,
+                                     candidate: dict[str, Any] | None) -> bool:
+    """Allow material-keyed MP tables to vary while keeping native species fixed."""
+    if not isinstance(baseline, dict) or not isinstance(candidate, dict):
+        return False
+
+    def normalize(signature: dict[str, Any]) -> dict[str, Any] | None:
+        species = signature.get("species")
+        relation = signature.get("rateCoefficients")
+        if not isinstance(species, list) or not isinstance(relation, dict):
+            return None
+        labels = [item.get("label") for item in species if isinstance(item, dict)]
+        if len(labels) != len(species) or not labels or len(labels) != len(set(labels)):
+            return None
+        defaults = relation.get("defaultBySpecies")
+        overrides = relation.get("byMaterial", {})
+        if not isinstance(defaults, dict) or set(defaults) != set(labels) or not isinstance(overrides, dict):
+            return None
+        normalized_species = []
+        for item in species:
+            if item.get("kind") == "ion":
+                normalized_species.append({key: value for key, value in item.items() if key != "label"})
+            elif item.get("kind") == "neutral":
+                sticking = item.get("stickingProbabilityByMaterial", {})
+                if not isinstance(sticking, dict) or any(
+                    isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value)) or not 0 <= float(value) <= 1
+                    for value in sticking.values()
+                ):
+                    return None
+                normalized_species.append({key: value for key, value in item.items()
+                                           if key not in {"label", "stickingProbabilityByMaterial"}})
+            else:
+                return None
+        for row in overrides.values():
+            if not isinstance(row, dict) or set(row) - set(labels):
+                return None
+            if any(isinstance(value, bool) or not isinstance(value, (int, float))
+                   or not math.isfinite(float(value)) or not 0 <= float(value) <= 2
+                   for value in row.values()):
+                return None
+        if any(isinstance(defaults[label], bool) or not isinstance(defaults[label], (int, float))
+               or not math.isfinite(float(defaults[label])) or not 0 <= float(defaults[label]) <= 2
+               for label in labels):
+            return None
+        return {"species": normalized_species,
+                "defaultRatesByOrder": [float(defaults[label]) for label in labels]}
+
+    left, right = normalize(baseline), normalize(candidate)
+    return left is not None and left == right
+
+
+def _gpu_combination_verified(dimension: int, model: str, operation: str, boundary: str,
+                              engine: str, schema_version: int | None, *,
+                              execution_strategy: str | None = None,
+                              flux_strategy: str | None = None,
+                              geometry_kind: str | None = None, pattern_kind: str | None = None,
+                              fin_extrusion_mode: str | None = None,
+                              fin_construction: str | None = None,
+                              gds_mapping_count: int | None = None,
+                              gds_has_3d_mask: bool = False,
+                              materials: list[str] | None = None,
+                              material_roles: dict[str, list[str]] | None = None,
+                              material_bindings: dict[str, str] | None = None,
+                              species_signature: dict[str, Any] | None = None,
+                              solver_profile: dict[str, Any] | None = None) -> bool:
+    path = Path(__file__).resolve().parents[1] / "docs" / "stage9-evidence" / "gpu-capability-matrix.json"
+    try:
+        data = json.loads(path.read_text())
+        # Solver profiles in positive rows describe representative direct runs.
+        # They do not define an exhaustive Cartesian product of CFL, ray count,
+        # advection, and ray-tracing settings. Only profiles with measured
+        # structural mismatches are held back in the explicit failure list.
+        for failure in data.get("knownGpuProfileFailures", []):
+            if not all(failure.get(key) == value for key, value in {
+                "dimension": dimension, "model": model, "operation": operation,
+                "boundaryXY": boundary, "engine": engine, "geometryKind": geometry_kind,
+                "materials": materials, "materialRoles": material_roles,
+                "materialBindings": material_bindings, "speciesSignature": species_signature,
+            }.items()):
+                continue
+            failed_profile = failure.get("solverProfile", {})
+            if failed_profile and solver_profile is not None and all(
+                solver_profile.get(key) == value for key, value in failed_profile.items()
+            ):
+                return False
+        for row in data.get("rows", []):
+            if row.get("status") != "verified" or (schema_version is not None and schema_version not in row.get("schemaVersions", [])):
+                continue
+            if not all(row.get(key) == value for key, value in {
+                "dimension": dimension, "model": model, "operation": operation,
+                "boundaryXY": boundary, "engine": engine,
+            }.items()):
+                continue
+            if execution_strategy is not None and row.get("executionStrategy") != execution_strategy:
+                continue
+            if flux_strategy is not None and row.get("singlePassFluxStrategy") != flux_strategy:
+                continue
+            # solverProfile is provenance for the representative run. Numerical
+            # profile changes inherit the model/geometry/material capability
+            # class, except for explicitly recorded profiles that failed direct
+            # structural comparison above.
+            # New schemas fail closed unless geometry and material scope match
+            # the combination that was measured against direct ViennaPS.
+            if schema_version not in (1, 2):
+                if geometry_kind is None or geometry_kind not in row.get("geometryKinds", []):
+                    continue
+                if geometry_kind == "fin" and (
+                    fin_extrusion_mode not in ("direct", "extruded")
+                    or row.get("finExtrusionMode") != fin_extrusion_mode
+                    or fin_construction not in ("native", "boolean")
+                    or row.get("finConstruction") != fin_construction
+                ):
+                    continue
+                if geometry_kind == "gds":
+                    scope = row.get("gdsScope", {})
+                    if (scope.get("kind") != "viennaps-gds-process-v1"
+                            or scope.get("engineVersion") != "4.6.2"
+                            or dimension not in scope.get("dimensions", [])
+                            or gds_mapping_count is None
+                            or gds_mapping_count < 1
+                            or gds_mapping_count > int(scope.get("maxLayerMappings", 0))
+                            or (gds_has_3d_mask and not scope.get("supports3DMask", False))):
+                        continue
+                if row.get("patternKinds") and (pattern_kind is None or pattern_kind not in row["patternKinds"]):
+                    continue
+                material_scope = row.get("materialScope")
+                if material_scope:
+                    if not _gpu_material_scope_matches(material_scope, materials, material_roles,
+                                                       material_bindings, geometry_kind, operation, boundary):
+                        continue
+                else:
+                    if materials is None or sorted(set(materials)) != sorted(row.get("materials", [])):
+                        continue
+                    # Material roles and selected native material handles affect
+                    # masking/deposition and must agree with the measured input.
+                    if material_roles is None or row.get("materialRoles") != material_roles:
+                        continue
+                    if material_bindings is None or row.get("materialBindings") != material_bindings:
+                        continue
+                if model == "multiParticle":
+                    if row.get("speciesScope", {}).get("kind") == "material-tables-v1":
+                        if not _gpu_species_table_scope_matches(row.get("speciesSignature"), species_signature):
+                            continue
+                    elif species_signature is None or row.get("speciesSignature") != species_signature:
+                        continue
+            return True
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    # Keep legacy v1/v2 projects working from the host probes, while all newer
+    # schemas require a Stage 9 exact-model matrix row.
+    if schema_version == 1:
+        return dimension == 2 and model == "singleParticle" and boundary == "reflective" and operation in ("etch", "deposit") and gpu_disk_verified()
+    if schema_version == 2:
+        try:
+            data = json.loads((Path(__file__).resolve().parents[1] / "docs" / "capabilities-3d.json").read_text())
+            return any(row.get("status") == "verified" and all(row.get(key) == value for key, value in {
+                "dimension": dimension, "model": model, "operation": operation,
+                "boundaryXY": boundary, "engine": engine,
+            }.items()) for row in data.get("rows", []))
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+    return False
+
+
+def capability_verified(dimension: int, model: str, operation: str, boundary: str, engine: str,
+                        *, schema_version: int | None = None, execution_strategy: str | None = None,
+                        flux_strategy: str | None = None,
+                        geometry_kind: str | None = None,
+                        pattern_kind: str | None = None, fin_extrusion_mode: str | None = None,
+                        fin_construction: str | None = None, gds_mapping_count: int | None = None,
+                        gds_has_3d_mask: bool = False,
+                        materials: list[str] | None = None,
+                        material_roles: dict[str, list[str]] | None = None,
+                        material_bindings: dict[str, str] | None = None,
+                        species_signature: dict[str, Any] | None = None,
+                        solver_profile: dict[str, Any] | None = None) -> bool:
+    if engine.startswith("GPU_"):
+        return _gpu_combination_verified(dimension, model, operation, boundary, engine, schema_version,
+                                         execution_strategy=execution_strategy,
+                                         flux_strategy=flux_strategy,
+                                         geometry_kind=geometry_kind, pattern_kind=pattern_kind, materials=materials,
+                                         fin_extrusion_mode=fin_extrusion_mode,
+                                         fin_construction=fin_construction,
+                                         gds_mapping_count=gds_mapping_count,
+                                         gds_has_3d_mask=gds_has_3d_mask,
+                                         material_roles=material_roles, material_bindings=material_bindings,
+                                         species_signature=species_signature,
+                                         solver_profile=solver_profile)
+    if model.startswith("specialized:"):
+        try:
+            data = json.loads((Path(__file__).resolve().parents[1] / "docs/stage8-evidence/capability-matrix.json").read_text())
+            native_model = model.split(":", 1)[1]
+            return any(row.get("status") == "verified" and all(row.get(key) == value for key, value in {
+                "dimension": dimension, "nativeModel": native_model, "operation": operation,
+                "boundaryXY": boundary, "engine": engine,
+            }.items()) for row in data.get("rows", []))
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+    if model == "multiParticle":
+        try:
+            data=json.loads((Path(__file__).resolve().parents[1]/"docs/stage7-evidence/capability-matrix.json").read_text())
+            return any(row.get("status")=="verified" and all(row.get(key)==value for key,value in {
+                "dimension":dimension,"model":model,"operation":operation,"boundaryXY":boundary,"engine":engine
+            }.items()) for row in data.get("rows",[]))
+        except (OSError,ValueError,KeyError,TypeError):
+            return False
+    if dimension == 2:
+        return engine == "CPU_DISK"
+    try:
+        data = json.loads((Path(__file__).resolve().parents[1]/"docs/capabilities-3d.json").read_text())
+        return any(row.get("status") == "verified" and all(row.get(k) == v for k,v in {"dimension":dimension,"model":model,"operation":operation,"boundaryXY":boundary,"engine":engine}.items()) for row in data["rows"])
+    except (OSError,ValueError,KeyError,TypeError):
+        return False
+
+
+def select_engine(project: dict, step: dict, *, analysis_mode: str = "process") -> str:
+    if not (uses_flux(step) if project.get("schemaVersion") in (4,5,6,7) else step["model"] == "singleParticle" and step["rateMagnitude"] > 0):
+        return "not-applicable"
+    preference = project["solver"]["enginePreference"]
+    model = step["model"]
+    if model == "specialized":
+        model = f"specialized:{step.get('nativeModel', '')}"
+    if project.get("schemaVersion") in (3,4,5,6,7):
+        if preference == "gpu":
+            candidates = ["GPU_DISK"]
+        elif preference == "auto" and project.get("schemaVersion") == 7:
+            candidates = ["GPU_DISK", "CPU_DISK"]
+        else:
+            candidates = ["CPU_DISK"]
+    else:
+        candidates = ["GPU_DISK", "GPU_TRIANGLE"] if preference == "gpu" else ["CPU_DISK", "CPU_TRIANGLE"]
+    boundary = project["domain"].get("boundaryXY", project["domain"].get("xBoundary"))
+    signature = gpu_project_signature(project, step)
+    for engine in candidates:
+        # Matrix entries describe measured coverage; an absent row is not an
+        # engine capability failure. The supervisor resolves the actual device
+        # and the bounded worker reports native errors without CPU fallback.
+        if engine == "GPU_DISK":
+            return engine
+        limitation = known_engine_limitation(project["dimension"], model, engine, step)
+        if project.get("schemaVersion") == 7 and limitation:
+            if analysis_mode == "flux":
+                strategy_verified = capability_verified(
+                    project["dimension"], model, step["operation"], boundary, engine,
+                    schema_version=project.get("schemaVersion"),
+                    flux_strategy=GPU_MULTIPARTICLE_FLUX_STRATEGY, **signature)
+            else:
+                strategy_verified = capability_verified(
+                    project["dimension"], model, step["operation"], boundary, engine,
+                    schema_version=project.get("schemaVersion"),
+                    execution_strategy=GPU_MULTIPARTICLE_SPLIT_STRATEGY, **signature)
+            if not strategy_verified:
+                continue
+        if project.get("schemaVersion") == 7 and known_native_failure(
+                project["dimension"], model, step["operation"], boundary,
+                project.get("geometry", {}).get("kind"), engine):
+            continue
+        if capability_verified(project["dimension"], model, step["operation"], boundary, engine,
+                               schema_version=project.get("schemaVersion"), **signature):
+            return engine
+    return "unavailable"
+
+
+def validate_3d(project, *, kind="project"):
+    issues=[]; warnings=[]
+    def issue(path,message): issues.append(FieldIssue(path,message))
+    d=project.domain; g=project.geometry; delta=d.gridDelta
+    if kind=="simulate" and not any(s.enabled for s in project.steps):issue("steps","simulate requires at least one enabled process step")
+    if project.solver.cpuThreads > available_cpu_threads():
+        issue("solver.cpuThreads", "thread count exceeds available CPU threads")
+    if g.kind=="plane":
+        if abs(g.height)>100:issue("geometry.height","height exceeds the 100 um application budget")
+    elif g.kind in ("fin", "gds"):
+        if g.kind == "fin":
+            if g.width >= d.xExtent: issue("geometry.width", "fin width must fit inside the lateral domain")
+            if g.height > 100: issue("geometry.height", "fin height exceeds the 100 um application budget")
+            if g.extrusion is not None and abs(g.extrusion.extent[1] - g.extrusion.extent[0]) > 40:
+                issue("geometry.extrusion.extent", "fin extrusion exceeds the 40 um application budget")
+        else:
+            for axis, value in enumerate(g.position):
+                if abs(value) > 1_000_000: issue(f"geometry.position[{axis}]", "GDS placement exceeds the application coordinate budget")
+    else:
+        width=g.width if g.kind=="trench" else 2*g.radius
+        bottom=width-2*g.depth*math.tan(math.radians(g.taperAngle))
+        spread=2*g.maskHeight*abs(math.tan(math.radians(g.maskTaperAngle)))
+        if bottom<2*delta:issue("geometry.taperAngle","bottom opening must span at least two grid intervals")
+        extent=d.xExtent if g.kind=="trench" else min(d.xExtent,d.yExtent)
+        if max(width,bottom,width+spread)>=extent:issue("geometry.width" if g.kind=="trench" else "geometry.radius","opening, bottom and mask must fit inside both applicable lateral bounds")
+        if g.maskHeight>0 and width-spread<2*delta:issue("geometry.maskTaperAngle","mask opening must span two grid intervals")
+        for path,size in [("width" if g.kind=="trench" else "radius",g.width if g.kind=="trench" else g.radius),("depth",g.depth),("maskHeight",g.maskHeight)]:
+            if path=="maskHeight" and size==0:continue
+            if size<2*delta:issue("geometry."+path,"positive features must span at least two grid intervals")
+            elif size<5*delta:warnings.append("geometry."+path+" spans fewer than five grid intervals")
+            if size>20:issue("geometry."+path,"feature exceeds 20 um application budget")
+    payload=project.model_dump(mode="json",exclude_none=True)
+    for index,s in enumerate(project.steps):
+        if not s.enabled or s.rateMagnitude==0:continue
+        engine=select_engine(payload,payload["steps"][index]) if s.model=="singleParticle" else "not-applicable"
+        if not engine.startswith("GPU_") and not capability_verified(3,s.model,s.operation,d.boundaryXY,engine,schema_version=project.schemaVersion):issue("solver.enginePreference","unverified 3D model/operation/boundary/engine combination")
+    if issues:raise ProjectInputError(issues)
+    return project,warnings

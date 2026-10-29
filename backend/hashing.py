@@ -1,0 +1,134 @@
+"""Stable request and execution hashes for saved runs."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+from typing import Any, Iterable
+
+from .models import Project, ProjectV3, ProjectV4, ProjectV5, ProjectV6, ProjectV7, Step
+from .rates import has_motion, uses_flux
+
+
+def _canonical_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _step_value(step: Any, key: str) -> Any:
+    return step.get(key) if isinstance(step, dict) else getattr(step, key)
+
+
+def _motion(step: Any, project: Any) -> bool:
+    return has_motion(step) if project.schemaVersion in (4, 5, 6, 7) else _step_value(step,"rateMagnitude")>0
+
+
+def _applicable_solver(project: Project | ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 | ProjectV7) -> dict[str, Any]:
+    active_steps = [step for step in project.steps if _step_value(step,"enabled") and _motion(step,project)]
+    if not active_steps:
+        return {}
+    data: dict[str, Any] = {"timeStepRatio": project.solver.timeStepRatio, "cpuThreads": project.solver.cpuThreads}
+    if project.schemaVersion == 7:
+        data["advection"] = project.solver.advection.model_dump(mode="json")
+        if project.solver.gpuDeviceId is not None:
+            data["gpuDeviceId"] = project.solver.gpuDeviceId
+    if any((uses_flux(step) if project.schemaVersion in (4, 5, 6, 7) else _step_value(step,"model")=="singleParticle" and _step_value(step,"rateMagnitude")>0) for step in project.steps if _step_value(step,"enabled")):
+        data.update(
+            raysPerPoint=project.solver.raysPerPoint,
+            random=project.solver.random.model_dump(mode="json", exclude_none=True),
+            enginePreference=project.solver.enginePreference,
+        )
+        if project.schemaVersion == 7:
+            data["rayTracing"] = project.solver.rayTracing.model_dump(mode="json")
+    return data
+
+
+def requested_input(project: Project | ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 | ProjectV7) -> dict[str, Any]:
+    geometry = json.loads(json.dumps(project.geometry)) if isinstance(project.geometry,dict) else project.geometry.model_dump(mode="json", exclude_none=True)
+    if project.schemaVersion in (3,4,5,6,7) and geometry.get("kind") == "stack":
+        for layer in geometry["layers"]:
+            layer.pop("id", None)
+            layer.pop("name", None)
+    steps = []
+    for step in project.steps:
+        if not _step_value(step,"enabled"):
+            continue
+        item = step if isinstance(step,dict) else step.model_dump(mode="json", exclude_none=True)
+        item = dict(item)
+        item.pop("id", None)
+        item.pop("name", None)
+        item.pop("enabled", None)
+        if project.schemaVersion in (4,5,6,7):
+            item.pop("selectivityReference",None)
+        if project.schemaVersion in (5,6,7) and item.get("model") == "directional":
+            if float(item.get("directionalRateMagnitude", 0.0)) == 0.0:
+                item.pop("direction", None)
+                item.pop("calculateVisibility", None)
+            else:
+                direction = item.get("direction", [0.0, 0.0, 0.0])
+                norm = math.sqrt(sum(float(value) ** 2 for value in direction))
+                if norm > 0.0:
+                    item["direction"] = [float(value) / norm for value in direction]
+            if not has_motion(step):
+                item.pop("operation", None)
+                item.pop("depositMaterial", None)
+        elif project.schemaVersion not in (4,5,6,7) and _step_value(step,"rateMagnitude") == 0:
+            for key in ("model", "depositMaterial", "stickingProbability", "sourceExponent"):
+                item.pop(key, None)
+        steps.append(item)
+    result = {
+        "dimension": project.dimension,
+        "units": {"length": "um", "time": "s", "rate": "um/s", "angle": "deg"},
+        "domain": project.domain.model_dump(mode="json"),
+        "geometry": geometry,
+        "steps": steps,
+        "solver": _applicable_solver(project),
+    }
+    if isinstance(project, (ProjectV6, ProjectV7)) and project.continuationState is not None:
+        # Provenance changes when a portable state package moves workbenches;
+        # the content hash and compatibility metadata define simulation input.
+        result["continuationState"] = project.continuationState.model_dump(mode="json", exclude_none=True, exclude={"sourceRunId", "sourceStepId"})
+    if project.schemaVersion == 7 and project.outputSettings is not None:
+        result["outputSettings"] = project.outputSettings.model_dump(mode="json")
+    definitions = getattr(project, "materialDefinitions", None) or []
+    if definitions:
+        from .materials import referenced_material_names
+        used = referenced_material_names(project)
+        result["customMaterials"] = [
+            row.model_dump(mode="json", exclude_none=True)
+            for row in definitions if row.name in used
+        ]
+    return result
+
+
+def requested_input_hash(project: Project | ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 | ProjectV7) -> str:
+    return hashlib.sha256(_canonical_bytes(requested_input(project))).hexdigest()
+
+
+def execution_hash(
+    request_hash: str,
+    *,
+    run_seed: int | None,
+    cpu_threads: int,
+    step_engines: Iterable[dict[str, Any]],
+    viennaps_version: str,
+    viennals_version: str,
+    native_engine_fingerprint: str | None = None,
+) -> str:
+    payload = {
+        "requestedInputHash": request_hash,
+        "runSeed": run_seed,
+        "cpuThreads": cpu_threads,
+        "steps": list(step_engines),
+        "viennapsVersion": viennaps_version,
+        "viennalsVersion": viennals_version,
+    }
+    if native_engine_fingerprint is not None:
+        payload["nativeEngineFingerprint"] = native_engine_fingerprint
+    return hashlib.sha256(_canonical_bytes(payload)).hexdigest()

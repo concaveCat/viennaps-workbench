@@ -1,0 +1,120 @@
+{
+  "schemaVersion": 1,
+  "status": "bounded-runtime-policy",
+  "scope": "2D and 3D single-user local application; fixed grid and mesh counts are not capped by the workbench.",
+  "probe": {
+    "timeoutSeconds": 30,
+    "rssTerminationMiB": 2048,
+    "rssPollMilliseconds": 200,
+    "combinedLogBytes": 1048576
+  },
+  "run": {
+    "defaultTimeoutSeconds": 120,
+    "maximumTimeoutSeconds": 600,
+    "rssTerminationMiB": 2048,
+    "rssPollMilliseconds": 200,
+    "rssLimitIsHard": false,
+    "rssLimitDescription": "Poll /proc RSS for this owned process group; terminate after the observed total exceeds the threshold. Sampling delay applies. This is not a hard memory limit and does not measure CUDA memory.",
+    "cancelGraceSeconds": 5,
+    "maximumCombinedStdoutStderrBytes": 4194304,
+    "maximumProjectImportBytes": null,
+    "maximumProjectImportBytesDescription": "No fixed byte cap for JSON project or replay imports.",
+    "maximumArtifactBytes": 536870912,
+    "maximumResultArchiveBytes": 536870912,
+    "maximumSteps": null,
+    "maximumStepsDescription": "No fixed step-count cap; memory, timeout, artifact and storage limits still apply.",
+    "maximumActiveRuns": 1,
+    "webWorkers": 1,
+    "cpuThreads": {
+      "default": 1,
+      "minimum": 1,
+      "maximum": null,
+      "maximumIsDynamic": true,
+      "limitSource": "process CPU affinity; os.cpu_count fallback"
+    },
+    "storage": {
+      "maximumWorkbenchBytes": 10737418240,
+      "minimumFreeBytes": 21474836480,
+      "checkIntervalSeconds": 5,
+      "automaticHistoryDeletion": false,
+      "archiveSpace": "The archive uses a streaming response; no second full-size archive is staged on disk."
+    }
+  },
+  "numerics": {
+    "dimension": 2,
+    "gridDeltaMicrometers": {
+      "minimumExclusive": 0.0,
+      "maximum": 0.5,
+      "suggested": [
+        0.2,
+        0.1,
+        0.05,
+        0.025,
+        0.01,
+        0.005
+      ]
+    },
+    "xExtentMicrometers": {
+      "minimum": 1.0,
+      "maximum": 40.0
+    },
+    "raysPerPoint": {
+      "minimum": 16,
+      "default": 256,
+      "maximum": 4096
+    },
+    "timeStepRatio": {
+      "minimum": 0.05,
+      "default": 0.25,
+      "maximum": 0.5
+    },
+    "rateMagnitudeMicrometersPerSecond": {
+      "minimum": 0.0,
+      "maximum": 2.0
+    },
+    "durationSecondsPerStep": {
+      "minimum": 0.01,
+      "maximum": 600.0
+    },
+    "stickingProbability": {
+      "minimum": 0.0,
+      "maximum": 1.0
+    },
+    "sourceExponent": {
+      "minimum": 0.0,
+      "maximum": 20.0
+    },
+    "trenchTaperAngleDegrees": {
+      "minimum": -45.0,
+      "maximum": 45.0
+    },
+    "minimumFeatureGridIntervals": 2,
+    "precisionWarningFeatureGridIntervals": 5,
+    "smallFeaturePolicy": "Reject a positive physical feature smaller than 2 grid intervals; warn from 2 up to 5 intervals. A zero mask height disables the mask; a zero taper angle is valid. Trench geometry also requires a positive post-taper bottom width."
+  },
+  "engineLimitsVsApplicationLimits": {
+    "engine": "Only verified API behavior is described in capabilities.json. No undocumented engine maximum is asserted.",
+    "application": "Physical feature constraints and bounded runtime/storage controls remain; there is no fixed application grid, surface point, triangle, or snapshot JSON size cap."
+  },
+  "memoryControlMechanism": {
+    "availableHardLimit": false,
+    "finding": "The sandbox exposes no usable cgroup memory.max. RLIMIT_AS is not used because it can conflict with CUDA address space and is not a GPU memory limit.",
+    "fallback": "Process-group RSS polling and explicit termination only."
+  },
+  "threeDimensional": {
+    "schemaVersion": 2,
+    "dimension": 3,
+    "default": {
+      "gridDelta": 0.2,
+      "xExtent": 6,
+      "yExtent": 6
+    },
+    "maximumResidentSnapshots": 2,
+    "maximumMaterialActors": 6,
+    "geometryToleranceUm": "2 * gridDelta",
+    "cpuReplayToleranceUm": "max(1e-8, 1e-4 * gridDelta)",
+    "vtkCoordinateToleranceUm": 0.0001,
+    "notes": "No fixed grid interval, surface point, triangle, or snapshot JSON size cap. Native mesh extraction and execution remain inside bounded_child.py process-group timeout/RSS/log supervision; the RSS poll is best-effort and does not measure CUDA memory. Run artifact and storage quotas remain.",
+    "fixedResolutionCountCaps": false
+  }
+}

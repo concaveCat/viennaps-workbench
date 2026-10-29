@@ -1,0 +1,35 @@
+# Python 虚拟环境与缓存
+.venv/
+__pycache__/
+*.py[cod]
+
+# 前端依赖与构建产物
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/tsconfig.tsbuildinfo
+
+# 运行时状态与用户数据（本机生成，不入库）
+var/*
+!var/projects/
+!var/runs/
+var/projects/*
+var/runs/*
+!var/projects/.keep
+!var/runs/.keep
+var/workbench.lock
+var/server.json
+var/server.log
+var/listen-port.json
+
+# 打补丁后的 ViennaPS/ViennaLS 运行时候选（按哈希缓存，可由脚本重建）
+runtime-patched/
+
+# 验收证据与重构快照（体积大、可重新生成；文件仍保留在工作目录中）
+docs/*-evidence/
+docs/refactor-baseline/
+docs/refactor-after/
+
+# 杂项
+*.log
+.DS_Store

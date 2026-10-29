@@ -1,0 +1,271 @@
+{
+  "$defs": {
+    "Axes": {
+      "additionalProperties": false,
+      "properties": {
+        "x": {
+          "const": 0,
+          "title": "X",
+          "type": "integer"
+        },
+        "y": {
+          "const": 1,
+          "title": "Y",
+          "type": "integer"
+        },
+        "z": {
+          "const": 2,
+          "title": "Z",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "x",
+        "y",
+        "z"
+      ],
+      "title": "Axes",
+      "type": "object"
+    },
+    "CellMaterials": {
+      "additionalProperties": false,
+      "properties": {
+        "materialIds": {
+          "items": {
+            "type": "integer"
+          },
+          "title": "Materialids",
+          "type": "array"
+        }
+      },
+      "required": [
+        "materialIds"
+      ],
+      "title": "CellMaterials",
+      "type": "object"
+    },
+    "Material": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "enum": [
+            "Mask",
+            "Si",
+            "SiO2"
+          ],
+          "title": "Name",
+          "type": "string"
+        },
+        "levelSetIndexes": {
+          "items": {
+            "type": "integer"
+          },
+          "title": "Levelsetindexes",
+          "type": "array"
+        },
+        "sourceStepId": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Sourcestepid"
+        }
+      },
+      "required": [
+        "name",
+        "levelSetIndexes",
+        "sourceStepId"
+      ],
+      "title": "Material",
+      "type": "object"
+    },
+    "Mesh3D": {
+      "additionalProperties": false,
+      "properties": {
+        "vtk": {
+          "title": "Vtk",
+          "type": "string"
+        },
+        "pointCount": {
+          "ge": 0,
+          "title": "Pointcount",
+          "type": "integer"
+        },
+        "triangleCount": {
+          "ge": 0,
+          "title": "Trianglecount",
+          "type": "integer"
+        },
+        "topology": {
+          "const": "triangles",
+          "title": "Topology",
+          "type": "string"
+        }
+      },
+      "required": [
+        "vtk",
+        "pointCount",
+        "triangleCount",
+        "topology"
+      ],
+      "title": "Mesh3D",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": {
+      "const": 2,
+      "title": "Schemaversion",
+      "type": "integer"
+    },
+    "dimension": {
+      "const": 3,
+      "title": "Dimension",
+      "type": "integer"
+    },
+    "topology": {
+      "const": "triangles",
+      "title": "Topology",
+      "type": "string"
+    },
+    "runId": {
+      "title": "Runid",
+      "type": "string"
+    },
+    "stepId": {
+      "title": "Stepid",
+      "type": "string"
+    },
+    "stepName": {
+      "title": "Stepname",
+      "type": "string"
+    },
+    "stepIndex": {
+      "title": "Stepindex",
+      "type": "integer"
+    },
+    "axisMap": {
+      "$ref": "#/$defs/Axes"
+    },
+    "coordinateUnit": {
+      "const": "um",
+      "title": "Coordinateunit",
+      "type": "string"
+    },
+    "points": {
+      "items": {
+        "items": {
+          "type": "number"
+        },
+        "maxItems": 3,
+        "minItems": 3,
+        "type": "array"
+      },
+      "title": "Points",
+      "type": "array"
+    },
+    "triangles": {
+      "items": {
+        "items": {
+          "type": "integer"
+        },
+        "maxItems": 3,
+        "minItems": 3,
+        "type": "array"
+      },
+      "title": "Triangles",
+      "type": "array"
+    },
+    "cellData": {
+      "$ref": "#/$defs/CellMaterials"
+    },
+    "materials": {
+      "additionalProperties": {
+        "$ref": "#/$defs/Material"
+      },
+      "title": "Materials",
+      "type": "object"
+    },
+    "mesh": {
+      "$ref": "#/$defs/Mesh3D"
+    },
+    "gridDelta": {
+      "gt": 0,
+      "title": "Griddelta",
+      "type": "number"
+    },
+    "materialIdsByLevelSetIndex": {
+      "items": {
+        "type": "integer"
+      },
+      "title": "Materialidsbylevelsetindex",
+      "type": "array"
+    },
+    "sameMaterialInternalInterfacesHidden": {
+      "title": "Samematerialinternalinterfaceshidden",
+      "type": "boolean"
+    },
+    "noOp": {
+      "title": "Noop",
+      "type": "boolean"
+    },
+    "measuredGeometry": {
+      "anyOf": [
+        {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Measuredgeometry"
+    },
+    "surfaceBounds": {
+      "items": {
+        "type": "number"
+      },
+      "maxItems": 6,
+      "minItems": 6,
+      "title": "Surfacebounds",
+      "type": "array"
+    },
+    "domainReadback": {
+      "additionalProperties": true,
+      "title": "Domainreadback",
+      "type": "object"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "dimension",
+    "topology",
+    "runId",
+    "stepId",
+    "stepName",
+    "stepIndex",
+    "axisMap",
+    "coordinateUnit",
+    "points",
+    "triangles",
+    "cellData",
+    "materials",
+    "mesh",
+    "gridDelta",
+    "materialIdsByLevelSetIndex",
+    "sameMaterialInternalInterfacesHidden",
+    "noOp",
+    "measuredGeometry",
+    "surfaceBounds",
+    "domainReadback"
+  ],
+  "title": "Snapshot3D",
+  "type": "object"
+}
