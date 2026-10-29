@@ -27,12 +27,12 @@ Date: 2026-10-26
 - A trench with `gridDelta=0.1`, `xExtent=4`, `width=1.2`, `depth=1`, zero taper returned no positive-x Si sidewall cells. A geometry post-check must reject this incomplete mesh. The same width at x extent 5 and typical width 2 at extent 4 or 5 returned both sides.
 - `getLevelSetMesh(width=1)` produced level-set grid values but no line cells; it is not a display mesh.
 
-## GPU and existing EDA environment
+## GPU and host environment
 
 - The bounded sandbox probe of `gpuAvailable()` raised `RuntimeError: Failed to load CUDA symbol via cuGetProcAddress: cuInit`. This establishes only that GPU access is blocked in the current sandbox.
 - After the user authorized an out-of-sandbox check, the bounded host probe returned `gpuAvailable() = true` and found one `NVIDIA GeForce RTX 3060 Laptop GPU`. ViennaPS 4.6.2 `GPU_DISK` completed 2D single-particle etch and deposition probes at `gridDelta=0.2`, `xExtent=4`, 64 rays, one thread, and a fixed seed. Guard records show normal exit and an empty owned group; see `var/probes/gpu-engine-host.record.json` and `var/probe-tests/gpu-engine-results.json`.
 - A second bounded test ran the actual API supervisor/worker path with explicit GPU preference, then exported and replayed its `GPU_DISK` replay project. GPU runs succeeded and the replay matched material IDs and geometry within `2*gridDelta`; see `var/probes/gpu-api-integration.log` and the associated run manifests. `AUTO` deliberately remains CPU_DISK. GPU_TRIANGLE and GPU_LINE were not tested and remain unavailable.
-- `/opt/eda-patches/verify.sh` returned 2. Patch bytes and static checks passed; hostid, license runtime and port checks were skipped because the shell is sandboxed. As documented locally, this is not evidence of an EDA failure. No EDA, license, network, hostname, MAC or loopback device was changed.
+- The read-only host self-check returned a non-zero status: patch bytes and static checks passed, while host identity, license runtime and port checks were skipped because the shell is sandboxed. This is not evidence of a host-environment failure. No system service, license, network interface, route, MAC, hostname, or loopback device was changed.
 
 ## Implementation and dependency status
 

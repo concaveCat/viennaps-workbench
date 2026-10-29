@@ -82,6 +82,7 @@ criterion has passed.
 - The sandbox itself still cannot initialize CUDA. The authorized host probe
   verified only GPU_DISK on the RTX 3060 Laptop GPU for 2D single-particle
   etch/deposition. Other GPU flux engines remain disabled; `AUTO` uses CPU_DISK.
-- `/opt/eda-patches/verify.sh` returned 2: static checks passed and runtime
-  checks were skipped due sandbox isolation. No EDA/license, network interface,
-  route, MAC, hostname, or `loopback0` state was changed.
+- The read-only host self-check returned a non-zero status: static checks passed
+  and runtime checks were skipped due to sandbox isolation. No system service,
+  license, network interface, route, MAC, hostname, or `loopback0` state was
+  changed.

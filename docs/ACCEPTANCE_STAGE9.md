@@ -61,7 +61,7 @@
 - 本轮多离子限制诊断后，在隔离数据目录重跑全套 Python 回归 87 项通过、4 项 GPU 专用用例按默认配置跳过；随后显式启用宿主 GPU，原有 4 个 GPU_DISK API/重放用例 4/4 实际通过。新 transcript：`docs/stage9-evidence/gpu-coverage-audit/full-gpu-api-regression-2026-10-27.log`；Chromium 的多离子限制与 CPU_DISK 对照在 `docs/stage9-evidence/gpu-coverage-audit/browser/multiparticle-ion-limit/acceptance.json`。
 - 覆盖旧格式和哈希/重放、取消与进程回收、2D/3D、连续算、几何操作、通量/中间输出、自定义材料、MultiParticle 精确 species 门控、项目偏好/重放引擎一致性、专用模型及 GPU API 运行和重放。
 - TypeScript 检查和 Vite 构建通过；浏览器脚本语法检查、Python 编译检查通过。Vite 仍报告现有约 1.2 MB 的主 JS chunk 警告。
-- `/opt/eda-patches/verify.sh` 经宿主只读复核退出码为 0：license、hostid、真实 checkout 和 CUDA 直通检查通过。仅提示 SPX 的 5000 端口未监听；没有启动或改动该服务。
+- 宿主环境的只读自检退出码为 0：许可、主机标识、安装来源与 CUDA 直通检查均通过。仅提示一个与本项目无关的本地服务端口未监听；没有启动或改动该服务。
 
 ### 候选版最终回归复核（2026-10-28）
 

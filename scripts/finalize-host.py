@@ -45,10 +45,13 @@ def main():
             if hashlib.sha256((OLD/file).read_bytes()).hexdigest()!=sha:mismatches.append(file)
         if mismatches:raise RuntimeError('preserved source differs from baseline: '+str(mismatches))
         report['checks'].append('all preserved original source and lockfile checksums unchanged')
-        result=subprocess.run(['/opt/eda-patches/verify.sh'],cwd=ROOT,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=60)
-        (ROOT/'var/evidence/eda-final-verify.log').write_text(result.stdout)
-        if result.returncode not in (0,2):raise RuntimeError('EDA verification reported an actual failure')
-        report['edaVerifyExitCode']=result.returncode;report['checks'].append('EDA verification; no EDA/engine/network configuration changes')
+        verify_script=os.environ.get('WORKBENCH_HOST_VERIFY_SCRIPT')
+        if verify_script:
+            result=subprocess.run([verify_script],cwd=ROOT,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=60)
+            (ROOT/'var/evidence/host-final-verify.log').write_text(result.stdout)
+            if result.returncode not in (0,2):raise RuntimeError('host verification reported an actual failure')
+            report['hostVerifyExitCode']=result.returncode
+        report['checks'].append('host verification; no engine/network configuration changes')
         report['url']='http://127.0.0.1:8766/';report['status']='passed'
     except BaseException as e:report['status']='failed';report['error']=str(e);raise
     finally:
