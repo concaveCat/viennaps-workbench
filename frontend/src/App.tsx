@@ -44,13 +44,14 @@ type SpecializedField = { key: string; label: string; kind: 'number' | 'boolean'
 type SpecializedModel = { id: string; label: string; nativeClass: string; operation: 'etch' | 'deposit' | 'native'; usesFlux: boolean; depositMaterial?: string; depositMaterialSelectable?: boolean; fields: SpecializedField[] };
 type SpecializedCatalog = { schemaVersion: number; engineVersion: string; unitsNote: string; models: SpecializedModel[] };
 type Step = {
-  id: string; name: string; enabled: boolean; operation?: 'etch' | 'deposit' | 'native'; model: 'isotropic' | 'singleParticle' | 'multiParticle' | 'directional' | 'specialized' | 'removeMaterial' | 'planarize' | 'boolean';
+  id: string; name: string; enabled: boolean; operation?: 'etch' | 'deposit' | 'native'; model: 'isotropic' | 'singleParticle' | 'multiParticle' | 'directional' | 'specialized' | 'removeMaterial' | 'planarize' | 'boolean' | 'gdsBoolean';
   rateMagnitude?: number; directionalRateMagnitude?: number; isotropicRateMagnitude?: number; direction?: [number, number, number]; calculateVisibility?: boolean;
   duration?: number; depositMaterial?: string; stickingProbability?: number; sourceExponent?: number;
   rateMode?: 'uniform' | 'material'; materialRates?: Record<string, number>; selectivityReference?: string;
   species?: ParticleSpecies[]; rateCoefficients?: MultiParticleRateCoefficients;
   nativeModel?: string; nativeParameters?: Record<string, unknown>;
   material?: string; cutoffHeight?: number; stopMaterial?: string; overPolish?: number; booleanOperation?: 'union' | 'intersection' | 'difference'; position?: [number, number, number]; width?: number; height?: number; depth?: number; angle?: number; applyToAll?: boolean;
+  gdsMask?: { layer: number; datatype: number; unitScale: number; position: [number, number, number]; baseHeight: number; height: number; retainedRegion: 'inside' | 'outside' };
 };
 type FixedRandom = { mode: 'fixed'; seed: number };
 type RandomPolicy = FixedRandom | { mode: 'random' };
@@ -219,7 +220,7 @@ function hasMotion(step: Step): boolean {
   return (step.rateMagnitude ?? 0) > 0 || Object.values(step.materialRates ?? {}).some(rate => rate > 0);
 }
 function usesFlux(step: Step): boolean { return step.enabled && ((step.model === 'specialized' && SPECIALIZED_FLUX_MODELS.has(step.nativeModel ?? '')) || (step.model === 'singleParticle' || step.model === 'multiParticle') && hasMotion(step)); }
-function isGeometryStep(step: Step): boolean { return step.model === 'removeMaterial' || step.model === 'planarize' || step.model === 'boolean'; }
+function isGeometryStep(step: Step): boolean { return step.model === 'removeMaterial' || step.model === 'planarize' || step.model === 'boolean' || step.model === 'gdsBoolean'; }
 // Thicknesses are small (a spacer etch removes a couple of nm), so keep µm for
 // absolute heights and switch to nm for sub-10 nm thickness readouts.
 function formatMicron(value: number | null | undefined): string { return value == null || !Number.isFinite(value) ? '—' : `${value.toFixed(4)} µm`; }
@@ -231,6 +232,7 @@ function stepKindLabel(step: Step): string {
   if (step.model === 'removeMaterial') return `移除材料 · ${step.material ?? '未选择'}`;
   if (step.model === 'planarize') return step.stopMaterial ? `平坦化 · 停在 ${step.stopMaterial}` : '平坦化';
   if (step.model === 'boolean') return `布尔几何 · ${{ union: '并集', intersection: '交集', difference: '差集' }[step.booleanOperation ?? 'difference']}`;
+  if (step.model === 'gdsBoolean') return `GDS 布尔 · layer ${step.gdsMask?.layer ?? '—'}/${step.gdsMask?.datatype ?? 0} · ${{ union: '并集', intersection: '交集', difference: '差集' }[step.booleanOperation ?? 'difference']}`;
   if (step.model === 'specialized') return `ViennaPS 专用模型 · ${step.nativeModel ?? '未选择'}`;
   return `${step.operation === 'etch' ? '刻蚀' : '沉积'} · ${step.model === 'isotropic' ? '各向同性' : step.model === 'singleParticle' ? '单粒子' : step.model === 'multiParticle' ? '多粒子' : '定向过程'}${hasMotion(step) ? '' : ' · 零速率'}`;
 }
@@ -974,7 +976,7 @@ export default function App() {
   const directionalActual = selectedExecution?.model === 'directional' ? selectedExecution.actualParameters ?? {} : null;
   const multiParticleActual = selectedExecution?.model === 'multiParticle' ? selectedExecution.actualParameters ?? {} : null;
   const specializedActual = selectedExecution?.model === 'specialized' ? selectedExecution.actualParameters ?? {} : null;
-  const geometryActual = selectedExecution && ['removeMaterial', 'planarize', 'boolean'].includes(selectedExecution.model ?? '') ? selectedExecution.actualParameters ?? {} : null;
+  const geometryActual = selectedExecution && ['removeMaterial', 'planarize', 'boolean', 'gdsBoolean'].includes(selectedExecution.model ?? '') ? selectedExecution.actualParameters ?? {} : null;
   const measuredChange = selectedSnapshot?.measuredRemoval
     ? { kind: 'removal' as const, record: selectedSnapshot.measuredRemoval }
     : selectedSnapshot?.measuredAdded ? { kind: 'addition' as const, record: selectedSnapshot.measuredAdded } : null;
@@ -1628,9 +1630,26 @@ export default function App() {
   };
   const editSpecializedParameter = (stepId: string, key: string, value: unknown) => editStep(stepId, step => step.model === 'specialized'
     ? { ...step, nativeParameters: { ...(step.nativeParameters ?? {}), [key]: value } } : step);
-  const addGeometryStep = (model: 'removeMaterial' | 'planarize' | 'boolean') => {
+  const addGeometryStep = (model: 'removeMaterial' | 'planarize' | 'boolean' | 'gdsBoolean') => {
     const id = newStepId();
-    const name = model === 'removeMaterial' ? '移除材料' : model === 'planarize' ? '平坦化' : '布尔几何';
+    const name = model === 'removeMaterial' ? '移除材料' : model === 'planarize' ? '平坦化' : model === 'gdsBoolean' ? 'GDS 布尔' : '布尔几何';
+    if (model === 'gdsBoolean') {
+      const geometry = project.geometry.kind === 'gds' ? project.geometry : null;
+      const pairs = geometry && gdsAsset ? gdsMaskPairs(gdsAsset, geometry.structure) : [];
+      const [layer, datatype] = pairs[0] ?? [geometry?.layers[0]?.layer ?? 1, 0];
+      const first = geometry?.layers.find(row => row.layer === layer) ?? geometry?.layers[0];
+      const step: Step = { id, name, enabled: true, model, booleanOperation: 'difference', applyToAll: true,
+        gdsMask: { layer, datatype, unitScale: 1, position: [0, 0, 0],
+          baseHeight: first?.baseHeight ?? 0,
+          height: Math.max(2 * project.domain.gridDelta, first?.height ?? 0.5),
+          retainedRegion: 'inside' } };
+      setProject(previous => {
+        const promoted = promoteProjectToV7(previous);
+        return { ...promoted, steps: [...promoted.steps, step] };
+      });
+      setSelectedStep(id);
+      return;
+    }
     const step: Step = model === 'removeMaterial'
       ? { id, name, enabled: true, model, material: materials.find(item => item.name === 'SiO2')?.name ?? materials[0]?.name ?? 'SiO2' }
       : model === 'planarize'
@@ -1906,7 +1925,8 @@ export default function App() {
       const { extrusion: _extrusion, ...fin } = source.geometry;
       geometry = fin;
     }
-    const convertedSteps = source.steps.map(step => {
+    const droppedGdsBoolean = dimension === 2 && source.steps.some(step => step.model === 'gdsBoolean');
+    const convertedSteps = source.steps.filter(step => !(dimension === 2 && step.model === 'gdsBoolean')).map(step => {
       if (step.model === 'boolean') {
         const position = step.position ?? [0, 0, 0];
         if (dimension === 3) return { ...step, position: [position[0], 0, position[1]] as [number, number, number], depth: step.depth ?? step.width ?? 1 };
@@ -1969,6 +1989,8 @@ export default function App() {
       ? '已转换到 2D：3D 方向若只有 y 分量则没有对应二维方向，已改为 [0, -1, 0]（向下）。'
       : convertedHole
       ? '已新建对应 2D 工程：圆孔按 x 截面转换为宽度等于孔径的沟槽；原工程和历史结果保持不变。'
+      : droppedGdsBoolean
+      ? '已新建对应 2D 工程：GDS 布尔步骤只支持三维 GDS 项目，已从副本中移除；原工程和历史结果保持不变。'
       : `已新建对应 ${dimension}D 工程；原工程和历史结果保持不变。`);
   };
   const snapshotRows = displayInfo?.runId === displayRunId ? displayInfo.snapshots : [];
@@ -2518,6 +2540,9 @@ export default function App() {
                 <button className="button add-step" onClick={() => addGeometryStep('removeMaterial')}>＋ 移除材料</button>
                 <button className="button add-step" onClick={() => addGeometryStep('planarize')}>＋ 平坦化</button>
                 <button className="button add-step" onClick={() => addGeometryStep('boolean')}>＋ 布尔几何</button>
+                <button className="button add-step" disabled={project.dimension !== 3 || project.geometry.kind !== 'gds'}
+                  title={project.dimension === 3 && project.geometry.kind === 'gds' ? '用项目 GDS 版图的某个图层多边形作为布尔操作数' : '仅三维 GDS 项目可用'}
+                  onClick={() => addGeometryStep('gdsBoolean')}>＋ GDS 布尔</button>
               </div></div>
             </div>
           </div>
@@ -2975,6 +3000,27 @@ export default function App() {
                   {project.dimension === 3 && <NumericField label="盒体深度（y）" unit="µm" value={selectedStepObject.depth ?? 1} min={project.domain.gridDelta * 2} max={40} step="0.05" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, depth: value }))} />}
                   <NumericField label="盒体旋转角" unit="°" value={selectedStepObject.angle ?? 0} min={-45} max={45} step="1" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, angle: value }))} />
                   <label className="visibility-option"><input type="checkbox" aria-label="布尔操作应用到所有材料界面" checked={selectedStepObject.applyToAll ?? true} onChange={event => editStep(selectedStepObject.id, step => ({ ...step, applyToAll: event.target.checked }))} /><span><strong>应用到所有材料界面</strong><small>传入 ViennaPS Domain.applyBooleanOperation 的 applyToAll 参数</small></span></label>
+                </>}
+                {selectedStepObject.model === 'gdsBoolean' && <>
+                  {project.geometry.kind !== 'gds'
+                    ? <div className="inline-note">GDS 布尔步骤只适用于 geometry.kind=gds 的三维项目。</div>
+                    : <>
+                      <SelectField label="布尔操作" value={selectedStepObject.booleanOperation ?? 'difference'} options={[{ value: 'difference', label: '差集 · RELATIVE_COMPLEMENT（挖孔/开槽）' }, { value: 'union', label: '并集 · UNION（在掩膜区补加材料）' }, { value: 'intersection', label: '交集 · INTERSECT（只保留掩膜区）' }]} onChange={value => editStep(selectedStepObject.id, step => ({ ...step, booleanOperation: value as Step['booleanOperation'] }))} />
+                      <div className="inline-note">操作数来自当前版图结构 <code>{project.geometry.structure}</code>：所选图层多边形按保留区域竖直拉伸成真实三维掩膜体，再调用原生 <code>Domain.applyBooleanOperation</code>。位置相对版图放置，默认 0 即与版图对齐。这是几何操作，不包含光刻胶、光学邻近/偏置、侧壁角或材料选择比。</div>
+                      {!gdsAsset && <div className="inline-note">正在读取版图图层…</div>}
+                      {gdsAsset && gdsMaskPairs(gdsAsset, project.geometry.structure).length === 0 && <div className="inline-note">该结构没有闭合的多边形图层，无法作为布尔掩膜。</div>}
+                      {gdsAsset && gdsMaskPairs(gdsAsset, project.geometry.structure).length > 0 && <SelectField label="掩膜图层 / datatype" value={`${selectedStepObject.gdsMask?.layer ?? 0}/${selectedStepObject.gdsMask?.datatype ?? 0}`} options={gdsMaskPairs(gdsAsset, project.geometry.structure).map(([gdsLayer, datatype]) => ({ value: `${gdsLayer}/${datatype}`, label: `Layer ${gdsLayer} · datatype ${datatype}` }))} onChange={value => { const [gdsLayer, datatype] = value.split('/').map(Number); editStep(selectedStepObject.id, step => ({ ...step, gdsMask: { ...(step.gdsMask ?? { layer: gdsLayer, datatype, unitScale: 1, position: [0, 0, 0], baseHeight: 0, height: Math.max(2 * project.domain.gridDelta, 0.5), retainedRegion: 'inside' }), layer: gdsLayer, datatype } })); }} />}
+                      <SelectField label="保留区域" value={selectedStepObject.gdsMask?.retainedRegion ?? 'inside'} options={[{ value: 'inside', label: '保留多边形内部（正向掩膜）' }, { value: 'outside', label: '保留多边形外部（反向掩膜）' }]} onChange={value => editStep(selectedStepObject.id, step => step.gdsMask ? { ...step, gdsMask: { ...step.gdsMask, retainedRegion: value as 'inside' | 'outside' } } : step)} hint="保留区域决定掩膜体覆盖多边形内部还是外部；差集使用反向掩膜会移除几乎全部材料" />
+                      <NumericField label="掩膜底面高度（z）" unit="µm" value={selectedStepObject.gdsMask?.baseHeight ?? 0} min={0} max={100} step="0.01" hint="相对版图 z 框架；与版图图层底面配合可只切上层材料（必须 ≥ 0）" onChange={value => editStep(selectedStepObject.id, step => step.gdsMask ? { ...step, gdsMask: { ...step.gdsMask, baseHeight: value } } : step)} />
+                      <NumericField label="掩膜厚度（z）" unit="µm" value={selectedStepObject.gdsMask?.height ?? Math.max(2 * project.domain.gridDelta, 0.5)} min={2 * project.domain.gridDelta} max={100} step="0.01" hint={`至少两个网格间距（${(2 * project.domain.gridDelta).toFixed(4)} µm）`} onChange={value => editStep(selectedStepObject.id, step => step.gdsMask ? { ...step, gdsMask: { ...step.gdsMask, height: value } } : step)} />
+                      {[{ index: 0, label: '掩膜 x 偏移', unit: 'µm' }, { index: 1, label: '掩膜 y 偏移', unit: 'µm' }, { index: 2, label: '掩膜 z 偏移', unit: 'µm' }].map(axis => <NumericField key={axis.label} label={axis.label} unit={axis.unit} value={(selectedStepObject.gdsMask?.position ?? [0, 0, 0])[axis.index]} min={-40} max={40} step="0.01" onChange={value => editStep(selectedStepObject.id, step => {
+                        const mask = step.gdsMask; if (!mask) return step;
+                        const position: [number, number, number] = [...mask.position]; position[axis.index] = value;
+                        return { ...step, gdsMask: { ...mask, position } };
+                      })} />)}
+                      <NumericField label="版图缩放系数" value={selectedStepObject.gdsMask?.unitScale ?? 1} min={0.000001} max={1000000} step="0.01" hint="与项目 GDS 放置的单位缩放相乘" onChange={value => editStep(selectedStepObject.id, step => step.gdsMask ? { ...step, gdsMask: { ...step.gdsMask, unitScale: value } } : step)} />
+                      <label className="visibility-option"><input type="checkbox" aria-label="GDS 布尔应用到所有材料界面" checked={selectedStepObject.applyToAll ?? true} onChange={event => editStep(selectedStepObject.id, step => ({ ...step, applyToAll: event.target.checked }))} /><span><strong>应用到所有材料界面</strong><small>关闭时只修改顶层材料，可能造成下层超过上层；仅在你确认要这样做时关闭</small></span></label>
+                    </>}
                 </>}
                 <div className="not-applicable"><strong>几何操作</strong><span>没有工艺速率、物理持续时间、随机种子或通量引擎。此步骤直接修改前一步的 ViennaPS Domain。</span></div>
               </div>}

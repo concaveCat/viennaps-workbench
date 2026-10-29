@@ -821,7 +821,37 @@ class SpecializedStepV7(StrictModel):
         return self
 
 
-StepV7 = Annotated[Union[StepV5, MultiParticleStepV7, SpecializedStepV7], Field(discriminator="model")]
+class GdsBooleanMaskV7(StrictModel):
+    """One selected GDS layer/datatype used as a boolean operand.
+
+    The geometry kind ``gds`` geometry owns the asset; this step re-reads that
+    same asset and layer, so there is no second upload path. ``position`` is an
+    additional XY placement (and a z offset added to ``baseHeight``) relative
+    to the geometry placement, so the zero default is exactly aligned.
+    """
+
+    layer: Annotated[Integer, Field(ge=0, le=65535)]
+    datatype: Annotated[Integer, Field(ge=0, le=32767)] = 0
+    unitScale: Annotated[Number, Field(gt=0, le=1000000)] = 1
+    position: Vector3 = [0, 0, 0]
+    baseHeight: Annotated[Number, Field(ge=0)]
+    height: Annotated[Number, Field(gt=0)]
+    retainedRegion: Literal["inside", "outside"] = "inside"
+
+
+class GdsBooleanStepV7(StrictModel):
+    """A boolean cut/add whose operand is a real 3D mask built from a GDS layer."""
+
+    id: Annotated[str, Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")]
+    name: Annotated[str, Field(min_length=1, max_length=80)]
+    enabled: bool
+    model: Literal["gdsBoolean"]
+    booleanOperation: Literal["union", "intersection", "difference"]
+    gdsMask: GdsBooleanMaskV7
+    applyToAll: bool = True
+
+
+StepV7 = Annotated[Union[StepV5, MultiParticleStepV7, SpecializedStepV7, GdsBooleanStepV7], Field(discriminator="model")]
 
 
 class DomainStateRef(StrictModel):
@@ -984,6 +1014,24 @@ class ProjectV7(ProjectV6):
                 raise ValueError("GDS mask height must span at least two grid intervals")
             if abs(mask["baseHeight"] + mask["position"][2]) / delta > 1_000_000:
                 raise ValueError("GDS mask base height exceeds the application coordinate budget")
+        for index, step in enumerate(self.steps):
+            if not isinstance(step, GdsBooleanStepV7):
+                continue
+            # A GDS boolean operand is re-read from the geometry's own asset and
+            # built as a real 3D body, so both a 3D project and GDS geometry are
+            # required. Anything else must fail loudly instead of becoming a box.
+            if self.dimension != 3:
+                raise ValueError(f"steps[{index}]: gdsBoolean requires a 3D project")
+            if geometry["kind"] != "gds":
+                raise ValueError(f"steps[{index}]: gdsBoolean requires geometry.kind=gds; "
+                                 "use the box boolean step for other structures")
+            mask = step.gdsMask
+            if float(mask.height) < 2 * delta:
+                raise ValueError(f"steps[{index}].gdsMask.height must span at least two grid intervals")
+            if abs(float(mask.baseHeight) + float(mask.position[2])) / delta > 1_000_000:
+                raise ValueError(f"steps[{index}].gdsMask.baseHeight exceeds the application coordinate budget")
+            if any(abs(float(value)) / delta > 1_000_000 for value in mask.position):
+                raise ValueError(f"steps[{index}].gdsMask.position exceeds the application coordinate budget")
         if self.dimension == 2 and self.outputSettings is not None and self.outputSettings.volumeMesh:
             raise ValueError("native volume mesh output is only available for 3D projects")
         return self

@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 
-GEOMETRY_MODELS = {"removeMaterial", "planarize", "boolean"}
+GEOMETRY_MODELS = {"removeMaterial", "planarize", "boolean", "gdsBoolean"}
 
 
 def value(step: Any, key: str, default: Any = None) -> Any:

@@ -7,4 +7,5 @@
 - `cpu-thread-evidence/`：本机 CPU 动态上限、schema 7 默认多粒子 GPU_DISK 浏览器运行/重放及发布页 smoke 证据。
 - `schema-project-union.json`、`schema-project-v*.json`、`schema-replay-v*.json`：项目和重放格式；旧格式兼容规则在 API contract 与阶段报告中。
 - `cmp-planarize-contract.md`：材质感知平坦化（按材料停止的 CMP）与每步实测去除/增加厚度。
+- `gds-boolean-contract.md`：schema 7 三维 GDS 工程的 `gdsBoolean` 步骤（版图图层作为原生布尔操作数）的坐标、语义与限制。
 - `implementation-status.md`：早期基线历史快照，不代表当前服务端口或当前验收状态。
