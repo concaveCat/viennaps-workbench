@@ -556,12 +556,13 @@ function SelectField({ label, value, options, onChange, hint }: { label: string;
 
 function ArtifactPreflightCard({ estimate }: { estimate: ArtifactEstimate | null }) {
   const risk = estimate?.risk ?? null;
+  const emptyEstimate = estimate !== null && estimate.estimatedMiB <= 0 && estimate.risk === 'ok';
   return <section className="panel-section artifact-preflight-panel" aria-label="运行产物预估">
     <div className="section-heading">
-      <div><span className="eyebrow">运行目录 · 工艺运行</span><h2>运行产物预估</h2></div>
+      <div><span className="eyebrow">当前工程 · 工艺运行</span><h2>运行产物预估</h2></div>
       {risk && <span className={`artifact-risk ${risk}`}>{ARTIFACT_RISK_LABELS[risk]}</span>}
     </div>
-    {!estimate ? <div className="inline-note">等待工作台校验后显示本次工艺运行目录的预估大小。该数值来自运行产物预检，是保守估算而不是实际测量。</div> : <>
+    {emptyEstimate ? <div className="inline-note">当前工程没有可估算的工艺步骤（历史运行请在“结果”页查看该 run 的快照和下载信息）。导入或新建工程并添加步骤后，这里会显示本次运行的目录预估。</div> : !estimate ? <div className="inline-note">等待工作台校验后显示本次工艺运行目录的预估大小。该数值来自运行产物预检，是保守估算而不是实际测量。</div> : <>
       <div className={`artifact-meter ${estimate.risk}`} role="img"
         aria-label={`预估占 ${estimate.capMiB} MiB 上限的 ${Math.round(estimate.utilization * 100)}%`}>
         <i style={{ width: `${Math.min(100, Math.max(2, Math.round(estimate.utilization * 100)))}%` }} />
@@ -3053,7 +3054,7 @@ export default function App() {
           <div className="validation-foot"><span>工艺步骤上限</span><strong>{capabilities?.resourcePolicy?.run?.maximumSteps == null ? '不限' : `${capabilities.resourcePolicy.run.maximumSteps} 步`}</strong></div>
           <div className="validation-foot" title="主机 GPU 能力来自 /api/gpu-devices，表示本机能否运行 CUDA 通量；不代表所选运行使用的引擎。"><span>主机 GPU 能力</span><strong>{gpuExposed ? 'GPU_DISK · 可选择' : gpuStatus === 'unverified-outside-sandbox' ? '设备不可用' : gpuStatus}</strong></div>
           <div className="validation-foot" title={runEngineTitle}><span>本次运行引擎</span><strong>{runEngine}{selectedStepEngine ? ` · 本步 ${selectedStepEngine}` : ''}</strong></div>
-          {artifactEstimate && <div className={`validation-foot artifact-foot ${artifactEstimate.risk}`} title={`运行产物预检估算；当前配置上限 ${artifactEstimate.capMiB} MiB，超限的运行会在启动前被拒绝。`}><span>运行产物预估</span><strong>{formatEstimateMiB(artifactEstimate.estimatedMiB)} / {artifactEstimate.capMiB} MiB · {ARTIFACT_RISK_LABELS[artifactEstimate.risk]}</strong></div>}
+          {artifactEstimate && (artifactEstimate.estimatedMiB > 0 || artifactEstimate.risk !== 'ok') && <div className={`validation-foot artifact-foot ${artifactEstimate.risk}`} title={`运行产物预检估算；当前配置上限 ${artifactEstimate.capMiB} MiB，超限的运行会在启动前被拒绝。`}><span>运行产物预估</span><strong>{formatEstimateMiB(artifactEstimate.estimatedMiB)} / {artifactEstimate.capMiB} MiB · {ARTIFACT_RISK_LABELS[artifactEstimate.risk]}</strong></div>}
         </section>
       </Inspector>
     </main>
