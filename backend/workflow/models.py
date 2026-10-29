@@ -10,13 +10,13 @@ from ..materials import MaterialDefinition
 from ..models import (
     Domain,
     Domain3D,
-    ProjectV6,
     ProjectV7,
     SolverV7,
     StepV7,
     StrictModel,
     Units,
 )
+from .hashing import compile_record_id, full_project_hash, source_map_hash
 
 
 class GeometryBindingV1(StrictModel):
@@ -105,9 +105,43 @@ class CompileRecordV1(StrictModel):
 
 
 class CompiledWorkflowV1(StrictModel):
-    project: Annotated[ProjectV6 | ProjectV7, Field(discriminator="schemaVersion")]
+    """Persisted/compiled envelope with content-addressed consistency checks."""
+
+    project: ProjectV7
     sourceMap: list[SourceMapEntryV1]
     compileRecord: CompileRecordV1
+
+    @model_validator(mode="after")
+    def content_matches_record(self) -> "CompiledWorkflowV1":
+        expected_project = full_project_hash(self.project)
+        if expected_project != self.compileRecord.fullProjectHash:
+            raise ValueError("compiled project content does not match fullProjectHash")
+        expected_source_map = source_map_hash(self.sourceMap)
+        if expected_source_map != self.compileRecord.sourceMapHash:
+            raise ValueError("SourceMap content does not match sourceMapHash")
+        project_step_ids = [step.id for step in self.project.steps]
+        source_step_ids = [entry.stepId for entry in self.sourceMap]
+        if project_step_ids != source_step_ids:
+            raise ValueError("SourceMap step ids must match compiled project step order")
+        expected_compile_id = compile_record_id(
+            compiler_version=self.compileRecord.compilerVersion,
+            flow_revision_hash=self.compileRecord.flowRevisionHash,
+            geometry_binding_hash=self.compileRecord.geometryBindingHash,
+            material_definitions_hash=self.compileRecord.materialDefinitionsHash,
+            variable_set=self.compileRecord.variableSet,
+            overrides=self.compileRecord.overrides,
+            seed_policy=self.compileRecord.seedPolicy,
+            step_id_policy=self.compileRecord.stepIdPolicy,
+            engine_versions=self.compileRecord.engineVersions,
+        )
+        if expected_compile_id != self.compileRecord.compileId:
+            raise ValueError("compile record fields do not match compileId")
+        return self
+
+    def verify(self) -> "CompiledWorkflowV1":
+        """Re-check a live envelope before persistence or execution submission."""
+
+        return CompiledWorkflowV1.model_validate(self.model_dump(mode="json", exclude_none=True))
 
 
 class CompileDiffV1(StrictModel):
