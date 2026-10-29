@@ -1717,9 +1717,18 @@ def execute(input_path: Path, run_dir: Path) -> None:
     uses_cuda_engine = any(isinstance(engine, str) and engine.startswith("GPU_") for engine in step_engines.values())
     selected_gpu_device = None
     cuda_readback = None
+    gpu_sample: dict[str, Any] | None = None
     if uses_cuda_engine:
-        inventory = cuda_devices()
         configured_device = config.get("selectedGpuDevice")
+        if isinstance(configured_device, dict) and configured_device.get("uuid"):
+            # The supervisor already enumerated and pinned this device; its
+            # nvidia-smi inventory call costs 0.27-0.75 s on this host. The
+            # CUDA Runtime readback below still verifies PCI bus and UUID.
+            inventory = {"status": "available", "devices": [configured_device],
+                         "preferredGpuDeviceId": configured_device.get("uuid"), "reason": None,
+                         "probe": {"source": "supervisor-selected-device"}}
+        else:
+            inventory = cuda_devices()
         requested_device = project.get("solver", {}).get("gpuDeviceId")
         if configured_device and requested_device is None:
             requested_device = configured_device.get("uuid")
@@ -1918,8 +1927,10 @@ def execute(input_path: Path, run_dir: Path) -> None:
         if selected_engine.startswith("GPU_"):
             post_flux_cuda_readback = cuda_runtime_readback(selected_gpu_device)
             gpu_usage = nvidia_process_readback(selected_gpu_device["uuid"])
+            if gpu_sample is None:
+                gpu_sample = nvidia_gpu_sample()
             flux_result["cudaDeviceReadback"] = {**cuda_readback, "afterCalculateFlux": post_flux_cuda_readback,
-                                                  "process": gpu_usage, "gpuSample": nvidia_gpu_sample()}
+                                                  "process": gpu_usage, "gpuSample": gpu_sample}
             flux_path = run_dir / flux_result["fileName"]
             flux_payload = json.loads(flux_path.read_text(encoding="utf-8"))
             flux_payload["execution"]["cudaDeviceReadback"] = flux_result["cudaDeviceReadback"]
@@ -2239,8 +2250,10 @@ def execute(input_path: Path, run_dir: Path) -> None:
                 else:
                     post_apply_cuda_readback = cuda_runtime_readback(selected_gpu_device)
                 gpu_usage = nvidia_process_readback(selected_gpu_device["uuid"])
+                if gpu_sample is None:
+                    gpu_sample = nvidia_gpu_sample()
                 step_cuda_readback = {**cuda_readback, "afterProcessApply": post_apply_cuda_readback,
-                                      "process": gpu_usage, "gpuSample": nvidia_gpu_sample(),
+                                      "process": gpu_usage, "gpuSample": gpu_sample,
                                       **({"stageSelection": split_result["gpuStageSelection"]}
                                          if split_result is not None else {})}
                 actual_parameters["cudaDeviceReadback"] = step_cuda_readback
