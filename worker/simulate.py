@@ -448,6 +448,180 @@ def measure_initial_geometry(mesh: dict[str, Any], geometry: dict[str, Any], del
     return {"openingWidth": measured_width, "depth": measured_depth}
 
 
+# An exposed surface cell counts as "up-facing" when its normal is within 60
+# degrees of the vertical axis. One threshold is shared by 2D line cells
+# ([x, h, 0]) and 3D triangle cells ([x, y, z]) so both dimensions use the same
+# definition of a material's top surface.
+TOP_FACING_COSINE = 0.5
+MEASUREMENT_METHOD = "surface-mesh up-facing cells; no volume mesh"
+
+
+def measure_material_tops(report: dict[str, Any], is3d: bool) -> dict[str, dict[str, float]]:
+    """Return the exposed top height of every material in a surface mesh.
+
+    The caller has already extracted the surface mesh for the snapshot, so this
+    adds no native work: it only classifies the returned cells. Per material it
+    reports
+
+    * ``topHeight``: the highest up-facing point, i.e. the top of that material
+      (a blanket layer's surface, or the highest rim of a partially removed
+      one). Used for the measured add/remove thickness.
+    * ``medianTopHeight``: the area-weighted median of the up-facing heights,
+      i.e. the level that dominates the exposed surface. Used to derive a CMP
+      stop height, because a narrow tall sliver must not move the whole cut.
+    * ``upFacingArea``/``upFacingCellCount``: the evidence behind both values.
+
+    A material with no up-facing cell (fully buried, fully removed, or only
+    vertical sidewalls left) is absent from the result.
+    """
+    points = report["points"]
+    cells = report["triangles"] if is3d else report["lines"]
+    material_ids = report["cellData"]["MaterialIds"]
+    heights: dict[int, list[tuple[float, float]]] = {}
+    if is3d:
+        for (first, second, third), material_id in zip(cells, material_ids):
+            ax, ay, az = points[first]
+            bx, by, bz = points[second]
+            cx, cy, cz = points[third]
+            ux, uy, uz = bx - ax, by - ay, bz - az
+            vx, vy, vz = cx - ax, cy - ay, cz - az
+            nx = uy * vz - uz * vy
+            ny = uz * vx - ux * vz
+            nz = ux * vy - uy * vx
+            if nz <= 0.0:
+                continue
+            norm_squared = nx * nx + ny * ny + nz * nz
+            if norm_squared <= 0.0 or nz * nz < TOP_FACING_COSINE ** 2 * norm_squared:
+                continue
+            heights.setdefault(int(material_id), []).append(
+                ((az + bz + cz) / 3.0, 0.5 * math.sqrt(norm_squared)))
+    else:
+        for (first, second), material_id in zip(cells, material_ids):
+            ax, ah = points[first][0], points[first][1]
+            bx, bh = points[second][0], points[second][1]
+            dh = bh - ah
+            length = math.hypot(bx - ax, dh)
+            if length <= 0.0 or abs(dh) > TOP_FACING_COSINE * length:
+                continue
+            heights.setdefault(int(material_id), []).append((0.5 * (ah + bh), length))
+    result: dict[str, dict[str, float]] = {}
+    for material_id, rows in heights.items():
+        name = MATERIAL_NAMES.get(material_id)
+        if name is None:
+            raise RuntimeError(f"surface mesh contains unknown material ID {material_id}")
+        rows.sort()
+        total_area = sum(area for _height, area in rows)
+        running = 0.0
+        median_height = rows[-1][0]
+        for height, area in rows:
+            running += area
+            if running >= 0.5 * total_area:
+                median_height = height
+                break
+        result[name] = {"topHeight": float(rows[-1][0]),
+                        "medianTopHeight": float(median_height),
+                        "upFacingArea": float(total_area),
+                        "upFacingCellCount": len(rows)}
+    return result
+
+
+def _changed_material_rows(previous_tops: dict[str, Any], current_tops: dict[str, Any],
+                           tolerance: float) -> list[dict[str, Any]]:
+    rows = []
+    for name in sorted(set(previous_tops) | set(current_tops)):
+        before = previous_tops.get(name) or {}
+        after = current_tops.get(name) or {}
+        top_before = before.get("topHeight")
+        top_after = after.get("topHeight")
+        delta = None if top_before is None or top_after is None else float(top_after) - float(top_before)
+        if delta is None:
+            changed = before.get("upFacingArea") is not None and after.get("upFacingArea") is None
+            changed = changed or (before.get("upFacingArea") is None and after.get("upFacingArea") is not None)
+        else:
+            changed = abs(delta) > tolerance
+        if not changed:
+            continue
+        rows.append({
+            "material": name, "topHeightBefore": top_before, "topHeightAfter": top_after,
+            "topHeightDelta": delta,
+            "removedThickness": -delta if delta is not None and delta < 0.0 else None,
+            "addedThickness": delta if delta is not None and delta > 0.0 else None,
+            "removedCompletely": before.get("upFacingArea") is not None and after.get("upFacingArea") is None,
+            "upFacingAreaBefore": before.get("upFacingArea"), "upFacingAreaAfter": after.get("upFacingArea"),
+        })
+    rows.sort(key=lambda row: (-abs(row["topHeightDelta"]) if row["topHeightDelta"] is not None else 0.0, row["material"]))
+    return rows
+
+
+def measure_step_change(step: dict[str, Any], previous_tops: dict[str, Any] | None,
+                        current_tops: dict[str, Any], delta: float) -> dict[str, Any] | None:
+    """Record what a step really did to each material's exposed top.
+
+    Both operands come from the surface mesh each snapshot already extracts, so
+    this costs one classification pass and no extra native work. The nominal
+    rate x duration of a particle or ion-beam step is a calibrated flux
+    quantity, not a line speed; this record is what actually happened.
+    """
+    if not previous_tops:
+        return None
+    rows = _changed_material_rows(previous_tops, current_tops, max(0.25 * float(delta), 1e-9))
+    deposition = step.get("operation") == "deposit"
+    target = step.get("depositMaterial") if deposition else None
+    if target is None and step.get("model") == "removeMaterial":
+        target = step.get("material")
+    primary = next((row for row in rows if row["material"] == target), None) if target else None
+    if deposition and isinstance(target, str) and (primary is None or primary.get("topHeightDelta") is None):
+        # ``Domain.duplicateTopLevelSet`` starts the new level set on the
+        # previous top surface, so a material that did not exist before the
+        # step grows from the highest point of the surface that existed then.
+        after = (current_tops.get(target) or {}).get("topHeight")
+        previous_heights = [(row or {}).get("topHeight") for row in previous_tops.values()]
+        before = max((value for value in previous_heights if value is not None), default=None)
+        if after is not None and before is not None:
+            appeared = {"material": target, "topHeightBefore": before, "topHeightAfter": after,
+                        "topHeightDelta": after - before, "removedThickness": None,
+                        "addedThickness": after - before if after > before else None,
+                        "removedCompletely": False, "materialAppeared": True,
+                        "upFacingAreaBefore": None,
+                        "upFacingAreaAfter": (current_tops.get(target) or {}).get("upFacingArea")}
+            rows = [row for row in rows if row["material"] != target]
+            rows.insert(0, appeared)
+            primary = appeared
+    if primary is None:
+        # A material that vanished from the surface has no measurable delta;
+        # it is still a removal, so prefer real drops and then the topmost
+        # completely removed layer.
+        def removal_rank(row: dict[str, Any]) -> tuple[int, float]:
+            if row["topHeightDelta"] is not None and row["topHeightDelta"] < 0.0:
+                return (0, row["topHeightDelta"])
+            return (1, -(row["topHeightBefore"] if row["topHeightBefore"] is not None else 0.0))
+        removals = [row for row in rows
+                    if (row["topHeightDelta"] is not None and row["topHeightDelta"] < 0.0)
+                    or row["removedCompletely"]]
+        if removals and not deposition:
+            primary = min(removals, key=removal_rank)
+    if primary is None:
+        return None
+    key = "measuredAdded" if deposition else "measuredRemoval"
+    thickness_key = "addedThickness" if deposition else "removedThickness"
+    remaining_top = max((row["topHeight"] for row in current_tops.values()
+                         if isinstance(row, dict) and row.get("topHeight") is not None), default=None)
+    record = {
+        "material": primary["material"],
+        "topHeightBefore": primary["topHeightBefore"],
+        "topHeightAfter": primary["topHeightAfter"],
+        thickness_key: primary[thickness_key],
+        "removedCompletely": primary["removedCompletely"],
+        # A material that vanished has no remaining top to difference against.
+        # The highest remaining surface bounds where it went, so record it
+        # instead of inventing a thickness.
+        "remainingTopHeight": remaining_top,
+        "method": MEASUREMENT_METHOD,
+        "materials": rows[:16],
+    }
+    return {key: record}
+
+
 def material_map(domain: Any) -> list[int]:
     mapping = domain.getMaterialMap()
     return [int(mapping.getMaterialIdAtIdx(index)) for index in range(mapping.size())]
@@ -1478,6 +1652,9 @@ def save_snapshot(
     extra: dict[str, Any] | None = None,
     extra_outputs: list[dict[str, Any]] | None = None,
     defer_payload: bool = False,
+    step: dict[str, Any] | None = None,
+    previous_tops: dict[str, Any] | None = None,
+    recorded_change: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Extract the surface once and persist one snapshot JSON per step.
 
@@ -1486,6 +1663,11 @@ def save_snapshot(
     Callers must not re-read and re-serialise the file afterwards: the old
     write -> json.loads -> write cycle cost a full copy of a multi-megabyte
     snapshot per step for no change other than one added key.
+
+    ``step``/``previous_tops`` add the measured add/remove record for the step
+    from the same surface mesh; ``recorded_change`` re-applies a record that
+    was already written, so deferred snapshot materialisation stays
+    byte-identical to the eager write.
     """
     v3 = requested["schemaVersion"] >= 3
     if v3:
@@ -1497,6 +1679,13 @@ def save_snapshot(
     if is3d:
         from mesh3d import mesh_report as mesh_report_3d, measure_initial, bounds, readback
     report = mesh_report_3d(mesh) if is3d else mesh_report(mesh)
+    material_tops = measure_material_tops(report, is3d)
+    measured_change: dict[str, Any] = {}
+    if recorded_change is not None:
+        measured_change = dict(recorded_change)
+    elif step is not None:
+        measured_change = measure_step_change(step, previous_tops, material_tops,
+                                              float(requested["domain"]["gridDelta"])) or {}
     measured_geometry = None
     if step_id == "initial" and requested["geometry"]["kind"] in ("plane", "trench", "hole"):
         if is3d:
@@ -1635,6 +1824,8 @@ def save_snapshot(
         "outputs": output_rows,
         "noOp": no_op,
         "measuredGeometry": measured_geometry,
+        "materialTops": material_tops,
+        **measured_change,
     }
     if is3d:
         snapshot.update(dimension=3,topology="triangles",surfaceBounds=surface_bounds,domainReadback=readback(domain,requested,report))
@@ -1658,7 +1849,7 @@ def save_snapshot(
                 **({"vtk": vtk_name} if surface_vtk_enabled else {}), "outputs": output_rows,
                 "pointCount": len(display_points), count_key: len(display_triangles), "materialIds": sorted(set(ids)),
                 "materialIdsByLevelSetIndex": levelset_ids, "noOp": no_op, "measuredGeometry": measured_geometry,
-                "surfaceBounds": surface_bounds, **(extra or {})}
+                "surfaceBounds": surface_bounds, "materialTops": material_tops, **measured_change, **(extra or {})}
     if defer_payload:
         # Keep the run's critical path free of the multi-megabyte JSON encode
         # and write. The document is regenerated from the step's .vpsd state
@@ -1683,16 +1874,42 @@ def _event_path(step: dict[str, Any]) -> str:
     return str(step["id"])
 
 
-def apply_geometry_operation(ps: Any, domain: Any, project: dict[str, Any], step: dict[str, Any]) -> dict[str, Any]:
+def apply_geometry_operation(ps: Any, domain: Any, project: dict[str, Any], step: dict[str, Any],
+                             previous_tops: dict[str, Any] | None = None) -> dict[str, Any]:
     model = step["model"]
     if model == "removeMaterial":
         material = material_handle(ps, step["material"])
         domain.removeMaterial(material)
         return {"geometryOperation": "removeMaterial", "material": step["material"], "materialId": MATERIAL_IDS[step["material"]]}
     if model == "planarize":
-        cutoff = float(step["cutoffHeight"])
+        stop_material = step.get("stopMaterial")
+        if stop_material is None:
+            cutoff = float(step["cutoffHeight"])
+            ps.Planarize(domain, cutoff).apply()
+            return {"geometryOperation": "planarize", "cutoffHeight": cutoff}
+        # Material-aware CMP: the installed ViennaPS 4.6.2 Planarize only
+        # accepts a height, so the stop level comes from the exposed top of the
+        # stop material measured on the previous step's surface mesh. The
+        # native call then removes every level set above that height; it is
+        # still one global cut, not lateral selectivity.
+        stop_top = ((previous_tops or {}).get(stop_material) or {}).get("medianTopHeight")
+        if stop_top is None:
+            raise RuntimeError(
+                f"planarize stopMaterial {stop_material!r} has no exposed up-facing surface before step "
+                f"{step['id']!r}; the CMP stop height cannot be derived. Deposit or expose that material "
+                f"in an earlier enabled step, or use an explicit cutoffHeight instead")
+        over_polish = float(step.get("overPolish") or 0.0)
+        cutoff = float(stop_top) - over_polish
         ps.Planarize(domain, cutoff).apply()
-        return {"geometryOperation": "planarize", "cutoffHeight": cutoff}
+        return {"geometryOperation": "planarize", "cutoffHeight": cutoff,
+                "stopMaterial": stop_material,
+                **({"stopMaterialId": MATERIAL_IDS[stop_material]} if stop_material in MATERIAL_IDS else {}),
+                "measuredStopTopHeight": float(stop_top), "overPolish": over_polish,
+                "cutoffMode": "material-aware",
+                "cutoffDerivation": ("area-weighted median height of the up-facing stopMaterial "
+                                     "surface at the start of this step minus overPolish"),
+                "nativePlanarizeScope": ("viennaps.Planarize(domain, cutoffHeight) cuts every level set "
+                                         "above the derived height; lateral selectivity is not modeled")}
     if model == "boolean":
         factory = ps.GeometryFactory(domain.getSetup(), f"WorkbenchBoolean_{step['id']}")
         position = [float(value) for value in step["position"]]
@@ -2151,11 +2368,14 @@ def execute(input_path: Path, run_dir: Path) -> None:
         geometry_step = is_geometry_step(step)
         no_op = not geometry_step and not has_motion(step)
         if geometry_step:
-            actual_parameters = apply_geometry_operation(ps, domain, project, step)
+            previous_tops = snapshots[-1].get("materialTops")
+            actual_parameters = apply_geometry_operation(ps, domain, project, step,
+                                                         previous_tops=previous_tops)
             event(run_dir, {"type": "step-configured", "stepId": step["id"], "operation": step["model"], "model": step["model"],
                             "noOp": False, "actualEngine": "not-applicable", "engineSelectionReason": "native geometry operation; no process engine or physical duration",
                             "actualSeed": None, "actualParameters": actual_parameters})
             metadata = save_snapshot(ps, domain, run_dir, run_id=run_id, step_id=step["id"], step_name=step["name"], step_index=index, requested=project,
+                                     step=step, previous_tops=previous_tops,
                                      defer_payload=LAZY_SNAPSHOTS)
             metadata["nativeState"] = save_native_state(ps, domain, run_dir, project=project, run_id=run_id,
                                                         step_id=step["id"], viennaps_version=ps_version, viennals_version=ls_version)
@@ -2196,13 +2416,18 @@ def execute(input_path: Path, run_dir: Path) -> None:
                     copied_mesh.pop("vtk", None)
                 copied.update({"stepId": step["id"], "stepName": step["name"], "stepIndex": index, "noOp": True,
                                "mesh": copied_mesh})
+                # The copied surface is the previous step's; its measured
+                # add/remove record belongs to that step, not to this no-op.
+                for key in ("measuredRemoval", "measuredAdded"):
+                    copied.pop(key, None)
                 atomic_json(run_dir / f"{step['id']}.json", copied)
             check_artifact_budget(run_dir)
             metadata = {"stepId": step["id"], "name": step["name"], "stepIndex": index, "snapshot": f"{step['id']}.json",
                         **({"vtk": next_vtk_name} if previous.get("vtk") else {}),
                         "pointCount": previous["pointCount"], **{k:previous[k] for k in ("lineCount","triangleCount","topology","dimension") if k in previous},
                         "materialIds": previous["materialIds"], "materialIdsByLevelSetIndex": previous["materialIdsByLevelSetIndex"], "noOp": True,
-                        "measuredGeometry": (copied or previous).get("measuredGeometry")}
+                        "measuredGeometry": (copied or previous).get("measuredGeometry"),
+                        "materialTops": previous.get("materialTops")}
             if copied is None:
                 # Previous step is deferred: this no-op step shares its native
                 # state and is materialised from state-<step>.vpsd on first read.
@@ -2518,6 +2743,7 @@ def execute(input_path: Path, run_dir: Path) -> None:
             with phase(f"stepSnapshot:{step['id']}"):
                 metadata = save_snapshot(ps, domain, run_dir, run_id=run_id, step_id=step["id"], step_name=step["name"], step_index=index, requested=project,
                                          extra_outputs=native_specialized_outputs or None,
+                                         step=step, previous_tops=snapshots[-1].get("materialTops"),
                                          defer_payload=LAZY_SNAPSHOTS)
             with phase(f"stepNativeState:{step['id']}"):
                 metadata["nativeState"] = save_native_state(ps, domain, run_dir, project=project, run_id=run_id,

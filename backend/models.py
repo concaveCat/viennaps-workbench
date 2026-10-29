@@ -674,7 +674,23 @@ class PlanarizeStepV5(StrictModel):
     name: Annotated[str, Field(min_length=1, max_length=80)]
     enabled: bool
     model: Literal["planarize"]
-    cutoffHeight: Number
+    # A planarize step either cuts at an explicit height (the historical shape,
+    # unchanged so old projects and their request hashes stay valid) or derives
+    # that height at run time from the measured top of one material.
+    # ``None`` rather than 0 keeps both new fields out of
+    # ``model_dump(exclude_none=True)``, which is the canonical request hash
+    # input, for every step that does not use them.
+    cutoffHeight: Number | None = None
+    stopMaterial: Annotated[str, Field(min_length=1, max_length=80)] | None = None
+    overPolish: Annotated[Number, Field(ge=0, le=100)] | None = None
+
+    @model_validator(mode="after")
+    def validate_cutoff_source(self):
+        if (self.cutoffHeight is None) == (self.stopMaterial is None):
+            raise ValueError("planarize requires exactly one of cutoffHeight or stopMaterial")
+        if self.overPolish is not None and self.stopMaterial is None:
+            raise ValueError("overPolish applies only to stopMaterial planarize steps")
+        return self
 
 
 class BooleanStepV5(StrictModel):

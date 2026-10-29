@@ -50,7 +50,7 @@ type Step = {
   rateMode?: 'uniform' | 'material'; materialRates?: Record<string, number>; selectivityReference?: string;
   species?: ParticleSpecies[]; rateCoefficients?: MultiParticleRateCoefficients;
   nativeModel?: string; nativeParameters?: Record<string, unknown>;
-  material?: string; cutoffHeight?: number; booleanOperation?: 'union' | 'intersection' | 'difference'; position?: [number, number, number]; width?: number; height?: number; depth?: number; angle?: number; applyToAll?: boolean;
+  material?: string; cutoffHeight?: number; stopMaterial?: string; overPolish?: number; booleanOperation?: 'union' | 'intersection' | 'difference'; position?: [number, number, number]; width?: number; height?: number; depth?: number; angle?: number; applyToAll?: boolean;
 };
 type FixedRandom = { mode: 'fixed'; seed: number };
 type RandomPolicy = FixedRandom | { mode: 'random' };
@@ -71,7 +71,12 @@ type Snapshot = {
   outputs?: NativeArtifact[];
   sliceReadback?: { nativeOperation: string; axis: number; axisLabel: string; position: number; sourceDimension: number; outputDimension: number; viewerClipping: boolean; levelSetCount: number; materialIdsByLevelSetIndex: number[] };
   mesh: { vtk?: string; pointCount: number; lineCount?: number; triangleCount?: number }; gridDelta: number; materialIdsByLevelSetIndex: number[]; noOp: boolean;
+  materialTops?: Record<string, { topHeight: number; medianTopHeight: number; upFacingArea: number; upFacingCellCount: number }>;
+  measuredRemoval?: MeasuredChange;
+  measuredAdded?: MeasuredChange;
 };
+type MeasuredChangeRow = { material: string; topHeightBefore?: number | null; topHeightAfter?: number | null; topHeightDelta?: number | null; removedThickness?: number | null; addedThickness?: number | null; removedCompletely?: boolean };
+type MeasuredChange = MeasuredChangeRow & { remainingTopHeight?: number | null; method?: string | null; materials?: MeasuredChangeRow[] };
 type SnapshotRow = { stepId: string; name: string; stepIndex: number; snapshot: string; vtk: string; pointCount: number; lineCount?: number; triangleCount?: number; materialIds: number[]; noOp?: boolean; geometryReadback?: Record<string, unknown>; sliceReadback?: Snapshot['sliceReadback']; nativeState?: DomainStateRef & { fileName: string } };
 type RunSummary = { runId: string; kind: string; status: string; createdAt?: string; finishedAt?: string; requestedInputHash?: string; failureReason?: string };
 type RunTermination = { reason?: string | null; returnCode?: number | null; rssLimitMiB?: number | null; peakObservedRssBytes?: number | null };
@@ -208,9 +213,16 @@ function hasMotion(step: Step): boolean {
 }
 function usesFlux(step: Step): boolean { return step.enabled && ((step.model === 'specialized' && SPECIALIZED_FLUX_MODELS.has(step.nativeModel ?? '')) || (step.model === 'singleParticle' || step.model === 'multiParticle') && hasMotion(step)); }
 function isGeometryStep(step: Step): boolean { return step.model === 'removeMaterial' || step.model === 'planarize' || step.model === 'boolean'; }
+// Thicknesses are small (a spacer etch removes a couple of nm), so keep µm for
+// absolute heights and switch to nm for sub-10 nm thickness readouts.
+function formatMicron(value: number | null | undefined): string { return value == null || !Number.isFinite(value) ? '—' : `${value.toFixed(4)} µm`; }
+function formatThickness(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return '—';
+  return Math.abs(value) < 0.01 ? `${(value * 1000).toFixed(2)} nm` : `${value.toFixed(4)} µm`;
+}
 function stepKindLabel(step: Step): string {
   if (step.model === 'removeMaterial') return `移除材料 · ${step.material ?? '未选择'}`;
-  if (step.model === 'planarize') return '平坦化';
+  if (step.model === 'planarize') return step.stopMaterial ? `平坦化 · 停在 ${step.stopMaterial}` : '平坦化';
   if (step.model === 'boolean') return `布尔几何 · ${{ union: '并集', intersection: '交集', difference: '差集' }[step.booleanOperation ?? 'difference']}`;
   if (step.model === 'specialized') return `ViennaPS 专用模型 · ${step.nativeModel ?? '未选择'}`;
   return `${step.operation === 'etch' ? '刻蚀' : '沉积'} · ${step.model === 'isotropic' ? '各向同性' : step.model === 'singleParticle' ? '单粒子' : step.model === 'multiParticle' ? '多粒子' : '定向过程'}${hasMotion(step) ? '' : ' · 零速率'}`;
@@ -860,6 +872,10 @@ export default function App() {
   const multiParticleActual = selectedExecution?.model === 'multiParticle' ? selectedExecution.actualParameters ?? {} : null;
   const specializedActual = selectedExecution?.model === 'specialized' ? selectedExecution.actualParameters ?? {} : null;
   const geometryActual = selectedExecution && ['removeMaterial', 'planarize', 'boolean'].includes(selectedExecution.model ?? '') ? selectedExecution.actualParameters ?? {} : null;
+  const measuredChange = selectedSnapshot?.measuredRemoval
+    ? { kind: 'removal' as const, record: selectedSnapshot.measuredRemoval }
+    : selectedSnapshot?.measuredAdded ? { kind: 'addition' as const, record: selectedSnapshot.measuredAdded } : null;
+  const hasMeasuredChange = measuredChange !== null;
   const displayFlux = fluxResultRunId === displayRunId ? fluxResult : null;
   const fluxField = displayFlux?.fields.find(item => `${item.association}:${item.name}` === selectedFluxField) ?? displayFlux?.fields[0];
   const fluxValues = displayFlux && fluxField
@@ -870,9 +886,9 @@ export default function App() {
     if (displayInfo?.kind === 'flux') { setDockTab('flux'); setDockOpen(true); }
     else if ((displayInfo?.intermediateOutputs?.length ?? 0) > 0) { setDockTab('intermediate'); setDockOpen(true); }
     else if ((selectedSnapshot?.outputs?.length ?? 0) > 0) { setDockTab('artifacts'); setDockOpen(true); }
-    else if (directionalActual || multiParticleActual || specializedActual || geometryActual) { setDockTab('native'); setDockOpen(true); }
+    else if (directionalActual || multiParticleActual || specializedActual || geometryActual || hasMeasuredChange) { setDockTab('native'); setDockOpen(true); }
     else if (visibleLog) { setDockTab('log'); setDockOpen(true); }
-  }, [displayInfo?.kind, displayInfo?.intermediateOutputs?.length, selectedSnapshot?.outputs?.length, directionalActual, multiParticleActual, specializedActual, geometryActual, visibleLog]);
+  }, [displayInfo?.kind, displayInfo?.intermediateOutputs?.length, selectedSnapshot?.outputs?.length, directionalActual, multiParticleActual, specializedActual, geometryActual, hasMeasuredChange, visibleLog]);
 
   const refreshLists = useCallback(async () => {
     try {
@@ -2516,6 +2532,9 @@ export default function App() {
             {selectedExecutionGpu.process?.processListStatus === 'not-observed' ? ' · 系统未列出进程' : ''}
           </span>}
           {selectedSnapshot && <span className="meta-item">网格 Δ={selectedSnapshot.gridDelta} µm</span>}
+          {measuredChange && <span className="meta-item measured-change-chip">
+            {measuredChange.kind === 'removal' ? '实测去除' : '实测增加'} {measuredChange.record.material} {formatThickness(measuredChange.kind === 'removal' ? measuredChange.record.removedThickness : measuredChange.record.addedThickness)}
+          </span>}
           {selectedSnapshot?.sliceReadback && <div className="inline-note">原生操作：{selectedSnapshot.sliceReadback.nativeOperation}，y 法向位置 {selectedSnapshot.sliceReadback.position} µm；输出是 2D 几何网格，未使用查看器裁剪。</div>}
           {selectedSnapshot?.geometryReadback && <details className="solver-advanced"><summary>ViennaPS 初始几何原生回读</summary><pre>{JSON.stringify(selectedSnapshot.geometryReadback, null, 2)}</pre></details>}
           {selectedSnapshot?.noOp && <span className="tag no-op-tag">零速率 no-op</span>}
@@ -2528,7 +2547,7 @@ export default function App() {
         <div className={`dock-shell ${dockOpen ? 'expanded' : 'collapsed'}`}>
           <div className="dock-header">
             <button type="button" className="dock-toggle" aria-expanded={dockOpen} onClick={() => setDockOpen(value => !value)}>{dockOpen ? '▾' : '▸'} 日志</button>
-            <Dock tab={dockTab} onChange={tab => { setDockTab(tab); setDockOpen(true); }} counts={{ log: runInfo ? 1 : 0, flux: displayFlux?.fields.length ?? 0, intermediate: displayInfo?.intermediateOutputs?.length ?? 0, native: directionalActual || multiParticleActual || specializedActual || geometryActual ? 1 : 0, artifacts: selectedSnapshot?.outputs?.length ?? 0 }} />
+            <Dock tab={dockTab} onChange={tab => { setDockTab(tab); setDockOpen(true); }} counts={{ log: runInfo ? 1 : 0, flux: displayFlux?.fields.length ?? 0, intermediate: displayInfo?.intermediateOutputs?.length ?? 0, native: directionalActual || multiParticleActual || specializedActual || geometryActual || hasMeasuredChange ? 1 : 0, artifacts: selectedSnapshot?.outputs?.length ?? 0 }} />
           </div>
           {dockOpen && <div className="dock-scroll">
         <div id="dock-flux" className="dock-block">
@@ -2591,7 +2610,19 @@ export default function App() {
         </div>}
         {geometryActual && <div className="directional-history">
           <strong>ViennaPS 几何操作 · 历史记录</strong>
+          {geometryActual.geometryOperation === 'planarize' && geometryActual.stopMaterial != null
+            ? <span>材质感知 CMP：停止材料 {String(geometryActual.stopMaterial)} · 实测顶面 {formatMicron(Number(geometryActual.measuredStopTopHeight))} − 过抛光 {formatMicron(Number(geometryActual.overPolish))} → 有效截断高度 {formatMicron(Number(geometryActual.cutoffHeight))}。原生 <code>Planarize</code> 仍是全局高度切割，不模拟横向选择比。</span>
+            : null}
           <pre>{JSON.stringify(geometryActual, null, 2)}</pre>
+        </div>}
+        {measuredChange && <div className="directional-history measured-change">
+          <strong>实测材料变化 · {measuredChange.kind === 'removal' ? '去除' : '增加'}（{measuredChange.record.material}）</strong>
+          <span>顶面高度：{formatMicron(measuredChange.record.topHeightBefore)} → {formatMicron(measuredChange.record.topHeightAfter)} · 实测{measuredChange.kind === 'removal' ? '去除' : '增加'}厚度 {formatThickness(measuredChange.kind === 'removal' ? measuredChange.record.removedThickness : measuredChange.record.addedThickness)}</span>
+          {measuredChange.record.removedCompletely && <span>该材料在这一步被完全移除，没有剩余上表面可比对；该步后最高表面为 {formatMicron(measuredChange.record.remainingTopHeight)}。</span>}
+          <span>测量方法：{measuredChange.record.method ?? '表面网格上表面单元'}；不生成体网格。名义 rate × duration 只是标定通量，不代表实际厚度。</span>
+          {(measuredChange.record.materials?.length ?? 0) > 1 && <div className="flux-table-wrap"><table className="flux-table"><thead><tr><th>材料</th><th>前顶面</th><th>后顶面</th><th>实测去除</th><th>实测增加</th></tr></thead><tbody>
+            {(measuredChange.record.materials ?? []).map(row => <tr key={row.material}><td>{row.material}</td><td>{formatMicron(row.topHeightBefore)}</td><td>{formatMicron(row.topHeightAfter)}{row.removedCompletely ? '（已移除）' : ''}</td><td>{formatThickness(row.removedThickness)}</td><td>{formatThickness(row.addedThickness)}</td></tr>)}
+          </tbody></table></div>}
         </div>}
         </div>
           </div>}
@@ -2786,7 +2817,18 @@ export default function App() {
               </div>
               </> : <div className="step-tab-panel" data-step-tab-panel="basic">
                 {selectedStepObject.model === 'removeMaterial' && <SelectField label="要移除的材料" value={selectedStepObject.material ?? materials[0]?.name ?? ''} options={materials.map(material => ({ value: material.name, label: material.name }))} onChange={value => editStep(selectedStepObject.id, step => ({ ...step, material: value }))} hint="调用 ViennaPS Domain.removeMaterial" />}
-                {selectedStepObject.model === 'planarize' && <NumericField label="平坦化截断高度" unit="µm" value={selectedStepObject.cutoffHeight ?? 0} min={-100} max={100} step="0.05" hint="调用 ViennaPS Planarize(domain, cutoffHeight)" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, cutoffHeight: value }))} />}
+                {selectedStepObject.model === 'planarize' && <>
+                  <SelectField label="截断高度来源" value={selectedStepObject.stopMaterial ? `material:${selectedStepObject.stopMaterial}` : 'height'} options={[{ value: 'height', label: '固定高度 · cutoffHeight' }, ...materials.map(material => ({ value: `material:${material.name}`, label: `按材料停止 · ${material.name} 顶面` }))]} onChange={value => editStep(selectedStepObject.id, step => {
+                    if (value === 'height') { const next = { ...step, cutoffHeight: step.cutoffHeight ?? 0 }; delete next.stopMaterial; delete next.overPolish; return next; }
+                    const next = { ...step, stopMaterial: value.slice('material:'.length) }; delete next.cutoffHeight;
+                    if (next.overPolish === undefined) next.overPolish = 0;
+                    return next;
+                  })} hint="按材料停止时，运行阶段从该材料顶面实测高度推导截断高度" />
+                  {!selectedStepObject.stopMaterial
+                    ? <NumericField label="平坦化截断高度" unit="µm" value={selectedStepObject.cutoffHeight ?? 0} min={-100} max={100} step="0.05" hint="调用 ViennaPS Planarize(domain, cutoffHeight)" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, cutoffHeight: value }))} />
+                    : <NumericField label="过抛光量" unit="µm" value={selectedStepObject.overPolish ?? 0} min={0} max={100} step="0.005" hint="有效截断高度 = 该材料实测顶面中位高度 − 过抛光量" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, overPolish: value }))} />}
+                  {selectedStepObject.stopMaterial && <div className="inline-note">材质感知 CMP：原生 <code>Planarize</code> 只接受一个高度，因此按“{selectedStepObject.stopMaterial}”顶面在运行时的实测高度推导该高度，再调用原生平坦化。它仍是一刀切的全局高度，不模拟横向选择比；该材料若不共面会被过切或欠切。实测值与有效截断高度会写入该步结果。</div>}
+                </>}
                 {selectedStepObject.model === 'boolean' && <>
                   <SelectField label="布尔操作" value={selectedStepObject.booleanOperation ?? 'difference'} options={[{ value: 'union', label: '并集 · UNION' }, { value: 'intersection', label: '交集 · INTERSECT' }, { value: 'difference', label: '差集 · RELATIVE_COMPLEMENT' }]} onChange={value => editStep(selectedStepObject.id, step => ({ ...step, booleanOperation: value as Step['booleanOperation'] }))} />
                   <div className="inline-note">ViennaPS 使用真实盒体 stencil。位置是盒体底面坐标，宽度沿 x；二维高度沿 h，三维高度沿 z、深度沿 y。</div>

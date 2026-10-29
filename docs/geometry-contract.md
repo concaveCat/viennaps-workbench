@@ -17,6 +17,12 @@ This contract is based on bounded calls to the installed ViennaPS 4.6.2 package,
 - A positive mask height creates material ID 0 (`Mask`); silicon is ID 10 and silicon dioxide is ID 30. The surface mesh stores `MaterialIds` as cell data aligned with line cells. The current Domain material map maps snapshot-local level-set indexes to IDs; it is not a stable layer ID.
 - `addInterfaces=True`, `sharpCorners=False`, and `minNodeDistanceFactor=0.01` are fixed for both viewer and VTK export. `addInterfaces=False` and `sharpCorners=True` are unsafe on this install and are not called.
 
+## Recipe geometry steps
+
+- `removeMaterial`, `planarize` and `boolean` steps call the native operations on the previous step's `Domain`.
+- `Planarize(domain, cutoffHeight)` accepts a height only. A `planarize` step with `stopMaterial` derives that height from the measured top of the stop material; it is a global height cut, not a CMP selectivity model. See `cmp-planarize-contract.md`.
+- Every executed step records the measured change of each material's exposed top (`measuredRemoval`/`measuredAdded`) from the surface mesh it already extracts. No volume mesh is built for the measurement.
+
 ## Discretization and geometry validation
 
 - The adapter stores requested and actual grid spacing and extents separately. It rejects non-finite inputs and a grid extent that cannot be represented within the accepted grid-interval budget.

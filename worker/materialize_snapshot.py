@@ -66,7 +66,11 @@ def materialize(input_path: Path, run_dir: Path, step_id: str) -> dict[str, Any]
         run_id=metadata.get("runId") or config.get("runId") or "",
         step_id=step_id, step_name=metadata["name"], step_index=int(metadata["stepIndex"]),
         requested=project, no_op=bool(metadata.get("noOp", False)),
-        extra_outputs=extra_outputs or None)
+        extra_outputs=extra_outputs or None,
+        # The measured top/removal record is a property of the step that was
+        # executed, not of the re-read Domain, so replay the recorded value to
+        # keep the materialised document byte-identical to the eager write.
+        recorded_change={key: metadata[key] for key in ("measuredRemoval", "measuredAdded") if key in metadata} or None)
     for key in ("pointCount", "triangleCount", "lineCount"):
         if key in metadata and produced.get(key) != metadata[key]:
             raise RuntimeError(f"materialised snapshot {step_id}: {key} {produced.get(key)} != recorded {metadata[key]}")

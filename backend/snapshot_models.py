@@ -22,6 +22,25 @@ class Material(StrictModel):
     levelSetIndexes:list[Integer]
     sourceStepId:str|None
 
+class MaterialTop(StrictModel):
+    """Exposed top of one material, measured on the snapshot surface mesh."""
+    topHeight:Number
+    medianTopHeight:Number
+    upFacingArea:Annotated[Number,Field(ge=0)]
+    upFacingCellCount:Annotated[Integer,Field(ge=0)]
+
+class MeasuredMaterialChange(StrictModel):
+    """Thickness a step really added or removed, from the surface mesh only."""
+    material:str
+    topHeightBefore:Number|None=None
+    topHeightAfter:Number|None=None
+    removedThickness:Number|None=None
+    addedThickness:Number|None=None
+    removedCompletely:bool=False
+    remainingTopHeight:Number|None=None
+    method:str|None=None
+    materials:list[dict]|None=None
+
 class Snapshot3D(StrictModel):
     schemaVersion:Literal[2]
     dimension:Literal[3]
@@ -44,6 +63,9 @@ class Snapshot3D(StrictModel):
     measuredGeometry:dict[str,Number]|None
     surfaceBounds:Annotated[list[Number],Field(min_length=6,max_length=6)]
     domainReadback:dict
+    materialTops:dict[str,MaterialTop]|None=None
+    measuredRemoval:MeasuredMaterialChange|None=None
+    measuredAdded:MeasuredMaterialChange|None=None
     substrateMaterialId:Integer|None=None
     materialSurfaceStatus:Literal['closed','unavailable']|None=None
     materialSurfaceError:str|None=None
