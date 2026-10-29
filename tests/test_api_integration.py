@@ -180,8 +180,16 @@ class ApiIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rejected_host[0], 400)
         rejected_origin = await asgi_request("/api/health", headers=[(b"origin", b"https://example.com")])
         self.assertEqual(rejected_origin[0], 403)
+        # General JSON bodies have no fixed byte cap; an oversized invalid body
+        # is rejected by project validation (422), not by the middleware.
         too_large = await asgi_request("/api/projects/validate", method="POST", payload=b"x" * (1024 * 1024 + 1), include_content_length=False)
-        self.assertEqual(too_large[0], 413)
+        self.assertEqual(too_large[0], 422)
+        # The dedicated GDS upload cap still returns 413.
+        with patch("backend.main.API_GDS_MAX_BODY", 4):
+            gds_too_large = await asgi_request(
+                "/api/gds-assets?file_name=oversized.gds", method="POST", payload=b"x" * 8,
+                headers=[(b"content-type", b"application/octet-stream")])
+        self.assertEqual(gds_too_large[0], 413)
 
         submitted = await asgi_request("/api/runs", method="POST", payload={"kind": "preview", "project": project})
         self.assertEqual(submitted[0], 202, submitted[2].decode("utf-8", errors="replace"))

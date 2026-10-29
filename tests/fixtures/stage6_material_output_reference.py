@@ -39,7 +39,7 @@ def emit_outputs(domain,dimension,step_id,outdir):
     surface=outdir/f'{step_id}.vtk';domain.saveSurfaceMesh(str(surface),addInterfaces=True,sharpCorners=False,minNodeDistanceFactor=.01);add('surfaceMesh',surface)
     level_prefix=outdir/f'{step_id}-levelsets.vtk';domain.saveLevelSets(str(level_prefix))
     for i,path in enumerate(sorted(outdir.glob(level_prefix.name+'_layer*.lvst'),key=lambda p:int(p.stem.split('_layer')[-1]))):add('levelSet',path,levelSetIndex=i,materialId=mapping[i])
-    mesh_prefix=outdir/f'{step_id}-levelset-mesh.vtk';domain.saveLevelSetMesh(str(mesh_prefix),1)
+    mesh_prefix=outdir/f'{step_id}-levelset-mesh.vtk';ps.Domain(domain).saveLevelSetMesh(str(mesh_prefix),1)
     for i,path in enumerate(sorted(outdir.glob(mesh_prefix.name+'_layer*.vtp'),key=lambda p:int(p.stem.split('_layer')[-1]))):add('levelSetMesh',path,levelSetIndex=i,materialId=mapping[i])
     if dimension==3:
         volume_prefix=outdir/f'{step_id}-volume.vtk';domain.saveVolumeMesh(str(volume_prefix),.01)
@@ -48,7 +48,7 @@ def emit_outputs(domain,dimension,step_id,outdir):
       'nativeUnit':None,'association':'domain metadata; native binding declares no point/cell association',
       'values':domain.getMetaData(),'dimension':dimension,'gridDelta':float(domain.getGridDelta()),
       'materialIdsByLevelSetIndex':mapping}
-    path=outdir/f'{step_id}-domain-metadata.json';path.write_text(json.dumps(metadata,ensure_ascii=False,indent=2,allow_nan=False)+'\n');add('nativeMetadata',path)
+    path=outdir/f'{step_id}-domain-metadata.json';path.write_text(json.dumps(metadata,ensure_ascii=False,separators=(',',':'),allow_nan=False)+'\n');add('nativeMetadata',path)
     return rows
 
 

@@ -67,22 +67,22 @@ git diff --check
 不要用“先停掉正式服务再跑测试”来绕过第二条：那会打断正在看结果的人，
 而且停服务后 60 s 内端口仍处于 TIME_WAIT（见 `/root/.pi/agent/AGENTS.md`）。
 
-已知环境缺失（不是代码回归）：`tests/test_stage9.py` 有一条断言依赖
-`docs/stage9-evidence/gpu-coverage-audit/.../cpu-nan-debug/worker.guard.json`。
-`docs/*-evidence/` 不在 git 中（见 §2、§5），新 checkout / worktree 缺该文件时这条会红。
-处理方式是**记录并绕过**，不要改证据文件、也不要删断言来让它变绿；
-要真正修复只能重跑生成该证据的实验。
+历史证据缺失（不是代码回归）：`docs/stage9-evidence/gpu-coverage-audit/.../cpu-nan-debug/worker.guard.json`
+没有被归档。`tests/test_stage9.py` 现在由独立用例
+`test_historical_cpu_nan_failure_guard_is_archived` 检查：文件存在则断言，缺失则 skip。
+不要伪造该证据；重跑 profile-recheck 实验并把真实 guard 归档后可恢复严格断言。
 
-当前基线的预期结果是 **102 项：99 通过 / 3 失败 / 4 跳过**。3 条已知红灯及原因：
+当前基线的预期结果是 **108 项：103 通过 / 0 失败 / 5 跳过**。
 
-| 用例 | 现象 | 根因（已定位） |
-|---|---|---|
-| `test_project_api_preview_and_bounded_archive` | 期望 413，实际 422 | `backend/main.py:118` 已按设计取消通用 JSON 请求体上限（注释原文 “General JSON request bodies have no fixed byte cap”），只有 GDS 64 MiB / continuation 512 MiB 还有 413；断言停留在旧契约 |
-| `test_custom_registry_materials_replay_and_native_output_roundtrip` | `nativeMetadata` 产物字节不等 | 两套 writer 分叉：`worker/simulate.py:87` 紧凑 `separators=(",",":")`，参考实现 `tests/fixtures/stage6_material_output_reference.py:51` 用 `indent=2`，而断言比原始字节 |
-| `test_patched_gpu_multiparticle_multi_ion_support_is_evidence_backed` | 缺 `worker.guard.json` | 证据只生成在 `/tmp` 的候选目录，未归档进 `docs/` |
+此前记录的 3 条红灯已处理：
 
-跑完若这 3 条之外还有红，才是真正的回归。前两条要修需要产品决策（是否恢复请求体上限）
-或统一 writer，不要在“只改文档”的改动里顺手改掉。
+| 用例 | 处理 |
+|---|---|
+| `test_project_api_preview_and_bounded_archive` | 断言改为符合“通用 JSON 无固定上限”的 422，并单独用 mock 验证 GDS 64 MiB 的 413 |
+| `test_custom_registry_materials_replay_and_native_output_roundtrip` | 修复延迟快照物化丢失 Domain 元数据的问题；参考 writer 改为 compact JSON |
+| `test_patched_gpu_multiparticle_multi_ion_support_is_evidence_backed` | 重新生成 eight-ion CPU/GPU 证据；历史 `cpu-nan-debug/worker.guard.json` 未归档，单独用例在缺失时 skip |
+
+跑完若出现新的红，才是真正的回归。
 
 - 提交信息说明“为什么”，中英文均可，与改动文件的文档语言一致。
 - 非平凡改动走分支 + PR，不要直接推 `main`。

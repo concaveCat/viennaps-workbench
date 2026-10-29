@@ -48,6 +48,14 @@ def materialize(input_path: Path, run_dir: Path, step_id: str) -> dict[str, Any]
                     if project["domain"]["xBoundary"] == "reflective" else ps.BoundaryType.PERIODIC_BOUNDARY)
         domain = ps.Domain(float(project["domain"]["gridDelta"]), float(project["domain"]["xExtent"]), boundary)
     ps.Reader(domain, str(state_path)).apply()
+    native_meta = meta.get("nativeDomainMetadata")
+    if native_meta:
+        level = {"0": ps.MetaDataLevel.NONE, "1": ps.MetaDataLevel.GRID,
+                 "2": ps.MetaDataLevel.PROCESS, "3": ps.MetaDataLevel.FULL}.get(
+                     str(native_meta.get("level")), ps.MetaDataLevel.FULL)
+        domain.enableMetaData(level)
+        if native_meta.get("values"):
+            domain.addMetaData(native_meta["values"])
 
     # Extra (non-derivable) outputs such as the native dense cell set are kept
     # as recorded rows; they point at files the run already wrote.
