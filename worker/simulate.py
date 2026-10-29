@@ -1608,8 +1608,16 @@ def save_snapshot(
         # Keep the run's critical path free of the multi-megabyte JSON encode
         # and write. The document is regenerated from the step's .vpsd state
         # the first time a consumer asks for it (backend.snapshots).
-        atomic_json(run_dir / f"{step_id}.meta.json",
-                    {"schemaVersion": 1, "deferred": True, "metadata": metadata})
+        deferred = {"schemaVersion": 1, "deferred": True, "metadata": metadata}
+        # .vpsd carries geometry but not process metadata. Persist the small
+        # metadata map so materialisation can reproduce level-set VTP FieldData
+        # and the nativeMetadata artifact byte-for-byte.
+        if output_settings.get("nativeMetadata"):
+            deferred["nativeDomainMetadata"] = {
+                "level": str(domain.getMetaDataLevel()),
+                "values": {key: list(value) for key, value in domain.getMetaData().items()},
+            }
+        atomic_json(run_dir / f"{step_id}.meta.json", deferred)
     else:
         atomic_json(run_dir / snapshot_name, snapshot)
     check_artifact_budget(run_dir)

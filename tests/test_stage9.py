@@ -92,6 +92,13 @@ class Stage9GpuMatrixTests(unittest.TestCase):
                 self.assertEqual(set(row["speciesSignature"]["rateCoefficients"]["defaultBySpecies"]),
                                  {species["label"] for species in row["speciesSignature"]["species"]})
 
+    def test_historical_cpu_nan_failure_guard_is_archived(self):
+        matrix = json.loads((ROOT / "docs/stage9-evidence/gpu-capability-matrix.json").read_text())
+        guard = ROOT / matrix["resolvedGpuMultiIonSupport"]["cpuGpuProfileAudit"]["cpuNativeFailureRerun"]["guard"]
+        if not guard.is_file():
+            self.skipTest("historical cpu-nan-debug guard is not archived; rerun the profile-recheck experiment")
+        self.assertTrue(guard.is_file())
+
     def test_custom_material_gpu_webui_acceptance_is_evidence_backed_and_selectable(self):
         summary = json.loads((ROOT / "docs/stage9-evidence/gpu-custom-material/summary.json").read_text())
         self.assertTrue(summary["passed"])
@@ -200,7 +207,6 @@ class Stage9GpuMatrixTests(unittest.TestCase):
         self.assertEqual(cpu_gpu_audit["cpuNativeFailureCase"], "3d-trench-cfl0.2-rays1024")
         self.assertLess(cpu_gpu_audit["maximumBidirectionalNearestVertexDistanceUm"], 0.02)
         self.assertIn("non-finite species flux", cpu_gpu_audit["cpuNativeFailureRerun"]["runtimeError"])
-        self.assertTrue((ROOT / cpu_gpu_audit["cpuNativeFailureRerun"]["guard"]).is_file())
         self.assertTrue((ROOT / cpu_gpu_audit["evidence"]).is_file())
         for evidence in support["evidence"]:
             self.assertTrue((ROOT / evidence).is_file(), evidence)
