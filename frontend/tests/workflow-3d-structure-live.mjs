@@ -8,7 +8,11 @@
  *    errors, and the canvas is not a flat single colour;
  *  - switching to the initial structure keeps the same viewer mounted;
  *  - the 02 step table's "结构" button jumps to 03 and selects that step;
- *  - the 03 segment row's "查看结构" button selects the segment's last step.
+ *  - the 03 segment row's "查看结构" button selects the segment's last step;
+ *  - standard views / the clip section / "适配视图" fit the visible geometry
+ *    instead of shrinking it to a dot (N6/N16);
+ *  - the clip slider names its axis and unit in µm;
+ *  - a measurement draws a red line inside the 3D scene (N23).
  */
 import assert from 'node:assert/strict';
 import path from 'node:path';
@@ -18,7 +22,9 @@ import { chromium } from 'playwright';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const baseUrl = (process.env.WORKBENCH_URL ?? 'http://127.0.0.1:8861').replace(/\/$/, '');
-const projectPath = process.env.WORKFLOW_PROJECT ?? path.join(here, 'fixtures', 'workflow-3d-plane.json');
+// A hole has a real Z extent: a flat plane would be edge-on in XZ and could
+// never show whether the standard views fit the geometry.
+const projectPath = process.env.WORKFLOW_PROJECT ?? path.join(here, 'fixtures', 'workflow-3d-hole.json');
 const screenshot = process.env.WORKFLOW_SCREENSHOT ?? '/tmp/workflow-3d-structure.png';
 
 /** Minimal 8-bit PNG decoder (Playwright screenshots are non-interlaced RGBA). */
@@ -110,6 +116,45 @@ function analyzePng(buffer) {
   return { width, height, painted, uniqueColors: quantized.size, backgroundKey };
 }
 
+/**
+ * Share of the canvas covered by the rendered structure (largest side of the
+ * painted bounding box). The bottom-left corner holds the orientation marker
+ * and the scale bar, so it is excluded.
+ */
+function paintedExtent(buffer) {
+  const { width, height, channels, pixels } = decodePng(buffer);
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      if (x < 190 && y > height - 130) continue;
+      const i = (y * width + x) * channels;
+      const r = pixels[i], g = pixels[i + 1], b = pixels[i + 2];
+      if (Math.abs(r - 247) + Math.abs(g - 249) + Math.abs(b - 251) <= 24) continue;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+  }
+  if (!Number.isFinite(minX)) return { width: 0, height: 0, ratio: 0 };
+  return {
+    width: (maxX - minX) / width,
+    height: (maxY - minY) / height,
+    ratio: Math.max((maxX - minX) / width, (maxY - minY) / height),
+  };
+}
+
+/** Reddish pixels: the measurement line is drawn in #b42318. */
+function countRedPixels(buffer) {
+  const { width, height, channels, pixels } = decodePng(buffer);
+  let red = 0;
+  for (let i = 0; i < width * height; i += 1) {
+    const r = pixels[i * channels], g = pixels[i * channels + 1], b = pixels[i * channels + 2];
+    if (r > 110 && r - g > 55 && r - b > 55) red += 1;
+  }
+  return red;
+}
+
 const browser = await chromium.launch({
   headless: true,
   args: ['--no-sandbox', '--use-angle=swiftshader', '--enable-unsafe-swiftshader'],
@@ -157,6 +202,54 @@ try {
   const canvasPixels = analyzePng(canvasPng);
   assert.ok(canvasPixels.painted > 500, `3D canvas looks blank (${canvasPixels.painted} painted pixels)`);
   assert.ok(canvasPixels.uniqueColors > 8, `3D canvas is flat (${canvasPixels.uniqueColors} quantized colours)`);
+
+  // ---- N6/N16: standard views fit the visible geometry --------------------
+  await page.getByLabel('标准视角').selectOption('xz');
+  await page.waitForTimeout(1200);
+  const xzExtent = paintedExtent(await page.locator('.wb-viewer3d__stage').screenshot());
+  assert.ok(xzExtent.ratio >= 0.3, `XZ view must fill the canvas (${JSON.stringify(xzExtent)})`);
+  await page.locator('.wb-viewer3d__stage').screenshot({ path: screenshot.replace(/\.png$/, '-xz.png') });
+
+  await page.getByRole('button', { name: '适配视图' }).click();
+  await page.waitForTimeout(900);
+  const fittedExtent = paintedExtent(await page.locator('.wb-viewer3d__stage').screenshot());
+  assert.ok(fittedExtent.ratio >= 0.3, `适配视图 must keep the geometry readable (${JSON.stringify(fittedExtent)})`);
+  await page.locator('.wb-viewer3d__stage').screenshot({ path: screenshot.replace(/\.png$/, '-fit.png') });
+
+  // ---- N16: the clip slider names its axis and unit, and stays readable ---
+  await page.getByRole('checkbox', { name: '截面' }).check();
+  await page.waitForTimeout(1200);
+  const clipLabel = await page.locator('.wb-viewer3d__clip-value').innerText();
+  assert.match(clipLabel, /^X = -?\d+\.\d{3} µm$/, `clip label must carry the axis and µm: ${clipLabel}`);
+  const clipRange = await page.locator('.wb-viewer3d__clip-range').innerText();
+  assert.match(clipRange, /-?\d+\.\d{3} … -?\d+\.\d{3} µm/, `clip range must show min … max µm: ${clipRange}`);
+  const sectionExtent = paintedExtent(await page.locator('.wb-viewer3d__stage').screenshot());
+  assert.ok(sectionExtent.ratio >= 0.3, `section must stay readable (${JSON.stringify(sectionExtent)})`);
+  await page.locator('.wb-viewer3d__stage').screenshot({ path: screenshot.replace(/\.png$/, '-clip.png') });
+
+  await page.getByLabel('截面位置（µm）').evaluate(node => {
+    const target = Number(node.min) + (Number(node.max) - Number(node.min)) * 0.25;
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+    setter.call(node, String(target));
+    node.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  await page.waitForTimeout(500);
+  assert.notEqual(await page.locator('.wb-viewer3d__clip-value').innerText(), clipLabel,
+    'dragging the slider must update the label in real time');
+  await page.getByRole('checkbox', { name: '截面' }).uncheck();
+  await page.waitForTimeout(800);
+
+  // ---- N23: the measurement draws a red line inside the 3D scene ---------
+  await page.getByRole('button', { name: '测量', exact: true }).click();
+  await page.getByText(/测量 · 已测量/).waitFor({ timeout: 90000 });
+  await page.waitForTimeout(1500);
+  const markerPixels = countRedPixels(await page.locator('.wb-viewer3d__stage').screenshot());
+  assert.ok(markerPixels > 50, `3D marker line must be visible (${markerPixels} red pixels)`);
+  assert.match(await page.locator('.wb-viewer3d__status').innerText(), /测量位置：X = -?[\d.]+ µm/);
+  const structureSide = await page.locator('.wf-structure-side').innerText();
+  assert.match(structureSide, /测量位置：X = -?[\d.]+ µm/, `3D wording must name the position: ${structureSide}`);
+  assert.doesNotMatch(structureSide, /2D 视图/, 'the 3D panel must not point at a 2D view');
+  await page.locator('.wb-viewer3d__stage').screenshot({ path: screenshot.replace(/\.png$/, '-marker.png') });
 
   // ---- initial structure keeps the viewer mounted -------------------------
   const initialChip = page.locator('.wf-step-chip[data-step-id="initial"]').first();

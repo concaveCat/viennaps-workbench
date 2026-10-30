@@ -64,23 +64,67 @@ try {
     const surfaceY = line
       ? Math.max(Number(line.getAttribute('y1')), Number(line.getAttribute('y2')))
       : null;
+    // The plot area is smaller than the viewBox: titles, ticks and the scale
+    // bar live in the margins (N7).
+    const axisLines = Array.from(svg.querySelectorAll('.wf-axis-line line'));
+    const plotBottom = axisLines[0] ? Number(axisLines[0].getAttribute('y1')) : box.y + box.height;
+    const plotTop = axisLines[1] ? Number(axisLines[1].getAttribute('y2')) : box.y;
     const polygons = Array.from(svg.querySelectorAll('polygon.wf-fill')).map(node =>
       (node.getAttribute('points') ?? '').trim().split(/\s+/).map(pair => pair.split(',').map(Number)));
-    return { top: box.y, height: box.height, surfaceY, polygons };
+    return { top: box.y, height: box.height, surfaceY, plotTop, plotBottom, polygons };
   });
   assert.ok(fillGeometry.polygons.length >= 1, '2D fill polygon must exist');
   assert.ok(fillGeometry.surfaceY !== null, '2D interface line must exist');
-  const fillBottomY = fillGeometry.top + fillGeometry.height;
+  const plotHeight = fillGeometry.plotBottom - fillGeometry.plotTop;
+  assert.ok(plotHeight > 0, '2D plot area must have a height');
   for (const polygon of fillGeometry.polygons) {
     const ys = polygon.map(([, y]) => y);
     assert.ok(Math.min(...ys) >= fillGeometry.surfaceY - 1e-6,
       `fill must start at the surface line (min y ${Math.min(...ys)} < surface ${fillGeometry.surfaceY})`);
-    assert.ok(Math.min(...ys) > fillGeometry.top + fillGeometry.height * 0.1,
+    assert.ok(Math.min(...ys) > fillGeometry.plotTop + plotHeight * 0.1,
       'fill must not be drawn above the surface');
-    assert.ok(Math.max(...ys) >= fillBottomY - fillGeometry.height * 0.02,
-      'fill must reach the bottom of the view');
-    assert.ok(Math.max(...ys) <= fillBottomY + 1e-6, 'fill must not extend past the view bottom');
+    assert.ok(Math.max(...ys) >= fillGeometry.plotBottom - plotHeight * 0.02,
+      'fill must reach the bottom of the plot');
+    assert.ok(Math.max(...ys) <= fillGeometry.plotBottom + 1e-6, 'fill must not extend past the plot bottom');
   }
+
+  // ---- N7: axis titles, ticks and the scale bar never overlap ------------
+  const structureLayout = await structureSvg.evaluate(svg => {
+    const rect = selector => {
+      const node = svg.querySelector(selector);
+      if (!node) return null;
+      const box = node.getBoundingClientRect();
+      return { left: box.left, top: box.top, right: box.right, bottom: box.bottom, text: node.textContent ?? '' };
+    };
+    const overlap = (a, b) => !!a && !!b
+      && Math.min(a.right, b.right) - Math.max(a.left, b.left) > 0.5
+      && Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > 0.5;
+    const xTitle = rect('.wf-axis-title--x');
+    const vTitle = rect('.wf-axis-title--v');
+    const scaleLabel = rect('.wf-scale-label');
+    const zeroTicks = Array.from(svg.querySelectorAll('.wf-tick-label')).filter(node => (node.textContent ?? '').trim() === '0');
+    const vTicks = Array.from(svg.querySelectorAll('.wf-tick-label--v')).map(node => {
+      const box = node.getBoundingClientRect();
+      return { left: box.left, top: box.top, right: box.right, bottom: box.bottom, text: node.textContent ?? '' };
+    });
+    const tickColor = getComputedStyle(svg.querySelector('.wf-tick-label')).fill;
+    return {
+      xTitle, vTitle, scaleLabel, vTicks, tickColor,
+      zeroCount: zeroTicks.length,
+      xTitleHitsScale: overlap(xTitle, scaleLabel),
+      vTitleHitsTicks: vTicks.some(tick => overlap(vTitle, tick)),
+      vTitleHitsXTitle: overlap(vTitle, xTitle),
+    };
+  });
+  assert.ok(structureLayout.xTitle && structureLayout.scaleLabel, '2D axis title and scale bar must exist');
+  assert.equal(structureLayout.xTitleHitsScale, false,
+    `X (µm) must not overlap the scale bar (${JSON.stringify(structureLayout)})`);
+  assert.equal(structureLayout.vTitleHitsTicks, false,
+    `高度 (µm) must not overlap a tick label (${JSON.stringify(structureLayout)})`);
+  assert.equal(structureLayout.vTitleHitsXTitle, false, 'the two axis titles must not overlap');
+  assert.equal(structureLayout.zeroCount, 1, `the origin must be labelled once, got ${structureLayout.zeroCount}`);
+  assert.equal(structureLayout.tickColor, 'rgb(38, 49, 58)', `tick text must stay dark, got ${structureLayout.tickColor}`);
+  assert.equal(await structureSvg.locator('.wf-structure-note').count(), 1, 'the depth/surface note must stay visible');
   await page.screenshot({
     path: process.env.WORKFLOW_STRUCTURE_SCREENSHOT ?? '/tmp/workflow-p3-structure.png',
     fullPage: true,
@@ -106,6 +150,7 @@ try {
   assert.equal(await page.locator('.wf-table').filter({ hasText: '最大点偏差' }).locator('tbody tr').count(), 3);
   assert.ok((await page.locator('.wf-compare-grid').innerText()).includes('µm'));
   assert.ok((await page.locator('.wf-compare-legend').first().innerText()).length > 0);
+  await page.locator('.wf-compare-grid').screenshot({ path: process.env.WORKFLOW_COMPARE_SCREENSHOT ?? '/tmp/workflow-p3-compare.png' });
 
   await page.locator('.wf-analysis-advanced > summary').click();
   await page.getByLabel('窗口下限').fill('0.00015');

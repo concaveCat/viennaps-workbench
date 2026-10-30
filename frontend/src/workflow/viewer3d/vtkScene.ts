@@ -23,9 +23,12 @@ import type { vtkPolyData } from '@kitware/vtk.js/Common/DataModel/PolyData';
 import type { vtkGenericRenderWindow } from '@kitware/vtk.js/Rendering/Misc/GenericRenderWindow';
 import type { vtkMapper } from '@kitware/vtk.js/Rendering/Core/Mapper';
 import type { vtkOrientationMarkerWidget } from '@kitware/vtk.js/Interaction/Widgets/OrientationMarkerWidget';
-import type { ClipState, DisplayMode, ParsedMesh } from './types';
+import type { ClipState, DisplayMode, ParsedMesh, Viewer3DMarker } from './types';
 
 export type StandardView = 'iso' | 'xy' | 'xz' | 'yz';
+
+/** [minX, minY, minZ, maxX, maxY, maxZ] */
+type Bounds6 = [number, number, number, number, number, number];
 
 export type VtkScene = {
   attach(mesh: ParsedMesh, hidden: ReadonlySet<number>): void;
@@ -33,9 +36,17 @@ export type VtkScene = {
   setDisplayMode(mode: DisplayMode): void;
   setProjection(mode: 'parallel' | 'perspective'): void;
   setClip(clip: ClipState): void;
+  setMarker(marker: Viewer3DMarker | null): void;
+  /** Fit the visible geometry while keeping the current camera direction. */
   resetView(): void;
+  /** Fit only when the current camera no longer frames the geometry. */
+  ensureVisible(): void;
   setStandardView(view: StandardView): void;
   rotate(azimuthDeg: number, elevationDeg: number): void;
+  /** World units per CSS pixel of the current view (scale bar). */
+  getUnitsPerPixel(): number;
+  /** Called whenever the zoom level changes by more than a few percent. */
+  setScaleListener(listener: ((unitsPerPixel: number) => void) | null): void;
   requestRender(): void;
   renderNow(): void;
   getFps(): number;
@@ -150,12 +161,33 @@ export async function createVtkScene(container: HTMLElement): Promise<VtkScene> 
   const camera = renderer.getActiveCamera();
   camera.setParallelProjection(true);
 
+  // ---- measurement marker: one thin red polyline, no lighting ------------
+  const markerData: vtkPolyData = polyDataModule.default.newInstance();
+  markerData.getPoints().setData(new Float32Array(6), 3);
+  markerData.getLines().setData(new Uint32Array([2, 0, 1]));
+  const markerMapper: vtkMapper = mapperModule.default.newInstance();
+  markerMapper.setInputData(markerData);
+  markerMapper.setScalarVisibility(false);
+  const markerActor: vtkActor = actorModule.default.newInstance();
+  markerActor.setMapper(markerMapper);
+  markerActor.getProperty().setColor(0.706, 0.137, 0.094);
+  markerActor.getProperty().setLineWidth(4);
+  markerActor.getProperty().setLighting(false);
+  markerActor.setVisibility(false);
+  renderer.addActor(markerActor);
+
   let currentMesh: ParsedMesh | null = null;
   let hiddenMaterials: ReadonlySet<number> = new Set<number>();
+  let currentClip: ClipState = { enabled: false, axis: 'x', position: 0, keep: 'positive' };
+  let markerSpec: Viewer3DMarker | null = null;
+  let markerBounds: Bounds6 | null = null;
+  let cachedGeometryBounds: Bounds6 | null = null;
   let frameTimes: number[] = [];
   let rafId: number | null = null;
   let destroyed = false;
   let cameraInitialized = false;
+  let scaleListener: ((unitsPerPixel: number) => void) | null = null;
+  let lastReportedScale = 0;
 
   const recordFrame = (): void => {
     const now = performance.now();
@@ -163,10 +195,32 @@ export async function createVtkScene(container: HTMLElement): Promise<VtkScene> 
     if (frameTimes.length > 90) frameTimes.splice(0, frameTimes.length - 90);
   };
 
+  const getUnitsPerPixel = (): number => {
+    // CSS pixels: the scale bar is drawn in the DOM, not in the framebuffer.
+    const heightPx = container.clientHeight || 1;
+    if (!heightPx) return 0;
+    if (camera.getParallelProjection()) return (camera.getParallelScale() * 2) / heightPx;
+    const position = camera.getPosition();
+    const focal = camera.getFocalPoint();
+    const distance = Math.hypot(position[0] - focal[0], position[1] - focal[1], position[2] - focal[2]);
+    const angle = (camera.getViewAngle() * Math.PI) / 180;
+    return (2 * distance * Math.tan(angle / 2)) / heightPx;
+  };
+
+  const emitScale = (): void => {
+    if (!scaleListener || destroyed) return;
+    const value = getUnitsPerPixel();
+    if (!Number.isFinite(value) || value <= 0) return;
+    if (lastReportedScale > 0 && Math.abs(value - lastReportedScale) / lastReportedScale < 0.02) return;
+    lastReportedScale = value;
+    scaleListener(value);
+  };
+
   const renderNow = (): void => {
     if (destroyed) return;
     renderWindow.render();
     recordFrame();
+    emitScale();
   };
 
   const requestRender = (): void => {
@@ -177,53 +231,294 @@ export async function createVtkScene(container: HTMLElement): Promise<VtkScene> 
     });
   };
 
-  const frameSubscription = interactor.onEndAnimation(() => recordFrame());
+  const frameSubscription = interactor.onEndAnimation(() => {
+    recordFrame();
+    // Only the camera moved: reuse the cached visible bounds.
+    updateMarkerGeometry(cachedGeometryBounds);
+  });
 
   const resizeObserver = new ResizeObserver(() => {
     if (destroyed) return;
+    // `win.resize()` reallocates the framebuffer, which clears it. Without a
+    // render here the canvas stays blank after the toolbar/stage changes size
+    // (for example when the clip controls appear).
     win.resize();
-    renderer.resetCameraClippingRange();
+    const bounds = unionBounds(visibleBounds() ?? fullBounds(), markerBounds);
+    if (bounds) applyClippingRange(bounds);
+    renderNow();
   });
   resizeObserver.observe(container);
 
-  const boundsOf = (): { center: [number, number, number]; radius: number } => {
-    const bounds = currentMesh?.bounds;
-    if (!bounds) return { center: [0, 0, 0], radius: 1 };
+  const fullBounds = (): Bounds6 | null =>
+    currentMesh ? [...currentMesh.bounds] as Bounds6 : null;
+
+  const dot = (a: readonly number[], b: readonly number[]): number => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+
+  const normalize = (v: readonly number[]): [number, number, number] => {
+    const length = Math.hypot(v[0], v[1], v[2]) || 1;
+    return [v[0] / length, v[1] / length, v[2] / length];
+  };
+
+  const cross = (a: readonly number[], b: readonly number[]): [number, number, number] => [
+    a[1] * b[2] - a[2] * b[1],
+    a[2] * b[0] - a[0] * b[2],
+    a[0] * b[1] - a[1] * b[0],
+  ];
+
+  /**
+   * Bounds of the geometry that is actually on screen: hidden materials are
+   * dropped and the triangles the clip plane removes are skipped. Framing the
+   * camera on this box is what makes XZ/YZ and a cross-section readable.
+   */
+  const visibleBounds = (): Bounds6 | null => {
+    const mesh = currentMesh;
+    if (!mesh) return null;
+    const { positions, polys, pointColor, triangleCount, pointCount } = mesh;
+    const clipIndex = AXIS_INDEX[currentClip.axis];
+    const clipSign = currentClip.keep === 'positive' ? 1 : -1;
+    const min: [number, number, number] = [Infinity, Infinity, Infinity];
+    const max: [number, number, number] = [-Infinity, -Infinity, -Infinity];
+    let seen = false;
+    const include = (index: number): void => {
+      const base = index * 3;
+      for (let k = 0; k < 3; k++) {
+        const value = positions[base + k];
+        if (value < min[k]) min[k] = value;
+        if (value > max[k]) max[k] = value;
+      }
+    };
+    if (triangleCount > 0) {
+      for (let t = 0; t < triangleCount; t++) {
+        const i0 = polys[t * 4 + 1];
+        if (hiddenMaterials.has(pointColor[i0])) continue;
+        const i1 = polys[t * 4 + 2];
+        const i2 = polys[t * 4 + 3];
+        if (currentClip.enabled) {
+          // The centroid is close enough to the GPU clipping for framing.
+          const centroid = (positions[i0 * 3 + clipIndex] + positions[i1 * 3 + clipIndex] + positions[i2 * 3 + clipIndex]) / 3;
+          if ((centroid - currentClip.position) * clipSign < 0) continue;
+        }
+        include(i0); include(i1); include(i2);
+        seen = true;
+      }
+    } else {
+      for (let i = 0; i < pointCount; i++) {
+        if (hiddenMaterials.has(pointColor[i])) continue;
+        if (currentClip.enabled && (positions[i * 3 + clipIndex] - currentClip.position) * clipSign < 0) continue;
+        include(i);
+        seen = true;
+      }
+    }
+    return seen ? [min[0], min[1], min[2], max[0], max[1], max[2]] : null;
+  };
+
+  /**
+   * Explicit near/far range over `bounds`. vtk's own resetCameraClippingRange
+   * does not always cover an actor that sits in front of the geometry (the
+   * measurement marker), so the range is computed here.
+   */
+  const applyClippingRange = (bounds: Bounds6): void => {
+    const position = camera.getPosition();
+    const focal = camera.getFocalPoint();
+    const axis = normalize([focal[0] - position[0], focal[1] - position[1], focal[2] - position[2]]);
+    let near = Infinity;
+    let far = -Infinity;
+    for (let corner = 0; corner < 8; corner++) {
+      const point = [
+        corner & 1 ? bounds[3] : bounds[0],
+        corner & 2 ? bounds[4] : bounds[1],
+        corner & 4 ? bounds[5] : bounds[2],
+      ];
+      const distance = dot([point[0] - position[0], point[1] - position[1], point[2] - position[2]], axis);
+      if (distance < near) near = distance;
+      if (distance > far) far = distance;
+    }
+    if (!Number.isFinite(near) || !Number.isFinite(far)) return;
+    const margin = Math.max((far - near) * 0.05, 1e-6);
+    camera.setClippingRange(Math.max(near - margin, 1e-6), far + margin);
+  };
+
+  const unionBounds = (a: Bounds6 | null, b: Bounds6 | null): Bounds6 | null => {
+    if (!a) return b;
+    if (!b) return a;
+    return [
+      Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.min(a[2], b[2]),
+      Math.max(a[3], b[3]), Math.max(a[4], b[4]), Math.max(a[5], b[5]),
+    ];
+  };
+
+  /**
+   * Place the marker line in front of the whole structure along the view axis.
+   * Under a parallel projection this does not move the projected position, it
+   * only keeps the line out of the solid (a line at the mid-plane would be
+   * hidden behind the front face in XZ/YZ).
+   *
+   * `knownBounds` skips the (O(triangles)) visible-bounds scan: the camera can
+   * move without changing which geometry is on screen.
+   */
+  const updateMarkerGeometry = (knownBounds?: Bounds6 | null): void => {
+    if (destroyed) return;
+    if (!markerSpec || !currentMesh) {
+      const hadMarker = markerBounds !== null;
+      markerActor.setVisibility(false);
+      markerBounds = null;
+      cachedGeometryBounds = null;
+      if (knownBounds) applyClippingRange(knownBounds);
+      else if (hadMarker) {
+        const bounds = visibleBounds() ?? fullBounds();
+        if (bounds) applyClippingRange(bounds);
+      }
+      return;
+    }
+    const geometryBounds = knownBounds ?? visibleBounds() ?? fullBounds();
+    if (!geometryBounds) {
+      markerActor.setVisibility(false);
+      markerBounds = null;
+      cachedGeometryBounds = null;
+      return;
+    }
+    cachedGeometryBounds = geometryBounds;
+    const [x0, y0, z0, x1, y1, z1] = geometryBounds;
+    const cy = (y0 + y1) / 2;
+    const value = markerSpec.value;
+    let from: [number, number, number];
+    let to: [number, number, number];
+    if (markerSpec.axis === 'x') {
+      from = [value, cy, z0];
+      to = [value, cy, z1];
+    } else if (markerSpec.axis === 'z') {
+      from = [x0, cy, value];
+      to = [x1, cy, value];
+    } else {
+      from = [(x0 + x1) / 2, value, z0];
+      to = [(x0 + x1) / 2, value, z1];
+    }
+    const direction = normalize(camera.getDirectionOfProjection());
+    const diagonal = Math.hypot(x1 - x0, y1 - y0, z1 - z0) || 1;
+    const offset = diagonal * 0.6;
+    const points = new Float32Array([
+      from[0] - direction[0] * offset, from[1] - direction[1] * offset, from[2] - direction[2] * offset,
+      to[0] - direction[0] * offset, to[1] - direction[1] * offset, to[2] - direction[2] * offset,
+    ]);
+    markerData.getPoints().setData(points, 3);
+    markerData.modified();
+    markerActor.setVisibility(true);
+    markerBounds = [
+      Math.min(points[0], points[3]), Math.min(points[1], points[4]), Math.min(points[2], points[5]),
+      Math.max(points[0], points[3]), Math.max(points[1], points[4]), Math.max(points[2], points[5]),
+    ];
+    // The marker floats in front of the structure, so the near/far range has
+    // to cover it as well.
+    applyClippingRange(unionBounds(geometryBounds, markerBounds) ?? geometryBounds);
+    requestRender();
+  };
+
+  /** Half height (world units) needed so `bounds` fills the view. */
+  const fitMetrics = (bounds: Bounds6, direction: readonly number[], up: readonly number[]): {
+    center: [number, number, number];
+    dir: [number, number, number];
+    upAxis: [number, number, number];
+    halfHeight: number;
+    diagonal: number;
+  } => {
     const center: [number, number, number] = [
       (bounds[0] + bounds[3]) / 2,
       (bounds[1] + bounds[4]) / 2,
       (bounds[2] + bounds[5]) / 2,
     ];
-    const radius = Math.max(
-      Math.hypot(bounds[3] - bounds[0], bounds[4] - bounds[1], bounds[5] - bounds[2]) / 2,
-      1e-6,
-    );
-    return { center, radius };
+    const dir = normalize(direction);
+    let upAxis = normalize(up);
+    if (Math.abs(dot(upAxis, dir)) > 0.999) upAxis = normalize(cross(dir, [1, 0, 0]));
+    // `dir` points into the scene (camera -> focal): right = dir x up,
+    // up = right x dir. Getting these backwards mirrors the section.
+    const right = normalize(cross(dir, upAxis));
+    upAxis = normalize(cross(right, dir));
+    let halfRight = 0;
+    let halfUp = 0;
+    for (let corner = 0; corner < 8; corner++) {
+      const point = [
+        corner & 1 ? bounds[3] : bounds[0],
+        corner & 2 ? bounds[4] : bounds[1],
+        corner & 4 ? bounds[5] : bounds[2],
+      ];
+      const rel = [point[0] - center[0], point[1] - center[1], point[2] - center[2]];
+      halfRight = Math.max(halfRight, Math.abs(dot(rel, right)));
+      halfUp = Math.max(halfUp, Math.abs(dot(rel, upAxis)));
+    }
+    const widthPx = container.clientWidth || 1;
+    const heightPx = container.clientHeight || 1;
+    const aspect = widthPx / Math.max(1, heightPx);
+    const diagonal = Math.hypot(bounds[3] - bounds[0], bounds[4] - bounds[1], bounds[5] - bounds[2]) || 1;
+    return {
+      center,
+      dir,
+      upAxis,
+      halfHeight: Math.max(halfUp, halfRight / aspect, diagonal * 1e-4) * 1.12,
+      diagonal,
+    };
   };
 
-  const lookFrom = (direction: [number, number, number], viewUp: [number, number, number]): void => {
-    const { center, radius } = boundsOf();
-    const length = Math.hypot(direction[0], direction[1], direction[2]) || 1;
+  const fitToBounds = (bounds: Bounds6, direction: readonly number[], up: readonly number[]): void => {
+    const { center, dir, upAxis, halfHeight, diagonal } = fitMetrics(bounds, direction, up);
+    let distance = diagonal * 3;
+    if (!camera.getParallelProjection()) {
+      const angle = (camera.getViewAngle() * Math.PI) / 180;
+      distance = (halfHeight / Math.tan(angle / 2)) * 1.05;
+    }
+    // `getDirectionOfProjection` is the viewing direction (camera -> focal), so
+    // the eye sits opposite it.
     camera.setFocalPoint(center[0], center[1], center[2]);
     camera.setPosition(
-      center[0] + (direction[0] / length) * radius * 3,
-      center[1] + (direction[1] / length) * radius * 3,
-      center[2] + (direction[2] / length) * radius * 3,
+      center[0] - dir[0] * distance,
+      center[1] - dir[1] * distance,
+      center[2] - dir[2] * distance,
     );
-    camera.setViewUp(viewUp[0], viewUp[1], viewUp[2]);
-    renderer.resetCamera();
-    renderer.resetCameraClippingRange();
+    camera.setViewUp(upAxis[0], upAxis[1], upAxis[2]);
+    camera.setParallelScale(halfHeight);
     cameraInitialized = true;
+    // Also sets the near/far range (including the marker when present).
+    updateMarkerGeometry(bounds);
+    if (!markerSpec) applyClippingRange(bounds);
     requestRender();
   };
 
-  const resetView = (): void => lookFrom([1, -1, 0.8], [0, 0, 1]);
+  /** Fit the visible geometry without changing the viewing direction. */
+  const resetView = (): void => {
+    const bounds = visibleBounds() ?? fullBounds();
+    if (!bounds) return;
+    fitToBounds(bounds, camera.getDirectionOfProjection(), camera.getViewUp());
+  };
+
+  /**
+   * Keep a user-rotated camera across step switches, but recover when the new
+   * geometry is far outside (or far inside) the current frame.
+   */
+  const ensureVisible = (): void => {
+    const bounds = visibleBounds() ?? fullBounds();
+    if (!bounds) return;
+    if (!cameraInitialized) {
+      fitToBounds(bounds, camera.getDirectionOfProjection(), camera.getViewUp());
+      return;
+    }
+    const { halfHeight } = fitMetrics(bounds, camera.getDirectionOfProjection(), camera.getViewUp());
+    const current = camera.getParallelScale();
+    if (!Number.isFinite(current) || current <= 0
+      || current > halfHeight * 2.5 || current < halfHeight * 0.4) {
+      fitToBounds(bounds, camera.getDirectionOfProjection(), camera.getViewUp());
+    } else {
+      updateMarkerGeometry();
+    }
+  };
 
   const setStandardView = (view: StandardView): void => {
-    if (view === 'xy') lookFrom([0, 0, 1], [0, 1, 0]);
-    else if (view === 'xz') lookFrom([0, -1, 0], [0, 0, 1]);
-    else if (view === 'yz') lookFrom([1, 0, 0], [0, 0, 1]);
-    else lookFrom([1, -1, 0.8], [0, 0, 1]);
+    const bounds = visibleBounds() ?? fullBounds();
+    if (!bounds) return;
+    // Directions are viewing directions (camera -> focal), so the eye sits at
+    // `center - direction * distance`.
+    if (view === 'xy') fitToBounds(bounds, [0, 0, -1], [0, 1, 0]);
+    else if (view === 'xz') fitToBounds(bounds, [0, 1, 0], [0, 0, 1]);
+    else if (view === 'yz') fitToBounds(bounds, [-1, 0, 0], [0, 0, 1]);
+    else fitToBounds(bounds, [-1, 1, -0.8], [0, 0, 1]);
   };
 
   const applyMaterials = (mesh: ParsedMesh): void => {
@@ -259,15 +554,18 @@ export async function createVtkScene(container: HTMLElement): Promise<VtkScene> 
     currentMesh = mesh;
     hiddenMaterials = hidden;
     upload(mesh);
-    renderer.resetCameraClippingRange();
-    if (!cameraInitialized) resetView();
-    else requestRender();
+    if (!cameraInitialized) setStandardView('iso');
+    else {
+      updateMarkerGeometry();
+      requestRender();
+    }
   };
 
   const setHidden = (hidden: ReadonlySet<number>): void => {
     if (!currentMesh) return;
     hiddenMaterials = hidden;
     upload(currentMesh);
+    updateMarkerGeometry();
     requestRender();
   };
 
@@ -284,8 +582,10 @@ export async function createVtkScene(container: HTMLElement): Promise<VtkScene> 
   };
 
   const setClip = (clip: ClipState): void => {
+    currentClip = clip;
     mapper.removeAllClippingPlanes();
     if (!clip.enabled) {
+      updateMarkerGeometry();
       requestRender();
       return;
     }
@@ -297,13 +597,33 @@ export async function createVtkScene(container: HTMLElement): Promise<VtkScene> 
     plane.setNormal(normal[0], normal[1], normal[2]);
     plane.setOrigin(origin[0], origin[1], origin[2]);
     mapper.addClippingPlane(plane);
+    updateMarkerGeometry();
     requestRender();
+  };
+
+  const setMarker = (marker: Viewer3DMarker | null): void => {
+    markerSpec = marker;
+    updateMarkerGeometry();
+    requestRender();
+  };
+
+  const setScaleListener = (listener: ((unitsPerPixel: number) => void) | null): void => {
+    scaleListener = listener;
+    lastReportedScale = 0;
+    if (listener) {
+      const value = getUnitsPerPixel();
+      if (Number.isFinite(value) && value > 0) {
+        lastReportedScale = value;
+        listener(value);
+      }
+    }
   };
 
   const rotate = (azimuthDeg: number, elevationDeg: number): void => {
     camera.azimuth(azimuthDeg);
     camera.elevation(elevationDeg);
     camera.orthogonalizeViewUp();
+    if (markerSpec) updateMarkerGeometry(cachedGeometryBounds);
     renderNow();
   };
 
@@ -346,6 +666,10 @@ export async function createVtkScene(container: HTMLElement): Promise<VtkScene> 
     mapper.removeAllClippingPlanes();
     plane.delete();
     renderer.removeActor(actor);
+    renderer.removeActor(markerActor);
+    markerActor.delete();
+    markerMapper.delete();
+    markerData.delete();
     actor.delete();
     mapper.delete();
     scalars.delete();
@@ -366,8 +690,12 @@ export async function createVtkScene(container: HTMLElement): Promise<VtkScene> 
     setDisplayMode,
     setProjection,
     setClip,
+    setMarker,
     resetView,
+    ensureVisible,
     setStandardView,
+    getUnitsPerPixel,
+    setScaleListener,
     rotate,
     requestRender,
     renderNow,

@@ -107,8 +107,19 @@ export type Viewer3DStats = {
   sourceTriangles?: number;
 };
 
+/**
+ * A red measurement line drawn over the structure.
+ *
+ * `axis` is the axis whose coordinate is fixed at `value`; the line runs along
+ * the other axis of the section: a fixed X (etch depth) draws a vertical line
+ * along Z, a fixed height (CD) draws a horizontal line along X. `y` is always
+ * the mid-plane of the current geometry, so the line sits in the section.
+ */
+export type Viewer3DMarker = { axis: 'x' | 'y' | 'z'; value: number; label: string };
+
 /** Imperative handle exposed through `onSceneReady` (toolbar / tests). */
 export type Viewer3DHandle = {
+  /** Fit the visible geometry, keeping the current camera direction. */
   resetView(): void;
   setStandardView(view: 'iso' | 'xy' | 'xz' | 'yz'): void;
   /** Rotate the camera and render synchronously (used for frame timing). */
@@ -140,6 +151,8 @@ export type WorkflowViewer3DProps = {
   height?: number;
   /** Optional ordered step list; neighbours are prefetched while idle. */
   stepIds?: readonly string[];
+  /** Optional measurement line (3D only); nothing is drawn without it. */
+  marker?: Viewer3DMarker | null;
   onStepUnavailable?: (reason: string) => void;
   onStats?: (stats: Viewer3DStats) => void;
   onSceneReady?: (handle: Viewer3DHandle) => void;

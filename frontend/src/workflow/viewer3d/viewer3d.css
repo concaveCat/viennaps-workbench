@@ -98,11 +98,17 @@
   accent-color: var(--wf-teal, #35d6c2);
 }
 
-.wb-viewer3d__clip output {
-  min-width: 52px;
+.wb-viewer3d__clip-value {
+  min-width: 104px;
   font: 11px/1 "IBM Plex Mono", ui-monospace, monospace;
   color: var(--wf-amber, #f0b35e);
   text-align: right;
+}
+
+.wb-viewer3d__clip-range {
+  font: 10px/1 "IBM Plex Mono", ui-monospace, monospace;
+  color: var(--wf-muted, #8da6bd);
+  white-space: nowrap;
 }
 
 .wb-viewer3d__hint {
@@ -115,6 +121,30 @@
   flex: 1 1 auto;
   min-height: 0;
   background: #f7f9fb;
+}
+
+/* Live scale bar: world length per CSS pixel comes from the camera. */
+.wb-viewer3d__scalebar {
+  position: absolute;
+  left: 12px;
+  bottom: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 4px 6px 5px;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.86);
+  color: #26313a;
+  font: 11px/1.2 "IBM Plex Mono", ui-monospace, monospace;
+  pointer-events: none;
+}
+
+.wb-viewer3d__scalebar-bar {
+  display: block;
+  height: 7px;
+  border: 2px solid #26313a;
+  border-top: none;
+  box-sizing: border-box;
 }
 
 .wb-viewer3d__canvas {
@@ -234,6 +264,14 @@
 
 .wb-viewer3d__status-warn {
   color: var(--wf-amber, #f0b35e);
+}
+
+.wb-viewer3d__status-marker {
+  color: #ff9b8f;
+}
+
+.wb-viewer3d__status-extent {
+  color: #cfe0ef;
 }
 
 .wb-viewer3d__status-muted {

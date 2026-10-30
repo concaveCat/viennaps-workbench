@@ -156,22 +156,59 @@ try {
     const surfaceY = line
       ? Math.max(Number(line.getAttribute('y1')), Number(line.getAttribute('y2')))
       : null;
+    // The plot is inset by the margins that hold the titles/ticks/scale bar.
+    const axisLines = Array.from(svg.querySelectorAll('.wf-axis-line line'));
+    const plotBottom = axisLines[0] ? Number(axisLines[0].getAttribute('y1')) : box.y + box.height;
+    const plotTop = axisLines[1] ? Number(axisLines[1].getAttribute('y2')) : box.y;
     const polygons = Array.from(svg.querySelectorAll('polygon.wf-fill')).map(node =>
       (node.getAttribute('points') ?? '').trim().split(/\s+/).map(pair => pair.split(',').map(Number)));
-    return { top: box.y, height: box.height, surfaceY, polygons };
+    return { top: box.y, height: box.height, surfaceY, plotTop, plotBottom, polygons };
   }));
   assert.equal(candidateFillGeometry.length, 3);
   for (const check of candidateFillGeometry) {
     assert.ok(check.polygons.length >= 1, 'candidate view must fill the material');
     assert.ok(check.surfaceY !== null, 'candidate view must draw the interface line');
-    const candidateBottom = check.top + check.height;
+    const plotHeight = check.plotBottom - check.plotTop;
+    assert.ok(plotHeight > 0, 'candidate plot must have a height');
     for (const polygon of check.polygons) {
       const ys = polygon.map(([, y]) => y);
       assert.ok(Math.min(...ys) >= check.surfaceY - 1e-6, 'candidate fill must start at the surface line');
-      assert.ok(Math.max(...ys) >= candidateBottom - check.height * 0.02, 'candidate fill must reach the view bottom');
-      assert.ok(Math.max(...ys) <= candidateBottom + 1e-6, 'candidate fill must not pass the view bottom');
+      assert.ok(Math.max(...ys) >= check.plotBottom - plotHeight * 0.02, 'candidate fill must reach the plot bottom');
+      assert.ok(Math.max(...ys) <= check.plotBottom + 1e-6, 'candidate fill must not pass the plot bottom');
     }
   }
+  // ---- N7: candidate views keep titles/ticks/scale bar apart ------------
+  const candidateLayout = await page.locator('.wf-compare-canvas').first().evaluate(svg => {
+    const rect = selector => {
+      const node = svg.querySelector(selector);
+      if (!node) return null;
+      const box = node.getBoundingClientRect();
+      return { left: box.left, top: box.top, right: box.right, bottom: box.bottom, text: node.textContent ?? '' };
+    };
+    const overlap = (a, b) => !!a && !!b
+      && Math.min(a.right, b.right) - Math.max(a.left, b.left) > 0.5
+      && Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > 0.5;
+    const xTitle = rect('.wf-axis-title--x');
+    const vTitle = rect('.wf-axis-title--v');
+    const scale = rect('.wf-scale-label');
+    const vTicks = Array.from(svg.querySelectorAll('.wf-tick-label--v')).map(node => {
+      const box = node.getBoundingClientRect();
+      return { left: box.left, top: box.top, right: box.right, bottom: box.bottom };
+    });
+    const zeros = Array.from(svg.querySelectorAll('.wf-tick-label')).filter(node => (node.textContent ?? '').trim() === '0');
+    return {
+      xTitle, vTitle, scale, zeros: zeros.length,
+      xTitleHitsScale: overlap(xTitle, scale),
+      vTitleHitsTicks: vTicks.some(tick => overlap(vTitle, tick)),
+      tickColor: getComputedStyle(svg.querySelector('.wf-tick-label')).fill,
+    };
+  });
+  assert.ok(candidateLayout.xTitle && candidateLayout.vTitle && candidateLayout.scale,
+    'candidate views must keep axis titles and a scale bar');
+  assert.equal(candidateLayout.xTitleHitsScale, false, 'candidate X title must not overlap the scale bar');
+  assert.equal(candidateLayout.vTitleHitsTicks, false, 'candidate height title must not overlap a tick label');
+  assert.equal(candidateLayout.zeros, 1, `candidate origin must be labelled once, got ${candidateLayout.zeros}`);
+  assert.equal(candidateLayout.tickColor, 'rgb(38, 49, 58)', `candidate tick text must stay dark, got ${candidateLayout.tickColor}`);
   const legend = await page.locator('.wf-compare-legend').first().innerText();
   assert.match(legend, /Si|材料/);
 

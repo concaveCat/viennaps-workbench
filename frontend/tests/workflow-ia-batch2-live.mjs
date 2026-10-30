@@ -203,6 +203,40 @@ try {
   await layerMaterial.selectOption('SiO2');
   await page.getByRole('button', { name: '预览', exact: true }).click();
   await page.locator('.wf-clip-canvas polygon').first().waitFor();
+  // ---- N7: clip canvas titles, ticks and scale bar stay apart -----------
+  const clipLayout = await page.locator('.wf-clip-canvas').evaluate(svg => {
+    const rect = selector => {
+      const node = svg.querySelector(selector);
+      if (!node) return null;
+      const box = node.getBoundingClientRect();
+      return { left: box.left, top: box.top, right: box.right, bottom: box.bottom, text: node.textContent ?? '' };
+    };
+    const overlap = (a, b) => !!a && !!b
+      && Math.min(a.right, b.right) - Math.max(a.left, b.left) > 0.5
+      && Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > 0.5;
+    const xTitle = rect('.wf-axis-title--x');
+    const yTitle = rect('.wf-axis-title--v');
+    const scale = rect('.wf-scale-label');
+    const vTicks = Array.from(svg.querySelectorAll('.wf-tick-label--v')).map(node => {
+      const box = node.getBoundingClientRect();
+      return { left: box.left, top: box.top, right: box.right, bottom: box.bottom };
+    });
+    const zeros = Array.from(svg.querySelectorAll('.wf-tick-label')).filter(node => (node.textContent ?? '').trim() === '0');
+    return {
+      xTitle, yTitle, scale, zeros: zeros.length,
+      xTitleHitsScale: overlap(xTitle, scale),
+      yTitleHitsTicks: vTicks.some(tick => overlap(yTitle, tick)),
+      tickColor: getComputedStyle(svg.querySelector('.wf-tick-label')).fill,
+      viewBox: svg.getAttribute('viewBox'),
+    };
+  });
+  assert.ok(clipLayout.xTitle && clipLayout.xTitle.text.includes('X (µm)'), 'clip canvas must title the X axis in µm');
+  assert.ok(clipLayout.yTitle && clipLayout.yTitle.text.includes('Y (µm)'), 'clip canvas must title the Y axis in µm');
+  assert.ok(clipLayout.scale, 'clip canvas must draw a scale bar');
+  assert.equal(clipLayout.xTitleHitsScale, false, `clip X title must not overlap the scale bar (${JSON.stringify(clipLayout)})`);
+  assert.equal(clipLayout.yTitleHitsTicks, false, `clip Y title must not overlap a tick label (${JSON.stringify(clipLayout)})`);
+  assert.equal(clipLayout.zeros, 1, `clip origin must be labelled once, got ${clipLayout.zeros}`);
+  assert.equal(clipLayout.tickColor, 'rgb(38, 49, 58)', `clip tick text must stay dark, got ${clipLayout.tickColor}`);
   const legendText = await page.locator('.spx-layer-legend').innerText();
   assert.match(legendText, /SiO2/);
   const canvasBox = await page.locator('.wf-clip-canvas').boundingBox();

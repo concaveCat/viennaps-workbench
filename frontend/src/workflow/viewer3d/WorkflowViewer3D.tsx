@@ -58,6 +58,21 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** 1 / 2 / 5 × 10ⁿ, the usual choice for a readable scale bar. */
+function niceLength(target: number): number {
+  if (!Number.isFinite(target) || target <= 0) return 1;
+  const power = Math.pow(10, Math.floor(Math.log10(target)));
+  const normalized = target / power;
+  const factor = normalized >= 5 ? 5 : normalized >= 2 ? 2 : 1;
+  return factor * power;
+}
+
+function formatLength(value: number): string {
+  if (!Number.isFinite(value)) return '—';
+  if (value >= 1) return String(Number(value.toPrecision(3)));
+  return String(Number(value.toPrecision(2)));
+}
+
 export default function WorkflowViewer3D({
   runId,
   stepId,
@@ -65,6 +80,7 @@ export default function WorkflowViewer3D({
   snapshot = null,
   height = 420,
   stepIds,
+  marker = null,
   onStepUnavailable,
   onStats,
   onSceneReady,
@@ -75,7 +91,12 @@ export default function WorkflowViewer3D({
   const [hiddenIds, setHiddenIds] = useState<ReadonlySet<number>>(() => new Set<number>());
   const [displayMode, setDisplayMode] = useState<DisplayMode>('surface');
   const [projection, setProjection] = useState<'parallel' | 'perspective'>('parallel');
+  const [standardView, setStandardView] = useState<StandardView>('iso');
   const [clip, setClip] = useState<ClipState>({ enabled: false, axis: 'x', position: 0, keep: 'positive' });
+  /** Bumped after every clip change so the scene can re-fit the visible half. */
+  const [clipFitToken, setClipFitToken] = useState(0);
+  /** World units per CSS pixel, reported by the scene for the scale bar. */
+  const [viewScale, setViewScale] = useState(0);
   // FPS is opt-in: a headless / software-GL session reports ~5 fps, which reads
   // as a defect instead of a measurement. Triangles / points / parse time stay
   // visible; `?debug=1` forces the FPS counter on.
@@ -184,6 +205,7 @@ export default function WorkflowViewer3D({
         created.setProjection(modeRef.current.projection);
         created.setDisplayMode(modeRef.current.displayMode);
         created.setClip(modeRef.current.clip);
+        created.setScaleListener(setViewScale);
         const handle: Viewer3DHandle = {
           resetView: () => created.resetView(),
           setStandardView: (view: StandardView) => created.setStandardView(view),
@@ -225,6 +247,9 @@ export default function WorkflowViewer3D({
     scene.setDisplayMode(modeRef.current.displayMode);
     scene.setProjection(modeRef.current.projection);
     scene.setClip(modeRef.current.clip);
+    // Keep the user's camera across steps, but recover if the new geometry no
+    // longer fits the frame.
+    scene.ensureVisible();
     reportStats(mesh);
     // Keep the clip slider inside the new geometry.
     setClip((previous) => {
@@ -245,6 +270,19 @@ export default function WorkflowViewer3D({
   useEffect(() => {
     sceneRef.current?.setClip(clip);
   }, [clip, sceneVersion]);
+
+  // Re-fit after a clip change: the visible half is smaller than the full box,
+  // and leaving the old framing would shrink the section to a dot. The fit is
+  // deferred one frame so it uses the stage size after the toolbar reflow.
+  useEffect(() => {
+    if (clipFitToken === 0) return;
+    const frame = requestAnimationFrame(() => sceneRef.current?.resetView());
+    return () => cancelAnimationFrame(frame);
+  }, [clipFitToken]);
+
+  useEffect(() => {
+    sceneRef.current?.setMarker(marker);
+  }, [marker, sceneVersion]);
 
   // ------------------------------------------------------------------ stats
   useEffect(() => {
@@ -315,17 +353,34 @@ export default function WorkflowViewer3D({
               type="button"
               className="wb-viewer3d__button"
               disabled={!ready || busy}
-              onClick={() => sceneRef.current?.resetView()}
+              title="回到等轴视角并铺满画布"
+              onClick={() => {
+                setStandardView('iso');
+                sceneRef.current?.setStandardView('iso');
+              }}
             >
               重置视角
+            </button>
+            <button
+              type="button"
+              className="wb-viewer3d__button wb-viewer3d__button--fit"
+              disabled={!ready || busy}
+              title="保持当前方向，把当前可见几何铺满画布"
+              onClick={() => sceneRef.current?.resetView()}
+            >
+              适配视图
             </button>
             <label className="wb-viewer3d__field">
               视角
               <select
                 aria-label="标准视角"
+                value={standardView}
                 disabled={!ready || busy}
-                defaultValue="iso"
-                onChange={(event) => sceneRef.current?.setStandardView(event.target.value as StandardView)}
+                onChange={(event) => {
+                  const view = event.target.value as StandardView;
+                  setStandardView(view);
+                  sceneRef.current?.setStandardView(view);
+                }}
               >
                 <option value="iso">等轴</option>
                 <option value="xy">XY</option>
@@ -367,6 +422,7 @@ export default function WorkflowViewer3D({
                   const [low, high] = ready ? axisRange(ready, clip.axis) : [0, 0];
                   const inside = clip.position >= low && clip.position <= high;
                   setClip({ ...clip, enabled, position: enabled && !inside ? (low + high) / 2 : clip.position });
+                  setClipFitToken((value) => value + 1);
                 }}
               />
               截面
@@ -380,6 +436,7 @@ export default function WorkflowViewer3D({
                     const axis = event.target.value as 'x' | 'y' | 'z';
                     const [low, high] = ready ? axisRange(ready, axis) : [0, 0];
                     setClip({ ...clip, axis, position: (low + high) / 2 });
+                    setClipFitToken((value) => value + 1);
                   }}
                 >
                   {AXIS_ORDER.map((axis) => (
@@ -387,19 +444,24 @@ export default function WorkflowViewer3D({
                   ))}
                 </select>
                 <input
-                  aria-label="截面位置"
+                  aria-label="截面位置（µm）"
                   type="range"
                   min={clipLow}
                   max={clipLow === clipHigh ? clipLow + 1e-6 : clipHigh}
                   step={(clipHigh - clipLow) / 500 || 1e-6}
                   value={clip.position}
+                  title={`${clip.axis.toUpperCase()} = ${clip.position.toFixed(3)} µm`}
                   onChange={(event) => setClip({ ...clip, position: Number(event.target.value) })}
                 />
-                <output>{clip.position.toFixed(3)}</output>
+                <output className="wb-viewer3d__clip-value">{`${clip.axis.toUpperCase()} = ${clip.position.toFixed(3)} µm`}</output>
+                <span className="wb-viewer3d__clip-range">{`${clipLow.toFixed(3)} … ${clipHigh.toFixed(3)} µm`}</span>
                 <select
                   aria-label="截面保留侧"
                   value={clip.keep}
-                  onChange={(event) => setClip({ ...clip, keep: event.target.value as 'positive' | 'negative' })}
+                  onChange={(event) => {
+                    setClip({ ...clip, keep: event.target.value as 'positive' | 'negative' });
+                    setClipFitToken((value) => value + 1);
+                  }}
                 >
                   <option value="positive">保留 +{clip.axis.toUpperCase()}</option>
                   <option value="negative">保留 -{clip.axis.toUpperCase()}</option>
@@ -440,6 +502,15 @@ export default function WorkflowViewer3D({
             <p>在下方图例中重新勾选材料即可恢复显示。</p>
           </div>
         )}
+        {ready && dimension === 3 && viewScale > 0 && (() => {
+          const nice = niceLength(viewScale * 72);
+          return (
+            <div className="wb-viewer3d__scalebar" aria-label="比例尺" data-length={nice}>
+              <span className="wb-viewer3d__scalebar-label">{`${formatLength(nice)} µm`}</span>
+              <span className="wb-viewer3d__scalebar-bar" style={{ width: `${Math.max(10, nice / viewScale)}px` }} />
+            </div>
+          );
+        })()}
       </div>
 
       {ready && counts && (
@@ -484,6 +555,16 @@ export default function WorkflowViewer3D({
               <span>线段 {numberFormat.format(ready.lineCount)}</span>
             )}
             <span>点 {numberFormat.format(ready.pointCount)}</span>
+            {dimension === 3 && (
+              <span className="wb-viewer3d__status-extent">
+                {`X 范围 ${formatLength(ready.bounds[3] - ready.bounds[0])} µm · Y 范围 ${formatLength(ready.bounds[4] - ready.bounds[1])} µm · Z 范围 ${formatLength(ready.bounds[5] - ready.bounds[2])} µm`}
+              </span>
+            )}
+            {dimension === 3 && marker && (
+              <span className="wb-viewer3d__status-marker">
+                {`测量位置：${marker.axis === 'x' ? 'X' : marker.axis === 'z' ? '高度' : 'Y'} = ${formatLength(marker.value)} µm`}
+              </span>
+            )}
             {(showStats || DEBUG_FPS) && dimension === 3 && (
               <span>{fps > 0 ? `${fps.toFixed(1)} fps` : '— fps'}</span>
             )}

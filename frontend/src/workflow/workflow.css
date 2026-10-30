@@ -912,7 +912,11 @@ body {
 .wf-step-structure { width: 46px; text-align: right; }
 .wf-link:disabled { color: #a3adb6; cursor: not-allowed; }
 .wf-axes line, .wf-axes path { stroke: #9aa3ab; }
-.wf-axes text { fill: #5f6b76; font-family: "Consolas", monospace; }
+/* Tick text stays dark on the light plot: #5f6b76 washed out next to the
+   scale bar and the axis titles (N7). */
+.wf-axes text, .wf-tick-label { fill: #26313a; font-family: "Consolas", monospace; }
+.wf-scale-label { fill: #26313a; font-family: "Consolas", monospace; }
+.wf-scale-bar { stroke: #34404b; }
 .wf-marker line { stroke: #b42318; stroke-dasharray: 4 3; }
 .wf-marker text { fill: #b42318; font-family: "Consolas", monospace; }
 

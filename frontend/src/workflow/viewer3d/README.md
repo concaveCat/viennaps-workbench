@@ -26,6 +26,7 @@ import WorkflowViewer3D from './viewer3d/WorkflowViewer3D';
   stepId={selectedStepId}
   dimension={run.dimension === 3 ? 3 : 2}
   height={460}
+  marker={{ axis: 'x', value: recipeX, label: '测量 X 0.2 µm' }}
   onStepUnavailable={(reason) => setViewerNotice(reason)}
   onStats={(stats) => console.debug(stats)}
 />
@@ -65,7 +66,8 @@ import WorkflowViewer3D from './viewer3d/WorkflowViewer3D';
 
 - 命中 `runId:stepId` 的 LRU 缓存（8 条）→ 直接上传几何，约 5–10 ms；
 - 未命中 → worker 解析（20 万三角形约 100 ms），期间显示“正在解析快照…”浮层；
-- **保留相机**：只有第一次加载或点“重置视角”才会重新取景；render window 不会重建；
+- **保留相机**：切换步骤不重新取景；如果新几何明显超出（或远小于）当前取景框，会自动
+  适配一次，也可以随时点“适配视图”手动恢复；render window 不会重建；
 - 空闲时（`requestIdleCallback`，无则 `setTimeout`）预取前后相邻步骤。
 
 ### 4. 2D / 3D 分支
@@ -74,7 +76,8 @@ import WorkflowViewer3D from './viewer3d/WorkflowViewer3D';
 快照），不会硬渲染，而是走 `onStepUnavailable`：
 
 - `3`：vtk.js（动态 `import()`，不进首屏 bundle）。三角网格 + 材料色 + 线框/表面 +
-  正交/透视 + 沿 X/Y/Z 的裁剪面 + 朝向坐标轴。
+  正交/透视 + 沿 X/Y/Z 的裁剪面 + 朝向坐标轴。切换等轴/XY/XZ/YZ、开关截面都会按
+  **当前可见几何**（隐藏材料与裁剪面之后）重新取景，状态栏给出 X/Y/Z 范围与实时比例尺。
 - `2`：`Viewer2D` 用 canvas 画 `points` + `lines`，按 `cellData.materialIds` 着色，
   带坐标轴、刻度和比例尺；滚轮缩放、拖动平移、双击复位。**不会**用 3D 引擎假装 2D。
 
@@ -103,6 +106,7 @@ onStats?: (stats: {
 }) => void;
 
 onSceneReady?: (handle: {
+  /** 按当前可见几何重新取景（保持视角方向）。 */
   resetView(): void;
   setStandardView(view: 'iso' | 'xy' | 'xz' | 'yz'): void;
   rotate(azimuthDeg: number, elevationDeg: number): void;
@@ -116,6 +120,18 @@ onSceneReady?: (handle: {
 
 `onStats` 在每次几何上传后触发一次；状态栏打开（默认开）时每 500 ms 再触发一次并带上
 实时 FPS。`onSceneReady` 供工具栏或 benchmark 使用（`readPixels` 用于像素断言）。
+
+### 7. 测量标记
+
+`marker` 是可选的三维测量线（红色实线），`axis` 表示**被固定的坐标轴**：
+
+| 配方 | 传参 | 画法 |
+|---|---|---|
+| `etch_depth`（X 处深度） | `{ axis: 'x', value: x }` | 沿 Z 的竖线，x = value，y 取几何中心 |
+| `cd_at_height`（高度处 CD） | `{ axis: 'z', value: height }` | 沿 X 的横线，z = value，y 取几何中心 |
+
+不传就不画。测量线沿**视线方向**前移到大盒之外，因此在正交投影下屏幕位置不变、又不会被
+实体挡住；状态栏同时显示 `测量位置：X = … µm`（或高度）。
 
 ## 性能设计
 

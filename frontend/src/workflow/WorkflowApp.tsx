@@ -2,7 +2,7 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'rea
 import './workflow.css';
 import { SAMPLE_2D_PLANE, SAMPLE_2D_TRENCH, SAMPLE_3D_HOLE } from './samples';
 import WorkflowViewer3D from './viewer3d/WorkflowViewer3D';
-import type { Viewer3DStats } from './viewer3d/types';
+import type { Viewer3DMarker, Viewer3DStats } from './viewer3d/types';
 
 type Health = { status: string; applicationVersion?: string; viennaps?: string; viennals?: string; activeRunId?: string | null };
 type GdsAsset = { assetId: string; fileName: string };
@@ -1062,8 +1062,10 @@ function mergeFrames(frames: StructureFrame[], zoom: number): StructureFrame {
   };
 }
 
-function frameViewBox(frame: StructureFrame): string {
-  return `${frame.minU} ${-frame.maxV} ${frame.maxU - frame.minU} ${frame.maxV - frame.minV}`;
+function frameViewBox(frame: StructureFrame, margin: { left: number; right: number; top: number; bottom: number }): string {
+  const width = (frame.maxU - frame.minU) + margin.left + margin.right;
+  const height = (frame.maxV - frame.minV) + margin.top + margin.bottom;
+  return `${frame.minU - margin.left} ${-frame.maxV - margin.top} ${width} ${height}`;
 }
 
 function axisTicks(min: number, max: number): number[] {
@@ -1189,29 +1191,49 @@ function StructureCanvas({ view, frame, axis = 'xy', marker = null, note = null,
   };
   const uTicks = showAxes ? axisTicks(frame.minU, frame.maxU) : [];
   const vTicks = showAxes ? axisTicks(frame.minV, frame.maxV) : [];
+  const points = view.points.map(point => structurePoint(point, axes));
+  const fills = structureFillPolygons(view, points);
+  // Plot area in SVG coordinates (y grows downwards). `fillBottom` stays in data
+  // coordinates because the fills are mapped with `-y`.
+  const plotLeft = frame.minU;
+  const plotRight = frame.maxU;
+  const plotTop = -frame.maxV;
+  const plotBottom = -frame.minV;
+  const fillBottom = frame.minV;
+  const tickHalo = fontSize * 0.1;
+  // Margins live outside the plot so the axis titles, the tick labels, the
+  // scale bar and the depth/surface note never sit on the structure or on each
+  // other (N7).
+  const marginLeft = showAxes ? fontSize * 5.2 : fontSize * 0.3;
+  const marginRight = fontSize * 0.6;
+  const marginTop = showAxes ? fontSize * 1.9 : fontSize * 0.3;
+  const marginBottom = showAxes ? fontSize * 3.9 : fontSize * 0.3;
   const barLength = (() => {
     const ticks = uTicks.length > 1 ? uTicks : [frame.minU, frame.maxU];
     return Math.abs(ticks[1] - ticks[0]) || span / 4;
   })();
-  const barY = -frame.maxV + fontSize * 2.6;
-  const barX = frame.maxU - barLength - span * 0.02;
-  const points = view.points.map(point => structurePoint(point, axes));
-  const fills = structureFillPolygons(view, points);
-  // `bottom` is the SVG y of the plot bottom (used by axes/ticks); the fills
-  // are built in data coordinates and mapped with `-height`, so they must close
-  // at the data height of the bottom edge instead.
-  const bottom = -frame.minV;
-  const fillBottom = frame.minV;
-  const tickHalo = fontSize * 0.1;
+  const barRight = plotRight;
+  const barX = barRight - barLength;
+  const barY = plotBottom + fontSize * 2.3;
+  const barLabelY = plotBottom + fontSize * 1.95;
+  const xTitleY = plotBottom + fontSize * 3.35;
+  const vTitleX = plotLeft - fontSize * 4.3;
+  const vTitleY = (plotTop + plotBottom) / 2;
   const axisTitle = `${axes.verticalLabel} (${frame.unit})`;
   const horizontalTitle = axes.is2D ? `X (${frame.unit})` : `${axis.toUpperCase().charAt(0)} (${frame.unit})`;
-  return <svg viewBox={frameViewBox(frame)} className={className} role="img" aria-label={label}
+  // The origin is labelled once: a vertical `0` on top of the horizontal one
+  // reads as `00`.
+  const uHasOrigin = uTicks.some(tick => Math.abs(tick) < 1e-9);
+  const markerOnRight = marker ? marker.value > (plotLeft + plotRight) / 2 : false;
+  const markerNearTop = marker ? -marker.value < plotTop + (plotBottom - plotTop) * 0.25 : false;
+  return <svg viewBox={frameViewBox(frame, { left: marginLeft, right: marginRight, top: marginTop, bottom: marginBottom })}
+    className={className} role="img" aria-label={label}
     data-dimension={view.dimension} data-flat={frame.flatV ? '1' : '0'}>
-    <rect x={frame.minU} y={-frame.maxV} width={frame.maxU - frame.minU} height={frame.maxV - frame.minV} fill="#f8fafb" />
+    <rect x={plotLeft} y={plotTop} width={plotRight - plotLeft} height={plotBottom - plotTop} fill="#f8fafb" />
     {showAxes && uTicks.map(tick => <line key={`ug-${tick}`} className="wf-axes wf-axes-grid"
-      x1={tick} y1={-frame.minV} x2={tick} y2={-frame.maxV} stroke="#e6eaee" strokeWidth={strokeWidth} />)}
+      x1={tick} y1={plotBottom} x2={tick} y2={plotTop} stroke="#e6eaee" strokeWidth={strokeWidth} />)}
     {showAxes && vTicks.map(tick => <line key={`vg-${tick}`} className="wf-axes wf-axes-grid"
-      x1={frame.minU} y1={-tick} x2={frame.maxU} y2={-tick} stroke="#e6eaee" strokeWidth={strokeWidth} />)}
+      x1={plotLeft} y1={-tick} x2={plotRight} y2={-tick} stroke="#e6eaee" strokeWidth={strokeWidth} />)}
     {fills.map((fill, index) => {
       const coords = fill.closed
         ? fill.coords
@@ -1246,32 +1268,40 @@ function StructureCanvas({ view, frame, axis = 'xy', marker = null, note = null,
           r={strokeWidth * 2} fill={colorOf(view.materialIds[index])} />))}
     {marker && <g className="wf-marker">
       {marker.orientation === 'vertical'
-        ? <line x1={marker.value} y1={-frame.maxV + span * 0.05} x2={marker.value} y2={-frame.minV - span * 0.05} strokeWidth={strokeWidth * 2} />
-        : <line x1={frame.minU + span * 0.1} y1={-marker.value} x2={frame.maxU - span * 0.02} y2={-marker.value} strokeWidth={strokeWidth * 2} />}
-      <text x={marker.orientation === 'vertical' ? marker.value + fontSize * 0.3 : frame.minU + span * 0.11}
-        y={marker.orientation === 'vertical' ? bottom - span * 0.075 : -marker.value - fontSize * 0.4}
+        ? <line x1={marker.value} y1={plotTop} x2={marker.value} y2={plotBottom} strokeWidth={strokeWidth * 2} />
+        : <line x1={plotLeft} y1={-marker.value} x2={plotRight} y2={-marker.value} strokeWidth={strokeWidth * 2} />}
+      <text x={marker.orientation === 'vertical'
+          ? marker.value + (markerOnRight ? -fontSize * 0.3 : fontSize * 0.3)
+          : plotLeft + fontSize * 0.4}
+        y={marker.orientation === 'vertical'
+          ? plotTop + fontSize * 1.15
+          : -marker.value + (markerNearTop ? fontSize * 1.3 : -fontSize * 0.45)}
+        textAnchor={marker.orientation === 'vertical' && markerOnRight ? 'end' : 'start'}
         fontSize={fontSize} stroke="#ffffff" strokeWidth={tickHalo} paintOrder="stroke">{marker.label}</text>
     </g>}
     {showAxes && <g className="wf-axes wf-axis-line">
-      <line x1={frame.minU} y1={bottom} x2={frame.maxU} y2={bottom} stroke="#6b7a8a" strokeWidth={strokeWidth} />
-      <line x1={frame.minU} y1={bottom} x2={frame.minU} y2={-frame.maxV} stroke="#6b7a8a" strokeWidth={strokeWidth} />
+      <line x1={plotLeft} y1={plotBottom} x2={plotRight} y2={plotBottom} stroke="#6b7a8a" strokeWidth={strokeWidth} />
+      <line x1={plotLeft} y1={plotBottom} x2={plotLeft} y2={plotTop} stroke="#6b7a8a" strokeWidth={strokeWidth} />
       {uTicks.map(tick => <g key={`u-${tick}`} className="wf-axes wf-tick">
-        <line x1={tick} y1={bottom} x2={tick} y2={bottom - fontSize * 0.55} stroke="#6b7a8a" strokeWidth={strokeWidth} />
-        {tick > frame.minU + fontSize * 1.8 && <text x={tick} y={bottom - fontSize * 0.9} fontSize={fontSize} textAnchor="middle"
-          stroke="#ffffff" strokeWidth={tickHalo} paintOrder="stroke">{formatTick(tick)}</text>}
+        <line x1={tick} y1={plotBottom} x2={tick} y2={plotBottom + fontSize * 0.4} stroke="#6b7a8a" strokeWidth={strokeWidth} />
+        <text className="wf-tick-label wf-tick-label--u" x={tick} y={plotBottom + fontSize * 0.95} fontSize={fontSize} textAnchor="middle"
+          fill="#26313a" stroke="#ffffff" strokeWidth={tickHalo} paintOrder="stroke">{formatTick(tick)}</text>
       </g>)}
       {vTicks.map(tick => <g key={`v-${tick}`} className="wf-axes wf-tick">
-        <line x1={frame.minU} y1={-tick} x2={frame.minU + fontSize * 0.4} y2={-tick} stroke="#6b7a8a" strokeWidth={strokeWidth} />
-        {-tick < bottom - fontSize * 1.9 && <text x={frame.minU + fontSize * 0.55} y={-tick - fontSize * 0.2} fontSize={fontSize} textAnchor="start"
-          stroke="#ffffff" strokeWidth={tickHalo} paintOrder="stroke">{formatTick(tick)}</text>}
+        <line x1={plotLeft} y1={-tick} x2={plotLeft - fontSize * 0.4} y2={-tick} stroke="#6b7a8a" strokeWidth={strokeWidth} />
+        {!(uHasOrigin && Math.abs(tick) < 1e-9) && <text className="wf-tick-label wf-tick-label--v" x={plotLeft - fontSize * 0.55}
+          y={-tick + fontSize * 0.35} fontSize={fontSize} textAnchor="end"
+          fill="#26313a" stroke="#ffffff" strokeWidth={tickHalo} paintOrder="stroke">{formatTick(tick)}</text>}
       </g>)}
-      <text className="wf-axis-title" x={frame.maxU - span * 0.012} y={-frame.maxV + fontSize * 1.1} fontSize={fontSize} textAnchor="end"
+      <text className="wf-axis-title wf-axis-title--x" x={(plotLeft + plotRight) / 2} y={xTitleY} fontSize={fontSize} textAnchor="middle"
         stroke="#ffffff" strokeWidth={tickHalo} paintOrder="stroke">{horizontalTitle}</text>
-      <text className="wf-axis-title" x={frame.minU + span * 0.012} y={-frame.maxV + fontSize * 1.1} fontSize={fontSize} textAnchor="start"
+      <text className="wf-axis-title wf-axis-title--v" x={vTitleX} y={vTitleY} fontSize={fontSize} textAnchor="middle"
+        transform={`rotate(-90 ${vTitleX} ${vTitleY})`}
         stroke="#ffffff" strokeWidth={tickHalo} paintOrder="stroke">{axisTitle}</text>
-      <line x1={barX} y1={barY} x2={barX + barLength} y2={barY} stroke="#34404b" strokeWidth={strokeWidth * 2.5} />
-      <text x={barX + barLength / 2} y={barY - fontSize * 0.5} fontSize={fontSize} textAnchor="middle">{`${formatTick(barLength)} ${frame.unit}`}</text>
-      {note && <text className="wf-structure-note" x={frame.minU + span * 0.22} y={-frame.maxV + fontSize * 2.3} fontSize={fontSize} textAnchor="start"
+      <line className="wf-scale-bar" x1={barX} y1={barY} x2={barRight} y2={barY} stroke="#34404b" strokeWidth={strokeWidth * 2.5} />
+      <text className="wf-scale-label" x={barX + barLength / 2} y={barLabelY} fontSize={fontSize} textAnchor="middle"
+        stroke="#ffffff" strokeWidth={tickHalo} paintOrder="stroke">{`${formatTick(barLength)} ${frame.unit}`}</text>
+      {note && <text className="wf-structure-note" x={plotLeft} y={plotTop - fontSize * 0.55} fontSize={fontSize} textAnchor="start"
         stroke="#ffffff" strokeWidth={tickHalo} paintOrder="stroke">{note}</text>}
     </g>}
   </svg>;
@@ -2376,6 +2406,30 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     if (!measurement || measurementHasValue(measurement)) return measurementMark;
     return { ...measurementMark, label: '测量位置（无有效值）' };
   }, [measurementMark, measurement]);
+
+  /**
+   * The same recipe position as a 3D line: an etch-depth X becomes a vertical
+   * line along Z, a CD height becomes a horizontal line along X.
+   */
+  const viewer3dMarker = useMemo<Viewer3DMarker | null>(() => {
+    if (!measurementMark) return null;
+    return measurementMark.orientation === 'vertical'
+      ? { axis: 'x', value: measurementMark.value, label: measurementMark.label }
+      : { axis: 'z', value: measurementMark.value, label: measurementMark.label };
+  }, [measurementMark]);
+
+  /** 3D wording: name the position, never point at a 2D view that is not there. */
+  const viewer3dMeasurementText = (): string => {
+    if (!measurement) return '';
+    if (viewer3dMarker) {
+      const axisLabel = viewer3dMarker.axis === 'x' ? 'X' : viewer3dMarker.axis === 'z' ? '高度' : 'Y';
+      return `测量位置：${axisLabel} = ${formatMicrons(viewer3dMarker.value)} µm`;
+    }
+    if (measurementHasValue(measurement)) {
+      return `测量值：${formatMicrons(measurement.value as number)} ${displayUnit(measurement.unit)}`;
+    }
+    return `测量${statusLabel(measurement.status)}：${measurementReasonText(measurement.reason)}`;
+  };
 
   useEffect(() => {
     // 3D reads the raw snapshot inside its worker; fetching a candidate view too
@@ -4489,19 +4543,40 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     const span = Math.max(source.width, source.height, 1e-6);
     const fontSize = span / 26;
     const strokeWidth = span / 400;
+    const tickHalo = fontSize * 0.1;
     const barLength = xTicks.length > 1 ? Math.abs(xTicks[1] - xTicks[0]) : span / 4;
+    // The plot keeps its own frame; titles, ticks and the scale bar live in the
+    // margins so nothing is drawn on top of the layout (N7).
+    const marginLeft = fontSize * 5.2;
+    const marginRight = fontSize * 0.6;
+    const marginTop = fontSize * 0.9;
+    const marginBottom = fontSize * 3.9;
+    const barRight = source.width;
+    const barX = barRight - barLength;
+    const barY = source.height + fontSize * 2.4;
+    const barLabelY = source.height + fontSize * 2.0;
+    const xTitleY = source.height + fontSize * 3.4;
+    const yTitleX = -fontSize * 4.3;
+    const yTitleY = source.height / 2;
+    const uHasOrigin = xTicks.some(tick => Math.abs(tick) < 1e-9);
     const legendRows = Array.from(new Set(source.polygons.map(polygon => polygon.layer)))
       .map(layer => ({ layer, material: clipLayerMaterial(layer), color: materialColor(materialCatalog, clipLayerMaterial(layer)) }));
     return <div className="wf-canvas-wrap">
-      <svg viewBox={`0 0 ${source.width} ${source.height}`} className="wf-clip-canvas" role="img" aria-label="版图 Clip 画布">
+      <svg viewBox={`${-marginLeft} ${-marginTop} ${source.width + marginLeft + marginRight} ${source.height + marginTop + marginBottom}`}
+        className="wf-clip-canvas" role="img" aria-label="版图 Clip 画布">
         <rect x={0} y={0} width={source.width} height={source.height} fill="#f8fafb" />
-        {xTicks.map(tick => <g key={`x-${tick}`} className="wf-axes">
+        {xTicks.map(tick => <g key={`x-${tick}`} className="wf-axes wf-tick">
           <line x1={tick} y1={0} x2={tick} y2={source.height} stroke="#e6eaee" strokeWidth={strokeWidth} />
-          <text x={tick} y={source.height - fontSize * 0.3} fontSize={fontSize} textAnchor="middle">{formatTick(tick)}</text>
+          <line x1={tick} y1={source.height} x2={tick} y2={source.height + fontSize * 0.4} stroke="#6b7a8a" strokeWidth={strokeWidth} />
+          <text className="wf-tick-label wf-tick-label--u" x={tick} y={source.height + fontSize * 0.95} fontSize={fontSize} textAnchor="middle"
+            fill="#26313a" stroke="#ffffff" strokeWidth={tickHalo} paintOrder="stroke">{formatTick(tick)}</text>
         </g>)}
-        {yTicks.map(tick => <g key={`y-${tick}`} className="wf-axes">
+        {yTicks.map(tick => <g key={`y-${tick}`} className="wf-axes wf-tick">
           <line x1={0} y1={source.height - tick} x2={source.width} y2={source.height - tick} stroke="#e6eaee" strokeWidth={strokeWidth} />
-          <text x={fontSize * 0.2} y={source.height - tick - fontSize * 0.2} fontSize={fontSize}>{formatTick(tick)}</text>
+          <line x1={0} y1={source.height - tick} x2={-fontSize * 0.4} y2={source.height - tick} stroke="#6b7a8a" strokeWidth={strokeWidth} />
+          {!(uHasOrigin && Math.abs(tick) < 1e-9) && <text className="wf-tick-label wf-tick-label--v" x={-fontSize * 0.55}
+            y={source.height - tick + fontSize * 0.35} fontSize={fontSize} textAnchor="end"
+            fill="#26313a" stroke="#ffffff" strokeWidth={tickHalo} paintOrder="stroke">{formatTick(tick)}</text>}
         </g>)}
         {source.polygons.map((polygon, index) => {
           const color = materialColor(materialCatalog, clipLayerMaterial(polygon.layer));
@@ -4518,9 +4593,17 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
           <circle cx={annotation.x} cy={activeClip.height - annotation.y} r={Math.max(source.width, source.height) / 80} className="wf-annotation" />
           <text x={annotation.x} y={activeClip.height - annotation.y} className="wf-annotation-text">{annotation.text}</text>
         </g>)}
-        <g className="wf-axes">
-          <line x1={source.width - barLength} y1={source.height - fontSize * 1.6} x2={source.width} y2={source.height - fontSize * 1.6} stroke="#34404b" strokeWidth={strokeWidth * 3} />
-          <text x={source.width - barLength / 2} y={source.height - fontSize * 2.1} fontSize={fontSize} textAnchor="middle">{`${formatTick(barLength)} ${unit}`}</text>
+        <g className="wf-axes wf-axis-line">
+          <line x1={0} y1={source.height} x2={source.width} y2={source.height} stroke="#6b7a8a" strokeWidth={strokeWidth} />
+          <line x1={0} y1={source.height} x2={0} y2={0} stroke="#6b7a8a" strokeWidth={strokeWidth} />
+          <text className="wf-axis-title wf-axis-title--x" x={source.width / 2} y={xTitleY} fontSize={fontSize} textAnchor="middle"
+            stroke="#ffffff" strokeWidth={tickHalo} paintOrder="stroke">{`X (${unit})`}</text>
+          <text className="wf-axis-title wf-axis-title--v" x={yTitleX} y={yTitleY} fontSize={fontSize} textAnchor="middle"
+            transform={`rotate(-90 ${yTitleX} ${yTitleY})`}
+            stroke="#ffffff" strokeWidth={tickHalo} paintOrder="stroke">{`Y (${unit})`}</text>
+          <line className="wf-scale-bar" x1={barX} y1={barY} x2={barRight} y2={barY} stroke="#34404b" strokeWidth={strokeWidth * 3} />
+          <text className="wf-scale-label" x={barX + barLength / 2} y={barLabelY} fontSize={fontSize} textAnchor="middle"
+            stroke="#ffffff" strokeWidth={tickHalo} paintOrder="stroke">{`${formatTick(barLength)} ${unit}`}</text>
         </g>
       </svg>
       <div className="wf-muted">{source.polygonCount} 多边形 · {source.pointCount} 点 · {source.width.toFixed(3)} × {source.height.toFixed(3)} {unit}</div>
@@ -5674,6 +5757,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                     dimension={3}
                     height={420}
                     stepIds={structureStepIds}
+                    marker={viewer3dMarker}
                     onStats={setStructureStats}
                   />
                   <div className="wf-structure-3d-stats" aria-label="三维结构统计" role="status">
@@ -5699,9 +5783,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                     <strong title={measurementReasonDetail(measurement.reason)}>
                       {measurementHasValue(measurement) ? `${formatMicrons(measurement.value as number)} ${displayUnit(measurement.unit)}` : '—'}
                     </strong>
-                    <span className="wf-muted">{measurementHasValue(measurement) ? '测量位置在 2D 视图显示' : `测量${statusLabel(measurement.status)}：${measurementReasonText(measurement.reason)}`}</span>
+                    <span className="wf-muted">{viewer3dMeasurementText()}</span>
                   </div>}
-                  {!measurement && <div className="wf-muted">测量后在 2D 视图显示位置</div>}
+                  {!measurement && <div className="wf-muted">测量后在此显示测量位置</div>}
                 </div>
               </div>
               : structureSelection && structureView
