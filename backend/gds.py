@@ -92,6 +92,72 @@ class Library:
         return sorted({pair for structure in self.structures if structure.name in closure
                        for pair in structure.mask_layer_datatypes})
 
+    def structure_xy_bounds(self, name: str) -> tuple[float, float, float, float] | None:
+        """Return the direct-element XY bounds of one structure in database units.
+
+        References are deliberately unsupported: SREF/AREF placement is applied
+        by ViennaPS and re-implementing rotations, magnifications and arrays here
+        would risk a wrong rejection. ``None`` means "not provable in Python", so
+        callers must keep their native run-time check instead of guessing.
+        """
+        structure = self.find_structure(name)
+        if structure.references:
+            return None
+        element_starts = {0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x15, 0x2D}
+        xy_kinds = {0x08, 0x09, 0x2D}  # BOUNDARY, PATH, BOX
+        min_x = min_y = float("inf")
+        max_x = max_y = float("-inf")
+        current_kind: int | None = None
+        for record in self.records:
+            if record.start < structure.start or record.start >= structure.end:
+                continue
+            if record.kind in element_starts:
+                current_kind = record.kind
+                continue
+            if record.kind == 0x11:
+                current_kind = None
+                continue
+            if record.kind != 0x10 or current_kind not in xy_kinds:
+                continue
+            payload = self.data[record.payload_start:record.payload_end]
+            if len(payload) < 8 or len(payload) % 8:
+                return None
+            coordinates = struct.unpack(">" + "i" * (len(payload) // 4), payload)
+            for index in range(0, len(coordinates), 2):
+                min_x = min(min_x, coordinates[index])
+                max_x = max(max_x, coordinates[index])
+                min_y = min(min_y, coordinates[index + 1])
+                max_y = max(max_y, coordinates[index + 1])
+        if min_x == float("inf") or max_x < min_x:
+            return None
+        return (min_x, min_y, max_x, max_y)
+
+    def selected_layout_bounds_um(self, name: str, *, unit_scale: float = 1.0,
+                                  position_um: Iterable[float] = (0.0, 0.0)
+                                  ) -> tuple[float, float, float, float] | None:
+        """Return the XY bounds ViennaPS will read for the selected structure.
+
+        The bounds use the same scale and placement that ``select_and_transform``
+        applies to the selected structure's coordinates. Unsupported references
+        return ``None`` so validation never rejects a layout it cannot prove.
+        """
+        bounds = self.structure_xy_bounds(name)
+        if bounds is None:
+            return None
+        position = tuple(float(value) for value in position_um)
+        if len(position) != 2 or any(not math.isfinite(value) for value in position):
+            return None
+        scale = self.meters_per_database_unit * 1_000_000 * float(unit_scale)
+        if not math.isfinite(scale) or scale <= 0:
+            return None
+        min_x, min_y, max_x, max_y = (value * scale for value in bounds)
+        # select_and_transform snaps a nonzero requested position to a database
+        # unit multiple. Keep the Python bounds conservative in that case, but
+        # do not inflate an unshifted layout that exactly fills the domain.
+        margin = 0.5 * scale if any(abs(value) > 0.0 for value in position) else 0.0
+        return (min_x + position[0] - margin, min_y + position[1] - margin,
+                max_x + position[0] + margin, max_y + position[1] + margin)
+
     def select_and_transform(self, name: str, *, unit_scale: float = 1.0,
                               position_um: Iterable[float] = (0.0, 0.0),
                               selected_layers: Iterable[int] | None = None,

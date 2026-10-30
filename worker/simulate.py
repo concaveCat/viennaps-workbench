@@ -34,7 +34,10 @@ from backend.preflight import CELL_SET_JSON_BYTES, CELL_SET_VTU_BYTES_PER_CELL
 from backend.validation import fin_construction_decision
 from backend.gpu_devices import cuda_devices, resolve_gpu_device
 from worker.gds_mask import CONSTRUCTION as GDS_MASK_CONSTRUCTION
-from worker.gds_mask import build_aligned_gds_layer, build_aligned_gds_mask, planar_point_count
+from worker.gds_mask import (NATIVE_CONSTRUCTION, NATIVE_REGRID_CONSTRUCTION,
+                             apply_gds_blur, build_aligned_gds_layer,
+                             build_aligned_gds_mask, native_layer_body,
+                             planar_point_count, resolve_blur)
 from worker.specialized import build_specialized_model
 from worker.csv_process import build_csv_process
 from worker.mask_materials import protected_material_names
@@ -1552,6 +1555,115 @@ def _stack_geometry(ps: Any, domain: Any, project: dict[str, Any]) -> None:
     domain.applyBooleanOperation(stencil,ps.ls.BooleanOperationEnum.RELATIVE_COMPLEMENT,False)
 
 
+def _load_gds_geometry(ps: Any, dimension: int, path: Path, delta: float,
+                       lateral: Any, *, padding: float = 0.0,
+                       blur: dict[str, Any] | None = None,
+                       second_boundary: Any | None = None) -> Any:
+    """Read one filtered GDS file with the requested native frame padding.
+
+    Padding is applied through the installed `GDSGeometry.setBoundaryPadding`
+    before the reader runs; it changes the native level-set frame, not the
+    polygons, so a polygon that exactly fills the layout bounds gets a real
+    inside/outside grid pair instead of an empty level set.
+    """
+    if dimension == 3:
+        geometry = ps.d3.GDSGeometry(float(delta))
+        geometry.setBoundaryConditions(
+            [lateral, lateral, ps.BoundaryType.INFINITE_BOUNDARY])
+    else:
+        geometry = ps.d2.GDSGeometry(float(delta))
+        geometry.setBoundaryConditions(
+            [lateral, second_boundary if second_boundary is not None
+             else ps.BoundaryType.INFINITE_BOUNDARY])
+    if padding:
+        geometry.setBoundaryPadding(float(padding), float(padding))
+    apply_gds_blur(geometry, blur)
+    if dimension == 3:
+        ps.d3.GDSReader(geometry, str(path)).apply()
+    else:
+        ps.d2.GDSReader(geometry, str(path)).apply()
+    return geometry
+
+
+def _gds_planar_layers(ps: Any, path: Path, delta: float, lateral: Any,
+                       layers: list[int], *, padding: float,
+                       blur: dict[str, Any] | None,
+                       three_d_source: bool = False) -> tuple[Any, dict[int, Any]]:
+    """Read the native 2D polygon interiors used by both GDS body paths.
+
+    A 3D body source uses the same reflective second boundary as the installed
+    3D `layerToLevelSet` internal 2D read, so a non-empty planar result proves
+    that the native 3D call cannot hit its empty-interior crash path.
+    """
+    geometry = _load_gds_geometry(
+        ps, 2, path, delta, lateral, padding=padding, blur=blur,
+        # The installed blur path cannot build its 2D contour grid on an
+        # INFINITE second boundary (std::bad_alloc at delta=0.1 on a 4x4 layout).
+        # The native blurred mask itself always uses the GDS boundary pair, so a
+        # reflective second boundary is the compatible choice whenever blur is on.
+        second_boundary=(lateral if (three_d_source or blur is not None) else None))
+    planars = {int(layer): geometry.layerToLevelSet(int(layer), True) for layer in layers}
+    return geometry, planars
+
+
+def _regrid_planar_to_domain(ps: Any, domain: Any, planar: Any) -> Any:
+    """Move a blurred 2D contour onto the simulation grid.
+
+    The installed blur always builds its contour on the GDS boundary pair, so
+    inserting it directly would replace the 2D domain's infinite second
+    boundary with a reflective one. Regridding keeps the contour and the
+    product's 2D `[lateral, INFINITE]` domain semantics.
+    """
+    mesh = ps.ls.Mesh()
+    ps.ls.d2.ToSurfaceMesh(planar, mesh).apply()
+    target = ps.ls.d2.Domain(domain.getGrid())
+    reconstruction = ps.ls.d2.FromSurfaceMesh(target, mesh)
+    reconstruction.setRemoveBoundaryTriangles(False)
+    reconstruction.apply()
+    return target
+
+
+def _gds_missing_interior_error(layers: list[int], padding: float) -> RuntimeError:
+    return RuntimeError(
+        "GDS 图层 " + ", ".join(str(layer) for layer in layers)
+        + " 在当前 GDS 边界内没有可用的多边形内部（多边形退化或小于网格间距），"
+        "无法构造实体。请检查这些图层的多边形，或减小 gridDelta 后重试。"
+        + (f"（已使用原生边界 padding={padding:g} um）" if padding else ""))
+
+
+def _require_gds_bounds_inside_domain(dimension: int, geometry: Any,
+                                      project: dict[str, Any], *,
+                                      padding: float) -> list[float]:
+    """Reject a layout that cannot be inserted into the simulation domain.
+
+    ViennaPS 4.6.2 does not clip an inserted level set: a GDS body wider than
+    the 2D/3D domain makes `insertNextLevelSetAsMaterial` crash the worker with
+    SIGSEGV. Keep the native call, but fail with a diagnostic before it.
+    """
+    delta = float(project["domain"]["gridDelta"])
+    tolerance = max(1e-7, delta * 1e-6)
+    bounds = [float(value) for value in geometry.getBounds()]
+    half_x = float(project["domain"]["xExtent"]) / 2.0
+    half_y = float(project["domain"]["yExtent"]) / 2.0 if dimension == 3 else None
+    outside = bounds[0] < -half_x - tolerance or bounds[1] > half_x + tolerance
+    if dimension == 3:
+        outside = (outside or bounds[2] < -half_y - tolerance
+                   or bounds[3] > half_y + tolerance)
+    if outside:
+        domain_text = (f"xExtent={float(project['domain']['xExtent']):g}"
+                       + (f", yExtent={float(project['domain']['yExtent']):g}"
+                          if dimension == 3 else ""))
+        layout_text = (f"[{bounds[0]:g}, {bounds[1]:g}]"
+                       + (f" x [{bounds[2]:g}, {bounds[3]:g}]" if dimension == 3 else ""))
+        padding_text = (f"；全边界多边形需要 {padding:g} um 原生 padding，"
+                        "请扩大计算域" if padding else "")
+        raise RuntimeError(
+            f"GDS 版图边界 {layout_text} 超出当前计算域（{domain_text}）。"
+            "ViennaPS 4.6.2 插入超出计算域的 GDS level set 会直接崩溃，"
+            f"请扩大计算域或移动版图后重试{padding_text}。")
+    return bounds
+
+
 def _apply_gds_stack_mask(ps: Any, domain: Any, project: dict[str, Any], *,
                           config: dict[str, Any] | None, run_dir: Path | None) -> dict[str, Any]:
     """Insert one selected GDS layer/datatype as a mask over a 3D film stack."""
@@ -1579,24 +1691,41 @@ def _apply_gds_stack_mask(ps: Any, domain: Any, project: dict[str, Any], *,
     # through the requested mask thickness along z.  GDSGeometry's native 3D
     # layerToLevelSet is bounded by the current Domain top surface, so a mask
     # positioned above an existing film stack silently disappears.  The 2D
-    # conversion plus ViennaLS Extrude preserves XY polygons and allows a real
-    # finite mask volume above the stack.
-    geometry = ps.d2.GDSGeometry(float(project["domain"]["gridDelta"]))
-    # The intermediate geometry only carries the selected polygons.  Its lateral
-    # boundaries are decoupled from the final simulation domain: regridding onto
-    # the real grid happens in build_aligned_gds_mask().
-    reflective = ps.BoundaryType.REFLECTIVE_BOUNDARY
-    geometry.setBoundaryConditions([reflective, reflective])
-    ps.d2.GDSReader(geometry, str(filtered)).apply()
+    # conversion plus the shared finite-body construction preserves XY polygons
+    # and allows a real finite mask volume above the stack.
+    delta = float(project["domain"]["gridDelta"])
+    lateral = ps.BoundaryType.REFLECTIVE_BOUNDARY
+    geometry, planars = _gds_planar_layers(
+        ps, filtered, delta, lateral, [int(mask["layer"])], padding=0.0, blur=None,
+        three_d_source=True)
     layers = sorted(int(value) for value in geometry.getAllLayers())
     if int(mask["layer"]) not in layers:
         raise RuntimeError("selected GDS layer was not read by ViennaPS")
     base_height = float(mask["baseHeight"]) + float(mask["position"][2])
-    planar_inside = geometry.layerToLevelSet(int(mask["layer"]), True)
+    planar_inside = planars[int(mask["layer"])]
+    planar_padding = 0.0
+    if planar_point_count(planar_inside) == 0:
+        # A polygon that exactly fills the filtered layout bounds has no
+        # inside/outside pair; one cell of native boundary padding recovers its
+        # real interior instead of inventing geometry.
+        planar_padding = delta
+        geometry, planars = _gds_planar_layers(
+            ps, filtered, delta, lateral, [int(mask["layer"])],
+            padding=planar_padding, blur=None, three_d_source=True)
+        planar_inside = planars[int(mask["layer"])]
+        if planar_point_count(planar_inside) == 0:
+            raise _gds_missing_interior_error([int(mask["layer"])], planar_padding)
+    gds3 = _load_gds_geometry(ps, 3, filtered, delta, lateral,
+                              padding=planar_padding, blur=None)
+    native_body = native_layer_body(
+        gds3, int(mask["layer"]), base_height=base_height,
+        height=float(mask["height"]), mask_tone=False, blur_layer=True)
     aligned_mask, diagnostics = build_aligned_gds_mask(
         ps, domain, planar_inside, base_height=base_height,
         height=float(mask["height"]), retained_region=mask["retainedRegion"],
-        layer=int(mask["layer"]))
+        layer=int(mask["layer"]), native_body=native_body)
+    diagnostics["planarGridPadding"] = planar_padding
+    diagnostics["nativeBodyUsed"] = native_body is not None
     # The regridded mask is a complete finite body on the simulation grid, so it
     # is unioned into the existing top level set (Si ∪ SiO₂ ∪ Mask) instead of
     # replacing it.
@@ -1612,12 +1741,12 @@ def _apply_gds_stack_mask(ps: Any, domain: Any, project: dict[str, Any], *,
                       "material": mask["material"], "filteredFile": filtered.name,
                       **diagnostics})
     atomic_json(run_dir / "gds-mask-transform.json", transform)
-    native_geometry = ("viennaps.d2.GDSReader + GDSGeometry.layerToLevelSet + viennals.Extrude"
-                       " + viennals.BooleanOperation(INTERSECT,RELATIVE_COMPLEMENT)"
+    native_geometry = ("viennaps.GDSReader + GDSGeometry.layerToLevelSet(3D inside body when available)"
+                       " + viennals.Extrude fallback for empty native bodies"
+                       " + viennals.BooleanOperation(RELATIVE_COMPLEMENT for outside)"
                        " + viennals.ToSurfaceMesh + viennals.FromSurfaceMesh"
-                       " + viennals.BooleanOperation(RELATIVE_COMPLEMENT)"
                        " + Domain.insertNextLevelSetAsMaterial(UNION)"
-                       f" [{GDS_MASK_CONSTRUCTION}]")
+                       f" [{NATIVE_REGRID_CONSTRUCTION} / {GDS_MASK_CONSTRUCTION}]")
     return {"nativeGeometry": native_geometry, **transform}
 
 
@@ -1827,135 +1956,184 @@ def make_v3_geometry(ps: Any, domain: Any, project: dict[str,Any], *, config: di
         selected_path = run_dir / "gds-selected.gds"
         selected_path.write_bytes(selected_bytes)
         if project["dimension"] == 2:
-            geometry = ps.d2.GDSGeometry(float(project["domain"]["gridDelta"]))
+            delta = float(project["domain"]["gridDelta"])
             lateral = ps.BoundaryType.REFLECTIVE_BOUNDARY if project["domain"]["xBoundary"] == "reflective" else ps.BoundaryType.PERIODIC_BOUNDARY
-            geometry.setBoundaryConditions([lateral, ps.BoundaryType.INFINITE_BOUNDARY])
-            ps.d2.GDSReader(geometry, str(selected_path)).apply()
-            native_bounds = [float(value) for value in geometry.getBounds()]
-            tolerance = max(1e-7, float(support_metadata.get("coordinateToleranceUm", 0.0)) * 1.1)
-            if support_metadata and (abs(native_bounds[0] + float(project["domain"]["xExtent"]) / 2.0) > tolerance
-                                     or abs(native_bounds[1] - float(project["domain"]["xExtent"]) / 2.0) > tolerance):
-                raise RuntimeError("native periodic 2D GDS bounds do not match the requested x period")
+            blur_spec = resolve_blur(g.get("blur"), delta)
+            if blur_spec is not None and lateral == ps.BoundaryType.PERIODIC_BOUNDARY:
+                raise RuntimeError(
+                    "GDS blur requires a reflective lateral boundary; periodic GDS layouts "
+                    "are sized to the full domain and cannot carry native blur padding")
+            # Native blur needs a real outside frame; without padding its
+            # exposure-grid sampling reads past the layout frame.
+            planar_padding = 2.0 * delta if blur_spec is not None else 0.0
+            geometry, planars = _gds_planar_layers(
+                ps, selected_path, delta, lateral, [int(row["layer"]) for row in g["layers"]],
+                padding=planar_padding, blur=blur_spec)
             actual_layers = sorted(int(value) for value in geometry.getAllLayers())
             selected_native_layers = sorted(set(actual_layers) & set(selected_layers))
             if selected_native_layers != sorted(selected_layers):
                 raise RuntimeError(f"native GDS layer readback {selected_native_layers} differs from selected layers {sorted(selected_layers)}")
-            delta = float(project["domain"]["gridDelta"])
-            planars = {int(mapping["layer"]): geometry.layerToLevelSet(
-                int(mapping["layer"]), True) for mapping in g["layers"]}
-            planar_padding = 0.0
-            if any(planar_point_count(planar) == 0 for planar in planars.values()):
-                # Same native frame defect as the 3D branch: a polygon that fills
-                # the GDS bounds has no zero crossing, so its interior reads back
-                # empty instead of covering the cell.  One cell of extra frame
-                # makes the native rasterizer report the real polygon interior.
+            empty_layers = sorted(layer for layer, planar in planars.items()
+                                  if planar_point_count(planar) == 0)
+            if empty_layers and planar_padding == 0.0:
+                # A polygon that fills the GDS bounds has no zero crossing, so
+                # its interior reads back empty. One cell of native frame
+                # padding makes the native rasterizer report the real interior.
                 planar_padding = delta
-                padded = ps.d2.GDSGeometry(delta)
-                padded.setBoundaryConditions([lateral, ps.BoundaryType.INFINITE_BOUNDARY])
-                padded.setBoundaryPadding(planar_padding, planar_padding)
-                ps.d2.GDSReader(padded, str(selected_path)).apply()
-                planars = {int(mapping["layer"]): padded.layerToLevelSet(
-                    int(mapping["layer"]), True) for mapping in g["layers"]}
-                still_empty = sorted(layer for layer, planar in planars.items()
-                                     if planar_point_count(planar) == 0)
-                if still_empty:
-                    raise RuntimeError(
-                        "GDS 图层 " + ", ".join(str(layer) for layer in still_empty)
-                        + " 在当前 GDS 边界内没有可用的多边形内部（多边形退化或小于网格间距），"
-                        "无法构造实体。请检查这些图层的多边形，或减小 gridDelta 后重试。")
+                geometry, planars = _gds_planar_layers(
+                    ps, selected_path, delta, lateral,
+                    [int(row["layer"]) for row in g["layers"]],
+                    padding=planar_padding, blur=blur_spec)
+                empty_layers = sorted(layer for layer, planar in planars.items()
+                                      if planar_point_count(planar) == 0)
+            if empty_layers:
+                raise _gds_missing_interior_error(empty_layers, planar_padding)
+            native_bounds = _require_gds_bounds_inside_domain(
+                2, geometry, project, padding=planar_padding)
+            bounds_readback = [float(value) for value in geometry.getBounds()]
+            if blur_spec is not None:
+                # Native blur contour -> simulation grid. Inserting the raw
+                # reflective-second-boundary contour would rewrite the 2D
+                # domain's infinite h boundary.
+                planars = {layer: _regrid_planar_to_domain(ps, domain, planar)
+                           for layer, planar in planars.items()}
+                empty_layers = sorted(layer for layer, planar in planars.items()
+                                      if planar_point_count(planar) == 0)
+                if empty_layers:
+                    raise _gds_missing_interior_error(empty_layers, planar_padding)
+            tolerance = max(1e-7, float(support_metadata.get("coordinateToleranceUm", 0.0)) * 1.1)
+            if support_metadata and planar_padding == 0.0 and (
+                    abs(native_bounds[0] + float(project["domain"]["xExtent"]) / 2.0) > tolerance
+                    or abs(native_bounds[1] - float(project["domain"]["xExtent"]) / 2.0) > tolerance):
+                raise RuntimeError("native periodic 2D GDS bounds do not match the requested x period")
             for mapping in g["layers"]:
                 level_set = planars[int(mapping["layer"])]
                 # All GDS layers share this native grid; cumulative wrapping keeps
                 # LS_n = LS_(n-1) union layer_n instead of replacing lower layers.
                 domain.insertNextLevelSetAsMaterial(level_set, material_handle(ps, mapping["material"]), True)
+            blur_readback = None
+            if blur_spec is not None:
+                blur_readback = {**blur_spec, "nativeMethod": "GDSGeometry.addBlur",
+                                 "blurLayer": True, "blurred": True,
+                                 "planarGridPadding": planar_padding,
+                                 "regriddedToDomain": True,
+                                 "semantics": "GDS proximity blur + threshold contour; not a resist/OPC model"}
+            layer_constructions = None
         else:
-            geometry = ps.d3.GDSGeometry(float(project["domain"]["gridDelta"]))
+            delta = float(project["domain"]["gridDelta"])
             lateral = ps.BoundaryType.REFLECTIVE_BOUNDARY if project["domain"]["boundaryXY"] == "reflective" else ps.BoundaryType.PERIODIC_BOUNDARY
-            geometry.setBoundaryConditions([lateral, lateral, ps.BoundaryType.INFINITE_BOUNDARY])
-            ps.d3.GDSReader(geometry, str(selected_path)).apply()
-            native_bounds = [float(value) for value in geometry.getBounds()]
-            tolerance = max(1e-7, float(support_metadata.get("coordinateToleranceUm", 0.0)) * 1.1)
-            if support_metadata and (abs(native_bounds[0] + float(project["domain"]["xExtent"]) / 2.0) > tolerance
-                                     or abs(native_bounds[1] - float(project["domain"]["xExtent"]) / 2.0) > tolerance
-                                     or abs(native_bounds[2] + float(project["domain"]["yExtent"]) / 2.0) > tolerance
-                                     or abs(native_bounds[3] - float(project["domain"]["yExtent"]) / 2.0) > tolerance):
-                raise RuntimeError("native periodic 3D GDS bounds do not match the requested XY periods")
-            actual_layers = sorted(int(value) for value in geometry.getAllLayers())
+            blur_spec = resolve_blur(g.get("blur"), delta)
+            if blur_spec is not None and lateral == ps.BoundaryType.PERIODIC_BOUNDARY:
+                raise RuntimeError(
+                    "GDS blur requires a reflective lateral boundary; periodic GDS layouts "
+                    "are sized to the full domain and cannot carry native blur padding")
+            planar_padding = 2.0 * delta if blur_spec is not None else 0.0
+            layers = [int(row["layer"]) for row in g["layers"]]
+            geometry, planars = _gds_planar_layers(
+                ps, selected_path, delta, lateral, layers,
+                padding=planar_padding, blur=blur_spec, three_d_source=True)
+            native_geometry = _load_gds_geometry(
+                ps, 3, selected_path, delta, lateral,
+                padding=planar_padding, blur=blur_spec)
+            actual_layers = sorted(int(value) for value in native_geometry.getAllLayers())
             selected_native_layers = sorted(set(actual_layers) & set(selected_layers))
             if selected_native_layers != sorted(selected_layers):
                 raise RuntimeError(f"native GDS layer readback {selected_native_layers} differs from selected layers {sorted(selected_layers)}")
-            # The installed 3D layerToLevelSet follows the GDS library grid and
-            # returns an empty body for some valid base/height pairs.  Read the
-            # polygon interior with the 2D API first, then build every layer with
-            # explicit caps and the simulation boundary conditions.
-            delta = float(project["domain"]["gridDelta"])
-            planar_geometry = ps.d2.GDSGeometry(delta)
-            planar_geometry.setBoundaryConditions([lateral, lateral])
-            ps.d2.GDSReader(planar_geometry, str(selected_path)).apply()
-            planars = {int(mapping["layer"]): planar_geometry.layerToLevelSet(
-                int(mapping["layer"]), True) for mapping in g["layers"]}
-            planar_padding = 0.0
             empty_layers = sorted(layer for layer, planar in planars.items()
                                   if planar_point_count(planar) == 0)
-            if empty_layers:
+            if empty_layers and planar_padding == 0.0:
                 # A polygon that fills the GDS bounds is clipped to the library
                 # frame, so the native rasterizer finds no inside/outside pair
                 # and returns an empty level set; extruding that field crashes
-                # ViennaLS.  Widen the read frame by one grid cell: the native
-                # rasterizer then reports the polygon's real interior, so no
-                # geometry is invented.  Layers whose interior is already
-                # readable are rebuilt on the same widened frame.
+                # ViennaLS.  Native boundary padding makes the rasterizer report
+                # the polygon's real interior, so no geometry is invented.
                 planar_padding = delta
-                padded = ps.d2.GDSGeometry(delta)
-                padded.setBoundaryConditions([lateral, lateral])
-                padded.setBoundaryPadding(planar_padding, planar_padding)
-                ps.d2.GDSReader(padded, str(selected_path)).apply()
-                planars = {int(mapping["layer"]): padded.layerToLevelSet(
-                    int(mapping["layer"]), True) for mapping in g["layers"]}
-                still_empty = sorted(layer for layer, planar in planars.items()
-                                     if planar_point_count(planar) == 0)
-                if still_empty:
-                    raise RuntimeError(
-                        "GDS 图层 " + ", ".join(str(layer) for layer in still_empty)
-                        + " 在当前 GDS 边界内没有可用的多边形内部（多边形退化或小于网格间距），"
-                        "无法构造实体。请检查这些图层的多边形，或减小 gridDelta 后重试。")
+                geometry, planars = _gds_planar_layers(
+                    ps, selected_path, delta, lateral, layers,
+                    padding=planar_padding, blur=blur_spec, three_d_source=True)
+                native_geometry = _load_gds_geometry(
+                    ps, 3, selected_path, delta, lateral,
+                    padding=planar_padding, blur=blur_spec)
+                empty_layers = sorted(layer for layer, planar in planars.items()
+                                      if planar_point_count(planar) == 0)
+            if empty_layers:
+                raise _gds_missing_interior_error(empty_layers, planar_padding)
+            native_bounds = _require_gds_bounds_inside_domain(
+                3, native_geometry, project, padding=planar_padding)
+            bounds_readback = [float(value) for value in native_geometry.getBounds()]
+            tolerance = max(1e-7, float(support_metadata.get("coordinateToleranceUm", 0.0)) * 1.1)
+            if support_metadata and planar_padding == 0.0 and (
+                    abs(native_bounds[0] + float(project["domain"]["xExtent"]) / 2.0) > tolerance
+                    or abs(native_bounds[1] - float(project["domain"]["xExtent"]) / 2.0) > tolerance
+                    or abs(native_bounds[2] + float(project["domain"]["yExtent"]) / 2.0) > tolerance
+                    or abs(native_bounds[3] - float(project["domain"]["yExtent"]) / 2.0) > tolerance):
+                raise RuntimeError("native periodic 3D GDS bounds do not match the requested XY periods")
             layer_constructions = []
             for mapping in g["layers"]:
                 layer = int(mapping["layer"])
                 base_height = float(mapping["baseHeight"]) + float(g["position"][2])
+                mask_tone = bool(mapping.get("mask", False))
+                # Prefer the installed native 3D body. ViennaPS 4.6.2 returns a
+                # deterministic empty level set for some valid baseHeight/height
+                # pairs, so a measured empty result falls back to the native 2D
+                # read plus ViennaLS extrusion/caps on the same GDS grid.
+                native_body = native_layer_body(
+                    native_geometry, layer, base_height=base_height,
+                    height=float(mapping["height"]), mask_tone=mask_tone,
+                    blur_layer=True)
                 aligned, diagnostics = build_aligned_gds_layer(
                     ps, domain, planars[layer], base_height=base_height,
-                    height=float(mapping["height"]), mask_tone=bool(mapping.get("mask", False)),
-                    layer=layer)
+                    height=float(mapping["height"]), mask_tone=mask_tone,
+                    layer=layer, native_body=native_body)
                 domain.insertNextLevelSetAsMaterial(
                     aligned, material_handle(ps, mapping["material"]), True)
-                layer_constructions.append({
+                item = {
                     "layer": layer, "material": mapping["material"],
                     "baseHeight": base_height, "height": float(mapping["height"]),
-                    "maskTone": bool(mapping.get("mask", False)),
-                    "planarGridPadding": planar_padding, **diagnostics})
+                    "maskTone": mask_tone, "planarGridPadding": planar_padding,
+                    "nativeBodyUsed": native_body is not None, **diagnostics}
+                if blur_spec is not None:
+                    item["blur"] = {**blur_spec, "nativeMethod": "GDSGeometry.addBlur",
+                                    "blurLayer": True, "applied": True}
+                layer_constructions.append(item)
+            blur_readback = None
+            if blur_spec is not None:
+                blur_readback = {**blur_spec, "nativeMethod": "GDSGeometry.addBlur",
+                                 "blurLayer": True, "blurred": True,
+                                 "planarGridPadding": planar_padding,
+                                 "semantics": "GDS proximity blur + threshold contour; not a resist/OPC model",
+                                 "nativeBodiesUsed": sum(row["nativeBodyUsed"]
+                                                         for row in layer_constructions)}
         transform.update({"sourceAssetId":g["assetId"],"selectedStructure":g["structure"],
                           "selectedLayers":selected_layers,"nativeLayers":actual_layers,
                           "selectedNativeLayers":selected_native_layers,
                           **support_metadata,
                           **({"layerConstructions": layer_constructions,
-                              "construction": GDS_MASK_CONSTRUCTION}
+                              "construction": (NATIVE_CONSTRUCTION
+                                               if all(row.get("nativeBodyUsed") for row in layer_constructions)
+                                               else GDS_MASK_CONSTRUCTION)}
                              if project["dimension"] == 3 else {}),
                           "supportLayers":sorted(set(actual_layers) - set(selected_layers)),
                           "planarGridPadding":planar_padding,
+                          **({"blur": blur_readback} if blur_readback is not None else {}),
                           "nativeUserUnitUm":physical_scale,"userUnitScaleAdjustment":float(g["unitScale"]),
-                          "nativeBounds":[float(value) for value in geometry.getBounds()],
+                          "nativeBounds":bounds_readback,
                           "dimension":project["dimension"],
                           "coordinateMapping":"GDS XY -> Workbench x,h in 2D; GDS XY -> x,y and mapped layer heights -> z in 3D",
                           "layerMappings":g["layers"],"filteredFile":"gds-selected.gds",
                           "filteredFileSha256":hashlib.sha256(selected_bytes).hexdigest()})
         atomic_json(run_dir / "gds-transform.json", transform)
         native_geometry = ("viennaps.GDSReader + GDSGeometry.layerToLevelSet"
+                           + (" + GDSGeometry.setBoundaryPadding" if planar_padding else "")
+                           + (" + GDSGeometry.addBlur + viennals.d2.ToSurfaceMesh"
+                              " + viennals.d2.FromSurfaceMesh(domain grid)"
+                              if blur_readback is not None else "")
                            if project["dimension"] == 2 else
-                           "viennaps.d2.GDSReader + GDSGeometry.layerToLevelSet + viennals.Extrude"
-                           " + viennals.BooleanOperation(INTERSECT,RELATIVE_COMPLEMENT)"
-                           " + viennals.ToSurfaceMesh + viennals.FromSurfaceMesh"
-                           f" + Domain.insertNextLevelSetAsMaterial(UNION) [{GDS_MASK_CONSTRUCTION}]")
+                           "viennaps.GDSReader + GDSGeometry.layerToLevelSet(3D when non-empty)"
+                           " + viennaps.d2.GDSReader + GDSGeometry.layerToLevelSet"
+                           " + viennals.Extrude/BooleanOperation fallback"
+                           " + Domain.insertNextLevelSetAsMaterial(UNION)"
+                           f" [{NATIVE_CONSTRUCTION} / {GDS_MASK_CONSTRUCTION}]")
         return {"nativeGeometry": native_geometry, **transform}
     if g["kind"]=="plane":
         ps.MakePlane(domain,height=float(g["height"]),material=material_handle(ps,g["substrateMaterial"]),addToExisting=False).apply()
@@ -2295,35 +2473,40 @@ def _gds_boolean_operand(ps: Any, domain: Any, project: dict[str, Any], step: di
     filtered = run_dir / f"gds-boolean-{step['id']}-selected.gds"
     filtered.write_bytes(selected_bytes)
     reflective = ps.BoundaryType.REFLECTIVE_BOUNDARY
-    planar_geometry = ps.d2.GDSGeometry(delta)
-    planar_geometry.setBoundaryConditions([reflective, reflective])
-    ps.d2.GDSReader(planar_geometry, str(filtered)).apply()
+    planar_geometry, planars = _gds_planar_layers(
+        ps, filtered, delta, reflective, [pair[0]], padding=0.0, blur=None,
+        three_d_source=True)
     if pair[0] not in {int(value) for value in planar_geometry.getAllLayers()}:
         raise RuntimeError(f"GDS boolean layer/datatype {pair[0]}/{pair[1]} was not read by ViennaPS")
-    planar = planar_geometry.layerToLevelSet(pair[0], True)
+    planar = planars[pair[0]]
     planar_padding = 0.0
     if planar_point_count(planar) == 0:
         # Same native frame defect as the geometry builder: a polygon that fills
-        # the filtered GDS bounds has no inside/outside pair. One extra cell of
-        # frame recovers its real interior instead of inventing geometry.
+        # the filtered GDS bounds has no inside/outside pair. Native boundary
+        # padding recovers its real interior instead of inventing geometry.
         planar_padding = delta
-        padded = ps.d2.GDSGeometry(delta)
-        padded.setBoundaryConditions([reflective, reflective])
-        padded.setBoundaryPadding(planar_padding, planar_padding)
-        ps.d2.GDSReader(padded, str(filtered)).apply()
-        planar = padded.layerToLevelSet(pair[0], True)
+        planar_geometry, planars = _gds_planar_layers(
+            ps, filtered, delta, reflective, [pair[0]],
+            padding=planar_padding, blur=None, three_d_source=True)
+        planar = planars[pair[0]]
         if planar_point_count(planar) == 0:
-            raise RuntimeError(
-                f"GDS boolean layer/datatype {pair[0]}/{pair[1]} has no usable polygon interior "
-                "inside the filtered layout bounds; reduce gridDelta or adjust the layout")
+            raise _gds_missing_interior_error([pair[0]], planar_padding)
     # The step's baseHeight is relative to the geometry frame, so the geometry's
     # z placement is added as well; this keeps a zero step position aligned with
     # the mapped 3D layers.
     base_height = float(mask["baseHeight"]) + float(mask["position"][2]) + float(geometry["position"][2])
     height = float(mask["height"])
+    gds3 = _load_gds_geometry(ps, 3, filtered, delta, reflective,
+                              padding=planar_padding, blur=None)
+    native_body = native_layer_body(
+        gds3, pair[0], base_height=base_height, height=height,
+        mask_tone=False, blur_layer=True)
     operand, diagnostics = build_aligned_gds_mask(
         ps, domain, planar, base_height=base_height, height=height,
-        retained_region=str(mask["retainedRegion"]), layer=pair[0])
+        retained_region=str(mask["retainedRegion"]), layer=pair[0],
+        native_body=native_body)
+    diagnostics["planarGridPadding"] = planar_padding
+    diagnostics["nativeBodyUsed"] = native_body is not None
     transform.update({
         "sourceAssetId": geometry["assetId"], "selectedStructure": structure,
         "selectedLayers": [pair[0]], "selectedLayerDatatypes": [[pair[0], pair[1]]],

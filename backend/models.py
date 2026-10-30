@@ -511,6 +511,39 @@ class StackV7(StackV3):
     gdsMask: GDSMaskPatternV7 | None = None
 
 
+class GDSBlurV7(StrictModel):
+    """Optional native GDS proximity blur (``GDSGeometry.addBlur``).
+
+    This is the installed layout proximity blur: Gaussian sigmas on an exposure
+    grid, a normalized weighted sum and one threshold contour. It is **not** a
+    resist model, OPC or three-dimensional lithography simulation. ``sigmas``
+    use the native unit (grid intervals, i.e. ``sigma * gridDelta`` um), exactly
+    like the shipped ``examples/GDSReader/GDSReader.py``. ``delta`` is the
+    exposure grid spacing and defaults to the project gridDelta.
+    """
+
+    enabled: bool = True
+    sigmas: Annotated[list[Annotated[Number, Field(gt=0)]],
+                      Field(min_length=1, max_length=4)] = Field(default_factory=list)
+    weights: Annotated[list[Annotated[Number, Field(ge=0)]],
+                       Field(min_length=1, max_length=4)] = Field(default_factory=list)
+    threshold: Annotated[Number, Field(gt=0, lt=1)] = 0.5
+    delta: Annotated[Number, Field(gt=0)] | None = None
+    gridRefine: Annotated[Integer, Field(ge=1, le=8)] = 4
+
+    @model_validator(mode="after")
+    def checked_sampling(self):
+        if not self.enabled:
+            return self
+        if not self.sigmas or not self.weights:
+            raise ValueError("GDS blur requires nonempty sigmas and weights")
+        if len(self.sigmas) != len(self.weights):
+            raise ValueError("GDS blur sigmas and weights must have the same length")
+        if not math.isfinite(math.fsum(self.weights)) or math.fsum(self.weights) <= 0:
+            raise ValueError("GDS blur weights must have a positive finite sum")
+        return self
+
+
 class GDSGeometryV7(StrictModel):
     kind: Literal["gds"]
     assetId: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
@@ -519,6 +552,7 @@ class GDSGeometryV7(StrictModel):
     unitScale: Annotated[Number, Field(gt=0, le=1000000)] = 1
     position: Vector3 = [0, 0, 0]
     layers: Annotated[list[GDSLayerV7], Field(min_length=1, max_length=64)]
+    blur: GDSBlurV7 | None = None
 
     @model_validator(mode="after")
     def unique_layers(self):
@@ -1304,6 +1338,27 @@ class ProjectV7(ProjectV6):
                 if min(abs(start), abs(end)) > self.domain.yExtent / 2 or max(abs(start), abs(end)) > self.domain.yExtent / 2:
                     raise ValueError("fin extrusion extent must fit inside the 3D y domain")
         elif geometry["kind"] == "gds":
+            blur = geometry.get("blur")
+            if blur is not None and blur.get("enabled", True):
+                sigmas = blur.get("sigmas") or []
+                grid_refine = int(blur.get("gridRefine", 4))
+                exposure_delta = (float(blur.get("delta"))
+                                  if blur.get("delta") is not None else float(delta))
+                if exposure_delta > float(delta) + 1e-12:
+                    raise ValueError(
+                        "geometry.blur.delta is the exposure grid spacing and cannot be coarser than gridDelta")
+                # The installed native blur allocates a refined exposure grid per
+                # sigma and keeps every intermediate grid alive. Bound the
+                # allocation from the requested domain before it reaches the
+                # worker, instead of letting a request exhaust the bounded child.
+                ratio = max(1, math.ceil(grid_refine * exposure_delta / float(delta)))
+                span = max(float(self.domain.xExtent),
+                           float(getattr(self.domain, "yExtent", self.domain.xExtent)))
+                cells = (math.ceil(span / exposure_delta) * ratio + 8) ** 2
+                if cells * max(1, len(sigmas)) > 8_000_000:
+                    raise ValueError(
+                        "geometry.blur exposure grid is too large for the bounded worker; "
+                        "increase delta, reduce gridRefine or reduce the domain extent")
             if self.dimension == 2:
                 if abs(geometry["position"][2]) > 1e-12:
                     raise ValueError("2D GDS position must use [x,h,0]")

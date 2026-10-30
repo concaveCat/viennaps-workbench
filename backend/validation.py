@@ -182,7 +182,8 @@ def validate_project(payload: Any, *, kind: str = "project") -> tuple[Project, l
     delta = project.domain.gridDelta
     extent = project.domain.xExtent
     if project.schemaVersion in (3,4,5,6,7):
-        issues.extend(_validate_materials(project))
+        issues.extend(_validate_materials(
+            project, enforce_gds_domain=kind in ("simulate", "preview", "flux")))
         warnings.extend(_planarize_warnings(project))
         warnings.extend(_gds_boolean_warnings(project))
         warnings.extend(_directional_rate_set_warnings(project))
@@ -485,7 +486,8 @@ def _gds_boolean_warnings(project: Any) -> list[str]:
     return warnings
 
 
-def _validate_materials(project: ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 | ProjectV7) -> list[FieldIssue]:
+def _validate_materials(project: ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 | ProjectV7, *,
+                        enforce_gds_domain: bool = False) -> list[FieldIssue]:
     try:
         from .materials import material_catalog
         catalog=material_catalog()
@@ -530,6 +532,40 @@ def _validate_materials(project: ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 |
             # path would extrude to an empty body and fail at run time.
             available_pairs = set(library.effective_layer_datatypes(g["structure"]))
             mask_pairs = set(library.effective_mask_layer_datatypes(g["structure"]))
+            # A GDS layer body is inserted on its layout grid. If the layout is
+            # wider than the simulation domain, ViennaPS 4.6.2 does not clip it:
+            # insertNextLevelSetAsMaterial crashes the worker with SIGSEGV. The
+            # bounds below are pure Python and only cover direct elements; any
+            # SREF/AREF layout returns None and keeps the native worker guard.
+            blur = g.get("blur")
+            padding_margin = 0.0
+            if isinstance(blur, dict) and blur.get("enabled"):
+                # Blur runs use two grid cells of native boundary padding, which
+                # the body must still fit inside the simulation domain.
+                padding_margin = 2.0 * float(project.domain.gridDelta)
+            bounds = (library.selected_layout_bounds_um(
+                g["structure"], unit_scale=float(g["unitScale"]),
+                position_um=g["position"][:2]) if enforce_gds_domain else None)
+            if bounds is not None:
+                tolerance = max(1e-7, float(project.domain.gridDelta) * 1e-6)
+                half_x = float(project.domain.xExtent) / 2.0 - padding_margin
+                outside = (bounds[0] < -half_x - tolerance
+                           or bounds[2] > half_x + tolerance)
+                if project.dimension == 3:
+                    half_y = float(project.domain.yExtent) / 2.0 - padding_margin
+                    outside = outside or (bounds[1] < -half_y - tolerance
+                                          or bounds[3] > half_y + tolerance)
+                if outside:
+                    margin_text = (f" and leave {padding_margin:g} um of native blur padding"
+                                   if padding_margin else "")
+                    issues.append(FieldIssue(
+                        "geometry.assetId",
+                        "GDS layout bounds "
+                        f"[{bounds[0]:g}, {bounds[2]:g}]"
+                        + (f" x [{bounds[1]:g}, {bounds[3]:g}]" if project.dimension == 3 else "")
+                        + f" exceed the simulation domain (xExtent={float(project.domain.xExtent):g}"
+                        + (f", yExtent={float(project.domain.yExtent):g}" if project.dimension == 3 else "")
+                        + f"); enlarge the domain or move the layout so it fits inside{margin_text}"))
             for step_index, step in enumerate(project.steps):
                 if not is_geometry_step(step) or step_value(step, "model") != "gdsBoolean":
                     continue
