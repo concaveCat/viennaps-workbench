@@ -49,13 +49,16 @@ data on the local disk, and never calls an external API. Verified against
   flux engines.
 - Native specialized models: SF6/O2, CF4/O2, HBr/O2, SF6/C4F8, fluorocarbon,
   ion-beam etching, Faraday-cage ion-beam etching (experimental, 3D only), geometric
-  trench deposition (experimental, 2D only), wet etch, TEOS deposition, TEOS PECVD,
+  trench deposition (experimental, 2D/3D), wet etch, TEOS deposition, TEOS PECVD,
   ALD, oxidation, oxide regrowth, selective epitaxy, neutral transport, and
   multi-particle. The two experimental models have real native construction and
   CPU smoke tests but no archived Stage 8/9 direct-reference acceptance row, so
-  their runs are reported with a validation warning. Their installed bindings
-  are dimension-restricted: the 2D FaradayCage path never returns and the 3D
-  GeometricTrenchDeposition path SIGSEGVs, so those dimensions are rejected.
+  their runs are reported with a validation warning. The 2D FaradayCage path
+  never returns in bounded probes and is rejected; GeometricTrenchDeposition runs
+  in both dimensions for plane, trench, hole, fin and stack geometry, while GDS
+  inputs are rejected because the native radius needs a bounded vertical span.
+- Optional native controls: `nvFactors` on selective epitaxy, `coverageTolerance`
+  on the four plasma models, and the `advanced` plasma parameter object.
 - Directional rate model and selectivity comparisons.
 - Per-step enable/disable, reordering, and per-step native parameters.
 
