@@ -117,28 +117,34 @@ try {
 
   // P4-4: the library manager occupies the main workspace (no modal) and
   // stores material presets by catalog + material from /api/materials.
-  await page.getByRole('tab', { name: '库管理' }).click();
+  // It is entered from the left tree "库" group only — 02 has no manager tab.
+  const libraryTree = page.locator('[aria-label="库分类"]');
+  await libraryTree.locator('.spx-tree-item').filter({ hasText: '材料' }).first().click();
   await page.getByLabel('库管理').waitFor();
   assert.equal(await page.locator('.spx-library-manager-body').count(), 1);
   assert.equal(await page.locator('.spx-library-manager-list').count(), 1);
   assert.equal(await page.locator('.spx-library-manager-actions').count(), 1);
   assert.equal(await page.locator('.spx-modal-backdrop').count(), 0, 'library manager must live in the main workspace');
+  assert.equal(await page.locator('.spx-flow-viewswitch').count(), 0, '02 must not have a library-manager tab');
+  assert.equal(await page.getByRole('button', { name: '返回流程编辑' }).count(), 0, 'the manager header must be gone');
+  assert.equal(await page.locator('.spx-library-manager-tabs').count(), 0, 'category tabs must live in the left tree only');
 
-  // Switching categories must replace the main-workspace heading and form.
+  // Switching categories from the left tree must replace the main-workspace
+  // heading and form.
   const categoryChecks = [
-    ['Materials', 'Materials · 材料', '库材料 Catalog', '库材料名称'],
-    ['Processes', 'Processes · 工艺', '库工艺操作', '库工艺模型'],
-    ['Flows', 'Flows · 流程', '库流程引用', null],
-    ['Experiments', 'Experiments · 实验', '库实验配方', null],
+    ['材料', '材料库', '库材料 Catalog', '库材料名称'],
+    ['工艺', '工艺库', '库工艺操作', '库工艺模型'],
+    ['流程', '流程库', '库流程引用', null],
+    ['实验', '实验库', '库实验配方', null],
   ];
-  for (const [tab, heading, field, extra] of categoryChecks) {
-    await page.getByRole('button', { name: tab, exact: true }).click();
+  for (const [treeLabel, heading, field, extra] of categoryChecks) {
+    await libraryTree.locator('.spx-tree-item').filter({ hasText: treeLabel }).first().click();
     await page.locator('.spx-library-category-head strong').filter({ hasText: heading }).waitFor();
-    assert.equal(await page.getByLabel(field).count(), 1, `${tab} must show ${field}`);
-    if (extra) assert.equal(await page.getByLabel(extra).count(), 1, `${tab} must show ${extra}`);
+    assert.equal(await page.getByLabel(field).count(), 1, `${treeLabel} must show ${field}`);
+    if (extra) assert.equal(await page.getByLabel(extra).count(), 1, `${treeLabel} must show ${extra}`);
   }
-  await page.getByRole('button', { name: 'Materials', exact: true }).click();
-  await page.locator('.spx-library-category-head strong').filter({ hasText: 'Materials · 材料' }).waitFor();
+  await libraryTree.locator('.spx-tree-item').filter({ hasText: '材料' }).first().click();
+  await page.locator('.spx-library-category-head strong').filter({ hasText: '材料库' }).waitFor();
   assert.equal(await page.getByLabel('库材料 Catalog').count(), 1);
   await page.getByRole('button', { name: '新增库条目' }).click();
   await page.getByLabel('库条目名称').fill('P4 SiO2 preset');
@@ -153,23 +159,28 @@ try {
   await page.getByText('已新增 P4 SiO2 preset').waitFor();
   await page.locator('.spx-library-manager-list button').filter({ hasText: 'P4 SiO2 preset' }).click();
   assert.equal(await page.getByLabel('库条目名称').inputValue(), 'P4 SiO2 preset');
-  await page.getByRole('button', { name: 'Processes', exact: true }).click();
-  await page.locator('.spx-library-category-head strong').filter({ hasText: 'Processes · 工艺' }).waitFor();
-  await page.getByRole('button', { name: 'Materials', exact: true }).click();
+  await libraryTree.locator('.spx-tree-item').filter({ hasText: '工艺' }).first().click();
+  await page.locator('.spx-library-category-head strong').filter({ hasText: '工艺库' }).waitFor();
+  await libraryTree.locator('.spx-tree-item').filter({ hasText: '材料' }).first().click();
   await page.locator('.spx-library-manager-list button').filter({ hasText: 'P4 SiO2 preset' }).click();
   assert.equal(await page.getByLabel('库条目名称').inputValue(), 'P4 SiO2 preset');
-  await page.getByRole('button', { name: '返回流程编辑' }).click();
-  await page.getByRole('tab', { name: '流程编辑' }).waitFor();
+
+  // 02 in the top bar returns to the flow editor (no in-manager back button).
+  await page.getByRole('button', { name: '02 流程' }).click();
+  await page.locator('.spx-library-view').waitFor({ state: 'detached' });
+  await page.locator('.spx-flow-editor').waitFor();
+  assert.equal(await page.getByLabel('库管理').count(), 0);
 
   // The left project tree's library categories must switch the main workspace
   // even when another zone is active.
   await page.getByRole('button', { name: '01 工程' }).click();
-  await page.locator('.spx-tree-item').filter({ hasText: '材料' }).first().click();
+  await libraryTree.locator('.spx-tree-item').filter({ hasText: '材料' }).first().click();
   await page.locator('.spx-doc-header h1').filter({ hasText: '流程编辑' }).waitFor();
-  await page.locator('.spx-library-category-head strong').filter({ hasText: 'Materials · 材料' }).waitFor();
-  await page.locator('.spx-tree-item').filter({ hasText: '工艺' }).first().click();
-  await page.locator('.spx-library-category-head strong').filter({ hasText: 'Processes · 工艺' }).waitFor();
-  await page.getByRole('button', { name: '返回流程编辑' }).click();
+  await page.locator('.spx-library-category-head strong').filter({ hasText: '材料库' }).waitFor();
+  await libraryTree.locator('.spx-tree-item').filter({ hasText: '工艺' }).first().click();
+  await page.locator('.spx-library-category-head strong').filter({ hasText: '工艺库' }).waitFor();
+  await page.getByRole('button', { name: '02 流程' }).click();
+  await page.locator('.spx-flow-editor').waitFor();
 
   const stored = (await getJson('/api/v1/workflow/library/items?category=material')).items;
   const preset = stored.find(item => item.name === 'P4 SiO2 preset');

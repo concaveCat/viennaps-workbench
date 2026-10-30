@@ -731,9 +731,6 @@ body {
 .spx-output-tabs button.active { background: #fff; color: var(--spx-ink); }
 .spx-library-manager { width: min(920px, 94vw); height: min(620px, 88vh); display: grid; grid-template-rows: auto auto minmax(0, 1fr); }
 .spx-library-manager .spx-modal-title { display: flex; align-items: center; justify-content: space-between; }
-.spx-library-manager-tabs { display: flex; border-bottom: 1px solid var(--spx-line); background: #f4f5f6; }
-.spx-library-manager-tabs button { height: 27px; padding: 0 14px; border: 0; border-right: 1px solid var(--spx-line); background: transparent; color: #34404b; font-size: 11px; cursor: pointer; }
-.spx-library-manager-tabs button.active { background: #fff; color: var(--spx-blue); font-weight: 600; }
 .spx-library-manager-body { min-height: 0; display: grid; grid-template-columns: 268px 46px minmax(0, 1fr); }
 .spx-library-manager-list { overflow: auto; border-right: 1px solid var(--spx-line); background: #fbfcfd; padding: 4px; }
 .spx-library-manager-list button { display: block; width: 100%; text-align: left; border: 0; background: transparent; padding: 5px 6px; font-size: 11px; color: #26313a; cursor: pointer; border-bottom: 1px solid #e6eaee; }
@@ -760,15 +757,7 @@ body {
 }
 
 /* Library management is a main-workspace view, not an overlay. */
-.spx-flow-viewswitch { display: flex; border: 1px solid var(--spx-line); background: #fff; }
-.spx-flow-viewswitch button { height: 24px; padding: 0 10px; border: 0; border-right: 1px solid var(--spx-line); background: #f6f7f8; color: #34404b; font-size: 11px; cursor: pointer; }
-.spx-flow-viewswitch button:last-child { border-right: 0; }
-.spx-flow-viewswitch button.active { background: var(--spx-blue); color: #fff; }
-.spx-library-view { border: 1px solid var(--spx-line); background: #fff; display: grid; grid-template-rows: auto auto minmax(0, 1fr); margin-top: 8px; }
-.spx-library-view-head { display: flex; align-items: center; gap: 10px; padding: 6px 9px; background: #eef1f4; border-bottom: 1px solid var(--spx-line); }
-.spx-library-view-head strong { font-size: 12px; }
-.spx-library-view-head .wf-muted { margin: 0; }
-.spx-library-view-head .wf-button { width: auto; margin: 0 0 0 auto; }
+.spx-library-view { border: 1px solid var(--spx-line); background: #fff; display: grid; grid-template-rows: auto minmax(0, 1fr); margin-top: 8px; }
 .spx-library-view .spx-library-manager-body { min-height: 440px; }
 
 /* Material color: text + live swatch with a native picker. */
@@ -989,3 +978,18 @@ body {
 
 /* Compact summary rows keep 05's comparison table inside the first screen. */
 .spx-doc-body .wf-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 3px 12px; }
+
+/* One-shot banners carry a × so they do not depend on the next action to clear.
+   Confirmation banners keep their 取消/确认 buttons instead. */
+.spx-banner { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 3px 12px; }
+.spx-banner-text { flex: 1 1 auto; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.spx-banner-inline { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.spx-banner .spx-banner-close { margin-left: auto; }
+.spx-banner-close {
+  flex: none; width: 18px; height: 18px; padding: 0; display: inline-flex;
+  align-items: center; justify-content: center; border: 1px solid transparent;
+  border-radius: 0; background: transparent; color: inherit; font-size: 13px;
+  line-height: 1; cursor: pointer;
+}
+.spx-banner-close:hover { background: #e4e7ea; border-color: #c9d0d6; }
+.spx-banner-close:focus-visible { outline: 2px solid var(--spx-blue); outline-offset: 1px; }

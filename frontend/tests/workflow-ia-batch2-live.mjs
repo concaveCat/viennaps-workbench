@@ -208,8 +208,8 @@ try {
   const processes = (await getJson('/api/v1/workflow/library/items?category=process')).items;
   assert.ok(materials.length >= 13, `expected seeded material presets, got ${materials.length}`);
   assert.ok(processes.length >= 3, `expected seeded process presets, got ${processes.length}`);
-  await page.locator('.spx-tree-item').filter({ hasText: '材料' }).first().click();
-  await page.locator('.spx-library-category-head strong').filter({ hasText: 'Materials · 材料' }).waitFor();
+  await page.locator('[aria-label="库分类"] .spx-tree-item').filter({ hasText: '材料' }).first().click();
+  await page.locator('.spx-library-category-head strong').filter({ hasText: '材料库' }).waitFor();
   await page.locator('.spx-library-manager-list button.spx-library-row').first().waitFor();
   assert.ok((await page.locator('.spx-library-manager-list .spx-library-row i').count()) >= 13);
   const firstRow = await page.locator('.spx-library-manager-list button.spx-library-row').first().innerText();
@@ -218,10 +218,12 @@ try {
   await roleSelect.waitFor();
   const roleOptions = await roleSelect.locator('option').evaluateAll(nodes => nodes.map(node => node.value));
   assert.deepEqual(roleOptions, ['substrate', 'film', 'mask', 'resist']);
-  await page.locator('.spx-library-manager-tabs button').filter({ hasText: 'Processes' }).click();
+  await page.locator('[aria-label="库分类"] .spx-tree-item').filter({ hasText: '工艺' }).first().click();
+  await page.locator('.spx-library-category-head strong').filter({ hasText: '工艺库' }).waitFor();
   await page.locator('.spx-library-manager-list button.spx-library-row').first().waitFor();
   assert.match(await page.locator('.spx-library-manager-list').innerText(), /(刻蚀|沉积).*µm\/s.*s/);
-  await page.locator('.spx-library-manager-tabs button').filter({ hasText: 'Flows' }).click();
+  await page.locator('[aria-label="库分类"] .spx-tree-item').filter({ hasText: '流程' }).first().click();
+  await page.locator('.spx-library-category-head strong').filter({ hasText: '流程库' }).waitFor();
   await page.locator('.spx-library-reason').filter({ hasText: '先在 02 保存流程模板' }).waitFor();
   assert.equal(await page.getByRole('button', { name: '保存', exact: true }).isDisabled(), true);
 

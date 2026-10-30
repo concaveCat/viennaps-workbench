@@ -494,6 +494,11 @@ function formatDateTime(value: string): string {
   return `${date.toLocaleDateString('en-CA')} ${date.toLocaleTimeString('en-GB', { hour12: false, hour: '2-digit', minute: '2-digit' })}`;
 }
 
+/** Compact × for one-shot banners. Confirmation banners keep 取消/确认 instead. */
+function BannerClose({ onClose }: { onClose: () => void }) {
+  return <button type="button" className="spx-banner-close" aria-label="关闭提示" onClick={onClose}>×</button>;
+}
+
 const PROJECT_STORAGE_KEY = 'viennaps.workflow.projectId';
 
 async function projectRequest(path: string, method: 'POST' | 'PUT', document: unknown): Promise<ProjectRecord> {
@@ -514,10 +519,10 @@ async function projectRequest(path: string, method: 'POST' | 'PUT', document: un
 }
 
 const LIBRARY_CATEGORY_LABELS: Record<LibraryCategory, string> = {
-  material: 'Materials · 材料',
-  process: 'Processes · 工艺',
-  flow: 'Flows · 流程',
-  experiment: 'Experiments · 实验',
+  material: '材料库',
+  process: '工艺库',
+  flow: '流程库',
+  experiment: '实验库',
 };
 
 function isHexColor(value: string): boolean {
@@ -1691,7 +1696,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const createRoute = (rebuild = false) => run('route', async () => {
     if (!compile) throw new Error('先编译流程');
     if (compileStale) throw new Error('流程已修改，请重新编译');
-    if (route && !rebuild) { setZone('run'); return; }
+    if (route && !rebuild) { navigateZone('run'); return; }
     const enabledSteps = compile.compile.project.steps.filter(step => step.enabled);
     const splitAfterStepId = enabledSteps.length > 1 ? enabledSteps[enabledSteps.length - 2].id : undefined;
     const result = await postJson<{ plan: RoutePlan }>('/api/v1/workflow/routes/from-compile', {
@@ -1704,13 +1709,13 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setMeasurement(null);
     setProvenance(null);
     setRebuildRouteArmed(false);
-    setZone('run');
+    navigateZone('run');
     setActivityLog(previous => [...previous.slice(-79), `${clockTime()}  Route 已创建 · ${result.plan.segments.length} Segment`]);
   });
 
   const goToRun = () => {
     if (!route) { void createRoute(); return; }
-    setZone('run');
+    navigateZone('run');
   };
 
   const execute = () => run('execute', async () => {
@@ -1960,7 +1965,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setAutoAnalysisId('');
     autoAnalysisRef.current = '';
     setExperimentInputsOpen(!['completed', 'failed'].includes(doc.status));
-    setZone('experiment');
+    navigateZone('experiment');
   });
 
   const refreshLayouts = async () => {
@@ -2338,8 +2343,11 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     void loadManagerCategory(category);
   };
 
-  const switchManagerCategory = (category: LibraryCategory) => {
-    void loadManagerCategory(category);
+  // 01–06 (top bar, menus, left tree) are the only navigation: leaving 02
+  // always closes the library manager so coming back lands on the flow editor.
+  const navigateZone = (target: typeof zone) => {
+    setLibraryManagerOpen(false);
+    setZone(target);
   };
 
   const selectManagerItem = (item: LibraryItem) => {
@@ -2514,7 +2522,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     }
     if (!project) throw new Error('先创建或导入工程');
     if (item.category === 'experiment') {
-      setZone('experiment');
+      navigateZone('experiment');
       setActivityLog(previous => [...previous.slice(-79), `${clockTime()}  实验模板 ${item.name} 在 04 中使用`]);
       return;
     }
@@ -2830,9 +2838,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
 
   const flowReferenceCount = flowDefinitions.length + templates.length;
   const managerSaveBlocked = managerCategory === 'flow'
-    ? (!flowReferenceCount ? '先在 02 保存流程模板或流程定义，Flows 条目才有可引用对象。' : !(managerForm.flowRef ?? '') ? '选择要引用的流程定义或模板后才能保存。' : '')
+    ? (!flowReferenceCount ? '先在 02 保存流程模板或流程定义，流程库条目才有可引用对象。' : !(managerForm.flowRef ?? '') ? '选择要引用的流程定义或模板后才能保存。' : '')
     : managerCategory === 'experiment'
-      ? (!recipeOptions.length ? '先在 03 完成一次测量以生成测量配方，Experiments 条目才能引用它。' : '')
+      ? (!recipeOptions.length ? '先在 03 完成一次测量以生成测量配方，实验库条目才能引用它。' : '')
       : '';
 
   const managerRowMeta = (item: LibraryItem): string => {
@@ -2869,10 +2877,6 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
 
   const renderFlowBar = () => (
     <div className="spx-flow-bar">
-      <div className="spx-flow-viewswitch" role="tablist" aria-label="流程视图">
-        <button type="button" role="tab" aria-selected={!libraryManagerOpen} className={!libraryManagerOpen ? 'active' : ''} onClick={() => setLibraryManagerOpen(false)}>流程编辑</button>
-        <button type="button" role="tab" aria-selected={libraryManagerOpen} className={libraryManagerOpen ? 'active' : ''} onClick={() => openLibraryManager(libraryCategory)}>库管理</button>
-      </div>
       <div className="spx-flow-actions">
         <span className={`spx-compile-badge${compile ? (compileStale ? ' stale' : ' ok') : ''}`}
           title={compile ? `Compile ${compile.compileId}` : '尚未编译流程'}>
@@ -2893,26 +2897,10 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
 
   const renderLibraryManager = () => (
     <div className="spx-library-view" aria-label="库管理">
-      <div className="spx-library-view-head">
-        <strong>库管理</strong>
-        <span className="wf-muted">按分类维护可复用的材料、工艺、流程与实验条目。</span>
-        <button type="button" className="wf-button" onClick={() => setLibraryManagerOpen(false)}>返回流程编辑</button>
-      </div>
-      <div className="spx-library-manager-tabs">
-        {([
-          ['material', 'Materials'],
-          ['process', 'Processes'],
-          ['flow', 'Flows'],
-          ['experiment', 'Experiments'],
-        ] as Array<[LibraryCategory, string]>).map(([category, label]) => <button
-          key={category} type="button" className={managerCategory === category ? 'active' : ''}
-          onClick={() => switchManagerCategory(category)}
-        >{label}</button>)}
-      </div>
       <div className="spx-library-category-head">
         <strong>{LIBRARY_CATEGORY_LABELS[managerCategory]}</strong>
         <span className={managerError ? 'spx-library-load-error' : 'wf-muted'}>
-          {managerLoading ? '加载中…' : managerError ? `加载失败：${managerError}` : `${managerItems.length} 条`}
+          {managerLoading ? '加载中…' : managerError ? `加载失败：${managerError}` : `· ${managerItems.length} 条`}
         </span>
         {managerError && <button type="button" className="wf-button ghost" onClick={() => void loadManagerCategory(managerCategory)}>重试</button>}
       </div>
@@ -2920,7 +2908,16 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         <div className="spx-library-manager-list">
           {managerLoading && <div className="wf-muted spx-library-empty">加载中…</div>}
           {!managerLoading && managerError && <div className="spx-library-load-error spx-library-empty">{managerError}<button type="button" className="wf-button ghost" onClick={() => void loadManagerCategory(managerCategory)}>重试</button></div>}
-          {!managerLoading && !managerError && managerItems.length === 0 && <div className="wf-muted spx-library-empty">该分类暂无条目。</div>}
+          {!managerLoading && !managerError && managerItems.length === 0 && <div className="wf-muted spx-library-empty">
+            {managerCategory === 'flow'
+              ? <>
+                  <span>流程库暂无条目</span>
+                  <button type="button" className="spx-link" onClick={() => navigateZone('flow')}>先在 02 保存流程模板</button>
+                </>
+              : managerCategory === 'experiment'
+                ? '实验库暂无条目，可先在 04 创建实验模板。'
+                : `${LIBRARY_CATEGORY_LABELS[managerCategory]}暂无条目，可用中间栏的“新增”创建。`}
+          </div>}
           {!managerLoading && !managerError && managerItems.map(item => {
             const duplicate = managerDuplicateNames.has(item.name);
             const color = item.category === 'material' && isHexColor(String(item.payload.color ?? ''))
@@ -3079,7 +3076,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               setManagerDeleteArmed(false);
             }}>取消</button>
           </div>
-          {managerStatus && <div className="wf-summary" role="status">{managerStatus}</div>}
+          {managerStatus && <div className="wf-summary spx-banner" role="status"><span className="spx-banner-text">{managerStatus}</span><BannerClose onClose={() => setManagerStatus('')} /></div>}
         </div>
       </div>
     </div>
@@ -3191,7 +3188,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
           <button className="wf-button ghost" disabled={!!busy} onClick={() => void saveClip()}>保存 Clip</button>
         </div>
       </>}
-      {clipNotice && <div className="spx-clip-conflict" role="status">{clipNotice}</div>}
+      {clipNotice && <div className="spx-clip-conflict spx-banner" role="status"><span className="spx-banner-text">{clipNotice}</span><BannerClose onClose={() => setClipNotice('')} /></div>}
       {canvas && renderClipCanvas(canvas)}
       {activeClip && <div className="wf-summary"><strong>{activeClip.name}</strong><span>{activeClip.layers.length} 层 · {activeClip.polygonCount} 多边形</span><span><code>{activeClip.clipHash.slice(0, 12)}…</code></span><span>{activeClip.annotations.length} 标注</span></div>}
       {activeClip && <div className="wf-template-row">
@@ -3260,7 +3257,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 <button role="menuitem" onClick={() => { setOpenMenu(null); setComparison(null); setCandidateViews({}); setSyncZoom(1); setSyncAxis('xy'); }}>重置分析视图</button>
               </>}
               {id === 'view' && <>
-                {ZONES.map(item => <button key={item.id} role="menuitem" onClick={() => { setOpenMenu(null); setZone(item.id); }}>{item.num} {item.label} — {item.title}</button>)}
+                {ZONES.map(item => <button key={item.id} role="menuitem" onClick={() => { setOpenMenu(null); navigateZone(item.id); }}>{item.num} {item.label} — {item.title}</button>)}
                 {onOpenLegacy && <button role="menuitem" onClick={() => { setOpenMenu(null); onOpenLegacy(); }}>传统工作区</button>}
               </>}
               {id === 'project' && <>
@@ -3269,9 +3266,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 <button role="menuitem" disabled={!canCompile} onClick={() => { setOpenMenu(null); void compileFlow(); }}>编译流程</button>
                 <button role="menuitem" disabled={!canRoute} onClick={() => { setOpenMenu(null); void createRoute(); }}>创建 Route</button>
                 <button role="menuitem" disabled={!project} onClick={() => { setOpenMenu(null); void saveTemplate(); }}>保存当前步骤为模板</button>
-                <button role="menuitem" onClick={() => { setOpenMenu(null); openLibraryManager('process'); }}>管理库</button>
                 <button role="menuitem" disabled={!libraryName.trim()} onClick={() => { setOpenMenu(null); void exportLibrary(); }}>导出共享库</button>
-                <button role="menuitem" onClick={() => { setOpenMenu(null); setZone('flow'); }}>打开流程编辑器</button>
+                <button role="menuitem" onClick={() => { setOpenMenu(null); navigateZone('flow'); }}>打开流程编辑器</button>
               </>}
               {id === 'run' && <>
                 <button role="menuitem" disabled={!canRun} onClick={() => { setOpenMenu(null); void execute(); }}>执行当前 Segment</button>
@@ -3284,7 +3280,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 <button role="menuitem" disabled={!activeLayout} onClick={() => { setOpenMenu(null); void previewClip(); }}>预览 Clip</button>
                 <button role="menuitem" disabled={!activeLayout} onClick={() => { setOpenMenu(null); void saveClip(); }}>保存 Clip</button>
                 <button role="menuitem" disabled={!compile || !activeRecipeId} onClick={() => { setOpenMenu(null); void createDoe(); }}>设计 DOE</button>
-                <button role="menuitem" onClick={() => { setOpenMenu(null); setZone('analyze'); }}>打开分析与标定</button>
+                <button role="menuitem" onClick={() => { setOpenMenu(null); navigateZone('analyze'); }}>打开分析与标定</button>
               </>}
               {id === 'help' && <>
                 <button role="menuitem" onClick={() => { setOpenMenu(null); setAboutOpen(true); }}>关于 ViennaPS Workbench</button>
@@ -3299,13 +3295,13 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               type="button"
               aria-pressed={zone === item.id}
               className={zone === item.id ? 'active' : ''}
-              onClick={() => setZone(item.id)}
+              onClick={() => navigateZone(item.id)}
             >{item.num} {item.label}</button>)}
           </div>
         </div>
       </header>
 
-      {error && <div className="wf-error spx-error">{error}</div>}
+      {error && <div className="wf-error spx-error spx-banner" role="alert"><span className="spx-banner-text">{error}</span><BannerClose onClose={() => setError('')} /></div>}
 
       <div className="spx-body">
         <aside className="spx-left">
@@ -3377,8 +3373,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 tabIndex={0}
                 aria-selected={zone === item.target}
                 className={zone === item.target ? 'spx-tree-item active' : 'spx-tree-item'}
-                onClick={() => setZone(item.target)}
-                onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') setZone(item.target); }}
+                onClick={() => navigateZone(item.target)}
+                onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') navigateZone(item.target); }}
                 title={item.title}
               ><span className="spx-tree-label">{item.label}</span><span className="spx-tree-value">{item.value}</span>{item.badge && <span className={`spx-tree-status ${item.badgeClass}`}>{item.badge}</span>}</div>)}
             </div>
@@ -3388,15 +3384,28 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
           </div>
           <div className="spx-panel">
             <div className="spx-panel-title"><span>库</span></div>
-            <div className="spx-tree">
+            <div className="spx-tree" role="tree" aria-label="库分类">
               {([
-                { label: '材料', count: libraryItems.filter(item => item.category === 'material').length, onClick: () => openLibraryManager('material') },
-                { label: '工艺', count: libraryItems.filter(item => item.category === 'process').length, onClick: () => openLibraryManager('process') },
-                { label: '流程', count: libraryItems.filter(item => item.category === 'flow').length, onClick: () => setZone('flow') },
-                { label: '实验', count: libraryItems.filter(item => item.category === 'experiment').length, onClick: () => openLibraryManager('experiment') },
-                { label: '版图', count: layouts.length, onClick: () => { setZone('setup'); setSetupMode('layout'); void refreshLayouts(); } },
-                { label: 'Clip', count: clips.length, onClick: () => { setZone('setup'); setSetupMode('layout'); void refreshLayouts(); } },
-                { label: 'Bundles', count: libraryBundles.length, onClick: () => { setZone('flow'); setLibraryAdvancedOpen(true); } },
+                { label: '材料', category: 'material' as const, count: libraryItems.filter(item => item.category === 'material').length },
+                { label: '工艺', category: 'process' as const, count: libraryItems.filter(item => item.category === 'process').length },
+                { label: '流程', category: 'flow' as const, count: libraryItems.filter(item => item.category === 'flow').length },
+                { label: '实验', category: 'experiment' as const, count: libraryItems.filter(item => item.category === 'experiment').length },
+              ]).map(item => {
+                const active = zone === 'flow' && libraryManagerOpen && managerCategory === item.category;
+                return <div
+                  key={item.label}
+                  role="treeitem"
+                  tabIndex={0}
+                  aria-selected={active}
+                  className={active ? 'spx-tree-item active' : 'spx-tree-item'}
+                  onClick={() => openLibraryManager(item.category)}
+                  onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') openLibraryManager(item.category); }}
+                ><span>{item.label}</span><span className="spx-count">{item.count}</span></div>;
+              })}
+              {([
+                { label: '版图', count: layouts.length, onClick: () => { navigateZone('setup'); setSetupMode('layout'); void refreshLayouts(); } },
+                { label: 'Clip', count: clips.length, onClick: () => { navigateZone('setup'); setSetupMode('layout'); void refreshLayouts(); } },
+                { label: 'Bundles', count: libraryBundles.length, onClick: () => { navigateZone('flow'); setLibraryAdvancedOpen(true); } },
               ]).map(item => <div
                 key={item.label}
                 role="treeitem"
@@ -3646,7 +3655,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               <strong className={projectId && !projectDirty ? 'ok' : ''}>{projectId ? (projectDirty ? '有未保存更改' : '已保存') : '草稿（未保存）'}</strong>
               <span>{projectId ? `工程 ${projectId}` : '尚未写入服务端'}</span>
               {projectSavedAt && <span>更新于 {formatDateTime(projectSavedAt)}</span>}
-              {projectNotice && <span className="spx-project-notice">{projectNotice}</span>}
+              {projectNotice && <span className="spx-project-notice spx-banner-inline">{projectNotice}<BannerClose onClose={() => setProjectNotice('')} /></span>}
             </div>
             <div className="spx-summary-grid">
               <div><span>维度</span><strong>{project.dimension ?? '—'}D</strong></div>
@@ -3659,7 +3668,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 {busy === 'project-save' ? '保存中…' : projectId ? '保存更改' : '保存工程'}
               </button>
               <button type="button" className="wf-button" disabled={!!busy} onClick={exportProjectJson}>导出工程 JSON</button>
-              <button type="button" className="wf-button" onClick={() => setZone('flow')}>去 02 定义流程</button>
+              <button type="button" className="wf-button" onClick={() => navigateZone('flow')}>去 02 定义流程</button>
               <button type="button" className="wf-button" onClick={closeProject}>关闭工程</button>
             </div>
             {overwriteArmed && <div className="spx-rebuild" role="alert">
@@ -3718,7 +3727,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         <section className={`wf-card wf-flow ${zone === 'flow' ? '' : 'wf-hidden'}`}>
           <div className="wf-card-head"><span>02</span><h2>流程编辑</h2></div>
           {!project && !libraryManagerOpen && <div className="wf-empty">先在 01 创建或导入工程；库管理不需要打开工程。</div>}
-          {(project || libraryManagerOpen) && renderFlowBar()}
+          {project && !libraryManagerOpen && renderFlowBar()}
           {libraryManagerOpen && renderLibraryManager()}
           {project && !libraryManagerOpen && <>
             <div className="spx-flow-summary">
@@ -3754,7 +3763,6 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               <div className="spx-library-browser">
                 <div className="spx-library-head">
                   <span>库</span>
-                  <button type="button" className="spx-link" onClick={() => openLibraryManager(libraryCategory)}>管理库</button>
                 </div>
                 <div className="spx-library-tabs">
                   {([
@@ -3779,10 +3787,10 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                   {!libraryLoading && libraryError && <div className="wf-muted spx-library-empty">加载失败：{libraryError}<button type="button" className="wf-button ghost" onClick={() => void loadLibraryItems()}>重试</button></div>}
                   {!libraryLoading && !libraryError && libraryItems.filter(item => item.category === libraryCategory).length === 0 && <div className="wf-muted spx-library-empty">
                     {libraryCategory === 'flow'
-                      ? '还没有流程条目。先在流程编辑器保存当前步骤为模板，再到库管理引用它。'
+                      ? '还没有流程条目。先在 02 保存流程模板，再到左树“库 → 流程”引用它。'
                       : libraryCategory === 'experiment'
-                        ? '还没有实验模板。先在 03 完成一次测量生成配方，再到库管理引用它。'
-                        : '该分类暂无条目，可从“管理库”新增。'}
+                        ? '还没有实验模板。先在 03 完成一次测量生成配方，再到左树“库 → 实验”引用它。'
+                        : '该分类暂无条目，可从左树“库”分类进入库管理新增。'}
                   </div>}
                   {!libraryLoading && !libraryError && libraryItems.filter(item => item.category === libraryCategory).map(item => {
                     const needsProject = item.category !== 'experiment';
@@ -3804,7 +3812,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                         <span>{meta}</span>
                       </div>
                       {item.category === 'experiment'
-                        ? <button type="button" className="spx-link" onClick={() => { setZone('experiment'); setActivityLog(previous => [...previous.slice(-79), `${clockTime()}  实验模板 ${item.name} 在 04 中使用`]); }}>去 04</button>
+                        ? <button type="button" className="spx-link" onClick={() => { navigateZone('experiment'); setActivityLog(previous => [...previous.slice(-79), `${clockTime()}  实验模板 ${item.name} 在 04 中使用`]); }}>去 04</button>
                         : <button type="button" className="spx-link" disabled={blocked}
                           title={blocked ? '先在 01 创建或导入工程' : item.category === 'material' ? '插入到当前沉积步骤或工程基底材料' : '插入到流程'}
                           onClick={() => {
@@ -3943,7 +3951,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                   <button className="wf-button ghost" disabled={!activeDefinitionId || !!busy} onClick={() => void expandDefinition()}>{busy === 'expand' ? '展开中…' : '展开预览'}</button>
                   <button className="wf-button primary" disabled={!activeDefinitionId || !project || !!busy} onClick={() => void compileDefinition()}>{busy === 'definition-compile' ? '编译中…' : '编译模块化流程'}</button>
                 </div>
-                {moduleStatus && <div className="wf-summary"><strong>{moduleStatus}</strong><span>definition {activeDefinitionId || '—'}</span></div>}
+                {moduleStatus && <div className="wf-summary spx-banner" role="status"><strong>{moduleStatus}</strong><span>definition {activeDefinitionId || '—'}</span><BannerClose onClose={() => setModuleStatus('')} /></div>}
                 {expansion && <>
                   <div className="wf-summary">
                     <strong>展开预览</strong>
@@ -3987,7 +3995,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                   </select>
                   <button className="wf-button primary" aria-label="导入共享库" disabled={!libraryBundleId || !!busy} onClick={() => void importLibraryBundle()}>{busy === 'library' ? '处理中…' : '导入共享库'}</button>
                 </div>
-                {libraryStatus && <div className="wf-summary" role="status"><strong>{libraryStatus}</strong><span>{libraryBundles.length} 个本地 bundle</span></div>}
+                {libraryStatus && <div className="wf-summary spx-banner" role="status"><strong>{libraryStatus}</strong><span>{libraryBundles.length} 个本地 bundle</span><BannerClose onClose={() => setLibraryStatus('')} /></div>}
                 {libraryBundles.length > 0 && <table className="wf-table" aria-label="共享库列表">
                   <thead><tr><th>共享库</th><th>内容</th><th>创建时间</th></tr></thead>
                   <tbody>
@@ -4270,7 +4278,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               <button className={experimentRunCount > 0 ? 'wf-button' : 'wf-button primary'} disabled={!!busy} onClick={() => void runPersistentExperiment()}>
                 {busy === 'experiment' ? '实验运行中…' : experimentRunCount > 0 ? '重新运行实验' : '运行实验'}
               </button>
-              <button className={experimentRunCount > 0 ? 'wf-button primary' : 'wf-button'} disabled={experimentRunCount === 0 || !!busy} onClick={() => setZone('analyze')}>在 05 分析</button>
+              <button className={experimentRunCount > 0 ? 'wf-button primary' : 'wf-button'} disabled={experimentRunCount === 0 || !!busy} onClick={() => navigateZone('analyze')}>在 05 分析</button>
             </div>
             {experimentDoc.queue && <div className="wf-summary">
               <strong>队列</strong>
@@ -4301,9 +4309,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             <strong>还不能创建实验</strong>
             <span>{experimentBlockReason}</span>
             <div className="wf-empty-actions">
-              {!project && <button className="wf-button primary" onClick={() => setZone('setup')}>去 01 新建工程</button>}
-              {project && (!compile || compileStale) && <button className="wf-button primary" onClick={() => setZone('flow')}>去 02 编译流程</button>}
-              {project && compile && !compileStale && !activeRecipeId && <button className="wf-button primary" onClick={() => setZone('run')}>去 03 运行测量</button>}
+              {!project && <button className="wf-button primary" onClick={() => navigateZone('setup')}>去 01 新建工程</button>}
+              {project && (!compile || compileStale) && <button className="wf-button primary" onClick={() => navigateZone('flow')}>去 02 编译流程</button>}
+              {project && compile && !compileStale && !activeRecipeId && <button className="wf-button primary" onClick={() => navigateZone('run')}>去 03 运行测量</button>}
             </div>
           </div>}
 
@@ -4439,10 +4447,10 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 ? '先在 02 编译流程。'
                 : '先在 04 创建并运行实验，或先在 03 完成一次运行与测量。'}</span>
             <div className="wf-empty-actions">
-              {!project && <button className="wf-button primary" onClick={() => setZone('setup')}>去 01 新建工程</button>}
-              {project && !compile && <button className="wf-button primary" onClick={() => setZone('flow')}>去 02 编译流程</button>}
-              <button className="wf-button primary" onClick={() => setZone('experiment')}>去 04 创建实验</button>
-              <button className="wf-button ghost" onClick={() => setZone('run')}>去 03 运行测量</button>
+              {!project && <button className="wf-button primary" onClick={() => navigateZone('setup')}>去 01 新建工程</button>}
+              {project && !compile && <button className="wf-button primary" onClick={() => navigateZone('flow')}>去 02 编译流程</button>}
+              <button className="wf-button primary" onClick={() => navigateZone('experiment')}>去 04 创建实验</button>
+              <button className="wf-button ghost" onClick={() => navigateZone('run')}>去 03 运行测量</button>
             </div>
           </div>}
 
@@ -4635,15 +4643,15 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             </button>
             <button className="wf-button ghost" disabled={!reportDocument} onClick={openReport}>打开报告</button>
             <button className="wf-button ghost" disabled={!reportDocument} onClick={downloadReportHtml}>下载 HTML</button>
-            {!reportReady && <button className="wf-button ghost" onClick={() => setZone('run')}>去 03 运行测量</button>}
+            {!reportReady && <button className="wf-button ghost" onClick={() => navigateZone('run')}>去 03 运行测量</button>}
           </div>
 
           {!reportReady && <div className="wf-empty" aria-label="报告空态">
             <strong>还没有可报告的结果</strong>
             <span>报告包含流程/编译、Route、Run、测量、实验统计与结构视图；先完成 03 运行与测量。</span>
             <div className="wf-empty-actions">
-              <button className="wf-button primary" onClick={() => setZone('run')}>去 03 运行测量</button>
-              <button className="wf-button ghost" onClick={() => setZone('experiment')}>去 04 创建实验</button>
+              <button className="wf-button primary" onClick={() => navigateZone('run')}>去 03 运行测量</button>
+              <button className="wf-button ghost" onClick={() => navigateZone('experiment')}>去 04 创建实验</button>
             </div>
           </div>}
 
