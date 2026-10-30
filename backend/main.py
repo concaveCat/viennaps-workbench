@@ -34,7 +34,7 @@ from .supervisor import ActiveRunError, ReplayMismatch, Supervisor
 from .validation import (GPU_MULTIPARTICLE_FLUX_STRATEGY, GPU_MULTIPARTICLE_SPLIT_STRATEGY,
                          GPU_MULTIPARTICLE_NATIVE_STRATEGY, GPU_MULTIPARTICLE_NATIVE_FLUX_STRATEGY,
                          ProjectInputError, gpu_disk_verified,
-                         validate_project, capability_verified, gpu_project_signature)
+                         validate_project, capability_verified, experimental_cpu_replay_allowed, gpu_project_signature)
 from .rates import uses_flux
 from .specialized_models import specialized_catalog
 from .runtime_limits import (artifact_limit_bytes, artifact_limit_label,
@@ -676,10 +676,12 @@ async def run_replay(request: Request, payload: Any = Body(...)) -> dict[str, An
                     "path": "executionRequirements.steps",
                     "message": "GPU MultiParticle replay must record the strategy for its process or single-pass flux mode",
                 })
-            if not step or (not item.engine.startswith("GPU_") and not capability_verified(replay_dimension,capability_model,step["operation"],boundary,item.engine,
-                                                   schema_version=envelope.schemaVersion,
-                                                   execution_strategy=item.executionStrategy,
-                                                   flux_strategy=item.fluxStrategy, **signature)):
+            if not step or (not item.engine.startswith("GPU_")
+                            and not capability_verified(replay_dimension,capability_model,step["operation"],boundary,item.engine,
+                                                        schema_version=envelope.schemaVersion,
+                                                        execution_strategy=item.executionStrategy,
+                                                        flux_strategy=item.fluxStrategy, **signature)
+                            and not experimental_cpu_replay_allowed(step, item.engine)):
                 raise HTTPException(status_code=422,detail={"path":"executionRequirements.steps","message":"unverified replay engine, geometry or material combination"})
         if item.stepId in requirements_by_id:
             raise HTTPException(status_code=422, detail={"path": "executionRequirements.steps", "message": "duplicate stepId"})

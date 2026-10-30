@@ -23,6 +23,7 @@ warning instead of claiming verified coverage.
 """
 from __future__ import annotations
 
+import asyncio
 import copy
 import sys
 import unittest
@@ -34,10 +35,12 @@ sys.path.insert(0, str(ROOT / "tests" / "fixtures"))
 import viennaps as ps  # noqa: E402
 
 from backend import storage  # noqa: E402
+from backend.main import app  # noqa: E402
 from backend.hashing import requested_input_hash  # noqa: E402
 from backend.specialized_models import CATALOG, model_spec  # noqa: E402
 from backend.validation import ProjectInputError, select_engine, validate_project  # noqa: E402
 from stage8_project_factory import make_project  # noqa: E402
+from tests.test_api_integration import asgi_request, json_body  # noqa: E402
 from worker.specialized import build_specialized_model  # noqa: E402
 
 FARADAY_FIELDS = {
@@ -213,6 +216,16 @@ class SpecializedValidationNegatives(unittest.TestCase):
         with self.assertRaises(ProjectInputError):
             validate_project(project)
 
+    def test_geometric_trench_rejects_fractional_n_and_zero_geometry(self):
+        for key, value in (("n", 0.5), ("trenchWidth", 0), ("depositionRate", 0)):
+            with self.subTest(key=key):
+                project = geometric_project(2)
+                project["steps"][0]["nativeParameters"][key] = value
+                with self.assertRaises(ProjectInputError) as ctx:
+                    validate_project(project)
+                self.assertTrue(any(key in issue.path for issue in ctx.exception.issues),
+                                [issue.path for issue in ctx.exception.issues])
+
     def test_geometric_deposition_requires_a_deposit_material(self):
         project = geometric_project(2)
         project["steps"][0].pop("depositMaterial")
@@ -330,6 +343,41 @@ class ModelSpecGuard(unittest.TestCase):
         self.assertEqual(model_spec("geometricTrenchDeposition")["nativeClass"],
                          "GeometricTrenchDeposition")
         self.assertIsNone(model_spec("FaradayCageEtching"))
+
+
+class FaradayCpuReplay(unittest.IsolatedAsyncioTestCase):
+    """A real experimental CPU run must remain replayable (codex checkpoint)."""
+
+    async def asyncSetUp(self):
+        self.life = app.router.lifespan_context(app)
+        await self.life.__aenter__()
+
+    async def asyncTearDown(self):
+        await self.life.__aexit__(None, None, None)
+
+    async def wait(self, run_id: str) -> dict:
+        for _ in range(1200):
+            info = json_body(await asgi_request(f"/api/runs/{run_id}"))
+            if info["status"] in {"succeeded", "failed", "timed_out", "cancelled", "interrupted"}:
+                self.assertEqual(info["status"], "succeeded", info.get("failureReason"))
+                return info
+            await asyncio.sleep(0.05)
+        self.fail("FaradayCage run did not finish")
+
+    async def test_faraday_cage_cpu_run_replays(self):
+        project = faraday_project(3)
+        project["name"] = "FaradayCage CPU replay checkpoint"
+        project["solver"]["enginePreference"] = "cpu"
+        project["solver"]["timeoutSeconds"] = 60
+        response = await asgi_request("/api/runs", method="POST",
+                                      payload={"kind": "simulate", "project": project})
+        self.assertEqual(response[0], 202, response[2])
+        run_id = json_body(response)["runId"]
+        await self.wait(run_id)
+        envelope = json_body(await asgi_request(f"/api/runs/{run_id}/replay-project"))
+        replay = await asgi_request("/api/runs/replay", method="POST", payload=envelope)
+        self.assertEqual(replay[0], 202, replay[2])
+        await self.wait(json_body(replay)["runId"])
 
 
 if __name__ == "__main__":
