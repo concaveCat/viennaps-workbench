@@ -18,7 +18,7 @@
   - `e4de2d8` / merge `0fc3ae3`: reject GDS/continuation inputs whose vertical bounds cannot be validated.
 - Final codex result: **No remaining Blocker, Major, or Minor within scope**.
 - Final full suite on main: **211 tests OK, 5 skipped**.
-- Codex session resumed three times; all findings closed.
+- Codex session resumed four times (`6d7a2fa`, `c7b1850`, `c4d240c`, `0fc3ae3`); all findings closed.
 
 ## 2026-10-30 — Batch A3 (CSVFileProcess + RateGrid)
 
@@ -88,8 +88,13 @@
 - Final: **no remaining Blocker/Major/Minor**; 24/24 new tests pass.
 - Final full suite on main: **318 tests OK, 5 skipped**.
 
+## Archive
+
+- Tag: `archive/engine-complete-20261030` (points at the commit containing this log).
+- Tarball: `/root/archives/viennaps-workbench-engine-complete-20261030.tar.gz`, built from the tag and filtered to exclude `var/`, `frontend/dist/`, `.venv/`, `runtime-patched/`, `docs/*-evidence/` and untracked acceptance directories.
+- `main` and the tag are pushed to `origin` without force.
+
 ## Remaining
 
 - Batch A4: particle shape distributions — branch `task/engine-particles` (`afe9f46`) intentionally not merged; masked Box/Sphere and CustomSphere are native-crash/inert blockers.
-- Archive tag + tarball (engine batches).
 - 22 nm FinFET geometry-only flow (wafer start to M0).

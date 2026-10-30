@@ -1,8 +1,12 @@
 # ViennaPS Workbench — engine completion archive (2026-10-30)
 
 This archive closes the backend/API-only engine exposure work on top of the installed
-ViennaPS 4.6.2 / ViennaLS 5.8.5 runtime. The frontend was not modified; the user's new
-frontend is expected to consume the JSON schema, validation, worker metadata and API.
+ViennaPS 4.6.2 / ViennaLS 5.8.5 runtime. The B3–B5 engine phase and this archive commit
+touch no `frontend/` files; the user's new frontend is expected to consume the JSON
+schema, validation, worker metadata and API. Earlier A1/A3 merges in this history
+contain frontend integration (CSV upload and dimension-conversion notices); those
+changes are preserved as-is, are outside the B3–B5 backend/API work, and should be
+reviewed or replaced with the new frontend as needed.
 
 ## Final state
 
@@ -16,9 +20,10 @@ frontend is expected to consume the JSON schema, validation, worker metadata and
 | Review log | [`engine-checkpoints-20261030.md`](engine-checkpoints-20261030.md) |
 | Machine-readable matrix | [`engine-capability-matrix.json`](engine-capability-matrix.json) |
 
-Every engine batch below has an independent codex checkpoint. The final checkpoint for
-B5 found no remaining Blocker, Major or Minor. The full suite was run on `main` before
-the archive documentation commit.
+Every engine batch below has an independent review checkpoint. B1 was reviewed by the
+DeepSeek V4.1 Flash fallback because codex returned a usage-limit error; B2–B5 used
+codex. The final B5 checkpoint found no remaining Blocker, Major or Minor. The full
+suite was run on `main` before the archive documentation commit.
 
 ## Delivered engine batches
 
@@ -98,6 +103,7 @@ VIENNAPS_WORKBENCH_DATA_DIR=$PWD/var/test-engine-final \
 
 Expected: `Ran 318 tests ... OK (skipped=5)`.
 
-The archive tarball is a `git archive` of the tag. It excludes `var/`, `frontend/dist/`,
-`.venv/`, `runtime-patched/`, `docs/*-evidence/` and untracked acceptance directories.
-The tag and `main` are pushed to `origin` without force.
+The archive tarball is built from a `git archive` of the tag, then filtered to remove
+`var/`, `frontend/dist/`, `.venv/`, `runtime-patched/`, `docs/*-evidence/` and untracked
+acceptance directories even where a placeholder or evidence matrix is tracked. The tag
+and `main` are pushed to `origin` without force.

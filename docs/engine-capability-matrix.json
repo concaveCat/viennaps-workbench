@@ -2708,13 +2708,13 @@
     {
       "id": "B2",
       "title": "Multi-RateSet directional model",
-      "classification": "advanced-parameter-or-output-not-exposed",
+      "classification": "exposed",
       "items": [
         "RateSet",
         "DirectionalProcess(rateSets)"
       ],
       "risk": "medium",
-      "notes": "Implemented as steps[].rateSets[] on model:directional, mutually exclusive with the scalar fields. Each set carries its own direction, material velocities, optional maskMaterials and visibility; 1–8 sets are accepted and the worker uses the native Sequence[RateSet] overload. The scalar form remains the default and keeps historical hashes.",
+      "notes": "Implemented as steps[].rateSets[] on model:directional, mutually exclusive with the scalar fields. Each set carries its own direction, directional/isotropic velocities, optional maskMaterials and calculateVisibility; 1–8 sets are accepted and the worker uses the native Sequence[RateSet] overload. The scalar form remains the default and keeps historical hashes.",
       "acceptanceCriteria": [
         "A rateSets list (1–8 sets) is accepted alongside, and mutually exclusive with, the scalar fields.",
         "Existing directional projects keep their request hashes and results when rateSets is omitted.",
