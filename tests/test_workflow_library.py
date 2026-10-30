@@ -93,7 +93,27 @@ def module_document(module_id: str, duration: float) -> ModuleV1:
     )
 
 
-def definition_document(definition_id: str, flow_id: str, module_id: str) -> FlowDefinitionV2:
+def nested_module_document(
+    module_id: str, child_id: str, *, child_revision: int | None = None
+) -> ModuleV1:
+    nested = {"id": "call_nested", "moduleId": child_id, "parameters": {}}
+    if child_revision is not None:
+        nested["moduleRevision"] = child_revision
+    return ModuleV1.model_validate(
+        {
+            "schemaVersion": 1,
+            "moduleId": module_id,
+            "name": f"{module_id} module",
+            "description": "",
+            "parameters": [],
+            "steps": [nested],
+        }
+    )
+
+
+def definition_document(
+    definition_id: str, flow_id: str, module_id: str, *, pin: bool = True
+) -> FlowDefinitionV2:
     return FlowDefinitionV2.model_validate(
         {
             "schemaVersion": 2,
@@ -108,7 +128,7 @@ def definition_document(definition_id: str, flow_id: str, module_id: str) -> Flo
                     "kind": "module-call",
                     "instanceId": "call_pinned",
                     "moduleId": module_id,
-                    "moduleRevision": 1,
+                    "moduleRevision": 1 if pin else None,
                     "parameters": {},
                 }
             ],
@@ -558,6 +578,174 @@ class LibraryStoreTests(unittest.TestCase):
         # Exact revision retention still resolves the definition's pin.
         expanded = expand_flow_definition(
             target.get_flow_definition(self.definition_id), target.module_history()
+        )
+        self.assertEqual([step.moduleRevision for step in expanded.steps], [1])
+        self.assertEqual(expanded.steps[0].step["duration"], 0.1)
+
+    def test_unpinned_definition_rejects_silent_module_drift(self):
+        unpinned_id = f"def_lib_unpinned_{self.suffix}"
+        flow_id = f"flow_lib_unpinned_{self.suffix}"
+        self.source.save_flow_definition(
+            definition_document(unpinned_id, flow_id, self.module_id, pin=False)
+        )
+        bundle = build_bundle(
+            self.source,
+            LibraryExportRequestV1.model_validate(
+                {
+                    "name": "unpinned bundle",
+                    "moduleIds": [self.module_id],
+                    "definitionIds": [unpinned_id],
+                    "templateIds": [],
+                    "experimentIds": [],
+                }
+            ),
+        )
+        target = self._target()
+        for duration in (0.1, 0.2, 0.3):
+            target.save_module(module_document(self.module_id, duration))
+        self.assertEqual(target.current_module_revision(self.module_id), 3)
+
+        with self.assertRaises(WorkflowConflict) as context:
+            import_bundle(target, bundle, "reject")
+        message = str(context.exception)
+        self.assertIn("unpinned", message)
+        self.assertIn(f"{self.module_id}@2->3", message)
+        with self.assertRaises(WorkflowNotFound):
+            target.get_flow_definition(unpinned_id)
+        self.assertEqual(target.current_module_revision(self.module_id), 3)
+
+    def test_unpinned_nested_module_call_rejects_silent_drift(self):
+        inner_id = f"mod_lib_inner_{self.suffix}"
+        outer_id = f"mod_lib_outer_{self.suffix}"
+        self.source.save_module(module_document(inner_id, 0.1))
+        self.source.save_module(module_document(inner_id, 0.2))
+        self.source.save_module(
+            ModuleV1.model_validate(
+                {
+                    "schemaVersion": 1,
+                    "moduleId": outer_id,
+                    "name": "outer module",
+                    "description": "",
+                    "parameters": [],
+                    "steps": [
+                        {"id": "call_inner", "moduleId": inner_id, "parameters": {}}
+                    ],
+                }
+            )
+        )
+        bundle = build_bundle(
+            self.source,
+            LibraryExportRequestV1.model_validate(
+                {
+                    "name": "nested unpinned bundle",
+                    "moduleIds": [outer_id],
+                    "definitionIds": [],
+                    "templateIds": [],
+                    "experimentIds": [],
+                }
+            ),
+        )
+        target = self._target()
+        for duration in (0.1, 0.2, 0.3):
+            target.save_module(module_document(inner_id, duration))
+
+        with self.assertRaises(WorkflowConflict) as context:
+            import_bundle(target, bundle, "reject")
+        message = str(context.exception)
+        self.assertIn("unpinned", message)
+        self.assertIn(f"{outer_id}", message)
+        self.assertIn(f"{inner_id}@2->3", message)
+        self.assertFalse(target.module_revision_exists(outer_id, 1))
+
+    def test_existing_parent_and_definition_still_reject_nested_unpinned_drift(self):
+        child_id = f"mod_lib_child_{self.suffix}"
+        parent_id = f"mod_lib_parent_{self.suffix}"
+        definition_id = f"def_lib_parent_{self.suffix}"
+        flow_id = f"flow_lib_parent_{self.suffix}"
+        self.source.save_module(module_document(child_id, 0.1))
+        self.source.save_module(nested_module_document(parent_id, child_id))
+        self.source.save_flow_definition(
+            definition_document(definition_id, flow_id, parent_id)
+        )
+        bundle = build_bundle(
+            self.source,
+            LibraryExportRequestV1.model_validate(
+                {
+                    "name": "existing parent bundle",
+                    "moduleIds": [],
+                    "definitionIds": [definition_id],
+                    "templateIds": [],
+                    "experimentIds": [],
+                }
+            ),
+        )
+
+        target = self._target()
+        # The parent revision and the definition are already identical locally,
+        # so the old preflight marked both as "no update needed" and skipped the
+        # parent's unpinned child call.
+        target.save_module(module_document(child_id, 0.1))
+        target.save_module(module_document(child_id, 0.2))
+        target.save_module(nested_module_document(parent_id, child_id))
+        target.save_flow_definition(
+            definition_document(definition_id, flow_id, parent_id)
+        )
+        self.assertEqual(target.current_module_revision(parent_id), 1)
+
+        with self.assertRaises(WorkflowConflict) as context:
+            import_bundle(target, bundle, "reject")
+        message = str(context.exception)
+        self.assertIn("unpinned", message)
+        self.assertIn(parent_id, message)
+        self.assertIn(f"{child_id}@1->2", message)
+        self.assertEqual(target.current_module_revision(child_id), 2)
+
+    def test_explicit_nested_pin_is_not_treated_as_drift(self):
+        child_id = f"mod_lib_child_pin_{self.suffix}"
+        parent_id = f"mod_lib_parent_pin_{self.suffix}"
+        definition_id = f"def_lib_parent_pin_{self.suffix}"
+        flow_id = f"flow_lib_parent_pin_{self.suffix}"
+        self.source.save_module(module_document(child_id, 0.1))
+        self.source.save_module(module_document(child_id, 0.2))
+        self.source.save_module(
+            nested_module_document(parent_id, child_id, child_revision=1)
+        )
+        self.source.save_flow_definition(
+            definition_document(definition_id, flow_id, parent_id)
+        )
+        bundle = build_bundle(
+            self.source,
+            LibraryExportRequestV1.model_validate(
+                {
+                    "name": "explicit nested pin bundle",
+                    "moduleIds": [],
+                    "definitionIds": [definition_id],
+                    "templateIds": [],
+                    "experimentIds": [],
+                }
+            ),
+        )
+        # The explicit child pin keeps the bundle to child revision 1 only.
+        self.assertNotIn(
+            (child_id, 2),
+            {(entry.module.moduleId, entry.revision) for entry in bundle.modules},
+        )
+
+        target = self._target()
+        target.save_module(module_document(child_id, 0.1))
+        target.save_module(module_document(child_id, 0.2))
+        target.save_module(
+            nested_module_document(parent_id, child_id, child_revision=1)
+        )
+        target.save_flow_definition(
+            definition_document(definition_id, flow_id, parent_id)
+        )
+        result = import_bundle(target, bundle, "reject")
+        self.assertEqual(result.definitionIds, [])
+        self.assertIn(f"definition:{definition_id}", result.skipped)
+        self.assertEqual(target.current_module_revision(child_id), 2)
+        expanded = expand_flow_definition(
+            target.get_flow_definition(definition_id), target.module_history()
         )
         self.assertEqual([step.moduleRevision for step in expanded.steps], [1])
         self.assertEqual(expanded.steps[0].step["duration"], 0.1)

@@ -5376,6 +5376,18 @@
             "title": "Recipeversion",
             "type": "integer"
           },
+          "recordHash": {
+            "anyOf": [
+              {
+                "pattern": "^[a-f0-9]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recordhash"
+          },
           "replayOf": {
             "anyOf": [
               {

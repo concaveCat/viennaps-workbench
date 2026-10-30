@@ -1429,6 +1429,12 @@ async def compile_definition(
             for value in expanded.moduleRevisions
         ]
         flow_paths = {step.authoredStepId: step.flowPath for step in expanded.steps}
+        parameter_provenance = {
+            step.authoredStepId: step.parameterProvenance for step in expanded.steps
+        }
+        step_variable_refs = {
+            step.authoredStepId: step.variableRefs for step in expanded.steps
+        }
         try:
             adopted_flow, binding, compiled = adopt_project(
                 payload,
@@ -1437,6 +1443,8 @@ async def compile_definition(
                 revision=definition.revision,
                 placements=placements,
                 flow_paths=flow_paths,
+                parameter_provenance=parameter_provenance,
+                variable_refs=step_variable_refs,
                 variable_set=variable_set,
                 overrides=overrides,
                 module_revisions=module_revisions,

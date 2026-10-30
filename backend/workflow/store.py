@@ -1396,13 +1396,21 @@ class WorkflowStore:
         future schema can still read the row and report why it cannot decode it.
         """
 
-        from .decisions import MeasurementDecisionV1
+        from .decisions import (
+            MeasurementDecisionV1,
+            seal_measurement_decision,
+            verify_measurement_decision,
+        )
 
         record = (
             decision
             if isinstance(decision, MeasurementDecisionV1)
             else MeasurementDecisionV1.model_validate(decision)
         )
+        if record.recordHash is None:
+            record = seal_measurement_decision(record)
+        else:
+            verify_measurement_decision(record)
         self.get_plan(record.routeId)
         payload = record.model_dump(mode="json", exclude_none=True)
         digest = sha256_hex(payload)
@@ -1429,9 +1437,9 @@ class WorkflowStore:
         return record
 
     def get_measurement_decision(
-        self, decision_id: str, *, route_id: str | None = None
+        self, decision_id: str, *, route_id: str | None = None, verify: bool = True
     ) -> Any:
-        from .decisions import MeasurementDecisionV1
+        from .decisions import MeasurementDecisionV1, verify_measurement_decision
 
         with self._connect() as connection:
             row = connection.execute(
@@ -1444,10 +1452,13 @@ class WorkflowStore:
             raise WorkflowNotFound(
                 f"measurement decision {decision_id!r} does not belong to route {route_id!r}"
             )
-        return MeasurementDecisionV1.model_validate(json.loads(row["document_json"]))
+        record = MeasurementDecisionV1.model_validate(json.loads(row["document_json"]))
+        if verify and record.recordHash is not None:
+            verify_measurement_decision(record)
+        return record
 
     def list_measurement_decisions(self, route_id: str) -> list[Any]:
-        from .decisions import MeasurementDecisionV1
+        from .decisions import MeasurementDecisionV1, verify_measurement_decision
 
         with self._connect() as connection:
             rows = connection.execute(
@@ -1455,10 +1466,15 @@ class WorkflowStore:
                 "ORDER BY created_at, rowid",
                 (route_id,),
             ).fetchall()
-        return [
-            MeasurementDecisionV1.model_validate(json.loads(row["document_json"]))
-            for row in rows
-        ]
+        decisions: list[Any] = []
+        for row in rows:
+            record = MeasurementDecisionV1.model_validate(
+                json.loads(row["document_json"])
+            )
+            if record.recordHash is not None:
+                verify_measurement_decision(record)
+            decisions.append(record)
+        return decisions
 
     def workflow_run_route_ids(self, workflow_run_id: str) -> set[str]:
         """Return the routes that already recorded this workflow run id.

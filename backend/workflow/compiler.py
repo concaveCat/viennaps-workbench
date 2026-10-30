@@ -61,12 +61,16 @@ def _compiled_steps(
     flow: FlowRevisionV1,
     placements: dict[str, tuple[str, str]] | None = None,
     flow_paths: dict[str, str] | None = None,
+    parameter_provenance: dict[str, dict[str, ParameterProvenanceV1]] | None = None,
+    variable_refs: dict[str, list[str]] | None = None,
 ) -> tuple[list[Any], list[SourceMapEntryV1]]:
     adapter = TypeAdapter(StepV7)
     compiled: list[Any] = []
     source_map: list[SourceMapEntryV1] = []
     placements = placements or {}
     flow_paths = flow_paths or {}
+    parameter_provenance = parameter_provenance or {}
+    variable_refs = variable_refs or {}
 
     for step in flow.steps:
         module_path, iteration_key = placements.get(step.id, ("root", "i0"))
@@ -80,6 +84,21 @@ def _compiled_steps(
         payload["id"] = step_id
         compiled_step = adapter.validate_python(payload)
         compiled.append(compiled_step)
+        # P4-1 expansion knows whether a field came from a literal, a variable
+        # or an expression. Carry that through to the SourceMap instead of
+        # flattening every resolved field back to "literal"; callers that did
+        # not expand a definition (P0) keep the literal-only default.
+        expanded_provenance = parameter_provenance.get(step.id) or {}
+        provenance: dict[str, ParameterProvenanceV1] = {}
+        for key, value in payload.items():
+            if key in {"id", "name", "enabled"}:
+                continue
+            entry = expanded_provenance.get(key)
+            provenance[key] = (
+                entry.model_copy(deep=True)
+                if entry is not None
+                else ParameterProvenanceV1(kind="literal", resolvedValue=value)
+            )
         source_map.append(
             SourceMapEntryV1(
                 stepId=step_id,
@@ -87,11 +106,8 @@ def _compiled_steps(
                 authoredStepId=step.id,
                 moduleInstanceIdPath=module_path,
                 iterationKey=iteration_key,
-                parameterProvenance={
-                    key: ParameterProvenanceV1(kind="literal", resolvedValue=value)
-                    for key, value in payload.items()
-                    if key not in {"id", "name", "enabled"}
-                },
+                parameterProvenance=provenance,
+                variableRefs=list(variable_refs.get(step.id, [])),
             )
         )
     return compiled, source_map
@@ -115,6 +131,8 @@ def compile_flow(
     engine_versions: dict[str, str] | None = None,
     placements: dict[str, tuple[str, str]] | None = None,
     flow_paths: dict[str, str] | None = None,
+    parameter_provenance: dict[str, dict[str, ParameterProvenanceV1]] | None = None,
+    variable_refs: dict[str, list[str]] | None = None,
     variable_set: list[dict[str, Any]] | None = None,
     overrides: list[dict[str, Any]] | None = None,
     module_revisions: list[dict[str, Any]] | list[ModuleRevisionRefV1] | None = None,
@@ -129,10 +147,12 @@ def compile_flow(
     Omitting it keeps the P0 behavior (root instance, first iteration).
     ``flow_paths`` optionally carries the authored path for module/loop steps so
     the SourceMap keeps the path from the expansion instead of guessing it from
-    the flattened authored id. ``variable_set``/``overrides`` are provenance
-    only; they never change step ids. ``module_revisions`` records the concrete
-    module versions that produced the expanded steps; omitting it keeps the P0
-    compile identity unchanged.
+    the flattened authored id. ``parameter_provenance``/``variable_refs`` carry
+    the expansion's per-field origin into the SourceMap; omitting them keeps the
+    P0 literal provenance. ``variable_set``/``overrides`` are provenance only;
+    they never change step ids. ``module_revisions`` records the concrete module
+    versions that produced the expanded steps; omitting it keeps the P0 compile
+    identity unchanged.
     """
 
     flow = flow.model_copy(deep=True)
@@ -140,7 +160,13 @@ def compile_flow(
 
     template = _template_project(flow, binding)
     normalized_geometry = dict(template.geometry)
-    steps, source_map = _compiled_steps(flow, placements, flow_paths)
+    steps, source_map = _compiled_steps(
+        flow,
+        placements,
+        flow_paths,
+        parameter_provenance=parameter_provenance,
+        variable_refs=variable_refs,
+    )
 
     if binding.dimension == 3:
         project = ProjectV7(
@@ -170,6 +196,7 @@ def compile_flow(
         )
 
     module_revisions = _module_revisions_payload(module_revisions)
+    source_map_digest = source_map_hash(source_map)
     flow_payload = flow.model_dump(mode="json", exclude_none=True)
     if placements:
         flow_payload["placements"] = {
@@ -180,13 +207,23 @@ def compile_flow(
         flow_payload["flowPaths"] = dict(sorted(flow_paths.items()))
     if module_revisions:
         flow_payload["moduleRevisions"] = module_revisions
+    # P4-1 provenance changed the SourceMap encoding without changing the
+    # compiled project. Give that encoding its own compile identity so a
+    # definition compiled by an older server keeps its existing compileId
+    # instead of colliding with a new envelope under the same id. Including the
+    # SourceMap digest also keeps two provenance encodings with identical steps
+    # (for example different variable names resolving to the same value) apart.
+    # P0 callers pass neither argument, so their flow payload stays
+    # byte-for-byte stable.
+    if parameter_provenance or variable_refs:
+        flow_payload["parameterProvenanceVersion"] = 1
+        flow_payload["parameterProvenanceSourceMapHash"] = source_map_digest
     flow_hash = sha256_hex(flow_payload)
     binding_hash = sha256_hex(binding.model_dump(mode="json", exclude_none=True))
     material_hash = sha256_hex(
         [item.model_dump(mode="json", exclude_none=True) for item in (binding.materialDefinitions or [])]
     )
     project_hash = full_project_hash(project)
-    source_map_digest = source_map_hash(source_map)
     engine_versions = dict(engine_versions or {})
     variable_set = list(variable_set or [])
     overrides = list(overrides or [])

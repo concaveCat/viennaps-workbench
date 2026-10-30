@@ -11,12 +11,20 @@ os.environ.setdefault("WORKBENCH_PORT", "8767")
 
 from backend import storage  # noqa: E402
 from backend.main import app  # noqa: E402
+from backend.workflow.adoption import adopt_project  # noqa: E402
+from backend.workflow.api import get_store  # noqa: E402
+from backend.workflow.compiler import compile_flow  # noqa: E402
+from backend.workflow.hashing import source_map_hash  # noqa: E402
+from backend.workflow.ids import sha256_hex  # noqa: E402
 from backend.workflow.modules import (  # noqa: E402
     MAX_EXPANDED_STEPS,
     MAX_EXPANSION_DEPTH,
     ExpressionError,
     ModuleV1,
     evaluate_expression,
+    expand_flow_definition,
+    resolve_value,
+    to_flow_revision,
 )
 from backend.workflow.store import SCHEMA_VERSION, WorkflowStore  # noqa: E402
 from tests.test_api_integration import asgi_request, json_body  # noqa: E402
@@ -189,6 +197,160 @@ class WorkflowModuleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             first["variableRefs"], ["duration", "rate"]
         )
+
+    async def test_nested_material_rate_expressions_keep_provenance(self):
+        module_id = f"mod_p41_material_{self.suffix}"
+        await self.save_module(
+            module(
+                module_id,
+                [
+                    etch_step(
+                        "etch_material_a",
+                        rateMode="material",
+                        materialRates={"Si": "${etch_rate}"},
+                    )
+                ],
+            )
+        )
+        definition_id = f"def_p41_material_{self.suffix}"
+        await self.save_definition(
+            definition(
+                definition_id,
+                f"flow_p41_material_{self.suffix}",
+                [
+                    {
+                        "kind": "module-call",
+                        "instanceId": "call_material",
+                        "moduleId": module_id,
+                    }
+                ],
+                variables=[{"name": "etch_rate", "default": 0.1, "unit": "um/s"}],
+            )
+        )
+
+        expanded = await self.expand(definition_id)
+        step = expanded["steps"][0]
+        self.assertEqual(step["step"]["materialRates"], {"Si": 0.1})
+        provenance = step["parameterProvenance"]["materialRates"]
+        self.assertEqual(provenance["kind"], "expression")
+        self.assertEqual(provenance["resolvedValue"], {"Si": 0.1})
+        self.assertEqual(step["variableRefs"], ["etch_rate"])
+        self.assertEqual(
+            resolve_value(
+                {"rates": ["${etch_rate}", {"double": "${etch_rate * 2}"}]},
+                {"etch_rate": 0.1},
+            ),
+            {"rates": [0.1, {"double": 0.2}]},
+        )
+
+        response = await self.post(
+            f"/api/v1/workflow/flows/definitions/{definition_id}/compile",
+            {"project": project()},
+        )
+        self.assertEqual(response[0], 201, response[2])
+        entry = json_body(response)["compile"]["sourceMap"][0]
+        self.assertEqual(
+            entry["parameterProvenance"]["materialRates"]["kind"], "expression"
+        )
+        self.assertEqual(
+            entry["parameterProvenance"]["materialRates"]["resolvedValue"],
+            {"Si": 0.1},
+        )
+        self.assertEqual(entry["variableRefs"], ["etch_rate"])
+
+    async def test_provenance_compile_identity_keeps_legacy_compile(self):
+        module_id = f"mod_p41_identity_{self.suffix}"
+        await self.save_module(
+            module(
+                module_id,
+                [etch_step("etch_identity_a", rateMagnitude="${rate}")],
+                parameters=[{"name": "rate", "default": 0.1, "unit": "um/s"}],
+            )
+        )
+        definition_id = f"def_p41_identity_{self.suffix}"
+        flow_id = f"flow_p41_identity_{self.suffix}"
+        await self.save_definition(
+            definition(
+                definition_id,
+                flow_id,
+                [
+                    {
+                        "kind": "module-call",
+                        "instanceId": "call_identity",
+                        "moduleId": module_id,
+                    }
+                ],
+                variables=[{"name": "rate", "default": 0.1, "unit": "um/s"}],
+            )
+        )
+
+        store = get_store()
+        definition_model = store.get_flow_definition(definition_id)
+        expanded = expand_flow_definition(definition_model, store.module_history())
+        flow, placements = to_flow_revision(definition_model, expanded)
+        flow_paths = {step.authoredStepId: step.flowPath for step in expanded.steps}
+        module_revisions = [
+            item.model_dump(mode="json") for item in expanded.moduleRevisions
+        ]
+        variable_set = [
+            item.model_dump(mode="json") for item in expanded.variables
+        ]
+        # This is what the pre-P4-provenance compiler produced for the same
+        # definition: same steps and ids, literal-only SourceMap.
+        _, binding, legacy = adopt_project(
+            project(),
+            flow_id=flow_id,
+            steps=flow.steps,
+            revision=definition_model.revision,
+            placements=placements,
+            flow_paths=flow_paths,
+            variable_set=variable_set,
+            module_revisions=module_revisions,
+        )
+        store.register_binding(binding)
+        store.register_compile(legacy)
+        legacy_id = legacy.compileRecord.compileId
+        legacy_source_map_hash = legacy.compileRecord.sourceMapHash
+        self.assertEqual(
+            legacy.sourceMap[0].parameterProvenance["rateMagnitude"].kind,
+            "literal",
+        )
+
+        response = await self.post(
+            f"/api/v1/workflow/flows/definitions/{definition_id}/compile",
+            {"project": project()},
+        )
+        self.assertEqual(response[0], 201, response[2])
+        body = json_body(response)
+        self.assertNotEqual(body["compileId"], legacy_id)
+        self.assertNotEqual(
+            body["compile"]["compileRecord"]["sourceMapHash"],
+            legacy_source_map_hash,
+        )
+        self.assertEqual(
+            body["compile"]["sourceMap"][0]["parameterProvenance"]["rateMagnitude"]["kind"],
+            "variable",
+        )
+        # The old envelope stays addressable under its original id.
+        retained = store.get_compile(legacy_id)
+        self.assertEqual(retained.compileRecord.compileId, legacy_id)
+        self.assertEqual(retained.compileRecord.sourceMapHash, legacy_source_map_hash)
+
+        # P0 callers pass no provenance at all: the flow payload and therefore
+        # compileId/sourceMapHash must stay exactly what the legacy path emits.
+        plain_flow, plain_binding, plain = adopt_project(
+            project(), flow_id=f"flow_p0_identity_{self.suffix}"
+        )
+        self.assertEqual(
+            plain.compileRecord.flowRevisionHash,
+            sha256_hex(plain_flow.model_dump(mode="json", exclude_none=True)),
+        )
+        self.assertEqual(
+            plain.compileRecord.sourceMapHash, source_map_hash(plain.sourceMap)
+        )
+        repeated = compile_flow(plain_flow, plain_binding)
+        self.assertEqual(repeated.compileRecord.compileId, plain.compileRecord.compileId)
+        self.assertEqual(repeated.compileRecord.sourceMapHash, plain.compileRecord.sourceMapHash)
 
     async def test_repeat_count_uses_loop_variable_and_index(self):
         module_id = f"mod_p41_count_{self.suffix}"
@@ -521,6 +683,24 @@ class WorkflowModuleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [step["id"] for step in first_body["authoredSteps"]], expanded_authored
         )
+        source_map_by_authored = {
+            entry["authoredStepId"]: entry
+            for entry in first_body["compile"]["sourceMap"]
+        }
+        variable_entry = source_map_by_authored[expanded_authored[0]]
+        self.assertEqual(
+            variable_entry["parameterProvenance"]["rateMagnitude"]["kind"], "variable"
+        )
+        self.assertEqual(
+            variable_entry["parameterProvenance"]["rateMagnitude"]["source"], "rate"
+        )
+        self.assertEqual(variable_entry["parameterProvenance"]["rateMagnitude"]["resolvedValue"], 0.1)
+        self.assertEqual(variable_entry["variableRefs"], ["rate"])
+        constant_entry = source_map_by_authored[expanded_authored[1]]
+        self.assertEqual(
+            constant_entry["parameterProvenance"]["rateMagnitude"]["kind"], "literal"
+        )
+        self.assertEqual(constant_entry["variableRefs"], [])
         first_step_ids = [step["id"] for step in first_body["compile"]["project"]["steps"]]
         self.assertEqual(
             sorted(entry["stepId"] for entry in first_body["compile"]["sourceMap"]),

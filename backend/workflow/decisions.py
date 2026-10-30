@@ -14,6 +14,7 @@ measurement-driven branches can form one sequence under one ``workflowRunId``.
 
 from __future__ import annotations
 
+import hmac
 import json
 import math
 import operator
@@ -27,7 +28,8 @@ from ..models import StepV7, StrictModel
 from .branches import create_branch
 from .compiler import compile_flow
 from .experiments import authored_project
-from .models import CompiledWorkflowV1, FlowRevisionV1
+from .ids import sha256_hex
+from .models import CompiledWorkflowV1, FlowRevisionV1, ParameterProvenanceV1
 from .routes import AttemptV1, RoutePlanV1, SegmentV1
 from .store import (
     WorkflowConflict,
@@ -128,6 +130,41 @@ class MeasurementDecisionV1(StrictModel):
     branchThroughStepId: Annotated[str, Field(min_length=3, max_length=64)] | None = None
     replayOf: DecisionId | None = None
     createdAt: str
+    # Tamper-evident digest over every other field. It is computed when the
+    # record is created and re-checked on read/replay. Old rows written before
+    # this field existed have ``None`` and are explicitly refused for replay.
+    recordHash: Hash64 | None = None
+
+
+def decision_record_hash(decision: MeasurementDecisionV1) -> str:
+    """Canonical digest of a decision record, excluding ``recordHash`` itself."""
+
+    payload = decision.model_dump(mode="json", exclude_none=True)
+    payload.pop("recordHash", None)
+    return sha256_hex(payload)
+
+
+def seal_measurement_decision(decision: MeasurementDecisionV1) -> MeasurementDecisionV1:
+    """Return a copy carrying the digest for its current field values."""
+
+    return decision.model_copy(update={"recordHash": decision_record_hash(decision)})
+
+
+def verify_measurement_decision(decision: MeasurementDecisionV1) -> MeasurementDecisionV1:
+    """Reject a missing or mismatched record digest with a 409-level conflict."""
+
+    if decision.recordHash is None:
+        raise WorkflowConflict(
+            f"decision {decision.decisionId!r} predates tamper-evident records and "
+            "has no recordHash; recreate it with the current server before replay"
+        )
+    expected = decision_record_hash(decision)
+    if not hmac.compare_digest(expected, decision.recordHash):
+        raise WorkflowConflict(
+            f"decision {decision.decisionId!r} recordHash does not match its content; "
+            "the stored decision was modified outside the workflow record"
+        )
+    return decision
 
 
 class WorkflowRunSummaryV1(StrictModel):
@@ -358,6 +395,29 @@ def _build_target_compile(
         flow_paths = {entry.authoredStepId: entry.flowPath for entry in source_compiled.sourceMap}
 
     overrides, variable_set = _compile_provenance(source_compiled, resolved)
+    # Keep the source expansion/variable provenance and replace only the fields
+    # this decision resolved. Without this, a decision target compile would
+    # flatten every inherited field back to "literal" and lose the variable
+    # references that flow diff and rerun scope depend on.
+    parameter_provenance = {
+        entry.authoredStepId: {
+            field: provenance.model_copy(deep=True)
+            for field, provenance in entry.parameterProvenance.items()
+        }
+        for entry in source_compiled.sourceMap
+    }
+    step_variable_refs = {
+        entry.authoredStepId: list(entry.variableRefs)
+        for entry in source_compiled.sourceMap
+    }
+    for authored_step_id, fields in resolved.items():
+        provenance = parameter_provenance.setdefault(authored_step_id, {})
+        for field, value in fields.items():
+            provenance[field] = ParameterProvenanceV1(
+                kind="variable",
+                source="measurement-decision",
+                resolvedValue=value,
+            )
     module_revisions = (
         [item.model_dump(mode="json", exclude_none=True) for item in record.moduleRevisions]
         if record.moduleRevisions
@@ -370,6 +430,8 @@ def _build_target_compile(
         engine_versions=dict(record.engineVersions),
         placements=placements,
         flow_paths=flow_paths,
+        parameter_provenance=parameter_provenance,
+        variable_refs=step_variable_refs,
         variable_set=variable_set,
         overrides=overrides,
         module_revisions=module_revisions,
@@ -652,7 +714,7 @@ def create_measurement_decision(
         branchThroughStepId=through,
         createdAt=_now(),
     )
-    stored = store.save_measurement_decision(decision)
+    stored = store.save_measurement_decision(seal_measurement_decision(decision))
     return {
         "decision": stored,
         "plan": branch_plan,
@@ -793,12 +855,15 @@ def replay_measurement_decision(
 ) -> dict[str, Any]:
     """Replay a recorded branch without measuring or re-deciding."""
 
-    original = store.get_measurement_decision(decision_id, route_id=route_id)
+    original = store.get_measurement_decision(
+        decision_id, route_id=route_id, verify=False
+    )
     if original.routeId != route_id:
         raise WorkflowNotFound(
             f"decision {decision_id!r} does not belong to route {route_id!r}"
         )
     _recorded_decision_checks(original)
+    verify_measurement_decision(original)
     plan = store.get_plan(route_id)
     source = next(
         (segment for segment in plan.segments if segment.segmentId == original.sourceSegmentId),
@@ -839,7 +904,6 @@ def replay_measurement_decision(
         raise WorkflowConflict(
             f"decision {decision_id!r} target compile content changed"
         )
-    _register_target(store, target)
     changed_step_ids = _resolved_scope(
         source_compiled,
         start_after_step_id,
@@ -849,6 +913,10 @@ def replay_measurement_decision(
 
     measurement = store.get_measurement(original.measurementId)
     _recorded_measurement_checks(original, measurement)
+
+    # Register the rebuilt target compile only after every record check passed,
+    # so a tampered replay cannot leave a compile behind.
+    _register_target(store, target)
 
     suffix = uuid.uuid4().hex[:10]
     submission_key = f"decision_{suffix}"
@@ -901,7 +969,7 @@ def replay_measurement_decision(
         replayOf=original.decisionId,
         createdAt=_now(),
     )
-    stored = store.save_measurement_decision(decision)
+    stored = store.save_measurement_decision(seal_measurement_decision(decision))
     return {
         "decision": stored,
         "plan": branch_plan,

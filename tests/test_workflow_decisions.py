@@ -247,6 +247,17 @@ class MeasurementDecisionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decision["measurementBindingStatus"], "verified")
         self.assertIsNone(decision["replayOf"])
 
+        gc = await asgi_request(
+            "/api/v1/workflow/gc/dry-run", method="POST", payload={}
+        )
+        self.assertEqual(gc[0], 200, gc[2])
+        gc_body = json_body(gc)
+        self.assertIn(self.executed_prefix["runId"], gc_body["referenced"])
+        self.assertNotIn(
+            self.executed_prefix["runId"],
+            {item["artifactId"] for item in gc_body["candidates"]},
+        )
+
         target = await self._target_step(decision["targetCompileId"], "step_etch_03")
         self.assertAlmostEqual(target["duration"], 0.03)
 
@@ -374,6 +385,34 @@ class MeasurementDecisionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attempt["compileId"], original["targetCompileId"])
         self.assertEqual(segment["sourceCompileId"], original["targetCompileId"])
         self.assertEqual(segment["startAfterStepId"], original["startAfterStepId"])
+
+    async def test_replayed_branch_executes_to_the_same_result(self):
+        created = await self._decide(
+            operator="gt", threshold=0.0,
+            true_parameters={"step_etch_03": {"duration": 0.03}},
+            false_parameters={"step_etch_03": {"duration": 0.2}},
+        )
+        original = created["decision"]
+        first = await self._execute(original["branchSegmentId"])
+        self.assertEqual(first["status"], "succeeded", first)
+        self.assertRegex(first["resultDigest"], r"^[a-f0-9]{64}$")
+
+        response = await asgi_request(
+            f"/api/v1/workflow/routes/{self.route_id}/measurement-decisions/"
+            f"{original['decisionId']}/replay",
+            method="POST",
+            payload={},
+        )
+        self.assertEqual(response[0], 201, response[2])
+        replayed = json_body(response)["decision"]
+        self.assertEqual(replayed["targetCompileId"], original["targetCompileId"])
+        second = await self._execute(replayed["branchSegmentId"])
+        self.assertEqual(second["status"], "succeeded", second)
+        self.assertEqual(second["resultDigest"], first["resultDigest"])
+        self.assertEqual(
+            second["endCheckpointRef"]["stateHash"],
+            first["endCheckpointRef"]["stateHash"],
+        )
 
     async def test_error_boundaries_are_explicit(self):
         # No succeeded prefix on a fresh route.
@@ -768,6 +807,55 @@ class MeasurementDecisionTests(unittest.IsolatedAsyncioTestCase):
         response = await replay()
         self.assertEqual(response[0], 201, response[2])
 
+    async def test_replay_rejects_record_hash_tampering_even_when_branch_is_unchanged(self):
+        created = await self._decide(
+            true_parameters={"step_etch_03": {"duration": 0.03}},
+            false_parameters={"step_etch_03": {"duration": 0.2}},
+            operator="gt",
+            threshold=0.0,
+        )
+        decision = created["decision"]
+        self.assertEqual(decision["chosenBranch"], "true")
+        self.assertIn("recordHash", decision)
+        original_document = self._read_decision(decision["decisionId"])
+        self.assertEqual(original_document["recordHash"], decision["recordHash"])
+        path = (
+            f"/api/v1/workflow/routes/{self.route_id}/measurement-decisions/"
+            f"{decision['decisionId']}/replay"
+        )
+
+        # 0.0 -> 0.001 still leaves the branch at "true", so the old replay
+        # self-consistency check alone would have accepted the tampering.
+        tampered = json.loads(json.dumps(original_document))
+        tampered["threshold"] = 0.001
+        self._set_decision_document(decision["decisionId"], tampered)
+        response = await asgi_request(path, method="POST", payload={})
+        self.assertEqual(response[0], 409, response[2])
+        self.assertIn("recordHash", response[2].decode())
+        for read_path in (
+            f"/api/v1/workflow/routes/{self.route_id}/measurement-decisions",
+            f"/api/v1/workflow/routes/{self.route_id}/measurement-decisions/"
+            f"{decision['decisionId']}",
+        ):
+            response = await asgi_request(read_path)
+            self.assertEqual(response[0], 409, response[2])
+            self.assertIn("recordHash", response[2].decode())
+        with sqlite3.connect(self._db_path()) as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM measurement_decisions WHERE route_id = ?",
+                (self.route_id,),
+            ).fetchone()[0]
+        self.assertEqual(count, 1)
+
+        # Records written before recordHash existed cannot be replayed; the
+        # policy is explicit rejection rather than silently trusting them.
+        legacy = json.loads(json.dumps(original_document))
+        legacy.pop("recordHash")
+        self._set_decision_document(decision["decisionId"], legacy)
+        response = await asgi_request(path, method="POST", payload={})
+        self.assertEqual(response[0], 409, response[2])
+        self.assertIn("no recordHash", response[2].decode())
+
     async def test_auto_prefix_without_suffix_and_nonfinite_threshold_are_rejected(self):
         route = await self._create_route("single segment", None)
         route_id = route["route"]["routeId"]
@@ -831,6 +919,23 @@ class DecisionCompileProvenanceTests(unittest.TestCase):
 
         resolved = {"step_etch_03": {"duration": 0.03}}
         target = _build_target_compile(store, varied, resolved)
+        target_map = {entry.authoredStepId: entry for entry in target.sourceMap}
+        self.assertEqual(
+            target_map["step_etch_03"].parameterProvenance["duration"].kind,
+            "variable",
+        )
+        self.assertEqual(
+            target_map["step_etch_03"].parameterProvenance["duration"].source,
+            "measurement-decision",
+        )
+        self.assertEqual(
+            target_map["step_etch_03"].parameterProvenance["duration"].resolvedValue,
+            0.03,
+        )
+        self.assertEqual(
+            target_map["step_etch_03"].parameterProvenance["rateMagnitude"].kind,
+            "literal",
+        )
         self.assertEqual(target.compileRecord.compilerVersion, "0.0.9")
         self.assertEqual(target.compileRecord.engineVersions, {"cpu": "test-engine"})
         self.assertIn(

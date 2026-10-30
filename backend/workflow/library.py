@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections import defaultdict
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal
 
@@ -524,6 +525,38 @@ def _module_exists(store: WorkflowStore, module_id: str) -> bool:
         return False
 
 
+def _bundle_current_revision(
+    module_groups: Mapping[str, Mapping[int, ModuleV1]], module_id: str
+) -> int | None:
+    """Return the revision an unpinned call would have resolved to at export."""
+
+    revisions = module_groups.get(module_id)
+    return max(revisions) if revisions else None
+
+
+def _effective_current_revision(
+    store: WorkflowStore,
+    module_groups: Mapping[str, Mapping[int, ModuleV1]],
+    module_id: str,
+) -> int | None:
+    """Return the current revision the target will use after this import.
+
+    Import never downgrades a newer local current revision, so an unpinned call
+    resolves to ``max(local_current, bundle_current)``.
+    """
+
+    bundle_revision = _bundle_current_revision(module_groups, module_id)
+    try:
+        local_revision = store.current_module_revision(module_id)
+    except WorkflowNotFound:
+        local_revision = None
+    if bundle_revision is None:
+        return local_revision
+    if local_revision is None:
+        return bundle_revision
+    return max(local_revision, bundle_revision)
+
+
 def _experiment_source_index(
     store: WorkflowStore, bundle_id: str
 ) -> tuple[dict[str, str], dict[int, str]]:
@@ -776,6 +809,57 @@ def import_bundle(
                 experiment_skips.append((index, imported_experiment_id))
                 continue
         experiment_plans.append((template, index, template_hash, recipe, metric))
+
+    # --- unpinned resolution preflight -----------------------------------
+    # A definition or module that calls another module without an explicit
+    # revision resolves against the target's *current* revision. Export adds the
+    # exporter's current revision to the bundle, but import never downgrades a
+    # newer local current. Without this check the same definition would silently
+    # compile different steps on the recipient.
+    #
+    # The walk is over every definition and every module revision in the bundle,
+    # then follows the modules they reach (including locally retained modules
+    # that the bundle itself references). It must not depend on whether the
+    # definition/module already exists or is skipped: an unchanged parent module
+    # can still contain an unpinned call whose child drifts on import.
+    visited_modules: set[tuple[str, int]] = set()
+
+    def walk_module_refs(owner: str, refs: list[tuple[str, int | None]]) -> None:
+        for module_id, revision in refs:
+            if revision is None:
+                expected = _bundle_current_revision(module_groups, module_id)
+                effective = _effective_current_revision(store, module_groups, module_id)
+                if expected is not None and effective != expected:
+                    conflicts.append(
+                        f"{owner}:unpinned:{module_id}@{expected}->{effective}"
+                    )
+                target_revision = effective
+            else:
+                # An explicit pin is the author's contract; never compare it
+                # against the target's current revision.
+                target_revision = revision
+            if target_revision is None:
+                continue
+            key = (module_id, target_revision)
+            if key in visited_modules:
+                continue
+            visited_modules.add(key)
+            module = module_groups.get(module_id, {}).get(target_revision)
+            if module is None:
+                try:
+                    module = store.get_module(module_id, target_revision)
+                except WorkflowNotFound:
+                    continue
+            walk_module_refs(f"module:{module_id}", _module_refs(module))
+
+    for definition, _target_id, _skipped in definition_plans:
+        walk_module_refs(
+            f"definition:{definition.definitionId}",
+            _definition_module_refs(definition),
+        )
+    for module_id, revisions in module_groups.items():
+        for module in revisions.values():
+            walk_module_refs(f"module:{module_id}", _module_refs(module))
 
     if conflicts:
         raise WorkflowConflict(

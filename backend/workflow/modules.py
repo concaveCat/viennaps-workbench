@@ -594,7 +594,7 @@ class _Expansion:
             if isinstance(raw_value, str):
                 _, kind, source, field_refs = _resolve_text(raw_value, scope.variables)
             else:
-                field_refs = []
+                field_refs = set()
                 _collect_references(raw_value, field_refs)
                 kind = "expression" if field_refs else "literal"
                 source = None
