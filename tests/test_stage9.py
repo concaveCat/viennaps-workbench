@@ -527,7 +527,10 @@ class Stage9GpuMatrixTests(unittest.TestCase):
                 self.assertTrue(capability_verified(row["dimension"], row["model"], row["operation"],
                                                     row["boundaryXY"], "GPU_DISK", schema_version=7,
                                                     **signature))
-        for spec in (row for row in specialized_catalog()["models"] if row["usesFlux"]):
+        fin_evidence_models = {item["model"].split(":", 1)[1] for item in masks}
+        self.assertNotIn("faradayCage", fin_evidence_models)
+        for spec in (row for row in specialized_catalog()["models"]
+                     if row["usesFlux"] and row["id"] in fin_evidence_models):
             for dimension, mode in ((2, "direct"), (3, "direct"), (3, "extruded")):
                 row = next(item for item in masks if item["model"] == f"specialized:{spec['id']}"
                            and item["dimension"] == dimension and item["finExtrusionMode"] == mode)
@@ -714,7 +717,7 @@ class Stage9GpuMatrixTests(unittest.TestCase):
 
     def test_verified_specialized_gpu_models_validate_and_select_without_fallback(self):
         for spec in specialized_catalog()["models"]:
-            for dimension in (2, 3):
+            for dimension in spec.get("dimensions") or (2, 3):
                 with self.subTest(model=spec["id"], dimension=dimension):
                     project = make_project(spec["id"], dimension)
                     project["solver"]["enginePreference"] = "gpu"
@@ -723,8 +726,12 @@ class Stage9GpuMatrixTests(unittest.TestCase):
                     self.assertEqual(select_engine(normalized, normalized["steps"][0]),
                                      "GPU_DISK" if spec["usesFlux"] else "not-applicable")
                     signature = gpu_project_signature(project, project["steps"][0])
+                    # Experimental entries are allowlisted and runnable on CPU
+                    # (covered by test_engine_batch1_specialized.py) but have no
+                    # archived Stage 9 GPU acceptance row.
                     self.assertEqual(capability_verified(dimension, f"specialized:{spec['id']}", spec["operation"],
-                                                        "reflective", "GPU_DISK", schema_version=7, **signature), spec["usesFlux"])
+                                                        "reflective", "GPU_DISK", schema_version=7, **signature),
+                                     spec["usesFlux"] and not spec.get("experimental"))
 
     def test_schema7_gpu_requests_route_to_native_even_without_a_matching_evidence_row(self):
         project = make_project("sf6o2", 2)
