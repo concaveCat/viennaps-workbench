@@ -1207,7 +1207,7 @@ class WorkflowStore:
         }
 
     def _reconcile_segment(self, segment_id: str) -> None:
-        from .. import storage
+        from .. import snapshots, storage
 
         with self._connect() as connection:
             row = connection.execute(
@@ -1240,9 +1240,9 @@ class WorkflowStore:
 
         result_digest = None
         try:
-            result_path = storage.read_json(run_dir / f"{row['through_step_id']}.json")
-            result_digest = snapshot_content_hash(result_path)
-        except (FileNotFoundError, OSError, ValueError):
+            snapshot_path = snapshots.ensure_materialized(run_dir, row["through_step_id"])
+            result_digest = snapshot_content_hash(storage.read_json(snapshot_path))
+        except (FileNotFoundError, OSError, RuntimeError, ValueError):
             pass
         self.finish_segment(
             segment_id,

@@ -197,6 +197,7 @@ class EquivalenceEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first["status"], "succeeded", first)
         before = json_body(await asgi_request(f"/api/v1/workflow/routes/{initial.route.routeId}"))["plan"]
         prefix_digest = next(item for item in before["segments"] if item["segmentId"] == s1.segmentId)["resultDigest"]
+        self.assertRegex(prefix_digest or "", r"^[a-f0-9]{64}$")
         from backend.workflow.routes import CheckpointRefV1
         checkpoint = CheckpointRefV1.model_validate(first["endCheckpointRef"])
         a2 = a2.model_copy(update={"baseCheckpointRef": checkpoint})
@@ -230,6 +231,7 @@ class EquivalenceEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report["status"], "established", report)
         after = json_body(await asgi_request(f"/api/v1/workflow/routes/{initial.route.routeId}"))["plan"]
         self.assertEqual(next(item for item in after["segments"] if item["segmentId"] == s1.segmentId)["resultDigest"], prefix_digest)
+        self.assertRegex(next(item for item in after["segments"] if item["segmentId"] == s2.segmentId)["resultDigest"] or "", r"^[a-f0-9]{64}$")
 
 
 if __name__ == "__main__":

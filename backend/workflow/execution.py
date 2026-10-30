@@ -6,7 +6,7 @@ import threading
 import time
 from typing import Any
 
-from .. import storage
+from .. import snapshots, storage
 from ..models import DomainStateRef, FixedRandom, ProjectV7
 from ..validation import ProjectInputError, validate_project
 from .hashing import full_project_hash
@@ -84,8 +84,9 @@ def _finish_from_manifest(store: WorkflowStore, segment_id: str, run_id: str, st
         segment = store.get_segment(segment_id)
         row = next((item for item in manifest.get("snapshots", []) if item.get("stepId") == segment.throughStepId), None)
         try:
-            result_digest = snapshot_content_hash(storage.read_json(run_dir / f"{segment.throughStepId}.json"))
-        except (FileNotFoundError, OSError, ValueError):
+            result_path = snapshots.ensure_materialized(run_dir, segment.throughStepId)
+            result_digest = snapshot_content_hash(storage.read_json(result_path))
+        except (FileNotFoundError, OSError, RuntimeError, ValueError):
             result_digest = None
         state = None if row is None else row.get("nativeState")
         if isinstance(state, dict) and state.get("stateId"):
