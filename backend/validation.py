@@ -690,6 +690,15 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
         prefix = f"steps[{index}].nativeParameters"
         params = step.nativeParameters
         if step.nativeModel == "geometricTrenchDeposition":
+            # The native closed form uses absolute z and the initial-structure
+            # bound below is only valid when this is the first enabled step.
+            # A later step can raise/lower the surface and move it outside the
+            # validated span; reject instead of guessing an operation chain.
+            if any(step_value(previous, "enabled") for previous in project.steps[:index]):
+                issues.append(FieldIssue(
+                    f"steps[{index}].nativeModel",
+                    "GeometricTrenchDeposition must be the first enabled step; its native radius formula is "
+                    "evaluated from absolute z and the validated vertical span cannot account for earlier operations"))
             # The native closed form is a*(1-|z|/depth)^n+b. A fractional n on
             # a negative base is NaN; the installed binding does not guard it.
             n_value = params.get("n")

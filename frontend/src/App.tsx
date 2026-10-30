@@ -1943,9 +1943,12 @@ export default function App() {
       return !!spec?.dimensions?.length && !spec.dimensions.includes(dimension);
     });
     const droppedSpecializedIds = new Set(droppedSpecialized.map(step => step.id));
-    const droppedNotice = droppedSpecialized.length
-      ? `已移除不支持的专用模型：${droppedSpecialized.map(step => step.nativeModel).join('、')}。`
-      : droppedGdsBoolean ? '已移除 GDS 布尔步骤（仅支持 3D GDS 项目）。' : '';
+    const droppedNotice = [
+      droppedSpecialized.length
+        ? `已移除不支持的专用模型：${droppedSpecialized.map(step => step.nativeModel).join('、')}。`
+        : '',
+      droppedGdsBoolean ? '已移除 GDS 布尔步骤（仅支持 3D GDS 项目）。' : '',
+    ].filter(Boolean).join(' ');
     const convertedSteps = source.steps
       .filter(step => !(dimension === 2 && step.model === 'gdsBoolean') && !droppedSpecializedIds.has(step.id))
       .map(step => {
