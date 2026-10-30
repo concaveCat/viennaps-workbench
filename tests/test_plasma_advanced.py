@@ -325,6 +325,30 @@ class AdvancedHashStability(unittest.TestCase):
 
 
 class AdvancedConstructionPath(unittest.TestCase):
+    def materialized_advanced(self, model_id: str) -> dict:
+        """Build the object a client gets by filling every published default."""
+        spec = advanced_spec(model_id)
+        advanced: dict = {}
+        for name, block in spec["blocks"].items():
+            advanced[name] = {field["key"]: field["default"] for field in block["fields"]}
+        for field in spec["scalars"]:
+            advanced[field["key"]] = field["default"]
+        for row in spec["maps"]:
+            advanced[row["key"]] = {"default": row["default"]}
+        return advanced
+
+    def test_materialising_catalog_defaults_keeps_the_effective_values(self):
+        for dimension in (2, 3):
+            for model_id in PLASMA_MODELS:
+                with self.subTest(model=model_id, dimension=dimension):
+                    _model, _extra, empty, _duration = build(
+                        plasma_project(model_id, dimension, advanced={}), dimension)
+                    _model, _extra, materialized, _duration = build(
+                        plasma_project(model_id, dimension,
+                                       advanced=self.materialized_advanced(model_id)), dimension)
+                    self.assertEqual(materialized["nativeAdvancedParameters"]["effective"],
+                                     empty["nativeAdvancedParameters"]["effective"])
+
     def test_empty_advanced_uses_the_parameter_object_overload_with_identical_values(self):
         for dimension in (2, 3):
             for model_id in PLASMA_MODELS:
