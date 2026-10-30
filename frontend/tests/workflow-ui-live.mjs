@@ -21,7 +21,7 @@ try {
   await page.getByRole('button', { name: '去 02 定义流程' }).click();
   await page.getByRole('button', { name: '编译流程' }).click();
   await page.getByText(/编译成功/).waitFor();
-  await page.getByRole('button', { name: '创建 Route / 去 03' }).click();
+  await page.getByRole('button', { name: /^(创建 Route|去 03)$/ }).click();
   await page.locator('.wf-status.planned').first().waitFor();
   await page.getByRole('button', { name: '执行当前 Segment' }).click();
   await page.locator('.wf-status.succeeded').first().waitFor({ timeout: 30000 });
@@ -29,7 +29,7 @@ try {
   await page.getByRole('button', { name: '测量', exact: true }).click();
   await page.getByText(/测量 · 已测量/).waitFor({ timeout: 30000 });
   await page.getByText(/2\.0000 um/).first().waitFor({ timeout: 30000 });
-  await page.getByText(/binding: verified/).waitFor({ timeout: 30000 });
+  await page.getByText(/绑定 \(binding\)：已绑定/).waitFor({ timeout: 30000 });
   await page.screenshot({ path: screenshot, fullPage: true });
 
   await page.getByRole('button', { name: '传统工作区' }).click();

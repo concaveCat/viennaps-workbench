@@ -23,11 +23,11 @@ try {
   await page.getByRole('button', { name: '去 02 定义流程' }).click();
   await page.getByRole('button', { name: '编译流程' }).click();
   await page.getByText(/编译成功/).waitFor();
-  await page.getByRole('button', { name: '创建 Route / 去 03' }).click();
+  await page.getByRole('button', { name: /^(创建 Route|去 03)$/ }).click();
   await page.getByRole('button', { name: '执行全部 Segment' }).click();
   await page.locator('.wf-status.succeeded').first().waitFor({ timeout: 60000 });
   await page.getByRole('button', { name: '测量', exact: true }).click();
-  await page.getByText(/binding: verified/).first().waitFor();
+  await page.getByText(/绑定 \(binding\)：已绑定/).first().waitFor();
 
   await page.getByRole('button', { name: '04 实验' }).click();
   for (const index of [1, 2, 3]) {

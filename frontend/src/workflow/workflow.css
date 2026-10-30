@@ -734,7 +734,7 @@ body {
 .spx-library-manager-tabs { display: flex; border-bottom: 1px solid var(--spx-line); background: #f4f5f6; }
 .spx-library-manager-tabs button { height: 27px; padding: 0 14px; border: 0; border-right: 1px solid var(--spx-line); background: transparent; color: #34404b; font-size: 11px; cursor: pointer; }
 .spx-library-manager-tabs button.active { background: #fff; color: var(--spx-blue); font-weight: 600; }
-.spx-library-manager-body { min-height: 0; display: grid; grid-template-columns: 230px 46px minmax(0, 1fr); }
+.spx-library-manager-body { min-height: 0; display: grid; grid-template-columns: 268px 46px minmax(0, 1fr); }
 .spx-library-manager-list { overflow: auto; border-right: 1px solid var(--spx-line); background: #fbfcfd; padding: 4px; }
 .spx-library-manager-list button { display: block; width: 100%; text-align: left; border: 0; background: transparent; padding: 5px 6px; font-size: 11px; color: #26313a; cursor: pointer; border-bottom: 1px solid #e6eaee; }
 .spx-library-manager-list button:hover { background: #f2f7fc; }
@@ -785,3 +785,145 @@ body {
 .spx-library-category-head.compact { border-top: 1px solid var(--spx-line-soft); padding: 4px 6px; }
 .spx-library-category-head .wf-button { width: auto; margin: 0; padding: 2px 6px; font-size: 10px; }
 .spx-library-load-error { color: var(--spx-red); font-size: 10px; }
+
+/* ---------------------------------------------------------------------------
+   IA batch 2: readable primary actions, separated flow actions, structure view,
+   material targets, layer legend and text status badges.
+--------------------------------------------------------------------------- */
+
+/* Primary buttons must stay readable in every state (hover used to win the
+   cascade over .wf-button.primary and paint white text on a light background). */
+.wf-button.primary:hover:not(:disabled) {
+  background: #084a8c;
+  border-color: #084a8c;
+  color: #fff;
+}
+.wf-button.primary:active:not(:disabled) { background: #063a70; border-color: #063a70; color: #fff; }
+.wf-button.primary:disabled {
+  background: #dfe5ea;
+  border-color: #c7cfd6;
+  color: #5f6b76;
+  opacity: 1;
+}
+.wf-button:focus-visible { outline: 2px solid var(--spx-blue); outline-offset: 1px; }
+.wf-button.primary:focus-visible { outline-color: #084a8c; }
+
+/* Flow view tabs (left) and actions (right) are separate bars, not one row. */
+.spx-flow-bar { display: flex; align-items: center; gap: 10px; padding: 5px 0 7px; border-bottom: 1px solid var(--spx-line-soft); margin-bottom: 8px; }
+.spx-flow-actions { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+.spx-flow-actions .wf-button { width: auto; margin: 0; min-width: 96px; }
+.spx-compile-badge { display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--spx-line); background: #f4f5f6; color: #5f6b76; padding: 2px 7px; font-size: 10px; }
+.spx-compile-badge.ok { border-color: #a9c9b0; background: #edf7ef; color: var(--spx-green); }
+.spx-compile-badge.stale { border-color: #e0c68d; background: #fff6e1; color: var(--spx-amber); }
+.spx-rebuild { display: flex; align-items: center; gap: 6px; padding: 5px 8px; margin: 0 0 8px; border: 1px solid #e0c68d; background: #fffaf0; color: #6b4a00; font-size: 10px; }
+.spx-rebuild .wf-button { width: auto; margin: 0; padding: 3px 8px; }
+
+.spx-compile-details { margin-top: 5px; border-top: 1px dashed var(--spx-line-soft); padding-top: 4px; }
+.spx-compile-details > summary { cursor: pointer; color: var(--spx-blue); font-size: 10px; }
+.spx-compile-details dl { display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: 2px 8px; margin: 5px 0 0; font-size: 10px; }
+.spx-compile-details dt { color: var(--spx-muted); }
+.spx-compile-details dd { margin: 0; font-family: "Consolas", monospace; overflow-wrap: anywhere; }
+
+/* 03 structure view: the run result is the main object, not a run id. */
+.wf-structure-panel { border: 1px solid var(--spx-line); background: #fff; margin: 8px 0 10px; }
+.wf-structure-head { display: flex; align-items: center; gap: 8px; padding: 4px 7px; background: #eef1f4; border-bottom: 1px solid var(--spx-line); }
+.wf-structure-head strong { font-size: 11px; }
+.wf-structure-head select { height: 22px; border: 1px solid var(--spx-line); background: #fff; font-size: 11px; padding: 0 4px; max-width: 260px; }
+.wf-structure-head .wf-structure-step { color: #26313a; font-size: 11px; }
+.wf-structure-head .wf-muted { margin: 0 0 0 auto; }
+.wf-structure-body { display: grid; grid-template-columns: minmax(0, 1fr) 172px; gap: 8px; padding: 7px; }
+.wf-structure-canvas { width: 100%; height: 300px; display: block; background: #f8fafb; border: 1px solid var(--spx-line-soft); }
+.wf-structure-empty { padding: 10px; }
+.wf-structure-side { min-width: 0; display: grid; align-content: start; gap: 5px; }
+.wf-structure-stats { display: grid; grid-template-columns: 58px minmax(0, 1fr); gap: 2px 6px; font-size: 10px; }
+.wf-structure-stats span { color: var(--spx-muted); }
+.wf-structure-stats code { font-family: "Consolas", monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wf-structure-legend { display: grid; gap: 2px; border-top: 1px solid var(--spx-line-soft); padding-top: 5px; }
+.wf-structure-legend div { display: flex; align-items: center; gap: 5px; font-size: 10px; color: #26313a; }
+.wf-structure-legend i { width: 10px; height: 10px; border: 1px solid #8a949c; display: inline-block; flex: none; }
+.wf-structure-legend span { margin-left: auto; color: var(--spx-muted); font-family: "Consolas", monospace; }
+.wf-axes line, .wf-axes path { stroke: #9aa3ab; }
+.wf-axes text { fill: #5f6b76; font-family: "Consolas", monospace; }
+.wf-marker line { stroke: #b42318; stroke-dasharray: 4 3; }
+.wf-marker text { fill: #b42318; font-family: "Consolas", monospace; }
+
+/* Measurement recipe: every field carries a visible label and unit. */
+.wf-recipe-fields { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)); gap: 6px 10px; }
+.wf-recipe-fields label { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.wf-recipe-fields label > span { color: var(--spx-muted); font-size: 10px; }
+.wf-recipe-fields input, .wf-recipe-fields select { width: 100%; }
+.wf-recipe-note { grid-column: 1 / -1; margin: 0; }
+
+/* Material insert feedback in 02. */
+.spx-material-badge { display: flex; align-items: center; gap: 6px; margin: 5px 0 0; padding: 4px 6px; border: 1px solid #a9c9b0; background: #f2fbf4; font-size: 10px; color: #1f5c33; }
+.spx-material-badge i { width: 10px; height: 10px; border: 1px solid #8a949c; flex: none; }
+.spx-material-badge code { font-family: "Consolas", monospace; }
+.spx-material-badge .spx-link { margin-left: auto; }
+.spx-target-note { margin: 4px 0 0; padding: 4px 6px; border-left: 2px solid var(--spx-blue); background: #f5f8fb; color: #34404b; font-size: 10px; }
+.spx-material-blocked { margin: 4px 0 0; color: var(--spx-red); font-size: 10px; }
+
+/* Left tree status is text, never a fake checkbox. */
+.spx-tree-status { margin-left: auto; border: 1px solid var(--spx-line); background: #f4f5f6; color: #5f6b76; padding: 0 4px; font: 9px "Consolas", monospace; white-space: nowrap; }
+.spx-tree-status.planned { background: #f4f5f6; color: #5f6b76; }
+.spx-tree-status.running { background: #fff6e1; border-color: #e0c68d; color: var(--spx-amber); }
+.spx-tree-status.succeeded, .spx-tree-status.measured { background: #edf7ef; border-color: #a9c9b0; color: var(--spx-green); }
+.spx-tree-status.failed { background: #fdf1f0; border-color: #e3b6b2; color: var(--spx-red); }
+.spx-tree-status.stale { background: #fff6e1; border-color: #e0c68d; color: var(--spx-amber); }
+.spx-tree-value { margin-left: auto; }
+.spx-tree-legend { display: flex; flex-wrap: wrap; gap: 4px 8px; padding: 3px 7px 6px; color: var(--spx-muted); font-size: 9px; }
+.spx-tree-legend span { display: inline-flex; align-items: center; gap: 3px; }
+
+/* GDS / layout area: bounded preview, axes, layer legend. */
+.spx-clip-canvas { height: 240px; }
+.spx-layer-map { display: grid; gap: 4px; margin-top: 4px; }
+.spx-layer-map-row { display: grid; grid-template-columns: 74px minmax(0, 1fr) 14px; align-items: center; gap: 6px; font-size: 10px; }
+.spx-layer-map-row select { height: 22px; border: 1px solid var(--spx-line); background: #fff; font-size: 10px; padding: 0 3px; }
+.spx-layer-map-row i { width: 12px; height: 12px; border: 1px solid #8a949c; }
+.spx-layer-legend { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 4px; font-size: 10px; color: #34404b; }
+.spx-layer-legend span { display: inline-flex; align-items: center; gap: 4px; }
+.spx-layer-legend i { width: 10px; height: 10px; border: 1px solid #8a949c; }
+.spx-clip-conflict { margin: 4px 0; padding: 5px 7px; border: 1px solid #b9cfe4; border-left: 3px solid var(--spx-blue); background: #f5f8fb; color: #26313a; font-size: 10px; }
+.spx-lock-note { margin: 3px 0 0; padding: 3px 6px; border-left: 2px solid #b9c0c7; background: #f2f3f5; color: #5f6b76; font-size: 10px; }
+.spx-layout-list { display: grid; gap: 3px; margin: 5px 0; }
+.spx-layout-list button { display: flex; align-items: center; gap: 8px; text-align: left; border: 1px solid var(--spx-line); background: #fff; padding: 4px 6px; font-size: 11px; cursor: pointer; }
+.spx-layout-list button:hover { border-color: var(--spx-blue); background: #f7fbff; }
+.spx-layout-list button.active { border-color: var(--spx-blue); background: var(--spx-blue-soft); color: #0a3f73; }
+.spx-layout-list button .spx-count { margin-left: auto; }
+.spx-clip-summary-list { display: grid; gap: 3px; }
+.spx-clip-summary-list button { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 1px 8px; text-align: left; border: 1px solid var(--spx-line); background: #fff; padding: 3px 6px; cursor: pointer; }
+.spx-clip-summary-list button.active { border-color: var(--spx-blue); background: var(--spx-blue-soft); }
+.spx-clip-summary-list strong { font-size: 11px; font-weight: 600; }
+.spx-clip-summary-list span { color: var(--spx-muted); font-size: 9px; }
+
+/* Library list rows: real color swatch + catalog/material, duplicates marked. */
+.spx-library-manager-list button.spx-library-row { display: grid; grid-template-columns: 14px minmax(0, 1fr); gap: 1px 6px; align-items: start; }
+.spx-library-row i { grid-column: 1; grid-row: 1 / span 3; width: 12px; height: 12px; border: 1px solid #8a949c; margin-top: 2px; }
+.spx-library-row strong { grid-column: 2; font-size: 11px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.spx-library-row span { grid-column: 2; color: var(--spx-muted); font-size: 9px; overflow: hidden; white-space: normal; line-height: 1.3; }
+.spx-library-row .spx-library-row-id { font-family: "Consolas", monospace; }
+.spx-library-manager-actions button.text { width: 100%; height: auto; padding: 4px 3px; font-size: 10px; }
+.spx-library-manager-actions .spx-library-confirm-delete { width: 100%; border: 1px solid #e3b6b2; background: #fdf1f0; color: var(--spx-red); padding: 3px; font-size: 9px; }
+.spx-library-reason { grid-column: 1 / -1; padding: 4px 6px; border-left: 2px solid var(--spx-amber); background: #fffaf0; color: #6b4a00; font-size: 10px; }
+.spx-library-form-actions { grid-column: 1 / -1; display: flex; align-items: center; gap: 6px; border-top: 1px solid var(--spx-line-soft); padding-top: 6px; }
+
+/* Project persistence status and recent-project list (main workspace, no modal). */
+.spx-project-status { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; margin: 8px 10px 0; padding: 5px 8px; border: 1px solid var(--spx-line-soft); background: #f5f7f9; font-size: 10px; color: var(--spx-muted); }
+.spx-project-status strong { color: var(--spx-amber); font-size: 11px; }
+.spx-project-status strong.ok { color: var(--spx-green); }
+.spx-project-notice { color: #26313a; }
+.spx-recent-projects { margin-top: 10px; }
+.spx-project-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; align-items: stretch; }
+.spx-project-row + .spx-project-row { margin-top: 3px; }
+.spx-project-open { display: grid; gap: 1px; text-align: left; border: 1px solid var(--spx-line); background: #fff; padding: 4px 7px; cursor: pointer; font: inherit; color: var(--spx-ink); }
+.spx-project-open:hover { border-color: var(--spx-blue); background: #f7fbff; }
+.spx-project-open strong { font-size: 11px; font-weight: 600; }
+.spx-project-open span { color: var(--spx-muted); font-size: 9px; }
+.spx-project-row .wf-button { width: auto; margin: 0; padding: 2px 8px; font-size: 10px; }
+
+/* Material swatch inside library rows and layer pickers. */
+.spx-library-swatch { display: inline-block; width: 9px; height: 9px; border: 1px solid #8a949c; margin-right: 4px; vertical-align: baseline; }
+.spx-layer-pick { display: grid; grid-template-columns: 14px auto minmax(70px, 1fr) 12px; align-items: center; gap: 4px; }
+.spx-layer-pick select { height: 20px; border: 1px solid var(--spx-line); background: #fff; font-size: 10px; padding: 0 2px; }
+.spx-layer-pick i { width: 11px; height: 11px; border: 1px solid #8a949c; }
+.wf-table tbody tr.material-match { background: #f2fbf4; }
+.wf-table tbody tr.material-match td:first-child { box-shadow: inset 2px 0 0 var(--spx-green); }

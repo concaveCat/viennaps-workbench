@@ -83,11 +83,11 @@ try {
   await page.getByText(/模块化流程已编译 · 4 步/).waitFor();
 
   // P4-2: split route, execute prefix, measure, decide, execute branch, replay.
-  await page.getByRole('button', { name: '创建 Route / 去 03' }).click();
+  await page.getByRole('button', { name: /^(创建 Route|去 03)$/ }).click();
   await page.getByRole('button', { name: '执行当前 Segment' }).click();
   await page.locator('.wf-status.succeeded').first().waitFor({ timeout: 60000 });
   await page.getByRole('button', { name: '测量', exact: true }).click();
-  await page.getByText(/binding: verified/).first().waitFor();
+  await page.getByText(/绑定 \(binding\)：已绑定/).first().waitFor();
   await page.getByText('高级：分支与测量决策').click();
   await page.getByLabel('决策阈值').fill('0.5');
   await page.getByRole('button', { name: '测量并生成分支' }).click();
@@ -149,7 +149,7 @@ try {
   await page.getByRole('textbox', { name: '库材料颜色', exact: true }).fill('#123456');
   assert.equal(await page.locator('.spx-color-swatch.invalid').count(), 0);
   assert.match(await page.locator('.spx-color-swatch').getAttribute('style') ?? '', /rgb\(18, 52, 86\)/);
-  await page.getByRole('button', { name: 'Save' }).click();
+  await page.getByRole('button', { name: '保存', exact: true }).click();
   await page.getByText('已新增 P4 SiO2 preset').waitFor();
   await page.locator('.spx-library-manager-list button').filter({ hasText: 'P4 SiO2 preset' }).click();
   assert.equal(await page.getByLabel('库条目名称').inputValue(), 'P4 SiO2 preset');

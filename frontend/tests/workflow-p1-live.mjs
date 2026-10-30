@@ -82,13 +82,13 @@ try {
   await page.getByRole('button', { name: '去 02 定义流程' }).click();
   await page.getByRole('button', { name: '编译流程' }).click();
   await page.getByText(/编译成功/).waitFor();
-  await page.getByRole('button', { name: '创建 Route / 去 03' }).click();
+  await page.getByRole('button', { name: /^(创建 Route|去 03)$/ }).click();
   await page.getByRole('button', { name: '执行全部 Segment' }).click();
   await page.locator('.wf-status.succeeded').first().waitFor({ timeout: 60000 });
 
   // Two recipe versions: v1 default, v2 after changing the reference height.
   await page.getByRole('button', { name: '测量', exact: true }).click();
-  await page.getByText(/binding: verified/).first().waitFor();
+  await page.getByText(/绑定 \(binding\)：已绑定/).first().waitFor();
   await page.getByLabel('参考高度').fill('0.1');
   await page.getByRole('button', { name: '测量', exact: true }).click();
   const versionTwoRow = page.locator('.wf-table tbody tr').filter({ hasText: / v2 · / });
@@ -104,15 +104,17 @@ try {
 
   // Template with ${duration}, applied and diffed.
   await page.getByRole('button', { name: '02 流程' }).click();
+  await page.getByText('模板（可选）').click();
   await page.getByRole('button', { name: '保存当前步骤为模板' }).click();
   await page.getByLabel('模板变量值').fill('0.03');
   await page.getByRole('button', { name: '替换流程' }).click();
+  await page.getByRole('button', { name: '确认替换' }).click();
   await waitForCompile(
     latest => latest.sourceMap.length === 5 && authoredDuration(latest, 'p1_step_04') === 0.03,
     'replace template with two 0.03 steps',
   );
   await page.getByRole('button', { name: '比较上一版' }).click();
-  await page.getByText('Compile diff').waitFor();
+  await page.getByText('编译差异').waitFor();
   await page.getByText(/0\.01 → 0\.03/).first().waitFor();
 
   // Insert a two-step template: original steps must survive with new authored ids.
@@ -130,9 +132,9 @@ try {
   assert.ok(insertedIds.every(stepId => stepId.startsWith('tpl_')), JSON.stringify(insertedIds));
   assert.deepEqual(insertedIds.map(stepId => authoredDuration(insertedCompile, stepId)), [0.03, 0.03]);
   await page.getByRole('button', { name: '比较上一版' }).click();
-  await page.getByText(/\+2 \/ -0 \/ moved 0 \/ changed 0/).waitFor();
+  await page.getByText(/\+2 \/ -0 \/ 移动 0 \/ 修改 0/).waitFor();
 
-  await page.getByRole('button', { name: '创建 Route / 去 03' }).click();
+  await page.getByRole('button', { name: /^(创建 Route|去 03)$/ }).click();
   await page.getByRole('button', { name: '执行全部 Segment' }).click();
   await page.locator('.wf-status.succeeded').first().waitFor({ timeout: 60000 });
 

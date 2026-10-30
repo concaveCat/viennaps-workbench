@@ -26,7 +26,7 @@ try {
   await page.goto(`${baseUrl}/`);
   await page.getByText('ViennaPS Workbench').first().waitFor();
   await page.locator('input[type=file]').nth(0).setInputFiles(layoutPath);
-  await page.locator('.spx-file-name').filter({ hasText: 'two-structure-two-layer.gds' }).waitFor();
+  await page.locator('.spx-file-name').filter({ hasText: 'two-structure-two-layer.gds' }).first().waitFor();
   await page.locator('input[type=file]').nth(1).setInputFiles(projectPath);
   await page.getByRole('button', { name: 'GDS / Layout' }).click();
   await page.getByRole('button', { name: '注册为 Layout' }).click();
@@ -38,11 +38,11 @@ try {
   // Three clips: two structures and one cropped/annotated region.
   await page.getByLabel('Clip 名称').fill('clip A');
   await page.getByRole('button', { name: '保存 Clip' }).click();
-  await page.locator('.wf-clip-list button').filter({ hasText: 'clip A' }).waitFor();
+  await page.locator('.spx-clip-summary-list button').filter({ hasText: 'clip A' }).waitFor();
   await page.getByLabel('版图结构').selectOption('CELL_B');
   await page.getByLabel('Clip 名称').fill('clip B');
   await page.getByRole('button', { name: '保存 Clip' }).click();
-  await page.locator('.wf-clip-list button').filter({ hasText: 'clip B' }).waitFor();
+  await page.locator('.spx-clip-summary-list button').filter({ hasText: 'clip B' }).waitFor();
   await page.getByLabel('版图结构').selectOption('CELL_A');
   for (const [label, value] of [['Clip x0', '0.5'], ['Clip y0', '0.2'], ['Clip x1', '1.5'], ['Clip y1', '0.8']]) {
     await page.getByLabel(label).fill(value);
@@ -51,7 +51,7 @@ try {
   await page.locator('.wf-clip-canvas polygon').first().waitFor();
   await page.getByLabel('Clip 名称').fill('clip C');
   await page.getByRole('button', { name: '保存 Clip' }).click();
-  await page.locator('.wf-clip-list button').filter({ hasText: 'clip C' }).waitFor();
+  await page.locator('.spx-clip-summary-list button').filter({ hasText: 'clip C' }).waitFor();
   await page.getByLabel('标注文本').fill('center');
   await page.getByLabel('标注 X').fill('0.5');
   await page.getByLabel('标注 Y').fill('0.3');
@@ -64,7 +64,7 @@ try {
 
   const hashes = [];
   for (const name of ['clip A', 'clip B', 'clip C']) {
-    await page.locator('.wf-clip-list button').filter({ hasText: name }).click();
+    await page.locator('.spx-clip-summary-list button').filter({ hasText: name }).click();
     const [response] = await Promise.all([
       page.waitForResponse(item => item.url().includes('/compile') && item.request().method() === 'POST'),
       page.getByRole('button', { name: '用此 Clip 编译' }).click(),
@@ -79,11 +79,11 @@ try {
 
   // Run the last clip compile and take a measurement so the DOE has an active recipe.
   await page.getByRole('button', { name: '02 流程' }).click();
-  await page.getByRole('button', { name: '创建 Route / 去 03' }).click();
+  await page.getByRole('button', { name: /^(创建 Route|去 03)$/ }).click();
   await page.getByRole('button', { name: '执行全部 Segment' }).click();
   await page.locator('.wf-status.succeeded').first().waitFor({ timeout: 60000 });
   await page.getByRole('button', { name: '测量', exact: true }).click();
-  await page.getByText(/binding: verified/).first().waitFor();
+  await page.getByText(/绑定 \(binding\)：已绑定/).first().waitFor();
 
   await page.getByRole('button', { name: '04 实验' }).click();
   const valueRows = [[0, '0.01,0.02'], [1, '0.01,0.02'], [2, '0.01,0.02']];
