@@ -629,6 +629,34 @@ def gpu_project_signature(project: dict[str, Any], step: dict[str, Any]) -> dict
     }
 
 
+
+
+def _initial_vertical_extent(project: Any) -> float:
+    """Conservative max |z| of the initial geometry.
+
+    GeometricTrenchDeposition evaluates ``a*(1-|z|/trenchDepth)**n+b`` from
+    absolute z. If the initial structure reaches beyond ``trenchDepth``, the
+    base is negative or >1 and a large integer exponent can overflow. Require
+    the native depth to cover the initial vertical span.
+    """
+    geometry = getattr(project, "geometry", {}) or {}
+    if not isinstance(geometry, dict):
+        return 0.0
+    kind = geometry.get("kind")
+    if kind == "plane":
+        return abs(float(geometry.get("height", 0.0)))
+    if kind in {"trench", "hole"}:
+        return max(abs(float(geometry.get("depth", 0.0))),
+                   abs(float(geometry.get("maskHeight", 0.0))))
+    if kind == "fin":
+        return max(abs(float(geometry.get("height", 0.0))),
+                   abs(float(geometry.get("maskHeight", 0.0))))
+    if kind == "stack":
+        base = float(geometry.get("baseHeight", 0.0))
+        return max(abs(base), abs(base) + sum(abs(float(row.get("thickness", 0.0)))
+                                                for row in geometry.get("layers", [])))
+    return 0.0
+
 def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
     issues: list[FieldIssue] = []
     material_names = {row["name"] for row in _catalog_names()}
@@ -678,6 +706,16 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
                     value = 0.0
                 if value <= 0.0:
                     issues.append(FieldIssue(f"{prefix}.{key}", "must be positive"))
+            try:
+                depth = float(params.get("trenchDepth", 0))
+            except (TypeError, ValueError):
+                depth = 0.0
+            max_z = _initial_vertical_extent(project)
+            if depth < max_z:
+                issues.append(FieldIssue(
+                    f"{prefix}.trenchDepth",
+                    f"must be at least the initial structure's maximum |z| ({max_z:g} um); "
+                    "a shallower depth puts the native radius formula outside its valid range and can overflow"))
         for field in spec["fields"]:
             key = field["key"]
             path = f"{prefix}.{key}"
