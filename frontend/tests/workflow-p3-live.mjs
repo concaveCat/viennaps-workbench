@@ -42,6 +42,18 @@ try {
   await page.locator('.wf-marker').first().waitFor();
   assert.equal(await initialChip.getAttribute('aria-selected'), 'true');
   assert.ok(await page.locator('.wf-structure-legend i').count() >= 1, '2D legend must stay visible after switching steps');
+
+  // 2D structure readability: material fill under the interface line, a real
+  // height axis with ticks, and no fake XY/XZ/YZ selector on a 2D snapshot.
+  const structureSvg = page.locator('.wf-structure-canvas').first();
+  assert.ok(await structureSvg.locator('polygon.wf-fill').count() >= 1, '2D structure must fill the material below the surface');
+  const structureMarkup = await structureSvg.innerHTML();
+  assert.ok(structureMarkup.includes('高度 (µm)'), '2D structure must label the height axis in µm');
+  assert.ok(structureMarkup.includes('X (µm)'), '2D structure must label the X axis in µm');
+  assert.ok((await structureSvg.locator('.wf-tick').count()) >= 3, '2D structure must draw at least 3 ticks');
+  assert.match(structureMarkup, /表面高度|深度/, '2D structure must annotate the surface height or etched depth');
+  assert.equal(await page.locator('select[aria-label="结构视图轴"]').count(), 0, '2D must not offer XY/XZ/YZ axes');
+  assert.equal((await page.getByLabel('结构视图轴').innerText()).trim(), 'X – 高度');
   await page.screenshot({
     path: process.env.WORKFLOW_STRUCTURE_SCREENSHOT ?? '/tmp/workflow-p3-structure.png',
     fullPage: true,
@@ -93,15 +105,25 @@ try {
   const frame = page.frameLocator('iframe.wf-report-preview');
   await frame.locator('body').waitFor();
   assert.ok((await frame.locator('svg.report-svg').count()) >= 1, 'inline report preview must contain the structure view');
+  // The preview grows with the report body so the structure section is on the
+  // first screen instead of hidden behind a fixed 420 px frame.
+  const structureHeading = frame.getByRole('heading', { name: '结构视图' });
+  await structureHeading.waitFor();
+  const headingBox = await structureHeading.boundingBox();
+  const previewBox = await page.locator('iframe.wf-report-preview').boundingBox();
+  assert.ok(headingBox && previewBox, 'report preview and structure heading must be laid out');
+  assert.ok(headingBox.y + headingBox.height <= previewBox.y + previewBox.height + 1, 'structure heading must be visible inside the preview');
+  assert.ok(previewBox.height > 520, `preview must grow with the report (${previewBox.height}px)`);
   const [popup] = await Promise.all([
     page.waitForEvent('popup'),
     page.getByRole('button', { name: '打开报告' }).click(),
   ]);
   await popup.waitForLoadState();
   const reportText = await popup.locator('body').innerText();
-  for (const text of ['P3 UI report', 'ViennaPS', 'process window selected', '打印 / 保存为 PDF', 'metric_', 'measurement']) {
+  for (const text of ['P3 UI report', 'ViennaPS', 'process window selected', '打印 / 保存为 PDF', '结构视图', '结论']) {
     assert.ok(reportText.includes(text), `report must contain ${text}`);
   }
+  assert.doesNotMatch(reportText, /\b(planned|running|succeeded|failed)\b/, 'report statuses must be Chinese');
   assert.ok((await popup.locator('svg.report-svg').count()) >= 1);
   await popup.close();
 

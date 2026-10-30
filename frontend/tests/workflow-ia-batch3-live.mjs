@@ -101,6 +101,29 @@ try {
   assert.doesNotMatch(resultText, /succeeded|planned|running/, 'statuses must be Chinese');
   assert.doesNotMatch(resultText, /\d\.\d{8,}/, 'numbers must not leak float noise');
   assert.match(resultText, /成功/);
+  assert.match(resultHeaders, /µm/, 'result units must use the micro sign');
+  assert.doesNotMatch(resultText, /\bum\b/, 'result units must not fall back to "um"');
+  // 4 significant digits at most (`0.0002`, not `0.0002000001`).
+  const measuredCells = [
+    ...await page.locator('.wf-result-table .wf-repeat code').allInnerTexts(),
+    ...await page.locator('.wf-result-table tbody tr td:nth-child(4)').allInnerTexts(),
+    ...await page.locator('.wf-result-table tbody tr td:nth-child(5)').allInnerTexts(),
+  ];
+  for (const text of measuredCells) {
+    const digits = text.replace(/[^0-9]/g, '').replace(/^0+/, '');
+    assert.ok(digits.length <= 4, `result value must keep 4 significant digits: ${text}`);
+  }
+  // No cloud cost configured => no "$0.0000".
+  const queueSummary = await page.locator('.wf-summary').filter({ hasText: '队列' }).innerText();
+  assert.ok(!queueSummary.includes('$0.0000'), 'zero cost must not render as $0.0000');
+  assert.match(queueSummary, /本地 CPU · 无云成本/);
+
+  // The result table stays above the Output panel: the first three rows are
+  // visible without scrolling behind it.
+  const thirdRow = await page.locator('.wf-result-table tbody tr').nth(2).boundingBox();
+  const outputBox = await page.locator('.spx-output').boundingBox();
+  assert.ok(thirdRow && outputBox && thirdRow.y + thirdRow.height <= outputBox.y + 1,
+    'the first three result rows must not be covered by the Output panel');
 
   const experimentSummaries = (await getJson('/api/v1/workflow/experiments')).experiments;
   const experiment = await getJson(`/api/v1/workflow/experiments/${experimentSummaries[0].experimentId}`);
@@ -127,7 +150,47 @@ try {
   assert.ok((await page.locator('.wf-compare-canvas .wf-axes text').count()) > 0, 'each candidate view must draw axes/scale');
   const legend = await page.locator('.wf-compare-legend').first().innerText();
   assert.match(legend, /Si|材料/);
+
+  // Candidate table: readable run/step names, no raw ids in the main text.
+  const candidateTable = page.locator('[aria-label="候选表"]');
+  await candidateTable.waitFor();
+  assert.equal(await candidateTable.locator('tbody tr').count(), 3, 'candidate table lists every candidate');
+  const candidateText = await candidateTable.innerText();
+  assert.match(candidateText, /V1 · 0\.01 s/);
+  assert.doesNotMatch(candidateText, /(?:^|\s)(?:run_|s_|c_|exp_)[a-z0-9]{6,}/, 'candidate table must not show raw ids');
+  const compareMaterials = await page.locator('[aria-label="候选对比表"] tbody td:nth-child(5)').allInnerTexts();
+  assert.ok(compareMaterials.every(text => text.includes('无材料差异') || text.includes('：')), 'material delta must be readable');
+
+  // Metric table always exists with at least one row.
+  const metricTable = page.locator('[aria-label="测量指标表"]');
+  await metricTable.waitFor();
+  assert.ok(await metricTable.locator('tbody tr').count() >= 1, 'metric table must list the measurement');
+  const metricHeaders = await metricTable.locator('thead').innerText();
+  for (const header of ['Run', '步骤', '方法', '数值', '单位', '绑定状态']) {
+    assert.ok(metricHeaders.includes(header), `metric header must exist: ${header}`);
+  }
+  assert.doesNotMatch(await metricTable.innerText(), /(?:^|\s)(?:run_|s_|c_)[a-z0-9]{6,}/, 'metric table must not show raw ids');
+
   assert.equal(await page.locator('.wf-analysis-advanced[open]').count(), 0, 'process window / calibration stay folded by default');
+
+  // Process window validation stays next to the lower/upper inputs.
+  await page.locator('.wf-analysis-advanced > summary').click();
+  await page.getByLabel('窗口下限').fill('0.3');
+  await page.getByLabel('窗口上限').fill('0.0001');
+  await page.getByRole('button', { name: '计算窗口' }).click();
+  const windowError = page.locator('[aria-label="窗口校验错误"]');
+  await windowError.waitFor();
+  assert.match(await windowError.innerText(), /下限必须小于上限/);
+  const lowerBox = await page.getByLabel('窗口下限').boundingBox();
+  const errorBox = await windowError.boundingBox();
+  assert.ok(lowerBox && errorBox && Math.abs(errorBox.y - (lowerBox.y + lowerBox.height)) < 80,
+    'window error must sit right under the inputs');
+  assert.equal(await page.getByLabel('窗口下限').getAttribute('aria-invalid'), 'true');
+  await page.getByLabel('窗口下限').fill('0');
+  await page.getByLabel('窗口上限').fill('1');
+  await page.getByRole('button', { name: '计算窗口' }).click();
+  await page.locator('.wf-summary').filter({ hasText: '工艺窗口' }).waitFor();
+  assert.equal(await page.locator('[aria-label="窗口校验错误"]').count(), 0, 'fixing the inputs clears the inline error');
 
   // ---- 06: form above the button, then a report with structure + results.
   await page.getByRole('button', { name: '06 报告', exact: true }).click();
@@ -148,12 +211,14 @@ try {
   for (const text of ['P1 2D five-step fixture', 'Route', '测量', '实验']) {
     assert.ok(summaryText.includes(text), `report summary must contain ${text}`);
   }
+  assert.doesNotMatch(summaryText, /\b(flow_|c_|run_|exp_|metric_|rep_)[a-z0-9]{6,}/, 'report summary must not show raw ids');
   const frame = page.frameLocator('iframe.wf-report-preview');
   await frame.locator('body').waitFor();
   const reportText = await frame.locator('body').innerText();
   for (const text of ['IA3 报告', 'IA3 三变体实验', '选择 V2', '结论', '视图']) {
     assert.ok(reportText.includes(text), `report must contain ${text}`);
   }
+  await frame.getByRole('heading', { name: '结构视图' }).waitFor();
   assert.ok((await frame.locator('svg.report-svg').count()) >= 1, 'report must embed the structure view');
   assert.match(reportText, /均值|mean/, 'report must contain the experiment result table');
 
@@ -168,12 +233,41 @@ try {
   const download = await downloadPromise;
   assert.equal(download.suggestedFilename(), 'IA3 报告.html');
 
+  // ---- 04 DOE: the defaults are legal and design without a 422.
+  await page.getByRole('button', { name: '04 实验', exact: true }).click();
+  await page.locator('.wf-experiment-inputs > summary').click();
+  assert.equal(await page.locator('.wf-doe-factor').count(), 2, 'DOE defaults to two factors');
+  const factorOne = await page.getByLabel('因子 1 参数').inputValue();
+  const factorTwo = await page.getByLabel('因子 2 参数').inputValue();
+  assert.deepEqual([factorOne, factorTwo], ['rateMagnitude', 'duration'], 'default DOE factors must differ');
+  assert.equal(await page.getByRole('button', { name: '设计 DOE' }).isDisabled(), false, 'default DOE factors must be valid');
+
+  // A repeated (step, parameter) pair is caught inline and blocks the button.
+  const firstStep = await page.getByLabel('因子 1 步骤').inputValue();
+  await page.getByLabel('因子 2 步骤').selectOption(firstStep);
+  await page.getByLabel('因子 2 参数').selectOption('rateMagnitude');
+  const factorError = page.locator('.wf-doe-factor .wf-field-error').first();
+  await factorError.waitFor();
+  assert.match(await factorError.innerText(), /重复/);
+  assert.equal(await page.getByRole('button', { name: '设计 DOE' }).isDisabled(), true, 'duplicate factors must disable the button');
+  assert.match(await page.locator('[aria-label="DOE 禁用原因"]').innerText(), /先修正因子/);
+
+  // Fixing the parameter re-enables the button and the design succeeds.
+  await page.getByLabel('因子 2 参数').selectOption('duration');
+  await page.locator('.wf-doe-factor .wf-field-error').first().waitFor({ state: 'detached' });
+  assert.equal(await page.getByRole('button', { name: '设计 DOE' }).isDisabled(), false);
+  await page.getByRole('button', { name: '设计 DOE' }).click();
+  await page.getByText('实验状态：待执行').waitFor({ timeout: 60000 });
+  assert.equal(await page.locator('.spx-log.error').count(), 0, 'default DOE must not return a 422');
+  assert.ok((await page.locator('.wf-result-table tbody tr').count()) > 0, 'DOE design must produce variants');
+
   await page.screenshot({ path: screenshot, fullPage: true });
   assert.deepEqual(errors, []);
   console.log(JSON.stringify({
     status: 'passed', baseUrl, screenshot, errors,
     experiment: { variants: experiment.variants.length, replicates: experiment.variants[0].replicates.length },
     candidates: candidateCount,
+    doeFactors: [factorOne, factorTwo],
   }));
 } finally {
   await browser.close();

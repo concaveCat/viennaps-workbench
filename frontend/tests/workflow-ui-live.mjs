@@ -28,7 +28,7 @@ try {
 
   await page.getByRole('button', { name: '测量', exact: true }).click();
   await page.getByText(/测量 · 已测量/).waitFor({ timeout: 30000 });
-  await page.getByText(/2\.0000 µm/).first().waitFor({ timeout: 30000 });
+  await page.getByText(/2\.000 µm/).first().waitFor({ timeout: 30000 });
   await page.getByText(/绑定 \(binding\)：已绑定/).waitFor({ timeout: 30000 });
   await page.screenshot({ path: screenshot, fullPage: true });
 

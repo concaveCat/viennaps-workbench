@@ -104,15 +104,21 @@ export async function createVtkScene(container: HTMLElement): Promise<VtkScene> 
   const interactor = win.getInteractor();
 
   const axes: vtkAxesActor = axesModule.default.newInstance();
+  // The default palette (bright yellow Y axis) disappears on the light stage
+  // background; deepen every shaft so the orientation marker stays readable.
+  axes.setXAxisColor([178, 34, 34]);
+  axes.setYAxisColor([161, 98, 7]);
+  axes.setZAxisColor([21, 115, 71]);
+  axes.update();
   const widget: vtkOrientationMarkerWidget = widgetModule.default.newInstance({
     actor: axes,
     interactor,
     parentRenderer: renderer,
   });
   widget.setEnabled(true);
-  widget.setViewportSize(0.12);
-  widget.setMinPixelSize(64);
-  widget.setMaxPixelSize(112);
+  widget.setViewportSize(0.16);
+  widget.setMinPixelSize(96);
+  widget.setMaxPixelSize(160);
 
   const data: vtkPolyData = polyDataModule.default.newInstance();
   let lookupTable: vtkLookupTable = lutModule.default.newInstance();

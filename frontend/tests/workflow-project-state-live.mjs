@@ -101,6 +101,21 @@ try {
   assert.ok(state.measurementIds.length >= 1, 'state must remember the measurement');
   assert.ok(state.segmentRuns.length >= 1, 'state must remember executed segments');
 
+  // --- A2: 04 restores the experiments saved in the project state ---------
+  await openZone('04 实验');
+  await page.getByLabel('实验名称').fill('STATE 实验');
+  await page.getByRole('button', { name: '创建实验', exact: true }).click();
+  await page.getByText('实验状态：待执行').waitFor();
+  await page.waitForTimeout(1500);
+  const stateWithExperiment = await (await fetch(`${baseUrl}/api/v1/workflow/projects/${projectId}/state`)).json();
+  assert.ok(stateWithExperiment.experimentIds.length >= 1, 'state must remember the experiment');
+  await page.reload();
+  await page.getByText('ViennaPS Workbench').first().waitFor();
+  await openZone('04 实验');
+  await page.locator('[aria-label="实验列表"]').waitFor({ timeout: 30000 });
+  assert.match(await page.locator('[aria-label="实验列表"]').innerText(), /STATE 实验/,
+    '04 must list the experiment restored from the project state');
+
   await page.reload();
   await page.getByText('ViennaPS Workbench').first().waitFor();
   await openZone('03 运行');

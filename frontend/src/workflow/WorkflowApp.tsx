@@ -277,6 +277,22 @@ type ExperimentDoc = {
   project?: { steps: Array<{ id: string }> };
 };
 type ExperimentSummaryRow = { experimentId: string; name: string; updatedAt: string; status: string; variantCount: number };
+type DoeFactorRow = { stepId: string; parameter: string; values: string };
+
+/** Numeric step parameters the DOE endpoint accepts. */
+const DOE_PARAMETERS: Array<{ id: string; label: string }> = [
+  { id: 'rateMagnitude', label: 'rateMagnitude（µm/s）' },
+  { id: 'duration', label: 'duration（s）' },
+  { id: 'stickingProbability', label: 'stickingProbability' },
+  { id: 'sourceExponent', label: 'sourceExponent' },
+];
+
+const DOE_DEFAULT_VALUES: Record<string, string> = {
+  rateMagnitude: '0.01,0.02,0.03',
+  duration: '0.02,0.04,0.06',
+  stickingProbability: '0.01,0.1',
+  sourceExponent: '0.5,1.0',
+};
 type SnapshotSummary = {
   runId: string;
   stepId: string;
@@ -315,6 +331,8 @@ type CandidateView = {
   bounds: number[];
   sampledPointCount: number;
   coordinateUnit?: string;
+  /** Point indices for x / h / z; 2D snapshots keep the height in `h`. */
+  axisMap?: { x?: number; h?: number; z?: number };
 };
 type ProcessWindowResult = {
   summary: { total: number; pass: number; fail: number; uncertain: number; notEvaluated: number };
@@ -644,6 +662,56 @@ function topologyLabel(topology: string): string {
   return TOPOLOGY_LABELS[topology] ?? topology;
 }
 
+/** Micron values: three decimals (`0.020`, `2.000`) so the unit column aligns. */
+function formatMicrons(value: number): string {
+  if (!Number.isFinite(value)) return '—';
+  return Math.abs(value) >= 1000 ? formatNumber(value) : value.toFixed(3);
+}
+
+/** One-line annotation drawn inside a 2D structure view. */
+function structureSurfaceNote(view: CandidateView, axis: StructureAxis): string {
+  const extent = structureExtent(view, axis);
+  const unit = structureUnit(view);
+  const depth = extent.maxV - extent.minV;
+  if (!extent.flatV) return `深度 ${formatMicrons(depth)} ${unit}`;
+  const surface = Math.abs(extent.maxV) < 5e-4 ? '0.000' : formatMicrons(extent.maxV);
+  return `表面高度 ${surface} ${unit}`;
+}
+
+/** `{"Si": 0}` reads as "无材料差异"; non-zero entries use a full-width colon. */
+function materialDeltaText(delta: Record<string, number>): string {
+  const entries = Object.entries(delta ?? {});
+  if (!entries.length) return '无材料差异';
+  const changed = entries.filter(([, value]) => Math.abs(Number(value) || 0) > 1e-12);
+  if (!changed.length) return '无材料差异';
+  return changed.map(([key, value]) => `${key}：${formatNumber(value)}`).join(' · ');
+}
+
+const COMPARE_REASON_PATTERNS: Array<[RegExp, (match: RegExpMatchArray) => string]> = [
+  [/^snapshot topology or element counts differ$/, () => '拓扑或元素数量不同'],
+  [/^snapshot line\/triangle connectivity differs$/, () => '线/三角形连接关系不同'],
+  [/^max point delta ([\d.eE+-]+) exceeds tolerance ([\d.eE+-]+)$/, match => `最大点偏差 ${formatNumber(Number(match[1]))} 超过公差 ${formatNumber(Number(match[2]))}`],
+  [/^bounds delta ([\d.eE+-]+) exceeds tolerance ([\d.eE+-]+)$/, match => `边界偏差 ${formatNumber(Number(match[1]))} 超过公差 ${formatNumber(Number(match[2]))}`],
+  [/^material (.+) measure delta ([\d.eE+-]+) exceeds material tolerance ([\d.eE+-]+)$/, match => `材料 ${match[1]} 偏差 ${formatNumber(Number(match[2]))} 超过材料公差 ${formatNumber(Number(match[3]))}`],
+];
+
+function compareReasonLabel(reason: string): string {
+  for (const [pattern, render] of COMPARE_REASON_PATTERNS) {
+    const match = reason.match(pattern);
+    if (match) return render(match);
+  }
+  return reason;
+}
+
+const METRIC_METHOD_LABELS: Record<string, string> = {
+  etch_depth: '刻蚀深度',
+  cd_at_height: '指定高度 CD',
+};
+
+function metricMethodLabel(method: string): string {
+  return METRIC_METHOD_LABELS[method] ?? method;
+}
+
 /** Backend stores `um`; the UI shows the micro sign. */
 function displayUnit(unit: string | null | undefined): string {
   if (!unit) return 'µm';
@@ -795,7 +863,9 @@ function postJson<T>(path: string, body: unknown): Promise<T> {
 --------------------------------------------------------------------------- */
 
 type StructureAxis = 'xy' | 'xz' | 'yz';
-type StructureFrame = { minU: number; maxU: number; minV: number; maxV: number; unit: string };
+/** Point indices actually drawn on the horizontal / vertical axis. */
+type StructureAxes = { horizontal: number; vertical: number; verticalLabel: string; is2D: boolean };
+type StructureFrame = { minU: number; maxU: number; minV: number; maxV: number; unit: string; flatV: boolean };
 type StructureMarker = { orientation: 'vertical' | 'horizontal'; value: number; label: string } | null;
 type StructureStepRow = {
   runId: string;
@@ -810,41 +880,93 @@ function structureUnit(view: CandidateView): string {
   return view.coordinateUnit === 'um' || !view.coordinateUnit ? 'µm' : view.coordinateUnit;
 }
 
-function structurePoint(point: number[], axis: StructureAxis): [number, number] {
-  const x = point[0] ?? 0;
-  const y = point[1] ?? 0;
-  const z = point[2] ?? 0;
-  if (axis === 'yz') return [y, z];
-  if (axis === 'xz') return [x, z];
-  return [x, y];
+/**
+ * Resolve the point indices drawn on each axis.
+ *
+ * 3D views follow the XY/XZ/YZ selector. 2D snapshots are authored on x with the
+ * height in the `h` slot (`z` is a constant 0 for those writers), so the old
+ * hard-coded `point[1]`/`point[2]` pair collapsed the profile into one flat
+ * line. Prefer `axisMap.h`, then `axisMap.z`, then the first axis with a real
+ * span, so both the current and older snapshots keep their depth.
+ */
+function structureAxes(view: CandidateView, axis: StructureAxis): StructureAxes {
+  if (view.dimension !== 2) {
+    if (axis === 'yz') return { horizontal: 1, vertical: 2, verticalLabel: 'Z', is2D: false };
+    if (axis === 'xz') return { horizontal: 0, vertical: 2, verticalLabel: 'Z', is2D: false };
+    return { horizontal: 0, vertical: 1, verticalLabel: 'Y', is2D: false };
+  }
+  const map = view.axisMap ?? {};
+  const asIndex = (value: unknown): number | null =>
+    typeof value === 'number' && Number.isInteger(value) && value >= 0 && value < 3 ? value : null;
+  const horizontal = asIndex(map.x) ?? 0;
+  const preferred = [asIndex(map.h), asIndex(map.z), 1, 2]
+    .filter((value): value is number => value !== null);
+  const candidates = [...new Set(preferred)].filter(value => value !== horizontal);
+  const spanOf = (index: number): number => {
+    let low = Infinity, high = -Infinity;
+    for (const point of view.points) {
+      const value = Number(point[index] ?? 0);
+      if (value < low) low = value;
+      if (value > high) high = value;
+    }
+    return Number.isFinite(low) ? high - low : 0;
+  };
+  const vertical = candidates.find(index => spanOf(index) > 1e-12)
+    ?? candidates[0]
+    ?? (horizontal === 1 ? 2 : 1);
+  return { horizontal, vertical, verticalLabel: '高度', is2D: true };
 }
 
-function structureFrame(view: CandidateView, axis: StructureAxis): StructureFrame {
+function structurePoint(point: number[], axes: StructureAxes): [number, number] {
+  return [Number(point[axes.horizontal] ?? 0), Number(point[axes.vertical] ?? 0)];
+}
+
+type StructureExtent = { minU: number; maxU: number; minV: number; maxV: number; flatV: boolean };
+
+/** Raw data extent of the drawn axes (no padding). */
+function structureExtent(view: CandidateView, axis: StructureAxis): StructureExtent {
+  const axes = structureAxes(view, axis);
   let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity;
   for (const point of view.points) {
-    const [u, v] = structurePoint(point, axis);
+    const [u, v] = structurePoint(point, axes);
     minU = Math.min(minU, u); maxU = Math.max(maxU, u);
     minV = Math.min(minV, v); maxV = Math.max(maxV, v);
   }
   if (!Number.isFinite(minU) || !Number.isFinite(minV)) {
     const bounds = view.bounds ?? [];
-    const pair = axis === 'yz'
-      ? [bounds[2], bounds[3], bounds[4], bounds[5]]
-      : axis === 'xz' ? [bounds[0], bounds[1], bounds[4], bounds[5]] : [bounds[0], bounds[1], bounds[2], bounds[3]];
+    const pair = axes.horizontal === 0 && axes.vertical === 1
+      ? [bounds[0], bounds[1], bounds[2], bounds[3]]
+      : axes.horizontal === 0 && axes.vertical === 2
+        ? [bounds[0], bounds[1], bounds[4], bounds[5]]
+        : [bounds[2], bounds[3], bounds[4], bounds[5]];
     [minU, maxU, minV, maxV] = pair.map(value => Number(value) || 0) as [number, number, number, number];
   }
   if (maxU - minU < 1e-9) { minU -= 0.5; maxU += 0.5; }
-  if (maxV - minV < 1e-9) { minV -= 0.5; maxV += 0.5; }
-  const padding = Math.max((maxU - minU), (maxV - minV)) * 0.1;
+  return { minU, maxU, minV, maxV, flatV: maxV - minV < 1e-9 };
+}
+
+function structureFrame(view: CandidateView, axis: StructureAxis): StructureFrame {
+  const extent = structureExtent(view, axis);
+  let { minU, maxU, minV, maxV } = extent;
+  if (extent.flatV) {
+    // A no-op / zero-rate step must still read as a substrate with thickness
+    // instead of a single hairline at y = 0.
+    const thickness = Math.max(maxU - minU, 1e-6) * 0.35;
+    minV -= thickness;
+    maxV += thickness * 0.15;
+  }
+  const paddingU = Math.max((maxU - minU) * 0.12, 1e-9);
+  const paddingV = Math.max((maxV - minV) * 0.12, 1e-9);
   return {
-    minU: minU - padding, maxU: maxU + padding,
-    minV: minV - padding, maxV: maxV + padding,
+    minU: minU - paddingU, maxU: maxU + paddingU,
+    minV: minV - paddingV, maxV: maxV + paddingV,
     unit: structureUnit(view),
+    flatV: extent.flatV,
   };
 }
 
 function mergeFrames(frames: StructureFrame[], zoom: number): StructureFrame {
-  if (!frames.length) return { minU: 0, maxU: 1, minV: 0, maxV: 1, unit: 'µm' };
+  if (!frames.length) return { minU: 0, maxU: 1, minV: 0, maxV: 1, unit: 'µm', flatV: false };
   const minU = Math.min(...frames.map(frame => frame.minU));
   const maxU = Math.max(...frames.map(frame => frame.maxU));
   const minV = Math.min(...frames.map(frame => frame.minV));
@@ -856,6 +978,7 @@ function mergeFrames(frames: StructureFrame[], zoom: number): StructureFrame {
     minU: (minU + maxU) / 2 - width / 2, maxU: (minU + maxU) / 2 + width / 2,
     minV: (minV + maxV) / 2 - height / 2, maxV: (minV + maxV) / 2 + height / 2,
     unit: frames[0].unit,
+    flatV: frames.every(frame => frame.flatV),
   };
 }
 
@@ -866,7 +989,7 @@ function frameViewBox(frame: StructureFrame): string {
 function axisTicks(min: number, max: number): number[] {
   const span = max - min;
   if (!Number.isFinite(span) || span <= 0) return [];
-  const raw = span / 4;
+  const raw = span / 5;
   const power = Math.pow(10, Math.floor(Math.log10(raw)));
   const normalized = raw / power;
   const factor = normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 5 ? 5 : 10;
@@ -879,19 +1002,104 @@ function axisTicks(min: number, max: number): number[] {
 }
 
 function formatTick(value: number): string {
-  const rounded = Number(value.toFixed(4));
-  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2).replace(/0$/, '');
+  if (!Number.isFinite(value)) return '—';
+  if (value === 0) return '0';
+  return String(Number(value.toPrecision(3)));
 }
 
-function StructureCanvas({ view, frame, axis = 'xy', marker = null, label, className = 'wf-structure-canvas', showAxes = true }: {
+/**
+ * Split the per-material line set into polylines. A 2D cross section is a set
+ * of open interface polylines (plus the occasional closed contour), so walking
+ * shared endpoints is enough to recover the drawable chains.
+ */
+function structureChains(edges: Array<[number, number]>): number[][] {
+  const used = new Array<boolean>(edges.length).fill(false);
+  const adjacency = new Map<number, number[]>();
+  edges.forEach(([a, b], index) => {
+    adjacency.set(a, [...(adjacency.get(a) ?? []), index]);
+    adjacency.set(b, [...(adjacency.get(b) ?? []), index]);
+  });
+  const other = (edgeIndex: number, node: number): number => (edges[edgeIndex][0] === node ? edges[edgeIndex][1] : edges[edgeIndex][0]);
+  const chains: number[][] = [];
+  for (let start = 0; start < edges.length; start++) {
+    if (used[start]) continue;
+    used[start] = true;
+    const chain = [edges[start][0], edges[start][1]];
+    for (let grew = true; grew;) {
+      grew = false;
+      const tail = chain[chain.length - 1];
+      for (const edgeIndex of adjacency.get(tail) ?? []) {
+        if (used[edgeIndex]) continue;
+        used[edgeIndex] = true;
+        chain.push(other(edgeIndex, tail));
+        grew = true;
+        break;
+      }
+    }
+    for (let grew = true; grew;) {
+      grew = false;
+      const head = chain[0];
+      for (const edgeIndex of adjacency.get(head) ?? []) {
+        if (used[edgeIndex]) continue;
+        used[edgeIndex] = true;
+        chain.unshift(other(edgeIndex, head));
+        grew = true;
+        break;
+      }
+    }
+    chains.push(chain);
+  }
+  return chains;
+}
+
+type StructureFill = { materialId: number; coords: Array<[number, number]>; closed: boolean };
+
+/**
+ * Fill the material below every interface line down to the bottom of the view,
+ * one polygon per material chain. Overlaps between materials stack their
+ * translucency (the outlines are drawn afterwards and stay crisp).
+ */
+function structureFillPolygons(view: CandidateView, points: Array<[number, number]>): StructureFill[] {
+  if (view.dimension !== 2 || !view.lines.length) return [];
+  const byMaterial = new Map<number, Array<[number, number]>>();
+  view.lines.forEach((line, index) => {
+    if (!line || line.length < 2) return;
+    const a = Number(line[0]);
+    const b = Number(line[1]);
+    if (!Number.isFinite(a) || !Number.isFinite(b) || a === b) return;
+    if (!points[a] || !points[b]) return;
+    const materialId = Number(view.lineMaterialIds[index] ?? -1);
+    const edges = byMaterial.get(materialId) ?? [];
+    edges.push([a, b]);
+    byMaterial.set(materialId, edges);
+  });
+  const fills: StructureFill[] = [];
+  for (const [materialId, edges] of byMaterial) {
+    for (const chain of structureChains(edges)) {
+      const closed = chain.length > 2 && chain[0] === chain[chain.length - 1];
+      const coords = chain.map(index => points[index]);
+      if (!closed) {
+        const xs = coords.map(([x]) => x);
+        if (Math.max(...xs) - Math.min(...xs) < 1e-12) continue;
+      }
+      fills.push({ materialId, coords, closed });
+    }
+  }
+  return fills;
+}
+
+function StructureCanvas({ view, frame, axis = 'xy', marker = null, note = null, label, className = 'wf-structure-canvas', showAxes = true }: {
   view: CandidateView;
   frame: StructureFrame;
   axis?: StructureAxis;
   marker?: StructureMarker;
+  /** Free-form annotation drawn in the top-left corner (surface height / depth). */
+  note?: string | null;
   label: string;
   className?: string;
   showAxes?: boolean;
 }) {
+  const axes = structureAxes(view, axis);
   const span = Math.max(frame.maxU - frame.minU, frame.maxV - frame.minV);
   const fontSize = span / 32;
   const strokeWidth = span / 220;
@@ -905,29 +1113,38 @@ function StructureCanvas({ view, frame, axis = 'xy', marker = null, label, class
     const ticks = uTicks.length > 1 ? uTicks : [frame.minU, frame.maxU];
     return Math.abs(ticks[1] - ticks[0]) || span / 4;
   })();
-  const barY = -frame.minV + fontSize * 1.4;
-  const barX = frame.maxU - barLength;
-  const points = view.points.map(point => structurePoint(point, axis));
-  return <svg viewBox={frameViewBox(frame)} className={className} role="img" aria-label={label}>
+  const barY = -frame.maxV + fontSize * 2.6;
+  const barX = frame.maxU - barLength - span * 0.02;
+  const points = view.points.map(point => structurePoint(point, axes));
+  const fills = structureFillPolygons(view, points);
+  const bottom = -frame.minV;
+  const tickHalo = fontSize * 0.1;
+  const axisTitle = `${axes.verticalLabel} (${frame.unit})`;
+  const horizontalTitle = axes.is2D ? `X (${frame.unit})` : `${axis.toUpperCase().charAt(0)} (${frame.unit})`;
+  return <svg viewBox={frameViewBox(frame)} className={className} role="img" aria-label={label}
+    data-dimension={view.dimension} data-flat={frame.flatV ? '1' : '0'}>
     <rect x={frame.minU} y={-frame.maxV} width={frame.maxU - frame.minU} height={frame.maxV - frame.minV} fill="#f8fafb" />
-    {showAxes && uTicks.map(tick => <g key={`u-${tick}`} className="wf-axes">
-      <line x1={tick} y1={-frame.minV} x2={tick} y2={-frame.maxV} stroke="#e6eaee" strokeWidth={strokeWidth} />
-      <line x1={tick} y1={-frame.minV} x2={tick} y2={-frame.minV + fontSize * 0.5} stroke="#9aa3ab" strokeWidth={strokeWidth} />
-      <text x={tick} y={-frame.minV + fontSize * 1.5} fontSize={fontSize} textAnchor="middle">{formatTick(tick)}</text>
-    </g>)}
-    {showAxes && vTicks.map(tick => <g key={`v-${tick}`} className="wf-axes">
-      <line x1={frame.minU} y1={-tick} x2={frame.maxU} y2={-tick} stroke="#e6eaee" strokeWidth={strokeWidth} />
-      <line x1={frame.minU} y1={-tick} x2={frame.minU + fontSize * 0.5} y2={-tick} stroke="#9aa3ab" strokeWidth={strokeWidth} />
-      <text x={frame.minU + fontSize * 0.15} y={-tick - fontSize * 0.15} fontSize={fontSize} textAnchor="start">{formatTick(tick)}</text>
-    </g>)}
+    {showAxes && uTicks.map(tick => <line key={`ug-${tick}`} className="wf-axes wf-axes-grid"
+      x1={tick} y1={-frame.minV} x2={tick} y2={-frame.maxV} stroke="#e6eaee" strokeWidth={strokeWidth} />)}
+    {showAxes && vTicks.map(tick => <line key={`vg-${tick}`} className="wf-axes wf-axes-grid"
+      x1={frame.minU} y1={-tick} x2={frame.maxU} y2={-tick} stroke="#e6eaee" strokeWidth={strokeWidth} />)}
+    {fills.map((fill, index) => {
+      const coords = fill.closed
+        ? fill.coords
+        : [...fill.coords, [fill.coords[fill.coords.length - 1][0], bottom], [fill.coords[0][0], bottom]];
+      return <polygon key={`f-${index}`} className="wf-fill" data-material={fill.materialId}
+        points={coords.map(([x, y]) => `${x},${-y}`).join(' ')}
+        fill={colorOf(fill.materialId)} fillOpacity={0.3} stroke="none" />;
+    })}
     {view.dimension === 2
       ? (view.lines.length
         ? view.lines.map((line, index) => {
           const a = points[line[0]];
           const b = points[line[1]];
           if (!a || !b) return null;
-          return <line key={`l-${index}`} x1={a[0]} y1={-a[1]} x2={b[0]} y2={-b[1]}
-            stroke={colorOf(view.lineMaterialIds[index])} strokeWidth={2} vectorEffect="non-scaling-stroke" />;
+          return <line key={`l-${index}`} className="wf-interface"
+            x1={a[0]} y1={-a[1]} x2={b[0]} y2={-b[1]}
+            stroke={colorOf(view.lineMaterialIds[index])} strokeWidth={1.5} vectorEffect="non-scaling-stroke" />;
         })
         : points.map((point, index) => <circle key={`p-${index}`} cx={point[0]} cy={-point[1]}
           r={strokeWidth * 2} fill={colorOf(view.materialIds[index])} />))
@@ -945,16 +1162,33 @@ function StructureCanvas({ view, frame, axis = 'xy', marker = null, label, class
           r={strokeWidth * 2} fill={colorOf(view.materialIds[index])} />))}
     {marker && <g className="wf-marker">
       {marker.orientation === 'vertical'
-        ? <line x1={marker.value} y1={-frame.minV} x2={marker.value} y2={-frame.maxV} strokeWidth={strokeWidth * 2} />
-        : <line x1={frame.minU} y1={-marker.value} x2={frame.maxU} y2={-marker.value} strokeWidth={strokeWidth * 2} />}
-      <text x={marker.orientation === 'vertical' ? marker.value + fontSize * 0.3 : frame.minU + fontSize * 0.3}
-        y={marker.orientation === 'vertical' ? -frame.maxV + fontSize * 1.4 : -marker.value - fontSize * 0.4}
-        fontSize={fontSize}>{marker.label}</text>
+        ? <line x1={marker.value} y1={-frame.maxV + span * 0.05} x2={marker.value} y2={-frame.minV - span * 0.05} strokeWidth={strokeWidth * 2} />
+        : <line x1={frame.minU + span * 0.1} y1={-marker.value} x2={frame.maxU - span * 0.02} y2={-marker.value} strokeWidth={strokeWidth * 2} />}
+      <text x={marker.orientation === 'vertical' ? marker.value + fontSize * 0.3 : frame.minU + span * 0.11}
+        y={marker.orientation === 'vertical' ? bottom - span * 0.075 : -marker.value - fontSize * 0.4}
+        fontSize={fontSize} stroke="#ffffff" strokeWidth={tickHalo} paintOrder="stroke">{marker.label}</text>
     </g>}
-    {showAxes && <g className="wf-axes">
+    {showAxes && <g className="wf-axes wf-axis-line">
+      <line x1={frame.minU} y1={bottom} x2={frame.maxU} y2={bottom} stroke="#6b7a8a" strokeWidth={strokeWidth} />
+      <line x1={frame.minU} y1={bottom} x2={frame.minU} y2={-frame.maxV} stroke="#6b7a8a" strokeWidth={strokeWidth} />
+      {uTicks.map(tick => <g key={`u-${tick}`} className="wf-axes wf-tick">
+        <line x1={tick} y1={bottom} x2={tick} y2={bottom - fontSize * 0.55} stroke="#6b7a8a" strokeWidth={strokeWidth} />
+        {tick > frame.minU + fontSize * 1.8 && <text x={tick} y={bottom - fontSize * 0.9} fontSize={fontSize} textAnchor="middle"
+          stroke="#ffffff" strokeWidth={tickHalo} paintOrder="stroke">{formatTick(tick)}</text>}
+      </g>)}
+      {vTicks.map(tick => <g key={`v-${tick}`} className="wf-axes wf-tick">
+        <line x1={frame.minU} y1={-tick} x2={frame.minU + fontSize * 0.4} y2={-tick} stroke="#6b7a8a" strokeWidth={strokeWidth} />
+        {-tick < bottom - fontSize * 1.9 && <text x={frame.minU + fontSize * 0.55} y={-tick - fontSize * 0.2} fontSize={fontSize} textAnchor="start"
+          stroke="#ffffff" strokeWidth={tickHalo} paintOrder="stroke">{formatTick(tick)}</text>}
+      </g>)}
+      <text className="wf-axis-title" x={frame.maxU - span * 0.012} y={-frame.maxV + fontSize * 1.1} fontSize={fontSize} textAnchor="end"
+        stroke="#ffffff" strokeWidth={tickHalo} paintOrder="stroke">{horizontalTitle}</text>
+      <text className="wf-axis-title" x={frame.minU + span * 0.012} y={-frame.maxV + fontSize * 1.1} fontSize={fontSize} textAnchor="start"
+        stroke="#ffffff" strokeWidth={tickHalo} paintOrder="stroke">{axisTitle}</text>
       <line x1={barX} y1={barY} x2={barX + barLength} y2={barY} stroke="#34404b" strokeWidth={strokeWidth * 2.5} />
-      <text x={barX + barLength / 2} y={barY + fontSize * 1.3} fontSize={fontSize} textAnchor="middle">{`${formatTick(barLength)} ${frame.unit}`}</text>
-      <text x={frame.minU} y={-frame.maxV - fontSize * 0.3} fontSize={fontSize}>{axis.toUpperCase()}</text>
+      <text x={barX + barLength / 2} y={barY - fontSize * 0.5} fontSize={fontSize} textAnchor="middle">{`${formatTick(barLength)} ${frame.unit}`}</text>
+      {note && <text className="wf-structure-note" x={frame.minU + span * 0.22} y={-frame.maxV + fontSize * 2.3} fontSize={fontSize} textAnchor="start"
+        stroke="#ffffff" strokeWidth={tickHalo} paintOrder="stroke">{note}</text>}
     </g>}
   </svg>;
 }
@@ -1038,10 +1272,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [annotationText, setAnnotationText] = useState('');
   const [annotationX, setAnnotationX] = useState('0');
   const [annotationY, setAnnotationY] = useState('0');
-  const [doeFactors, setDoeFactors] = useState([
+  const [doeFactors, setDoeFactors] = useState<DoeFactorRow[]>([
     { stepId: '', parameter: 'rateMagnitude', values: '0.01,0.02,0.03' },
     { stepId: '', parameter: 'duration', values: '0.02,0.04,0.06' },
-    { stepId: '', parameter: 'duration', values: '0.01,0.02,0.03' },
   ]);
   const [doeReplicates, setDoeReplicates] = useState(3);
   const [doeSeed, setDoeSeed] = useState('20261029');
@@ -1057,10 +1290,14 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [syncAxis, setSyncAxis] = useState<'xy' | 'xz' | 'yz'>('xy');
   const [windowLower, setWindowLower] = useState('');
   const [windowUpper, setWindowUpper] = useState('');
+  const [windowError, setWindowError] = useState('');
   const [windowResult, setWindowResult] = useState<ProcessWindowResult | null>(null);
+  const windowLowerRef = useRef<HTMLInputElement>(null);
+  const windowUpperRef = useRef<HTMLInputElement>(null);
   const [reportTitle, setReportTitle] = useState('工作流报告');
   const [reportConclusions, setReportConclusions] = useState('');
   const [reportDocument, setReportDocument] = useState<ReportDocument | null>(null);
+  const reportFrameRef = useRef<HTMLIFrameElement>(null);
   const [calibrationCsv, setCalibrationCsv] = useState('');
   const [calibrationName, setCalibrationName] = useState('calibration');
   const [calibrationModel, setCalibrationModel] = useState('scale_offset');
@@ -1137,7 +1374,6 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [structureView, setStructureView] = useState<CandidateView | null>(null);
   const [structureLoading, setStructureLoading] = useState(false);
   const [structureError, setStructureError] = useState('');
-  const [structureAxis, setStructureAxis] = useState<StructureAxis>('xy');
   const [measurementMark, setMeasurementMark] = useState<StructureMarker>(null);
   const [runSnapshots, setRunSnapshots] = useState<Record<string, string[]>>({});
   const [structureStats, setStructureStats] = useState<Viewer3DStats | null>(null);
@@ -1675,9 +1911,24 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   useEffect(() => {
     const steps = (project?.steps ?? []).filter(step => step.enabled);
     if (!steps.length) return;
-    setDoeFactors(previous => previous.map((row, index) => row.stepId
-      ? row
-      : { ...row, stepId: steps[Math.min(index, steps.length - 1)]?.id ?? '' }));
+    setDoeFactors(previous => {
+      const used = new Set<string>();
+      let changed = false;
+      const next = previous.map((row, index) => {
+        if (row.stepId && steps.some(step => step.id === row.stepId) && !used.has(row.stepId)) {
+          used.add(row.stepId);
+          return row;
+        }
+        // Rotate through the enabled steps so the default factors never collide
+        // on `(stepId, parameter)`. A single-step project keeps every factor on
+        // that step and relies on distinct parameters instead.
+        const pick = steps.find(step => !used.has(step.id)) ?? steps[Math.min(index, steps.length - 1)];
+        used.add(pick.id);
+        changed = true;
+        return { ...row, stepId: pick.id };
+      });
+      return changed ? next : previous;
+    });
   }, [project]);
 
   useEffect(() => {
@@ -1910,6 +2161,22 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     [structureRunId, structureStepId, runSnapshots],
   );
   const structureStatsForStep = structureStats && structureStats.stepId === structureStepId ? structureStats : null;
+  const structureViewExtent = useMemo(
+    () => (structureView ? structureExtent(structureView, 'xy') : null),
+    [structureView],
+  );
+  // Flat (no-op / zero-rate) steps still need a readable label; a measurement
+  // reports the etched depth instead of the surface height.
+  const structureNote = useMemo(() => {
+    if (!structureView || !structureViewExtent) return null;
+    const measuredDepth = measurement && measurement.value !== null && measurement.method === 'etch_depth'
+      ? Math.abs(measurement.value)
+      : null;
+    if (measuredDepth !== null && measuredDepth >= 5e-4 && measurement) {
+      return `深度 ${formatMicrons(measuredDepth)} ${displayUnit(measurement.unit)}`;
+    }
+    return structureSurfaceNote(structureView, 'xy');
+  }, [structureView, structureViewExtent, measurement]);
 
   useEffect(() => {
     // 3D reads the raw snapshot inside its worker; fetching a candidate view too
@@ -2392,24 +2659,60 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setMeasurement(null); setProvenance(null); setMetrics([]);
   });
 
-  const refreshExperimentList = async (): Promise<ExperimentSummaryRow[]> => {
+  const refreshExperimentList = async (preferred: string[] = []): Promise<ExperimentSummaryRow[]> => {
     try {
       const data = await api<{ experiments: Array<{ experimentId: string; name: string; updatedAt: string }> }>('/api/v1/workflow/experiments');
-      const rows = await Promise.all(data.experiments.slice(0, 8).map(async row => {
+      const listed = await Promise.all(data.experiments.slice(0, 12).map(async row => {
         try {
           const doc = await api<ExperimentDoc>(`/api/v1/workflow/experiments/${row.experimentId}`);
-          return { ...row, status: doc.status, variantCount: doc.variants.length };
+          return { ...row, name: doc.name || row.name, status: doc.status, variantCount: doc.variants.length };
         } catch {
           return { ...row, status: 'unknown', variantCount: 0 };
         }
       }));
-      setExperimentList(rows);
-      return rows;
+      const known = new Set(listed.map(row => row.experimentId));
+      // Experiments saved in the project state must stay visible even when they
+      // are older than the newest page of the global list.
+      const restored = await Promise.all(preferred.filter(id => !known.has(id)).slice(0, 8).map(async id => {
+        try {
+          const doc = await api<ExperimentDoc>(`/api/v1/workflow/experiments/${id}`);
+          return { experimentId: id, name: doc.name, updatedAt: '', status: doc.status, variantCount: doc.variants.length };
+        } catch {
+          return null;
+        }
+      }));
+      const byId = new Map<string, ExperimentSummaryRow>();
+      for (const row of [...listed, ...restored.filter((item): item is ExperimentSummaryRow => !!item)]) byId.set(row.experimentId, row);
+      const ordered = [
+        ...preferred.map(id => byId.get(id)).filter((row): row is ExperimentSummaryRow => !!row),
+        ...listed.filter(row => !preferred.includes(row.experimentId)).map(row => byId.get(row.experimentId) as ExperimentSummaryRow),
+      ].slice(0, 12);
+      setExperimentList(ordered);
+      return ordered;
     } catch {
       setExperimentList([]);
       return [];
     }
   };
+
+  // Restore the experiments recorded in the project state (schema 11) so 04
+  // lists them after reopening a project instead of only after a new run.
+  const stateExperimentIds = projectState.experimentIds.join(',');
+  useEffect(() => {
+    if (!projectId) return;
+    const ids = projectState.experimentIds;
+    if (!ids.length) return;
+    let cancelled = false;
+    void refreshExperimentList(ids).then(() => {
+      if (cancelled) return;
+      const target = ids[ids.length - 1];
+      void api<ExperimentDoc>(`/api/v1/workflow/experiments/${target}`)
+        .then(doc => setExperimentDoc(previous => previous ?? doc))
+        .catch(() => undefined);
+    });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, stateExperimentIds]);
 
   const resizeVariants = (count: number) => {
     const size = Math.max(1, Math.min(16, Math.floor(count) || 1));
@@ -2432,6 +2735,49 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
 
   const experimentTargetStep = (project?.steps ?? []).filter(step => step.enabled)
     .find(step => step.id === experimentStepId) ?? null;
+
+  const enabledProjectSteps = useMemo(
+    () => (project?.steps ?? []).filter(step => step.enabled),
+    [project?.steps],
+  );
+
+  /**
+   * Inline DOE validation: a repeated `(stepId, parameter)` pair is a hard 422
+   * from the API, so it is surfaced on the factor row and blocks the button.
+   */
+  const doeFactorErrors = useMemo(() => {
+    const seen = new Map<string, number>();
+    return doeFactors.map((row, index) => {
+      if (!row.stepId) return '请选择该因子作用的步骤';
+      const key = `${row.stepId}/${row.parameter}`;
+      const first = seen.get(key);
+      if (first !== undefined) return `与因子 ${first + 1} 重复：同一 (步骤, 参数) 只能配置一次`;
+      seen.set(key, index);
+      const values = row.values.split(',').map(value => Number(value.trim())).filter(value => Number.isFinite(value));
+      if (values.length < 2 || values.length > 10) return '取值需要 2–10 个数字（逗号分隔）';
+      return '';
+    });
+  }, [doeFactors]);
+  const doeBlocked = doeFactorErrors.some(Boolean);
+
+  const addDoeFactor = () => {
+    setDoeFactors(previous => {
+      const used = new Set(previous.map(row => `${row.stepId}/${row.parameter}`));
+      for (const step of enabledProjectSteps) {
+        for (const parameter of DOE_PARAMETERS) {
+          if (!used.has(`${step.id}/${parameter.id}`)) {
+            return [...previous, {
+              stepId: step.id,
+              parameter: parameter.id,
+              values: DOE_DEFAULT_VALUES[parameter.id] ?? '0.01,0.02',
+            }];
+          }
+        }
+      }
+      const fallback = enabledProjectSteps[0]?.id ?? '';
+      return [...previous, { stepId: fallback, parameter: 'duration', values: DOE_DEFAULT_VALUES.duration }];
+    });
+  };
 
   const createPersistentExperiment = () => run('experiment', async () => {
     if (!project || !compile || !activeRecipeId) throw new Error('先在 03 完成一次测量以固定配方');
@@ -2460,6 +2806,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setComparison(null);
     setCandidateViews({});
     setAutoAnalysisId('');
+    setExperimentInputsOpen(false);
     recordExperiment(doc.experimentId);
     await refreshExperimentList();
   });
@@ -3249,12 +3596,12 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     if (!project || !compile || !activeRecipeId) throw new Error('先在 03 完成一次测量以固定配方');
     if (compileStale) throw new Error('流程已修改，请先在 02 重新编译');
     if (doeFactors.length < 1 || doeFactors.length > 5) throw new Error('DOE 因子数必须在 1–5 之间');
-    const factors = doeFactors.map((row, index) => {
-      if (!row.stepId) throw new Error(`因子 ${index + 1} 还没有选择步骤`);
-      const values = row.values.split(',').map(value => Number(value.trim())).filter(value => Number.isFinite(value));
-      if (values.length < 2 || values.length > 10) throw new Error(`因子 ${index + 1} 需要 2–10 个数值（逗号分隔）`);
-      return { stepId: row.stepId, parameter: row.parameter, values };
-    });
+    if (doeBlocked) throw new Error(doeFactorErrors.find(Boolean) ?? '先修正 DOE 因子');
+    const factors = doeFactors.map(row => ({
+      stepId: row.stepId,
+      parameter: row.parameter,
+      values: row.values.split(',').map(value => Number(value.trim())).filter(value => Number.isFinite(value)),
+    }));
     const duplicates = new Set(factors.map(row => `${row.stepId}/${row.parameter}`));
     if (duplicates.size !== factors.length) throw new Error('同一 (步骤, 参数) 只能配置一次');
     const replicates = Math.round(Number(doeReplicates));
@@ -3275,6 +3622,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setComparison(null);
     setCandidateViews({});
     setAutoAnalysisId('');
+    setExperimentInputsOpen(false);
     recordExperiment(document.experimentId);
     await refreshExperimentList();
   });
@@ -3425,15 +3773,36 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     });
   }, [experimentDoc]);
 
-  const computeProcessWindow = () => run('window', async () => {
-    if (!experimentDoc) throw new Error('先创建实验');
+  const windowBlockedReason = !experimentDoc
+    ? '先完成实验或测量：还没有可分析的实验。'
+    : experimentRunCount === 0
+      ? '先完成实验或测量：实验尚未运行。'
+      : '';
+
+  const computeProcessWindow = () => {
     const lower = Number(windowLower);
     const upper = Number(windowUpper);
-    if (!Number.isFinite(lower) || !Number.isFinite(upper) || lower >= upper) throw new Error('填写有效的窗口上下限');
-    setWindowResult(await postJson<ProcessWindowResult>('/api/v1/workflow/analysis/process-window', {
-      experimentId: experimentDoc.experimentId, lower, upper,
-    }));
-  });
+    const problem = windowBlockedReason
+      || (!windowLower.trim() || !windowUpper.trim() || !Number.isFinite(lower) || !Number.isFinite(upper)
+        ? '填写有效的窗口上下限（数字）'
+        : lower >= upper ? '窗口下限必须小于上限' : '');
+    if (problem) {
+      // Inline next to the offending inputs, then bring them into view instead
+      // of relying on the single red line at the top of the page.
+      setWindowError(problem);
+      const target = windowLowerRef.current ?? windowUpperRef.current;
+      target?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      target?.focus({ preventScroll: true });
+      return;
+    }
+    setWindowError('');
+    void run('window', async () => {
+      if (!experimentDoc) throw new Error('先创建实验');
+      setWindowResult(await postJson<ProcessWindowResult>('/api/v1/workflow/analysis/process-window', {
+        experimentId: experimentDoc.experimentId, lower, upper,
+      }));
+    });
+  };
 
   const generateReport = () => run('report', async () => {
     if (!reportReady) throw new Error('先完成 03 运行与测量，或在 04 运行一个实验');
@@ -3472,6 +3841,27 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     URL.revokeObjectURL(url);
   };
 
+  /** Grow the preview to the report body so the structure view is on screen. */
+  const resizeReportFrame = () => {
+    const frame = reportFrameRef.current;
+    if (!frame) return;
+    const apply = () => {
+      const doc = frame.contentDocument;
+      if (!doc) return;
+      const height = Math.max(
+        doc.documentElement?.scrollHeight ?? 0,
+        doc.body?.scrollHeight ?? 0,
+        520,
+      );
+      frame.style.height = `${Math.min(height + 16, 12000)}px`;
+    };
+    apply();
+    // The body is laid out one frame after `load`; re-measure so the preview
+    // never keeps a half-sized box that clips the structure section.
+    window.requestAnimationFrame(apply);
+    window.setTimeout(apply, 120);
+  };
+
   const loadCalibrationFile = async (file: File) => {
     setCalibrationCsv(await file.text());
     setCalibrationName(file.name.replace(/\.[^.]+$/, ''));
@@ -3500,6 +3890,28 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     if (!views.length) return null;
     return mergeFrames(views.map(view => structureFrame(view, syncAxis)), syncZoom);
   }, [candidateViews, syncAxis, syncZoom]);
+
+  const candidateViewsHave3D = useMemo(
+    () => Object.values(candidateViews).some(view => view.dimension === 3),
+    [candidateViews],
+  );
+  const candidateUnit = Object.values(candidateViews)[0]?.coordinateUnit ?? 'um';
+  /** The metric table always has at least the current measurement. */
+  const analysisMetrics = useMemo(
+    () => (metrics.length ? metrics : (measurement ? [measurement] : [])),
+    [metrics, measurement],
+  );
+
+  /** Readable run name for the metric table; the raw id stays in `title`. */
+  const runDisplayLabel = useCallback((runId: string | null | undefined): string => {
+    if (!runId) return '—';
+    const variant = experimentDoc?.variants.find(item =>
+      item.replicates.some(replicate => replicate.runId === runId));
+    if (variant) return variantConditionLabel(variant);
+    const index = route?.segments.findIndex(item => item.runId === runId) ?? -1;
+    if (index >= 0) return `当前 Run · 第 ${index + 1} 段`;
+    return 'Run 已记录';
+  }, [experimentDoc, route]);
 
   const libraryDuplicateNames = useMemo(() => {
     const counts = new Map<string, number>();
@@ -4970,8 +5382,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                       ? <>
                         <span>三角形 <code>{structureStatsForStep.triangles.toLocaleString('en-US')}</code></span>
                         <span>点 <code>{structureStatsForStep.points.toLocaleString('en-US')}</code></span>
-                        <span>FPS <code>{structureStatsForStep.fps > 0 ? structureStatsForStep.fps.toFixed(1) : '—'}</code></span>
-                        <span>解析 <code>{structureStatsForStep.parseMs} ms</code></span>
+                        <span>解析耗时 <code>{structureStatsForStep.parseMs} ms</code></span>
                         {structureStatsForStep.simplified && <span className="warn">简化 {Number(structureStatsForStep.sourceTriangles ?? structureStatsForStep.triangles).toLocaleString('en-US')} → {structureStatsForStep.triangles.toLocaleString('en-US')} 面</span>}
                       </>
                       : <span className="wf-muted">等待三维统计…</span>}
@@ -4986,7 +5397,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                   </div>
                   {measurement && <div className="wf-structure-info">
                     <span className="wf-muted">测量值</span>
-                    <strong>{measurement.value === null ? measurement.reason ?? '无值' : `${measurement.value.toFixed(4)} ${displayUnit(measurement.unit)}`}</strong>
+                    <strong>{measurement.value === null ? measurement.reason ?? '无值' : `${formatMicrons(measurement.value)} ${displayUnit(measurement.unit)}`}</strong>
                     <span className="wf-muted">测量位置在 2D 视图显示</span>
                   </div>}
                   {!measurement && <div className="wf-muted">测量后在 2D 视图显示位置</div>}
@@ -4996,27 +5407,29 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 ? <div className="wf-structure-body">
                   <StructureCanvas
                     view={structureView}
-                    frame={structureFrame(structureView, structureAxis)}
-                    axis={structureAxis}
+                    frame={structureFrame(structureView, 'xy')}
+                    axis="xy"
                     marker={measurement ? measurementMark : null}
+                    note={structureNote}
                     label="当前 Run 结构视图"
                   />
                   <div className="wf-structure-side">
-                    <label className="spx-field"><span>视图轴</span>
-                      <select aria-label="结构视图轴" value={structureAxis} onChange={event => setStructureAxis(event.target.value as StructureAxis)}>
-                        <option value="xy">XY</option>
-                        <option value="xz">XZ</option>
-                        <option value="yz">YZ</option>
-                      </select>
-                    </label>
+                    <div className="spx-field">
+                      <span>视图轴</span>
+                      <code className="wf-axis-chip" aria-label="结构视图轴">X – 高度</code>
+                    </div>
                     <div className="wf-structure-stats">
-                      <span>拓扑</span><code>{structureView.topology}</code>
+                      <span>拓扑</span><code>{topologyLabel(structureView.topology)}</code>
                       <span>点</span><code>{structureView.pointCount}</code>
                       <span>线</span><code>{structureView.lineCount}</code>
                       <span>三角形</span><code>{structureView.triangleCount}</code>
-                      <span>单位</span><code>µm</code>
-                      <span>X 范围</span><code>{`${Number(structureView.bounds[0]).toFixed(3)} … ${Number(structureView.bounds[1]).toFixed(3)}`}</code>
-                      <span>Y 范围</span><code>{`${Number(structureView.bounds[2]).toFixed(3)} … ${Number(structureView.bounds[3]).toFixed(3)}`}</code>
+                      <span>单位</span><code>{structureUnit(structureView)}</code>
+                      <span>X 范围</span><code>{structureViewExtent ? `${formatNumber(structureViewExtent.minU)} … ${formatNumber(structureViewExtent.maxU)}` : '—'}</code>
+                      <span>高度范围</span><code>{structureViewExtent
+                        ? structureViewExtent.flatV
+                          ? `${formatMicrons(structureViewExtent.maxV)}（平坦）`
+                          : `${formatMicrons(structureViewExtent.minV)} … ${formatMicrons(structureViewExtent.maxV)}`
+                        : '—'}</code>
                     </div>
                     <div className="wf-structure-legend">
                       {structureLegend(structureView).map(row => <div key={row.id}>
@@ -5114,10 +5527,10 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             {segment.status === 'running' && <div className="wf-progress"><i /></div>}
             {measurement && <div className="wf-summary">
               <strong>测量 · {statusLabel(measurement.status)}</strong>
-              <span>{measurement.value === null ? measurement.reason ?? '无值' : `${measurement.value.toFixed(4)} ${displayUnit(measurement.unit)}`}</span>
+              <span>{measurement.value === null ? measurement.reason ?? '无值' : `${formatMicrons(measurement.value)} ${displayUnit(measurement.unit)}`}</span>
               <span>绑定 (binding)：{bindingLabel(measurement.bindingStatus)} · 等价 (equivalence)：{bindingLabel(measurement.equivalenceStatus)}</span>
             </div>}
-            {metrics.length > 0 && <table className="wf-table"><thead><tr><th>状态</th><th>数值</th><th>配方 / 步骤</th><th>绑定 / 等价</th><th /></tr></thead><tbody>{metrics.map(item => <tr key={item.measurementId}><td>{statusLabel(item.status)}</td><td>{item.value === null ? item.reason : `${item.value.toFixed(4)} ${displayUnit(item.unit)}`}</td><td>{item.recipeId} v{item.recipeVersion} · {item.method} · {item.material} · {stepDisplayName(item.sourceStepId ?? '')}</td><td>{bindingLabel(item.bindingStatus)} / {bindingLabel(item.equivalenceStatus)}</td><td><button className="wf-link" aria-label={`查看 ${item.measurementId} 证据`} onClick={() => void showMetricDetail(item)}>详情</button></td></tr>)}</tbody></table>}
+            {metrics.length > 0 && <table className="wf-table"><thead><tr><th>状态</th><th>数值</th><th>配方 / 步骤</th><th>绑定 / 等价</th><th /></tr></thead><tbody>{metrics.map(item => <tr key={item.measurementId}><td>{statusLabel(item.status)}</td><td>{item.value === null ? item.reason : `${formatMicrons(item.value)} ${displayUnit(item.unit)}`}</td><td>{item.recipeId} v{item.recipeVersion} · {item.method} · {item.material} · {stepDisplayName(item.sourceStepId ?? '')}</td><td>{bindingLabel(item.bindingStatus)} / {bindingLabel(item.equivalenceStatus)}</td><td><button className="wf-link" aria-label={`查看 ${item.measurementId} 证据`} onClick={() => void showMetricDetail(item)}>详情</button></td></tr>)}</tbody></table>}
             {metricDetail && <div className="wf-evidence">
               <div className="wf-evidence-head"><strong>{metricDetail.measurement.measurementId}</strong><span className={`wf-status ${metricDetail.measurement.status}`}>{statusLabel(metricDetail.measurement.status)}</span></div>
               <div className="wf-evidence-grid">
@@ -5223,6 +5636,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               <span className={`wf-status ${experimentDoc.status}`}>{statusLabel(experimentDoc.status)}</span>
               <span className="wf-muted">实验状态：{statusLabel(experimentDoc.status)}{experimentDoc.kind === 'doe' ? ' · DOE' : ''}</span>
               <span className="wf-muted">{experimentDoc.variants.length} 变体 · 配方 v{experimentDoc.recipeVersion}</span>
+              {experimentDoc.design && <span className="wf-muted" aria-label="DOE 设计摘要">
+                {experimentDoc.design.conditionCount} 条件 × {experimentDoc.design.replicates} 重复 = {experimentDoc.design.logicalRunCount} 逻辑执行
+              </span>}
               <span className="wf-spacer" />
               <button className={experimentRunCount > 0 ? 'wf-button' : 'wf-button primary'} disabled={!!busy} onClick={() => void runPersistentExperiment()}>
                 {busy === 'experiment' ? '实验运行中…' : experimentRunCount > 0 ? '重新运行实验' : '运行实验'}
@@ -5233,11 +5649,13 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               <strong>队列</strong>
               <span>{experimentDoc.queue.succeeded}/{experimentDoc.queue.total} 已成功 · 待处理 {experimentDoc.queue.pending} · 运行中 {experimentDoc.queue.running}</span>
               <span>预计剩余 {experimentDoc.queue.estimatedSecondsRemaining} s</span>
-              <span>成本 ${experimentDoc.queue.estimatedCostUsd.toFixed(4)}</span>
+              <span>{experimentDoc.queue.estimatedCostUsd > 0
+                ? `成本 $${experimentDoc.queue.estimatedCostUsd.toFixed(4)}`
+                : '本地 CPU · 无云成本'}</span>
               <span>重试 {experimentDoc.queue.retries}</span>
             </div>}
             {experimentResultRows.length > 0 ? <table className="wf-table wf-result-table" aria-label="实验结果表">
-              <thead><tr><th>变体</th><th>条件</th><th>重复结果（每次）</th><th>均值（{experimentResultRows[0].unit}）</th><th>标准差（{experimentResultRows[0].unit}）</th><th>状态</th></tr></thead>
+              <thead><tr><th>变体</th><th>条件</th><th>重复结果（每次）</th><th>均值（{displayUnit(experimentResultRows[0].unit)}）</th><th>标准差（{displayUnit(experimentResultRows[0].unit)}）</th><th>状态</th></tr></thead>
               <tbody>{experimentResultRows.map(row => <tr key={row.ordinal}>
                 <td>V{row.ordinal}</td>
                 <td className="wf-condition">{row.condition}</td>
@@ -5311,7 +5729,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               <div className="wf-card-subhead">DOE 全因子</div>
               <p className="wf-muted">每个因子 2–10 个取值（逗号分隔），1–5 个因子；组合数 = 各因子取值数相乘。</p>
               <div className="wf-doe-factors">
-                {doeFactors.map((row, index) => <div className="wf-doe-factor" key={index}>
+                {doeFactors.map((row, index) => <div className={`wf-doe-factor${doeFactorErrors[index] ? ' has-error' : ''}`} key={index}>
                   <label className="spx-field"><span>因子 {index + 1} 步骤</span>
                     <select aria-label={`因子 ${index + 1} 步骤`} value={row.stepId} onChange={event => setDoeFactors(previous => previous.map((item, itemIndex) => itemIndex === index ? { ...item, stepId: event.target.value } : item))}>
                       {(project?.steps ?? []).filter(step => step.enabled).map((step, stepIndex) => <option key={step.id} value={step.id}>{stepOptionLabel(step, stepIndex)}</option>)}
@@ -5319,19 +5737,20 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                   </label>
                   <label className="spx-field"><span>参数</span>
                     <select aria-label={`因子 ${index + 1} 参数`} value={row.parameter} onChange={event => setDoeFactors(previous => previous.map((item, itemIndex) => itemIndex === index ? { ...item, parameter: event.target.value } : item))}>
-                      <option value="duration">duration（s）</option>
-                      <option value="rateMagnitude">rateMagnitude（µm/s）</option>
-                      <option value="stickingProbability">stickingProbability</option>
+                      {DOE_PARAMETERS.map(parameter => <option key={parameter.id} value={parameter.id}>{parameter.label}</option>)}
                     </select>
                   </label>
                   <label className="spx-field"><span>取值（2–10 个，逗号分隔）</span>
-                    <input aria-label={`因子 ${index + 1} 取值`} value={row.values} onChange={event => setDoeFactors(previous => previous.map((item, itemIndex) => itemIndex === index ? { ...item, values: event.target.value } : item))} />
+                    <input aria-label={`因子 ${index + 1} 取值`} value={row.values}
+                      aria-invalid={doeFactorErrors[index] ? 'true' : undefined}
+                      onChange={event => setDoeFactors(previous => previous.map((item, itemIndex) => itemIndex === index ? { ...item, values: event.target.value } : item))} />
                   </label>
                   <button type="button" className="wf-link" disabled={doeFactors.length <= 1} onClick={() => setDoeFactors(previous => previous.filter((_, itemIndex) => itemIndex !== index))}>移除</button>
+                  {doeFactorErrors[index] && <div className="wf-field-error" role="alert" data-factor={index + 1}>{doeFactorErrors[index]}</div>}
                 </div>)}
               </div>
               <div className="spx-run-actions">
-                <button className="wf-button ghost" disabled={doeFactors.length >= 5} onClick={() => setDoeFactors(previous => [...previous, { stepId: experimentTargetStep?.id ?? '', parameter: 'duration', values: '0.01,0.02' }])}>＋ 添加因子</button>
+                <button className="wf-button ghost" disabled={doeFactors.length >= 5} onClick={addDoeFactor}>＋ 添加因子</button>
               </div>
               <div className="spx-field-grid">
                 <label className="spx-field"><span>DOE 重复数（1–8）</span>
@@ -5345,8 +5764,13 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 </label>
               </div>
               <div className="spx-run-actions">
-                <button className="wf-button primary" disabled={!!busy} onClick={() => void createDoe()}>设计 DOE</button>
+                <button className="wf-button primary" disabled={!!busy || doeBlocked}
+                  title={doeBlocked ? '有重复或无效的因子，请先修正高亮的行' : '按全因子组合设计 DOE'}
+                  onClick={() => void createDoe()}>设计 DOE</button>
               </div>
+              {doeBlocked && <div className="wf-block-reason" aria-label="DOE 禁用原因">
+                先修正因子：{doeFactorErrors.find(Boolean)}
+              </div>}
               {experimentDoc?.design && <div className="wf-summary"><strong>DOE</strong><span>{experimentDoc.design.conditionCount} 条件 × {experimentDoc.design.replicates} 重复 = {experimentDoc.design.logicalRunCount} 逻辑执行</span></div>}
               {experimentDoc?.kind === 'doe' && <div className="spx-field-grid">
                 <label className="spx-field"><span>均值下限（{displayUnit(experimentResultRows[0]?.unit)}）</span>
@@ -5429,22 +5853,45 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             <div className="spx-run-actions">
               <button className="wf-button ghost" disabled={!experimentDoc || !!busy} onClick={loadExperimentCandidates}>刷新候选</button>
               <button className="wf-button ghost" disabled={!hasExecutedRun || !!busy} onClick={addCurrentCandidate}>加入当前 Run</button>
-              <button className="wf-button primary" disabled={compareCandidates.length < 1 || !!busy} onClick={() => void runComparison()}>
-                {busy === 'compare' ? '比较中…' : '刷新视图 / 比较'}
+              <button className="wf-button primary" disabled={compareCandidates.length < 2 || !!busy}
+                title={compareCandidates.length < 2 ? '先选择至少 2 个候选' : '比较所选候选并加载结构视图'}
+                onClick={() => void runComparison()}>
+                {busy === 'compare' ? '比较中…' : '比较并加载视图'}
               </button>
               {autoAnalysisId && autoAnalysisId === experimentDoc?.experimentId && <span className="wf-muted">已自动载入该实验的候选</span>}
             </div>
+            {compareCandidates.length < 2 && <div className="wf-block-reason" aria-label="比较禁用原因">
+              先选择至少 2 个候选：点击“刷新候选”载入实验变体，或“加入当前 Run”添加一个对照。
+            </div>}
+
+            {compareCandidates.length > 0 && <table className="wf-table" aria-label="候选表">
+              <thead><tr><th>候选</th><th>步骤</th><th>状态</th><th>来源</th></tr></thead>
+              <tbody>{compareCandidates.map(candidate => {
+                const variant = experimentDoc?.variants.find(item =>
+                  item.replicates.some(replicate => replicate.runId === candidate.runId));
+                return <tr key={`${candidate.runId}:${candidate.stepId}`} title={`${candidate.runId} / ${candidate.stepId}`}>
+                  <td>{candidate.label}</td>
+                  <td>{stepDisplayName(candidate.stepId)}</td>
+                  <td><span className={`wf-status ${variant ? experimentVariantStatus(variant) : 'succeeded'}`}>
+                    {variant ? statusLabel(experimentVariantStatus(variant)) : '已记录'}
+                  </span></td>
+                  <td title={candidate.runId}>{variant ? '实验 Run' : '当前 Run'}</td>
+                </tr>;
+              })}</tbody>
+            </table>}
 
             {Object.keys(candidateViews).length > 0 && <div className="wf-compare-controls">
               <label>同步缩放 <input aria-label="同步缩放" type="range" min="0.5" max="3" step="0.1" value={syncZoom} onChange={event => setSyncZoom(Number(event.target.value))} /></label>
-              <label>视图轴
-                <select aria-label="同步轴" value={syncAxis} onChange={event => setSyncAxis(event.target.value as typeof syncAxis)}>
-                  <option value="xy">XY</option>
-                  <option value="xz">XZ</option>
-                  <option value="yz">YZ</option>
-                </select>
-              </label>
-              <span className="wf-muted">单位 µm · 所有候选共用同一坐标范围</span>
+              {candidateViewsHave3D
+                ? <label>视图轴
+                  <select aria-label="同步轴" value={syncAxis} onChange={event => setSyncAxis(event.target.value as typeof syncAxis)}>
+                    <option value="xy">XY</option>
+                    <option value="xz">XZ</option>
+                    <option value="yz">YZ</option>
+                  </select>
+                </label>
+                : <span className="wf-axis-chip" aria-label="同步轴">X – 高度</span>}
+              <span className="wf-muted">单位 {displayUnit(candidateUnit)} · 所有候选共用同一坐标范围</span>
             </div>}
 
             {compareCandidates.length > 0 && <div className="wf-compare-grid">
@@ -5455,16 +5902,17 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                   ? comparison?.pairwise.find(row =>
                     (row.left === candidate.label && row.right === firstLabel) || (row.right === candidate.label && row.left === firstLabel))
                   : undefined;
-                return <figure key={`${candidate.runId}:${candidate.stepId}`}>
+                return <figure key={`${candidate.runId}:${candidate.stepId}`} title={`${candidate.runId} / ${candidate.stepId}`}>
                   <figcaption>
                     <strong>{candidate.label}</strong>
-                    <span>{view ? `${view.dimension}D · ${topologyLabel(view.topology)} · ${syncAxis.toUpperCase()} · ${structureUnit(view)}` : '视图加载中…'}</span>
+                    <span>{view ? `${view.dimension}D · ${topologyLabel(view.topology)} · ${view.dimension === 2 ? 'X–高度' : syncAxis.toUpperCase()} · ${structureUnit(view)}` : '视图加载中…'}</span>
                     {pairRow && <span>与 {firstLabel} 最大点偏差 {formatNumber(pairRow.maxPointDelta)} µm · 边界偏差 {formatNumber(pairRow.boundsDelta)} µm</span>}
                   </figcaption>
                   {view && analysisFrame ? <StructureCanvas
                     view={view}
                     frame={analysisFrame}
                     axis={syncAxis}
+                    note={view.dimension === 2 ? structureSurfaceNote(view, syncAxis) : null}
                     className="wf-compare-canvas"
                     label={`候选 ${index + 1} 结构视图`}
                   /> : <div className="wf-empty">视图加载中…</div>}
@@ -5482,12 +5930,28 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 <td><span className={`wf-status ${row.status}`}>{toleranceLabel(row.status)}</span></td>
                 <td>{formatNumber(row.maxPointDelta)}</td>
                 <td>{formatNumber(row.boundsDelta)}</td>
-                <td>{Object.keys(row.materialDelta).length
-                  ? Object.entries(row.materialDelta).map(([key, value]) => `${key} ${formatNumber(value)}`).join(' · ')
-                  : '—'}</td>
-                <td>{row.reasons.join('；') || '—'}</td>
+                <td>{materialDeltaText(row.materialDelta)}</td>
+                <td>{row.reasons.map(reason => compareReasonLabel(reason)).join('；') || '—'}</td>
               </tr>)}</tbody>
             </table>}
+
+            <div className="wf-card-subhead">测量指标</div>
+            {analysisMetrics.length > 0
+              ? <table className="wf-table" aria-label="测量指标表">
+                <thead><tr><th>Run</th><th>步骤</th><th>方法</th><th>数值</th><th>单位</th><th>绑定状态</th></tr></thead>
+                <tbody>{analysisMetrics.map(item => <tr key={item.measurementId} title={item.measurementId}>
+                  <td title={item.sourceRunId ?? undefined}>{runDisplayLabel(item.sourceRunId)}</td>
+                  <td>{item.sourceStepId ? stepDisplayName(item.sourceStepId) : '—'}</td>
+                  <td>{metricMethodLabel(item.method)}</td>
+                  <td>{item.value === null ? (item.reason ?? '—') : formatNumber(item.value)}</td>
+                  <td>{displayUnit(item.unit)}</td>
+                  <td><span className={`wf-status ${item.bindingStatus === 'verified' ? 'succeeded' : 'planned'}`}>{bindingLabel(item.bindingStatus)}</span></td>
+                </tr>)}</tbody>
+              </table>
+              : <div className="wf-empty" aria-label="测量指标空态">
+                <strong>还没有测量记录</strong>
+                <span>在 03 执行 Segment 后点击“测量”，这里会列出每次测量的数值与绑定状态。</span>
+              </div>}
 
             <details className="spx-advanced wf-analysis-advanced">
               <summary>高级：Process Window（工艺窗口）与基础标定</summary>
@@ -5498,15 +5962,24 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 {experimentDoc && experimentRunCount === 0 && <div className="wf-muted">实验尚未运行，窗口无法计算。</div>}
                 <div className="spx-field-grid">
                   <label className="spx-field"><span>窗口下限（{displayUnit(experimentDoc?.unit)}）</span>
-                    <input aria-label="窗口下限" value={windowLower} onChange={event => setWindowLower(event.target.value)} placeholder="下限" />
+                    <input aria-label="窗口下限" ref={windowLowerRef} value={windowLower}
+                      aria-invalid={windowError ? 'true' : undefined}
+                      onChange={event => { setWindowLower(event.target.value); setWindowError(''); }} placeholder="下限" />
                   </label>
                   <label className="spx-field"><span>窗口上限（{displayUnit(experimentDoc?.unit)}）</span>
-                    <input aria-label="窗口上限" value={windowUpper} onChange={event => setWindowUpper(event.target.value)} placeholder="上限" />
+                    <input aria-label="窗口上限" ref={windowUpperRef} value={windowUpper}
+                      aria-invalid={windowError ? 'true' : undefined}
+                      onChange={event => { setWindowUpper(event.target.value); setWindowError(''); }} placeholder="上限" />
                   </label>
                   <div className="wf-field-action">
-                    <button className="wf-button primary" disabled={!experimentDoc || experimentRunCount === 0 || !!busy} onClick={() => void computeProcessWindow()}>计算窗口</button>
+                    <button className="wf-button primary"
+                      disabled={!experimentDoc || experimentRunCount === 0 || !!busy}
+                      title={windowBlockedReason || '按当前实验的重复测量计算工艺窗口'}
+                      onClick={() => void computeProcessWindow()}>计算窗口</button>
                   </div>
+                  {windowError && <div className="wf-field-error span-2" role="alert" aria-label="窗口校验错误">{windowError}</div>}
                 </div>
+                {windowBlockedReason && <div className="wf-block-reason" aria-label="窗口禁用原因">{windowBlockedReason}</div>}
                 {windowResult && <>
                   <div className="wf-summary"><strong>工艺窗口 [{formatNumber(windowResult.lower)}, {formatNumber(windowResult.upper)}] {displayUnit(experimentDoc?.unit)}</strong>
                     <span>通过 {windowResult.summary.pass} · 超出 {windowResult.summary.fail} · 不确定 {windowResult.summary.uncertain} · 未评估 {windowResult.summary.notEvaluated}</span>
@@ -5542,10 +6015,14 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                     </select>
                   </label>
                 </div>
-                {!calibrationCsv && <div className="wf-muted">选择 CSV 后可创建数据集。</div>}
+                {!calibrationCsv && <div className="wf-block-reason" aria-label="标定禁用原因">先选择标定 CSV，再创建数据集并拟合。</div>}
                 <div className="spx-run-actions">
-                  <button className="wf-button ghost" disabled={!calibrationCsv || !!busy} onClick={() => void createCalibrationDataset()}>创建数据集</button>
-                  <button className="wf-button primary" disabled={!calibrationDataset || !!busy} onClick={() => void fitCalibration()}>拟合</button>
+                  <button className="wf-button ghost" disabled={!calibrationCsv || !!busy}
+                    title={calibrationCsv ? '用所选 CSV 创建标定数据集' : '先选择标定 CSV'}
+                    onClick={() => void createCalibrationDataset()}>创建数据集</button>
+                  <button className="wf-button primary" disabled={!calibrationDataset || !!busy}
+                    title={!calibrationCsv ? '先选择标定 CSV' : !calibrationDataset ? '先创建数据集' : '按所选模型与方法拟合'}
+                    onClick={() => void fitCalibration()}>拟合</button>
                 </div>
                 {calibrationDataset && <div className="wf-muted">数据集 {calibrationDataset.name} · 训练 {calibrationDataset.trainCount} / 验证 {calibrationDataset.validationCount} · {calibrationDataset.sha256.slice(0, 12)}…</div>}
                 {calibrationFit && <>
@@ -5570,7 +6047,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             <div><span>Run</span><strong>{hasExecutedRun && segment ? statusLabel(segment.status) : '未提供'}</strong></div>
             <div><span>测量</span><strong>{measurement ? `${formatNumber(measurement.value)} ${displayUnit(measurement.unit)}` : '未提供'}</strong></div>
             <div><span>实验</span><strong>{experimentDoc ? `${experimentDoc.name} · ${experimentDoc.variants.length} 变体` : '未提供'}</strong></div>
-            <div><span>报告</span><strong>{reportDocument ? '已生成' : '未生成'}</strong></div>
+            <div><span>报告</span><strong>{reportDocument ? `已生成 · ${formatDateTime(reportDocument.createdAt)}` : '未生成'}</strong></div>
           </div>
 
           <div className="spx-field-grid wf-report-form">
@@ -5609,13 +6086,26 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               <strong>{reportDocument.title}</strong>
               <span className="wf-status succeeded">已生成</span>
               <span className="wf-muted">{formatDateTime(reportDocument.createdAt)}</span>
-              <span className="wf-muted">SHA256 {reportDocument.sha256.slice(0, 16)}…</span>
             </div>
             <div className="wf-report-conclusions">
               <strong>结论 / 候选说明</strong>
               <p>{reportConclusions.trim() || '未提供'}</p>
             </div>
-            <iframe className="wf-report-preview" title="报告预览" srcDoc={reportDocument.html} />
+            <details className="spx-advanced wf-report-tech">
+              <summary>技术详情（ID 与哈希）</summary>
+              <div className="wf-evidence-grid">
+                <span>报告</span><code>{reportDocument.reportId}</code>
+                <span>工程</span><code>{projectId ?? '—'}</code>
+                <span>编译</span><code>{compile?.compileId ?? '—'}</code>
+                <span>Route</span><code>{route?.route.routeId ?? '—'}</code>
+                <span>Run</span><code>{segment?.runId ?? '—'}</code>
+                <span>测量</span><code>{measurement?.measurementId ?? '—'}</code>
+                <span>实验</span><code>{experimentDoc?.experimentId ?? '—'}</code>
+                <span>SHA256</span><code>{reportDocument.sha256}</code>
+              </div>
+            </details>
+            <iframe ref={reportFrameRef} className="wf-report-preview" title="报告预览" srcDoc={reportDocument.html}
+              onLoad={resizeReportFrame} />
           </>}
         </section>}
           </main>

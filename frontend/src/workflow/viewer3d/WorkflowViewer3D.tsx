@@ -34,6 +34,10 @@ type LoadState =
 
 const AXIS_ORDER: Array<'x' | 'y' | 'z'> = ['x', 'y', 'z'];
 
+/** `?debug=1` exposes the frame-rate counter without opening 性能. */
+const DEBUG_FPS = typeof window !== 'undefined'
+  && new URLSearchParams(window.location.search).get('debug') === '1';
+
 const numberFormat = new Intl.NumberFormat('en-US');
 
 function axisRange(mesh: ParsedMesh, axis: 'x' | 'y' | 'z'): [number, number] {
@@ -72,7 +76,10 @@ export default function WorkflowViewer3D({
   const [displayMode, setDisplayMode] = useState<DisplayMode>('surface');
   const [projection, setProjection] = useState<'parallel' | 'perspective'>('parallel');
   const [clip, setClip] = useState<ClipState>({ enabled: false, axis: 'x', position: 0, keep: 'positive' });
-  const [showStats, setShowStats] = useState(true);
+  // FPS is opt-in: a headless / software-GL session reports ~5 fps, which reads
+  // as a defect instead of a measurement. Triangles / points / parse time stay
+  // visible; `?debug=1` forces the FPS counter on.
+  const [showStats, setShowStats] = useState(false);
   const [fps, setFps] = useState(0);
   const [sceneVersion, setSceneVersion] = useState(0);
   const [sceneError, setSceneError] = useState<string | null>(null);
@@ -241,7 +248,7 @@ export default function WorkflowViewer3D({
 
   // ------------------------------------------------------------------ stats
   useEffect(() => {
-    if (!showStats || dimension !== 3 || state.status !== 'ready') {
+    if ((!showStats && !DEBUG_FPS) || dimension !== 3 || state.status !== 'ready') {
       setFps(0);
       return;
     }
@@ -406,7 +413,8 @@ export default function WorkflowViewer3D({
             <span className="wb-viewer3d__hint">二维界面线 · 滚轮缩放 · 拖动平移 · 双击复位</span>
           </>
         )}
-        <label className="wb-viewer3d__toggle wb-viewer3d__toggle--end">
+        <label className="wb-viewer3d__toggle wb-viewer3d__toggle--end"
+          title="显示帧率（FPS）；无 GPU 时该数字不代表渲染性能">
           <input type="checkbox" checked={showStats} onChange={(event) => setShowStats(event.target.checked)} />
           性能
         </label>
@@ -467,30 +475,30 @@ export default function WorkflowViewer3D({
         </div>
       )}
 
-      {showStats && (
-        <div className="wb-viewer3d__status" role="status" aria-live="polite">
-          {ready ? (
-            <>
-              {dimension === 3 ? (
-                <span>三角形 {numberFormat.format(ready.triangleCount)}</span>
-              ) : (
-                <span>线段 {numberFormat.format(ready.lineCount)}</span>
-              )}
-              <span>点 {numberFormat.format(ready.pointCount)}</span>
-              {dimension === 3 && <span>{fps > 0 ? `${fps.toFixed(1)} fps` : '— fps'}</span>}
-              <span>解析 {Math.round(ready.parseMs)} ms{ready.fromCache ? '（缓存）' : ''}</span>
-              {ready.simplified && (
-                <span className="wb-viewer3d__status-warn">
-                  顶点聚类简化 {numberFormat.format(ready.sourceTriangles)} → {numberFormat.format(ready.triangleCount)} 面
-                </span>
-              )}
-              <span className="wb-viewer3d__status-muted">{ready.stepName ?? ready.stepId}</span>
-            </>
-          ) : (
-            <span className="wb-viewer3d__status-muted">等待快照…</span>
-          )}
-        </div>
-      )}
+      <div className="wb-viewer3d__status" role="status" aria-live="polite">
+        {ready ? (
+          <>
+            {dimension === 3 ? (
+              <span>三角形 {numberFormat.format(ready.triangleCount)}</span>
+            ) : (
+              <span>线段 {numberFormat.format(ready.lineCount)}</span>
+            )}
+            <span>点 {numberFormat.format(ready.pointCount)}</span>
+            {(showStats || DEBUG_FPS) && dimension === 3 && (
+              <span>{fps > 0 ? `${fps.toFixed(1)} fps` : '— fps'}</span>
+            )}
+            <span>解析 {Math.round(ready.parseMs)} ms{ready.fromCache ? '（缓存）' : ''}</span>
+            {ready.simplified && (
+              <span className="wb-viewer3d__status-warn">
+                顶点聚类简化 {numberFormat.format(ready.sourceTriangles)} → {numberFormat.format(ready.triangleCount)} 面
+              </span>
+            )}
+            <span className="wb-viewer3d__status-muted">{ready.stepName ?? ready.stepId}</span>
+          </>
+        ) : (
+          <span className="wb-viewer3d__status-muted">等待快照…</span>
+        )}
+      </div>
     </section>
   );
 }

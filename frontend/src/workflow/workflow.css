@@ -1089,3 +1089,30 @@ body {
 /* `hidden` must win over the .spx-field-grid display rule (GDS projects hide
    the parametric material fields). */
 .spx-field-grid[hidden] { display: none; }
+
+/* 2D structure view: material fills under the interface line, in-plot axis
+   titles and the flat-surface / depth note. */
+.wf-structure-canvas .wf-axis-title { fill: #34404b; font-weight: 600; }
+.wf-structure-note { fill: #8a1c12; font-family: "Consolas", monospace; }
+.wf-interface { stroke-linejoin: round; stroke-linecap: round; }
+.wf-axis-chip {
+  display: inline-block; padding: 3px 7px; border: 1px solid var(--spx-line);
+  background: #f4f5f6; color: #34404b; font: 10px "Consolas", monospace;
+}
+.wf-compare-controls .wf-axis-chip { padding: 4px 7px; }
+.wf-structure-side .wf-axis-chip { margin: 2px 0 4px; }
+
+/* Inline validation for 04 (DOE factors) and 05 (process window). */
+.wf-field-error {
+  grid-column: 1 / -1; margin: 2px 0 0; padding: 3px 6px;
+  border-left: 2px solid var(--spx-red); background: #fdf1f0;
+  color: #8a1c12; font-size: 10px; line-height: 1.35;
+}
+.wf-doe-factor.has-error { border-color: #d08a84; background: #fffafa; }
+.wf-doe-factor .wf-field-error { margin-top: 1px; }
+.spx-field-grid > .wf-field-error { margin-top: 0; }
+
+/* 06: the preview grows with the report body so the structure view is visible. */
+.wf-report-preview { min-height: 520px; }
+.wf-report-tech { margin: 6px 0; }
+.wf-report-tech .wf-evidence-grid { padding: 4px 8px; }

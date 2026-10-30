@@ -94,13 +94,17 @@ try {
   assert.equal(await page.locator('.wf-segment-structure:not([disabled])').count(), 2);
 
   await page.getByRole('button', { name: '04 实验' }).click();
-  const valueRows = [[0, '0.01,0.02'], [1, '0.01,0.02'], [2, '0.01,0.02']];
-  for (const [index] of valueRows) {
+  // The default DOE has two legal factors; add a third so the full factorial
+  // design stays 2×2×2 = 8 conditions.
+  assert.equal(await page.locator('.wf-doe-factor').count(), 2, 'DOE defaults to two factors');
+  await page.getByRole('button', { name: '＋ 添加因子' }).click();
+  assert.equal(await page.locator('.wf-doe-factor').count(), 3, 'adding a factor keeps the design usable');
+  for (const index of [0, 1, 2]) {
     await page.getByLabel(`因子 ${index + 1} 取值`).fill('0.01,0.02');
   }
   await page.getByLabel('DOE 重复数').fill('1');
   await page.getByRole('button', { name: '设计 DOE' }).click();
-  await page.getByText(/8 条件 × 1 重复 = 8 逻辑执行/).waitFor();
+  await page.locator('[aria-label="DOE 设计摘要"]').filter({ hasText: '8 条件 × 1 重复 = 8 逻辑执行' }).waitFor();
   await page.getByRole('button', { name: '运行实验', exact: true }).click();
   await page.getByText('实验状态：已完成').waitFor({ timeout: 180000 });
   assert.match(await page.locator('.wf-summary').filter({ hasText: '队列' }).innerText(), /8\/8 已成功/);
