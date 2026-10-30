@@ -105,6 +105,16 @@ try {
   const csv = await page.getByRole('link', { name: '导出 CSV' }).getAttribute('href');
   assert.match(csv ?? '', /\/experiments\/exp_[a-f0-9]+\/export\.csv$/);
 
+  // Retention preview/release/restore must complete without a 405 error.
+  await page.getByRole('button', { name: '预览释放' }).click();
+  await page.getByText(/可释放 8 run/).waitFor();
+  await page.getByRole('button', { name: '应用 release-runs' }).click();
+  await page.getByText(/当前 release-runs/).waitFor();
+  assert.equal(await page.locator('.wf-error').count(), 0);
+  await page.getByRole('button', { name: '恢复 keep-all' }).click();
+  await page.getByText(/当前 keep-all/).waitFor();
+  assert.equal(await page.locator('.wf-error').count(), 0);
+
   const experiment = (await getJson('/api/v1/workflow/experiments')).experiments[0];
   const document = await getJson(`/api/v1/workflow/experiments/${experiment.experimentId}`);
   assert.equal(document.kind, 'doe');

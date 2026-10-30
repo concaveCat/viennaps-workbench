@@ -30,17 +30,27 @@ def adopt_project(
         raise ValueError("workflow adoption currently requires a schemaVersion 7 project")
     suffix = uuid.uuid4().hex[:12]
     flow_id = flow_id or f"flow_{suffix}"
+    material_definitions = [
+        item.model_dump(mode="json", exclude_none=True)
+        for item in (validated.materialDefinitions or [])
+    ]
     binding_payload = {
+        "schemaVersion": 1,
+        "name": f"{validated.name} · geometry",
         "dimension": validated.dimension,
         "units": validated.units.model_dump(mode="json"),
         "domain": validated.domain.model_dump(mode="json"),
         "geometry": validated.geometry,
-        "materialDefinitions": [item.model_dump(mode="json", exclude_none=True) for item in (validated.materialDefinitions or [])],
+        "geometrySource": geometry_source,
+        "materialDefinitions": material_definitions,
+        "materialCatalogVersion": "4.6.2",
+        "defaultValuesVersion": "1",
+        "schemaVersions": {},
     }
     binding = GeometryBindingV1(
         schemaVersion=1,
         bindingId=f"bind_{sha256_hex(binding_payload)[:16]}",
-        name=f"{validated.name} · geometry",
+        name=binding_payload["name"],
         dimension=validated.dimension,
         units=validated.units,
         domain=validated.domain,

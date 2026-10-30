@@ -609,8 +609,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     if (!experimentDoc) throw new Error('先创建实验');
     await postJson(`/api/v1/workflow/experiments/${experimentDoc.experimentId}/retention`, { mode });
     setExperimentDoc(await api<ExperimentDoc>(`/api/v1/workflow/experiments/${experimentDoc.experimentId}`));
-    setRetentionInfo(await api<{ releasable: string[]; protected: Array<{ runId: string; reasons: string[] }> }>(
-      `/api/v1/workflow/experiments/${experimentDoc.experimentId}/retention/preview`,
+    setRetentionInfo(await postJson<{ releasable: string[]; protected: Array<{ runId: string; reasons: string[] }> }>(
+      `/api/v1/workflow/experiments/${experimentDoc.experimentId}/retention/preview`, { mode: 'release-runs' },
     ));
   });
 

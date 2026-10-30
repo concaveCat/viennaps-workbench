@@ -716,6 +716,11 @@ async def list_compiles() -> CompileListResponse:
     return CompileListResponse(compiles=[CompileSummaryV1.model_validate(row) for row in rows])
 
 
+@router.get("/geometry-bindings/{binding_id}", response_model=GeometryBindingV1)
+async def get_geometry_binding(binding_id: str) -> GeometryBindingV1:
+    return _call(lambda: get_store().get_binding(binding_id))
+
+
 @router.get("/compiles/{compile_id}", response_model=CompiledWorkflowV1)
 async def get_compile(compile_id: str) -> CompiledWorkflowV1:
     return _call(lambda: get_store().get_compile(compile_id))

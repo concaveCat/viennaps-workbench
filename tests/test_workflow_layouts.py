@@ -120,6 +120,40 @@ class LayoutClipTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(run_compile["project"]["geometry"]["kind"], "gds")
         self.assertEqual(run_compile["project"]["geometry"]["assetId"], clip["gdsAssetId"])
 
+    async def test_annotation_change_creates_new_binding_and_old_binding_remains(self):
+        clip = await self._clip(
+            "binding annotation clip", "CELL_A", 1,
+            {"x0": -0.1, "y0": -0.1, "x1": 2.1, "y1": 1.1},
+        )
+        first = await asgi_request(
+            f"/api/v1/workflow/clips/{clip['clipId']}/compile", method="POST",
+            payload={"project": project(), "flowId": "flow_clip_annotation"},
+        )
+        self.assertEqual(first[0], 201, first[2])
+        first_body = json_body(first)
+        annotated = await asgi_request(
+            f"/api/v1/workflow/clips/{clip['clipId']}/annotations", method="POST",
+            payload={"text": "new annotation", "x": 0.5, "y": 0.2},
+        )
+        self.assertEqual(annotated[0], 201, annotated[2])
+        second = await asgi_request(
+            f"/api/v1/workflow/clips/{clip['clipId']}/compile", method="POST",
+            payload={"project": project(), "flowId": "flow_clip_annotation"},
+        )
+        self.assertEqual(second[0], 201, second[2])
+        second_body = json_body(second)
+        self.assertNotEqual(first_body["binding"]["bindingId"], second_body["binding"]["bindingId"])
+        self.assertNotEqual(
+            first_body["compile"]["compileRecord"]["geometryBindingHash"],
+            second_body["compile"]["compileRecord"]["geometryBindingHash"],
+        )
+        old = await asgi_request(
+            f"/api/v1/workflow/geometry-bindings/{first_body['binding']['bindingId']}"
+        )
+        self.assertEqual(old[0], 200, old[2])
+        self.assertEqual(json_body(old)["bindingId"], first_body["binding"]["bindingId"])
+        self.assertEqual(json_body(old)["geometrySource"]["clipHash"], first_body["binding"]["geometrySource"]["clipHash"])
+
     async def test_hierarchical_reference_flattens_into_layout_bounds(self):
         source = Path(__file__).resolve().parents[1] / "docs" / "stage5-evidence" / "hierarchical-reference.gds"
         uploaded = await asgi_request(

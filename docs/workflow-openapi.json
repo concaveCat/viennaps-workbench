@@ -8993,6 +8993,48 @@
         ]
       }
     },
+    "/api/v1/workflow/geometry-bindings/{binding_id}": {
+      "get": {
+        "operationId": "get_geometry_binding_api_v1_workflow_geometry_bindings__binding_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "binding_id",
+            "required": true,
+            "schema": {
+              "title": "Binding Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GeometryBindingV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Geometry Binding",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
     "/api/v1/workflow/layouts": {
       "get": {
         "operationId": "list_layouts_api_v1_workflow_layouts_get",
