@@ -92,7 +92,7 @@ def native_stack(dimension: int, boundary: str = "periodic"):
     delta, extent = 0.2, 2.0
     boundary_type = (ps.BoundaryType.PERIODIC_BOUNDARY if boundary == "periodic"
                      else ps.BoundaryType.REFLECTIVE_BOUNDARY)
-    domain = (ps.Domain(delta, extent, boundary_type) if dimension == 2
+    domain = (ps.Domain(delta, extent, boundary=boundary_type) if dimension == 2
               else ps.Domain(delta, extent, extent, boundary_type))
     ps.MakePlane(domain, height=0.0, material=ps.Material.Si, addToExisting=False).apply()
     ps.MakePlane(domain, height=0.4, material=ps.Material.Si3N4, addToExisting=True).apply()
@@ -107,7 +107,7 @@ def native_plane(dimension: int):
     ps.Time.setUnit("s")
     delta, extent = 0.2, 2.0
     boundary = ps.BoundaryType.REFLECTIVE_BOUNDARY
-    domain = (ps.Domain(delta, extent, boundary) if dimension == 2
+    domain = (ps.Domain(delta, extent, boundary=boundary) if dimension == 2
               else ps.Domain(delta, extent, extent, boundary))
     ps.MakePlane(domain, height=0.0, material=ps.Material.Si, addToExisting=False).apply()
     return domain

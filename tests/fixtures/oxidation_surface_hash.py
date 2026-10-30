@@ -122,8 +122,7 @@ def main() -> int:
     step = normalized["steps"][0]
 
     if args.dimension == 2:
-        domain = ps.Domain(args.delta, args.extent,
-                           ps.BoundaryType.REFLECTIVE_BOUNDARY)
+        domain = ps.Domain(args.delta, args.extent, boundary=ps.BoundaryType.REFLECTIVE_BOUNDARY)
     else:
         domain = ps.Domain(args.delta, args.extent, args.extent,
                            ps.BoundaryType.REFLECTIVE_BOUNDARY)

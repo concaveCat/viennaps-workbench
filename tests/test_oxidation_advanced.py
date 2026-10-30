@@ -131,7 +131,7 @@ def native_domain(project: dict):
     delta = float(domain_spec["gridDelta"])
     boundary = ps.BoundaryType.REFLECTIVE_BOUNDARY
     if dimension == 2:
-        domain = ps.Domain(delta, float(domain_spec["xExtent"]), boundary)
+        domain = ps.Domain(delta, float(domain_spec["xExtent"]), boundary=boundary)
     else:
         domain = ps.Domain(delta, float(domain_spec["xExtent"]),
                            float(domain_spec["yExtent"]), boundary)
@@ -211,7 +211,7 @@ def run_3d_subprocess(*, delta: float, oxide: float, orientation: str,
 def planar_estimate(orientation: str, *, temperature: float = 1000.0,
                     time_hours: float = 0.5, dry: bool = True) -> float:
     model = ps.Oxidation()
-    model.setOxidant(ps.OxidantType.Dry if dry else ps.OxidantType.Wet)
+    model.setOxidant(getattr(ps.OxidantType, "Dry", getattr(ps.OxidantType, "DRY")) if dry else getattr(ps.OxidantType, "Wet", getattr(ps.OxidantType, "WET")))
     model.setOrientation(getattr(ps.SiliconOrientation, orientation))
     model.setTemperature(temperature)
     model.setPressure(1.0)

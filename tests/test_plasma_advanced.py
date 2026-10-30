@@ -112,7 +112,7 @@ def native_plane(dimension: int, top_material: str | None = "SiO2"):
     ps.Length.setUnit("um")
     ps.Time.setUnit("s")
     boundary = ps.BoundaryType.REFLECTIVE_BOUNDARY
-    domain = (ps.Domain(0.2, 4.0, boundary) if dimension == 2
+    domain = (ps.Domain(0.2, 4.0, boundary=boundary) if dimension == 2
               else ps.Domain(0.2, 4.0, 4.0, boundary))
     ps.MakePlane(domain, height=0.0, material=ps.Material.Si, addToExisting=False).apply()
     if top_material is not None:

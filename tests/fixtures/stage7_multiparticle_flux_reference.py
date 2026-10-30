@@ -36,7 +36,7 @@ def main(project_path, step_id, output_path, engine="CPU_DISK", initial_state_pa
         boundary_name = settings.get("xBoundary", settings.get("boundaryXY"))
         boundary = ps.BoundaryType.REFLECTIVE_BOUNDARY if boundary_name == "reflective" else ps.BoundaryType.PERIODIC_BOUNDARY
         if project["dimension"] == 2:
-            domain = ps.Domain(float(settings["gridDelta"]), float(settings["xExtent"]), boundary)
+            domain = ps.Domain(float(settings["gridDelta"]), float(settings["xExtent"]), boundary=boundary)
         else:
             domain = ps.Domain(float(settings["gridDelta"]), float(settings["xExtent"]),
                                float(settings["yExtent"]), boundary)

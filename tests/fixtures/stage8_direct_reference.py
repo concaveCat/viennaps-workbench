@@ -66,7 +66,7 @@ def make_domain(project: dict[str, Any]):
     ps.Time.setUnit("s")
     d = project["domain"]
     boundary = ps.BoundaryType.REFLECTIVE_BOUNDARY if (d.get("xBoundary", d.get("boundaryXY")) == "reflective") else ps.BoundaryType.PERIODIC_BOUNDARY
-    domain = ps.Domain(float(d["gridDelta"]), float(d["xExtent"]), boundary) if dimension == 2 else ps.Domain(float(d["gridDelta"]), float(d["xExtent"]), float(d["yExtent"]), boundary)
+    domain = ps.Domain(float(d["gridDelta"]), float(d["xExtent"]), boundary=boundary) if dimension == 2 else ps.Domain(float(d["gridDelta"]), float(d["xExtent"]), float(d["yExtent"]), boundary)
     geometry = project["geometry"]
     ps.MakePlane(domain, height=float(geometry["baseHeight"]), material=material(geometry["substrateMaterial"]), addToExisting=False).apply()
     height = float(geometry["baseHeight"])

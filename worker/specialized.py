@@ -349,7 +349,13 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
             resolved["surfaceDiffusion"] = recorded
     elif model_id == "oxidation":
         model = ps.Oxidation()
-        model.setOxidant(getattr(ps.OxidantType, p["oxidant"]))
+        # viennals 5.8.5 spelled these enum members ``Dry``/``Wet``; 5.10.0
+        # renamed them to ``DRY``/``WET``. Accept both so the worker keeps
+        # working on either installed runtime.
+        oxidant = getattr(ps.OxidantType, p["oxidant"], None)
+        if oxidant is None:
+            oxidant = getattr(ps.OxidantType, str(p["oxidant"]).upper())
+        model.setOxidant(oxidant)
         model.setOrientation(getattr(ps.SiliconOrientation, p["orientation"]))
         model.setTemperature(float(p["temperatureC"]))
         model.setPressure(float(p["pressureAtm"]))
@@ -396,7 +402,12 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
             model.setCFLFactor(effective["cflFactor"])
             model.setMechanicsTolerance(effective["mechanicsTolerance"])
             model.setCouplingTolerance(effective["couplingTolerance"])
-            model.setSimplePressureRelaxation(effective["simplePressureRelaxation"])
+            # 4.7.0 removed setSimplePressureRelaxation (pressure/stokes
+            # controls moved into OxidationParameters). Keep sending it when
+            # the binding has it; otherwise record that the knob is inert.
+            pressure_relaxation_applied = hasattr(model, "setSimplePressureRelaxation")
+            if pressure_relaxation_applied:
+                model.setSimplePressureRelaxation(effective["simplePressureRelaxation"])
             # ``Oxidation`` has no getters for these solver controls. The only
             # native readback available on the installed binding is the
             # Deal-Grove planar estimate, which also re-reads the orientation.
@@ -404,8 +415,10 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
                 "orientation": str(p["orientation"]),
                 "planarOxideThicknessUm": float(model.estimatePlanarOxideThickness(
                     float(p["initialOxideThicknessUm"]))),
-                "solverControls": "no native getters in viennaps 4.6.2; requested == effective after schema validation",
+                "solverControls": "no native getters in the installed viennaps; requested == effective after schema validation",
                 "nativeGetters": "not exposed",
+                "pressureRelaxationSetter": ("applied" if pressure_relaxation_applied
+                                             else "removed by the installed viennaps (4.7.0)"),
             }
             resolved["advancedOxidation"] = {
                 "schemaVersion": 1,

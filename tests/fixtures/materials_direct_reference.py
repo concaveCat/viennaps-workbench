@@ -7,7 +7,7 @@ def build(project):
     dim=project['dimension'];ps.setDimension(dim);ps.setNumThreads(project['solver']['cpuThreads'])
     d=project['domain']; b=d.get('boundaryXY',d.get('xBoundary'))
     boundary=ps.BoundaryType.REFLECTIVE_BOUNDARY if b=='reflective' else ps.BoundaryType.PERIODIC_BOUNDARY
-    domain=ps.Domain(d['gridDelta'],d['xExtent'],d['yExtent'],boundary) if dim==3 else ps.Domain(d['gridDelta'],d['xExtent'],boundary)
+    domain=ps.Domain(d['gridDelta'],d['xExtent'],d['yExtent'],boundary) if dim==3 else ps.Domain(d['gridDelta'], d['xExtent'], boundary=boundary)
     reg=ps.MaterialRegistry.instance();g=project['geometry'];protected=[]
     if g['kind']=='stack':
         ps.MakePlane(domain,height=g['baseHeight'],material=reg.getMaterial(g['substrateMaterial']),addToExisting=False).apply()
