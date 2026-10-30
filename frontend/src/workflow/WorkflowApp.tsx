@@ -1,6 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import './workflow.css';
 import { SAMPLE_2D_PLANE, SAMPLE_2D_TRENCH, SAMPLE_3D_HOLE } from './samples';
+import WorkflowViewer3D from './viewer3d/WorkflowViewer3D';
+import type { Viewer3DStats } from './viewer3d/types';
 
 type Health = { status: string; applicationVersion?: string; viennaps?: string; viennals?: string; activeRunId?: string | null };
 type GdsAsset = { assetId: string; fileName: string };
@@ -706,6 +708,14 @@ function postJson<T>(path: string, body: unknown): Promise<T> {
 type StructureAxis = 'xy' | 'xz' | 'yz';
 type StructureFrame = { minU: number; maxU: number; minV: number; maxV: number; unit: string };
 type StructureMarker = { orientation: 'vertical' | 'horizontal'; value: number; label: string } | null;
+type StructureStepRow = {
+  runId: string;
+  stepId: string;
+  segmentId: string;
+  segmentIndex: number;
+  kind: 'initial' | 'step';
+  label: string;
+};
 
 function structureUnit(view: CandidateView): string {
   return view.coordinateUnit === 'um' || !view.coordinateUnit ? 'µm' : view.coordinateUnit;
@@ -1040,6 +1050,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [structureError, setStructureError] = useState('');
   const [structureAxis, setStructureAxis] = useState<StructureAxis>('xy');
   const [measurementMark, setMeasurementMark] = useState<StructureMarker>(null);
+  const [runSnapshots, setRunSnapshots] = useState<Record<string, string[]>>({});
+  const [structureStats, setStructureStats] = useState<Viewer3DStats | null>(null);
   const [rebuildRouteArmed, setRebuildRouteArmed] = useState(false);
   const [replaceTemplateArmed, setReplaceTemplateArmed] = useState(false);
   const [materialTarget, setMaterialTarget] = useState<{ itemName: string; material: string; target: string; stepName?: string } | null>(null);
@@ -1336,6 +1348,10 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     () => new Map((compile?.compile.sourceMap ?? []).map(entry => [entry.stepId, entry.authoredStepId])),
     [compile],
   );
+  const compiledByAuthored = useMemo(
+    () => new Map((compile?.compile.sourceMap ?? []).map(entry => [entry.authoredStepId, entry.stepId])),
+    [compile],
+  );
 
   useEffect(() => {
     const step = (compile?.compile.project.steps ?? []).find(item => item.id === decisionThroughId);
@@ -1367,7 +1383,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       : previous);
   }, [compile, decisionThroughId, authoredByCompiled]);
 
-  const authoredSteps = project?.steps ?? [];
+  const authoredSteps = useMemo(() => project?.steps ?? [], [project]);
   const selectedFlowStep = authoredSteps.find(step => step.id === selectedFlowStepId) ?? null;
   const canCompile = !!project && authoredSteps.length > 0 && !busy;
   const canRoute = !!compile && !compileStale && !busy;
@@ -1395,20 +1411,78 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const reportReady = hasExecutedRun || !!measurement || experimentRunCount > 0;
   const routeStale = !!route && !!compile && route.attempts.some(attempt => attempt.compileId !== compile.compileId);
 
+  const stepDisplayName = useCallback((stepId: string): string => {
+    const compiled = compile?.compile.project.steps.find(step => step.id === stepId);
+    const authoredId = authoredByCompiled.get(stepId);
+    const authored = authoredSteps.find(step => step.id === authoredId);
+    return compiled?.name ?? authored?.name ?? stepId.slice(0, 10);
+  }, [compile, authoredByCompiled, authoredSteps]);
+
+  const structureDimension: 2 | 3 = compile?.dimension === 3 || project?.dimension === 3 ? 3 : 2;
+
+  // The 03 timeline lists the initial structure of every executed segment plus
+  // the step snapshots that run actually produced. The manifest is the source
+  // of truth: older runs may not have every step, and continuation segments
+  // start from a saved Domain state instead of the project geometry.
+  const succeededSegmentRuns = useMemo(() => (route?.segments ?? [])
+    .filter(item => !!item.runId && !item.runId.startsWith('pending_') && item.status === 'succeeded')
+    .map(item => item.runId as string), [route]);
+
+  useEffect(() => {
+    const missing = succeededSegmentRuns.filter(runId => !(runId in runSnapshots));
+    if (missing.length === 0) return;
+    let cancelled = false;
+    void Promise.all(missing.map(async runId => {
+      try {
+        const manifest = await api<{ snapshots?: Array<{ stepId?: unknown }> }>(`/api/runs/${runId}`);
+        const stepIds = (manifest.snapshots ?? [])
+          .map(item => (typeof item?.stepId === 'string' ? item.stepId : ''))
+          .filter(Boolean);
+        return [runId, stepIds] as const;
+      } catch {
+        return [runId, [] as string[]] as const;
+      }
+    })).then(entries => {
+      if (cancelled) return;
+      setRunSnapshots(previous => ({ ...previous, ...Object.fromEntries(entries) }));
+    });
+    return () => { cancelled = true; };
+  }, [succeededSegmentRuns, runSnapshots]);
+
   const runStructureSteps = useMemo(() => {
-    if (!route) return [] as Array<{ stepId: string; runId: string; segmentId: string; status: string }>;
-    const rows: Array<{ stepId: string; runId: string; segmentId: string; status: string }> = [];
-    for (const item of route.segments) {
-      if (!item.runId || item.status !== 'succeeded') continue;
+    if (!route) return [] as StructureStepRow[];
+    const rows: StructureStepRow[] = [];
+    route.segments.forEach((item, segmentIndex) => {
+      if (!item.runId || item.runId.startsWith('pending_') || item.status !== 'succeeded') return;
+      const snapshots = runSnapshots[item.runId];
+      if (!snapshots) return;
+      if (snapshots.includes('initial')) {
+        rows.push({
+          runId: item.runId,
+          stepId: 'initial',
+          segmentId: item.segmentId,
+          segmentIndex,
+          kind: 'initial',
+          label: segmentIndex === 0 ? '初始结构' : `Segment ${segmentIndex + 1} 起始`,
+        });
+      }
       const start = item.startAfterStepId ? route.stepOrder.indexOf(item.startAfterStepId) + 1 : 0;
       const end = route.stepOrder.indexOf(item.throughStepId);
-      if (end < 0) continue;
+      if (end < 0) return;
       for (const stepId of route.stepOrder.slice(start, end + 1)) {
-        rows.push({ stepId, runId: item.runId, segmentId: item.segmentId, status: item.status });
+        if (!snapshots.includes(stepId)) continue;
+        rows.push({
+          runId: item.runId,
+          stepId,
+          segmentId: item.segmentId,
+          segmentIndex,
+          kind: 'step',
+          label: stepDisplayName(stepId),
+        });
       }
-    }
+    });
     return rows;
-  }, [route]);
+  }, [route, runSnapshots, stepDisplayName]);
 
   useEffect(() => {
     setStructurePick(previous => runStructureSteps.some(row => `${row.runId}:${row.stepId}` === previous)
@@ -1422,8 +1496,21 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const structureSelection = runStructureSteps.find(row => `${row.runId}:${row.stepId}` === structurePick) ?? null;
   const structureRunId = structureSelection?.runId ?? null;
   const structureStepId = structureSelection?.stepId ?? '';
+  const structureStepIds = useMemo(
+    () => (structureRunId ? (runSnapshots[structureRunId] ?? [structureStepId]) : []),
+    [structureRunId, structureStepId, runSnapshots],
+  );
+  const structureStatsForStep = structureStats && structureStats.stepId === structureStepId ? structureStats : null;
 
   useEffect(() => {
+    // 3D reads the raw snapshot inside its worker; fetching a candidate view too
+    // would double the network and memory cost for no visible gain.
+    if (structureDimension === 3) {
+      setStructureView(null);
+      setStructureError('');
+      setStructureLoading(false);
+      return;
+    }
     if (!structureRunId || !structureStepId) {
       setStructureView(null);
       setStructureError('');
@@ -1441,14 +1528,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       })
       .finally(() => { if (!cancelled) setStructureLoading(false); });
     return () => { cancelled = true; };
-  }, [structureRunId, structureStepId, route?.segments.map(item => `${item.segmentId}:${item.status}`).join(',')]);
-
-  const stepDisplayName = (stepId: string): string => {
-    const compiled = compile?.compile.project.steps.find(step => step.id === stepId);
-    const authoredId = authoredByCompiled.get(stepId);
-    const authored = authoredSteps.find(step => step.id === authoredId);
-    return compiled?.name ?? authored?.name ?? stepId.slice(0, 10);
-  };
+  }, [structureRunId, structureStepId, structureDimension, route?.segments.map(item => `${item.segmentId}:${item.status}`).join(',')]);
 
   const run = async (name: string, task: () => Promise<void>) => {
     const label = actionLabel(name);
@@ -3853,19 +3933,38 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 {authoredSteps.length === 0
                   ? <div className="wf-empty">把左侧 Process 拖到这里，或点击“插入”。</div>
                   : <table className="wf-table" aria-label="流程步骤">
-                    <thead><tr><th>#</th><th>步骤</th><th>模型</th><th>操作</th><th>材料</th><th>启用</th></tr></thead>
-                    <tbody>{authoredSteps.map((step, index) => (
-                      <tr key={step.id}
-                        className={`${selectedFlowStepId === step.id ? 'selected' : ''}${materialTarget && step.depositMaterial === materialTarget.material ? ' material-match' : ''}`}
-                        onClick={() => setSelectedFlowStepId(step.id)}>
-                        <td>{String(index + 1).padStart(2, '0')}</td>
-                        <td>{step.name}</td>
-                        <td>{STEP_LABELS[step.model] ?? step.model}</td>
-                        <td>{step.operation === 'deposit' ? '沉积' : step.operation === 'etch' ? '刻蚀' : step.operation ?? '—'}</td>
-                        <td>{step.depositMaterial ?? '—'}</td>
-                        <td>{step.enabled ? '是' : '否'}</td>
-                      </tr>
-                    ))}</tbody>
+                    <thead><tr><th>#</th><th>步骤</th><th>模型</th><th>操作</th><th>材料</th><th>启用</th><th>结构</th></tr></thead>
+                    <tbody>{authoredSteps.map((step, index) => {
+                      const compiledStepId = compiledByAuthored.get(step.id);
+                      const structureRow = compiledStepId
+                        ? runStructureSteps.find(row => row.kind === 'step' && row.stepId === compiledStepId)
+                        : undefined;
+                      return (
+                        <tr key={step.id}
+                          className={`${selectedFlowStepId === step.id ? 'selected' : ''}${materialTarget && step.depositMaterial === materialTarget.material ? ' material-match' : ''}`}
+                          onClick={() => setSelectedFlowStepId(step.id)}>
+                          <td>{String(index + 1).padStart(2, '0')}</td>
+                          <td>{step.name}</td>
+                          <td>{STEP_LABELS[step.model] ?? step.model}</td>
+                          <td>{step.operation === 'deposit' ? '沉积' : step.operation === 'etch' ? '刻蚀' : step.operation ?? '—'}</td>
+                          <td>{step.depositMaterial ?? '—'}</td>
+                          <td>{step.enabled ? '是' : '否'}</td>
+                          <td className="wf-step-structure">
+                            <button type="button" className="wf-link"
+                              disabled={!structureRow}
+                              title={structureRow ? `在 03 查看 ${step.name} 的结构` : '先执行包含该步骤的 Segment'}
+                              onClick={event => {
+                                event.stopPropagation();
+                                if (!structureRow) return;
+                                setZone('run');
+                                setStructurePick(`${structureRow.runId}:${structureRow.stepId}`);
+                              }}>
+                              结构
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}</tbody>
                   </table>}
                 <div className="spx-step-inspector">
                   <div className="spx-step-inspector-title">步骤参数</div>
@@ -4037,72 +4136,124 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
           {route && <div className="wf-summary success">
             <strong>Route 已创建</strong>
             <span>{route.route.name} · {route.segments.length} Segment · {route.stepOrder.length} 步</span>
+            {structureSelection && <span>结构：{structureSelection.label}</span>}
             {routeStale && <span className="wf-rerun">流程已变更，现有 Segment 待重跑</span>}
           </div>}
 
           <div className="wf-structure-panel" aria-label="当前 Run 结构">
             <div className="wf-structure-head">
               <strong>结构</strong>
-              {runStructureSteps.length > 0
-                ? <select aria-label="结构步骤选择" value={structurePick} onChange={event => setStructurePick(event.target.value)}>
-                  {runStructureSteps.map(row => <option key={`${row.runId}:${row.stepId}`} value={`${row.runId}:${row.stepId}`}>
-                    {stepDisplayName(row.stepId)}
-                  </option>)}
-                </select>
-                : <span className="wf-muted">尚未执行</span>}
-              {structureSelection && <span className="wf-structure-step">当前步骤：{stepDisplayName(structureSelection.stepId)}</span>}
-              {structureView && <span className="wf-muted">{structureView.dimension}D · {structureView.coordinateUnit === 'um' || !structureView.coordinateUnit ? 'µm' : structureView.coordinateUnit}</span>}
+              {structureSelection
+                ? <span className="wf-structure-step">当前：{structureSelection.label}</span>
+                : <span className="wf-muted">{route ? '执行 Segment 后生成结构时间轴' : '尚未创建 Route'}</span>}
+              <span className="wf-muted">{structureDimension}D · µm</span>
             </div>
-            {structureView
-              ? <div className="wf-structure-body">
-                <StructureCanvas
-                  view={structureView}
-                  frame={structureFrame(structureView, structureAxis)}
-                  axis={structureAxis}
-                  marker={measurement ? measurementMark : null}
-                  label="当前 Run 结构视图"
-                />
+            {runStructureSteps.length > 0 && <div className="wf-structure-timeline" role="tablist" aria-label="结构步骤时间轴">
+              {runStructureSteps.map((row, index) => {
+                const key = `${row.runId}:${row.stepId}`;
+                const active = key === structurePick;
+                return <Fragment key={key}>
+                  {index > 0 && <span className="wf-step-chip-sep" aria-hidden="true">→</span>}
+                  <button type="button" role="tab" aria-selected={active}
+                    className={`wf-step-chip${active ? ' active' : ''}${row.kind === 'initial' ? ' initial' : ''}`}
+                    data-step-id={row.stepId} data-run-id={row.runId} data-segment-id={row.segmentId}
+                    title={`${row.label} · ${row.runId}`}
+                    onClick={() => setStructurePick(key)}>
+                    <span className="wf-step-chip-index">{String(index + 1).padStart(2, '0')}</span>
+                    <span className="wf-step-chip-label">{row.label}</span>
+                  </button>
+                </Fragment>;
+              })}
+            </div>}
+            {structureSelection && structureDimension === 3
+              ? <div className="wf-structure-body wf-structure-body--3d">
+                <div className="wf-structure-3d">
+                  <WorkflowViewer3D
+                    runId={structureSelection.runId}
+                    stepId={structureSelection.stepId}
+                    dimension={3}
+                    height={420}
+                    stepIds={structureStepIds}
+                    onStats={setStructureStats}
+                  />
+                  <div className="wf-structure-3d-stats" aria-label="三维结构统计" role="status">
+                    {structureStatsForStep
+                      ? <>
+                        <span>三角形 <code>{structureStatsForStep.triangles.toLocaleString('en-US')}</code></span>
+                        <span>点 <code>{structureStatsForStep.points.toLocaleString('en-US')}</code></span>
+                        <span>FPS <code>{structureStatsForStep.fps > 0 ? structureStatsForStep.fps.toFixed(1) : '—'}</code></span>
+                        <span>解析 <code>{structureStatsForStep.parseMs} ms</code></span>
+                        {structureStatsForStep.simplified && <span className="warn">简化 {Number(structureStatsForStep.sourceTriangles ?? structureStatsForStep.triangles).toLocaleString('en-US')} → {structureStatsForStep.triangles.toLocaleString('en-US')} 面</span>}
+                      </>
+                      : <span className="wf-muted">等待三维统计…</span>}
+                  </div>
+                </div>
                 <div className="wf-structure-side">
-                  <label className="spx-field"><span>视图轴</span>
-                    <select aria-label="结构视图轴" value={structureAxis} onChange={event => setStructureAxis(event.target.value as StructureAxis)}>
-                      <option value="xy">XY</option>
-                      <option value="xz">XZ</option>
-                      <option value="yz">YZ</option>
-                    </select>
-                  </label>
-                  <div className="wf-structure-stats">
-                    <span>拓扑</span><code>{structureView.topology}</code>
-                    <span>点</span><code>{structureView.pointCount}</code>
-                    <span>线</span><code>{structureView.lineCount}</code>
-                    <span>三角形</span><code>{structureView.triangleCount}</code>
-                    <span>单位</span><code>µm</code>
-                    <span>X 范围</span><code>{`${Number(structureView.bounds[0]).toFixed(3)} … ${Number(structureView.bounds[1]).toFixed(3)}`}</code>
-                    <span>Y 范围</span><code>{`${Number(structureView.bounds[2]).toFixed(3)} … ${Number(structureView.bounds[3]).toFixed(3)}`}</code>
+                  <div className="wf-structure-info">
+                    <span className="wf-muted">步骤</span>
+                    <strong>{structureSelection.label}</strong>
+                    <code>{structureSelection.stepId}</code>
+                    <span className="wf-muted">Segment {structureSelection.segmentIndex + 1} · Run {structureSelection.runId.slice(0, 12)}…</span>
                   </div>
-                  <div className="wf-structure-legend">
-                    {structureLegend(structureView).map(row => <div key={row.id}>
-                      <i style={{ background: row.color }} aria-hidden="true" />
-                      <span style={{ marginLeft: 0, color: '#26313a' }}>{row.name}</span>
-                      <span>{row.count}</span>
-                    </div>)}
-                  </div>
-                  {measurement && measurementMark && <div className="wf-muted">测量标记：{measurementMark.label}</div>}
+                  {measurement && <div className="wf-structure-info">
+                    <span className="wf-muted">测量值</span>
+                    <strong>{measurement.value === null ? measurement.reason ?? '无值' : `${measurement.value.toFixed(4)} ${measurement.unit}`}</strong>
+                    <span className="wf-muted">测量位置在 2D 视图显示</span>
+                  </div>}
+                  {!measurement && <div className="wf-muted">测量后在 2D 视图显示位置</div>}
                 </div>
               </div>
-              : <div className="wf-structure-empty">
-                <div className="wf-empty">
-                  {structureLoading
-                    ? '结构快照加载中…'
-                    : structureError
-                      ? `暂无结构快照：${structureError}`
+              : structureSelection && structureView
+                ? <div className="wf-structure-body">
+                  <StructureCanvas
+                    view={structureView}
+                    frame={structureFrame(structureView, structureAxis)}
+                    axis={structureAxis}
+                    marker={measurement ? measurementMark : null}
+                    label="当前 Run 结构视图"
+                  />
+                  <div className="wf-structure-side">
+                    <label className="spx-field"><span>视图轴</span>
+                      <select aria-label="结构视图轴" value={structureAxis} onChange={event => setStructureAxis(event.target.value as StructureAxis)}>
+                        <option value="xy">XY</option>
+                        <option value="xz">XZ</option>
+                        <option value="yz">YZ</option>
+                      </select>
+                    </label>
+                    <div className="wf-structure-stats">
+                      <span>拓扑</span><code>{structureView.topology}</code>
+                      <span>点</span><code>{structureView.pointCount}</code>
+                      <span>线</span><code>{structureView.lineCount}</code>
+                      <span>三角形</span><code>{structureView.triangleCount}</code>
+                      <span>单位</span><code>µm</code>
+                      <span>X 范围</span><code>{`${Number(structureView.bounds[0]).toFixed(3)} … ${Number(structureView.bounds[1]).toFixed(3)}`}</code>
+                      <span>Y 范围</span><code>{`${Number(structureView.bounds[2]).toFixed(3)} … ${Number(structureView.bounds[3]).toFixed(3)}`}</code>
+                    </div>
+                    <div className="wf-structure-legend">
+                      {structureLegend(structureView).map(row => <div key={row.id}>
+                        <i style={{ background: row.color }} aria-hidden="true" />
+                        <span style={{ marginLeft: 0, color: '#26313a' }}>{row.name}</span>
+                        <span>{row.count}</span>
+                      </div>)}
+                    </div>
+                    {measurement && measurementMark && <div className="wf-muted">测量标记：{measurementMark.label}</div>}
+                  </div>
+                </div>
+                : <div className="wf-structure-empty">
+                  <div className="wf-empty">
+                    {structureSelection
+                      ? structureLoading
+                        ? '结构快照加载中…'
+                        : structureError
+                          ? `暂无结构快照：${structureError}`
+                          : '结构视图准备中…'
                       : segment?.status === 'running'
                         ? 'Segment 运行中，完成后显示结构。'
-                        : '执行当前 Segment 后，这里显示该 Run 的结构视图（2D/3D）。'}
-                </div>
-                {canRun && <div className="spx-run-actions">
-                  <button className="wf-button primary" onClick={() => void execute()}>{busy === 'execute' ? '启动中…' : '启动 Run 并生成结构'}</button>
+                        : route
+                          ? '执行下方的「执行当前 Segment」后，这里按「初始结构 → 每个工艺步骤」预览结构。'
+                          : '在 02 编译流程并创建 Route 后，这里显示每个工艺步骤的结构。'}
+                  </div>
                 </div>}
-              </div>}
           </div>
 
           {segment && <>
@@ -4123,11 +4274,20 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 return <div key={attempt.attemptId} className="wf-attempt">
                 <div className="wf-attempt-title"><strong>尝试 {attemptIndex + 1}/{route.attempts.length}</strong><span>{statusLabel(attemptStatus)}</span></div>
                 {route.reuse.filter(item => item.attemptId === attempt.attemptId).map(item => <div key={item.reuseId} className="wf-segment-row"><span className="wf-status verified">复用</span><code>{stepDisplayName(item.fromStepId)} → {stepDisplayName(item.toStepId)}</code></div>)}
-                {route.segments.filter(item => item.attemptId === attempt.attemptId).map(item => <div key={item.segmentId} className="wf-segment-row">
-                  <span className={`wf-status ${item.status}`}>{statusLabel(item.status)}</span>
-                  <code>{item.startAfterStepId ? `自 ${stepDisplayName(item.startAfterStepId)} 之后` : '从首步'} → {stepDisplayName(item.throughStepId)}</code>
-                  {(item.status === 'planned' && routeStale) || (item.status === 'succeeded' && routeStale) ? <span className="wf-rerun">待重跑</span> : null}
-                </div>)}
+                {route.segments.filter(item => item.attemptId === attempt.attemptId).map(item => {
+                  const structureRow = runStructureSteps.find(row => row.runId === item.runId && row.stepId === item.throughStepId);
+                  return <div key={item.segmentId} className="wf-segment-row">
+                    <span className={`wf-status ${item.status}`}>{statusLabel(item.status)}</span>
+                    <code>{item.startAfterStepId ? `自 ${stepDisplayName(item.startAfterStepId)} 之后` : '从首步'} → {stepDisplayName(item.throughStepId)}</code>
+                    {(item.status === 'planned' && routeStale) || (item.status === 'succeeded' && routeStale) ? <span className="wf-rerun">待重跑</span> : null}
+                    <button type="button" className="wf-link wf-segment-structure"
+                      disabled={!structureRow}
+                      title={structureRow ? `查看 ${stepDisplayName(item.throughStepId)} 的结构` : '先执行该 Segment'}
+                      onClick={() => { if (structureRow) setStructurePick(`${structureRow.runId}:${structureRow.stepId}`); }}>
+                      查看结构
+                    </button>
+                  </div>;
+                })}
               </div>;})}
             </div>}
             <div className="spx-run-actions">

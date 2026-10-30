@@ -133,10 +133,12 @@ try {
   // ---- 03: the run result is a structure view, not just a run id.
   await page.getByRole('button', { name: '执行全部 Segment' }).click();
   await page.locator('.wf-structure-canvas').waitFor({ timeout: 120000 });
-  await page.getByLabel('结构步骤选择').waitFor();
+  await page.locator('.wf-structure-timeline').waitFor();
+  assert.ok((await page.locator('.wf-step-chip').count()) >= 2, 'timeline must show the initial structure and every executed step');
+  await page.locator('.wf-step-chip[data-step-id="initial"]').first().waitFor();
   assert.ok((await page.locator('.wf-structure-canvas > line').count()) > 0, '2D structure must draw line segments');
   const structureText = await page.locator('.wf-structure-panel').innerText();
-  assert.match(structureText, /当前步骤：/);
+  assert.match(structureText, /当前：/);
   assert.match(structureText, /µm/);
   assert.ok((await page.locator('.wf-axes text').count()) > 0, 'structure view must draw axes or a scale bar');
   assert.match(structureText, /材料|Si/);

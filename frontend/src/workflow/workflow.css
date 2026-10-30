@@ -831,6 +831,83 @@ body {
 .wf-structure-legend div { display: flex; align-items: center; gap: 5px; font-size: 10px; color: #26313a; }
 .wf-structure-legend i { width: 10px; height: 10px; border: 1px solid #8a949c; display: inline-block; flex: none; }
 .wf-structure-legend span { margin-left: auto; color: var(--spx-muted); font-family: "Consolas", monospace; }
+
+/* 03 timeline: the previewable structures are a horizontal filmstrip, not a
+   hidden dropdown. Chips scroll sideways on narrow viewports. */
+.wf-structure-timeline {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 7px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  border-bottom: 1px solid var(--spx-line-soft);
+  background: #fbfcfd;
+  scrollbar-width: thin;
+}
+.wf-step-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: none;
+  max-width: 190px;
+  padding: 3px 8px;
+  border: 1px solid var(--spx-line);
+  background: #fff;
+  color: #26313a;
+  font-size: 10px;
+  line-height: 1.4;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.wf-step-chip:hover { border-color: var(--spx-blue); color: var(--spx-blue); }
+.wf-step-chip.active { border-color: var(--spx-blue); background: var(--spx-blue); color: #fff; }
+.wf-step-chip.initial { border-style: dashed; }
+.wf-step-chip.initial.active { border-style: solid; }
+.wf-step-chip-index { font: 9px "Consolas", monospace; opacity: 0.72; }
+.wf-step-chip-label { overflow: hidden; text-overflow: ellipsis; }
+.wf-step-chip-sep { flex: none; color: #8a949c; font-size: 10px; }
+
+/* 3D viewer inside the light workflow shell. The viewer ships its own dark
+   theme; only colours are overridden here, layout stays untouched. */
+.wf-structure-body--3d { align-items: start; }
+.wf-structure-3d { min-width: 0; }
+.wf-structure-body--3d .wb-viewer3d { border-color: var(--spx-line); border-radius: 0; background: #fff; }
+.wf-structure-body--3d .wb-viewer3d__bar { background: #eef1f4; border-color: var(--spx-line); }
+.wf-structure-body--3d .wb-viewer3d__button { background: #f4f5f6; border-color: var(--spx-line); color: #26313a; }
+.wf-structure-body--3d .wb-viewer3d__button:hover:not(:disabled) { border-color: var(--spx-blue); color: var(--spx-blue); }
+.wf-structure-body--3d .wb-viewer3d__field,
+.wf-structure-body--3d .wb-viewer3d__toggle,
+.wf-structure-body--3d .wb-viewer3d__hint { color: var(--spx-muted); }
+.wf-structure-body--3d .wb-viewer3d__field select,
+.wf-structure-body--3d .wb-viewer3d__clip select { background: #fff; border-color: var(--spx-line); color: #26313a; }
+.wf-structure-body--3d .wb-viewer3d__clip { border-color: var(--spx-line); }
+.wf-structure-body--3d .wb-viewer3d__legend { background: #f7f8f9; border-color: var(--spx-line); }
+.wf-structure-body--3d .wb-viewer3d__legend-name { color: #26313a; }
+.wf-structure-body--3d .wb-viewer3d__legend-count { color: var(--spx-muted); }
+/* The parent renders the onStats bar below the viewer; hide the viewer's
+   duplicate status row and its now redundant toggle. */
+.wf-structure-body--3d .wb-viewer3d__status,
+.wf-structure-body--3d .wb-viewer3d__toggle--end { display: none; }
+.wf-structure-3d-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 14px;
+  padding: 5px 8px;
+  border: 1px solid var(--spx-line-soft);
+  border-top: 0;
+  background: #f7f8f9;
+  color: #4b5b6b;
+  font-size: 10px;
+}
+.wf-structure-3d-stats code { font-family: "Consolas", monospace; color: #26313a; }
+.wf-structure-3d-stats .warn { color: var(--spx-amber); }
+.wf-structure-info { display: grid; gap: 2px; min-width: 0; }
+.wf-structure-info strong { font-size: 11px; color: #26313a; }
+.wf-structure-info code { font: 10px "Consolas", monospace; color: #26313a; overflow: hidden; text-overflow: ellipsis; }
+.wf-segment-structure { margin-left: auto; flex: none; }
+.wf-step-structure { width: 46px; text-align: right; }
+.wf-link:disabled { color: #a3adb6; cursor: not-allowed; }
 .wf-axes line, .wf-axes path { stroke: #9aa3ab; }
 .wf-axes text { fill: #5f6b76; font-family: "Consolas", monospace; }
 .wf-marker line { stroke: #b42318; stroke-dasharray: 4 3; }
