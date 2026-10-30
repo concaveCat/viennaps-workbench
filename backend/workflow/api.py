@@ -19,6 +19,12 @@ from .adoption import adopt_project, first_route
 from .analysis import build_report, candidate_view, compare_snapshots as compare_analysis_snapshots, load_snapshot, process_window, snapshot_summary
 from .calibration import create_dataset, run_fit
 from .branches import create_branch
+from .decisions import (
+    MeasurementDecisionRequestV1,
+    MeasurementDecisionV1,
+    create_measurement_decision,
+    replay_measurement_decision,
+)
 from .equivalence import ComparisonProtocolV1, EquivalenceResultV1, compare_snapshots as compare_equivalence_snapshots
 from .execution import execute_segment
 from .experiments import (
@@ -431,6 +437,18 @@ class BranchRequest(StrictModel):
     compileId: str
     startAfterStepId: str
     changedStepIds: list[str] = Field(default_factory=list)
+
+
+class MeasurementDecisionResponse(StrictModel):
+    decision: MeasurementDecisionV1
+    plan: RoutePlanV1
+    workflowRunId: str
+    measurement: MeasurementResultV1
+    resolvedParameters: dict[str, dict]
+
+
+class MeasurementDecisionListResponse(StrictModel):
+    decisions: list[MeasurementDecisionV1]
 
 
 class FromTemplateRequest(StrictModel):
@@ -1431,6 +1449,58 @@ async def branch_route(route_id: str, request: BranchRequest) -> RoutePlanRespon
         get_store(), route_id, request.compileId, request.startAfterStepId, request.changedStepIds,
     ))
     return RoutePlanResponse(plan=plan)
+
+
+@router.post(
+    "/routes/{route_id}/measurement-decisions",
+    response_model=MeasurementDecisionResponse,
+    status_code=201,
+)
+async def create_measurement_decision_endpoint(
+    route_id: str, request: MeasurementDecisionRequestV1
+) -> MeasurementDecisionResponse:
+    result = _call(lambda: create_measurement_decision(get_store(), route_id, request))
+    return MeasurementDecisionResponse.model_validate(result)
+
+
+@router.get(
+    "/routes/{route_id}/measurement-decisions",
+    response_model=MeasurementDecisionListResponse,
+)
+async def list_measurement_decisions_endpoint(
+    route_id: str,
+) -> MeasurementDecisionListResponse:
+    def operation():
+        get_store().get_plan(route_id)
+        return get_store().list_measurement_decisions(route_id)
+
+    return MeasurementDecisionListResponse(decisions=_call(operation))
+
+
+@router.get(
+    "/routes/{route_id}/measurement-decisions/{decision_id}",
+    response_model=MeasurementDecisionV1,
+)
+async def get_measurement_decision_endpoint(
+    route_id: str, decision_id: str
+) -> MeasurementDecisionV1:
+    return _call(
+        lambda: get_store().get_measurement_decision(decision_id, route_id=route_id)
+    )
+
+
+@router.post(
+    "/routes/{route_id}/measurement-decisions/{decision_id}/replay",
+    response_model=MeasurementDecisionResponse,
+    status_code=201,
+)
+async def replay_measurement_decision_endpoint(
+    route_id: str, decision_id: str
+) -> MeasurementDecisionResponse:
+    result = _call(
+        lambda: replay_measurement_decision(get_store(), route_id, decision_id)
+    )
+    return MeasurementDecisionResponse.model_validate(result)
 
 
 @router.post("/routes", response_model=RoutePlanResponse, status_code=201)

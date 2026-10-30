@@ -160,3 +160,37 @@ POST /api/v1/workflow/measurements/{measurementId}/equivalence   # not implement
 - `sourceSnapshotHash` is recalculated from the actual snapshot.
 - `resultDigest` is never a substitute for intermediate-step binding.
 - Failed or absent verification is explicit, never silent.
+
+## 9. P4-2 measurement-driven workflow runs
+
+P4-2 does **not** add control flow inside a native engine process. A *workflow
+run* is a composition in the workflow control layer:
+
+```text
+Route
+  └─ Attempt A (prefix) → Segment A (real run, succeeded, end checkpoint)
+       └─ measurement at Segment A.throughStepId
+            └─ MeasurementDecisionV1 (measurement, condition, resolved parameters)
+                 └─ Attempt B (branch) → Segment B (planned, reuses checkpoint of A)
+```
+
+The `MeasurementDecisionV1` record is the only place where the branch condition
+is decided. It stores the source Segment/Run, Measurement, recipe/metric,
+operator/threshold, the measured value, the boolean result, the chosen branch,
+the authored-step resolved parameters, the target compile, and the new branch
+Attempt/Segment. Decisions on one Route form a sequence under one
+`workflowRunId` (`wfr_...`); the first decision creates it, later decisions may
+continue it.
+
+Replay is record-driven:
+
+- The original Measurement is reused; no new Measurement is created and the
+  source snapshot is not measured again.
+- `chosenBranch`, `resolvedParameters` and `measurementId` are copied unchanged.
+- The target compile is rebuilt from `resolvedParameters` and must reproduce the
+  recorded `targetCompileId`; otherwise replay is rejected.
+- A new branch Attempt/Segment is appended with `replayOf=<originalDecisionId>`.
+
+This preserves Route → Attempt → Segment → Run → Compile provenance. It makes
+no claim that the branch was executed inside one native process; the branch
+Segment is a normal bounded run that starts from the reused prefix checkpoint.

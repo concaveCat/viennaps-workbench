@@ -18,6 +18,9 @@ class WorkflowOpenApiTests(unittest.TestCase):
         paths = schema["paths"]
         for path in (
             "/api/v1/workflow/routes",
+            "/api/v1/workflow/routes/{route_id}/measurement-decisions",
+            "/api/v1/workflow/routes/{route_id}/measurement-decisions/{decision_id}",
+            "/api/v1/workflow/routes/{route_id}/measurement-decisions/{decision_id}/replay",
             "/api/v1/workflow/compiles",
             "/api/v1/workflow/measurements",
             "/api/v1/workflow/measurements/{measurement_id}/bind",
@@ -42,6 +45,20 @@ class WorkflowOpenApiTests(unittest.TestCase):
             "ExpandFlowDefinitionRequest",
         ):
             self.assertIn(name, schema["components"]["schemas"])
+        for name in (
+            "MeasurementDecisionV1",
+            "MeasurementDecisionRequestV1",
+            "MeasurementDecisionResponse",
+            "MeasurementDecisionListResponse",
+        ):
+            self.assertIn(name, schema["components"]["schemas"])
+        decision_request = schema["components"]["schemas"]["MeasurementDecisionRequestV1"]
+        self.assertFalse(decision_request.get("additionalProperties", False))
+        self.assertIn("branches", decision_request["properties"])
+        self.assertIn("operator", decision_request["properties"])
+        decision = schema["components"]["schemas"]["MeasurementDecisionV1"]
+        self.assertIn("resolvedParameters", decision["properties"])
+        self.assertIn("replayOf", decision["properties"])
         expand_request = schema["components"]["schemas"]["ExpandFlowDefinitionRequest"]
         self.assertFalse(expand_request.get("additionalProperties", False))
         self.assertIn("variables", expand_request["properties"])

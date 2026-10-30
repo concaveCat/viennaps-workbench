@@ -663,6 +663,25 @@
         "title": "BooleanStepV5",
         "type": "object"
       },
+      "BranchParametersV1": {
+        "additionalProperties": false,
+        "description": "Authored step id -> field overrides applied after the reused prefix.",
+        "properties": {
+          "parameters": {
+            "additionalProperties": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Parameters",
+            "type": "object"
+          }
+        },
+        "required": [
+          "parameters"
+        ],
+        "title": "BranchParametersV1",
+        "type": "object"
+      },
       "BranchRequest": {
         "additionalProperties": false,
         "properties": {
@@ -4446,6 +4465,383 @@
           "snapshot"
         ],
         "title": "MeasureSnapshotRequest",
+        "type": "object"
+      },
+      "MeasurementBranchesV1": {
+        "additionalProperties": false,
+        "properties": {
+          "false": {
+            "$ref": "#/components/schemas/BranchParametersV1"
+          },
+          "true": {
+            "$ref": "#/components/schemas/BranchParametersV1"
+          }
+        },
+        "required": [
+          "true",
+          "false"
+        ],
+        "title": "MeasurementBranchesV1",
+        "type": "object"
+      },
+      "MeasurementDecisionListResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "decisions": {
+            "items": {
+              "$ref": "#/components/schemas/MeasurementDecisionV1"
+            },
+            "title": "Decisions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "decisions"
+        ],
+        "title": "MeasurementDecisionListResponse",
+        "type": "object"
+      },
+      "MeasurementDecisionRequestV1": {
+        "additionalProperties": false,
+        "properties": {
+          "baseCompileId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Basecompileid"
+          },
+          "branches": {
+            "$ref": "#/components/schemas/MeasurementBranchesV1"
+          },
+          "operator": {
+            "enum": [
+              "lt",
+              "lte",
+              "gt",
+              "gte",
+              "eq"
+            ],
+            "title": "Operator",
+            "type": "string"
+          },
+          "recipeId": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Recipeid",
+            "type": "string"
+          },
+          "recipeVersion": {
+            "minimum": 1.0,
+            "title": "Recipeversion",
+            "type": "integer"
+          },
+          "startAfterStepId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Startafterstepid"
+          },
+          "threshold": {
+            "title": "Threshold",
+            "type": "number"
+          },
+          "workflowRunId": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 8,
+                "pattern": "^wfr_[A-Za-z0-9_-]+$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workflowrunid"
+          }
+        },
+        "required": [
+          "recipeId",
+          "recipeVersion",
+          "operator",
+          "threshold",
+          "branches"
+        ],
+        "title": "MeasurementDecisionRequestV1",
+        "type": "object"
+      },
+      "MeasurementDecisionResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "decision": {
+            "$ref": "#/components/schemas/MeasurementDecisionV1"
+          },
+          "measurement": {
+            "$ref": "#/components/schemas/MeasurementResultV1"
+          },
+          "plan": {
+            "$ref": "#/components/schemas/RoutePlanV1"
+          },
+          "resolvedParameters": {
+            "additionalProperties": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Resolvedparameters",
+            "type": "object"
+          },
+          "workflowRunId": {
+            "title": "Workflowrunid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "decision",
+          "plan",
+          "workflowRunId",
+          "measurement",
+          "resolvedParameters"
+        ],
+        "title": "MeasurementDecisionResponse",
+        "type": "object"
+      },
+      "MeasurementDecisionV1": {
+        "additionalProperties": false,
+        "description": "Immutable record of one measurement-driven branch decision.\n\n``replayOf`` turns a replay into another explicit record: it keeps the\noriginal measurement, chosen branch and resolved parameters, but points at\nthe newly created Attempt/Segment.",
+        "properties": {
+          "branchAttemptId": {
+            "maxLength": 64,
+            "minLength": 3,
+            "title": "Branchattemptid",
+            "type": "string"
+          },
+          "branchSegmentId": {
+            "maxLength": 64,
+            "minLength": 3,
+            "title": "Branchsegmentid",
+            "type": "string"
+          },
+          "chosenBranch": {
+            "enum": [
+              "true",
+              "false"
+            ],
+            "title": "Chosenbranch",
+            "type": "string"
+          },
+          "createdAt": {
+            "title": "Createdat",
+            "type": "string"
+          },
+          "decisionId": {
+            "maxLength": 64,
+            "minLength": 4,
+            "pattern": "^dec_[A-Za-z0-9_-]+$",
+            "title": "Decisionid",
+            "type": "string"
+          },
+          "measuredValue": {
+            "title": "Measuredvalue",
+            "type": "number"
+          },
+          "measurementBindingStatus": {
+            "default": "unbound",
+            "enum": [
+              "unbound",
+              "verified",
+              "failed"
+            ],
+            "title": "Measurementbindingstatus",
+            "type": "string"
+          },
+          "measurementId": {
+            "maxLength": 64,
+            "minLength": 3,
+            "title": "Measurementid",
+            "type": "string"
+          },
+          "measurementStatus": {
+            "default": "measured",
+            "title": "Measurementstatus",
+            "type": "string"
+          },
+          "method": {
+            "anyOf": [
+              {
+                "enum": [
+                  "cd_at_height",
+                  "etch_depth"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Method"
+          },
+          "metricId": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Metricid",
+            "type": "string"
+          },
+          "operator": {
+            "enum": [
+              "lt",
+              "lte",
+              "gt",
+              "gte",
+              "eq"
+            ],
+            "title": "Operator",
+            "type": "string"
+          },
+          "recipeId": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Recipeid",
+            "type": "string"
+          },
+          "recipeVersion": {
+            "minimum": 1.0,
+            "title": "Recipeversion",
+            "type": "integer"
+          },
+          "replayOf": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 4,
+                "pattern": "^dec_[A-Za-z0-9_-]+$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Replayof"
+          },
+          "resolvedParameters": {
+            "additionalProperties": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Resolvedparameters",
+            "type": "object"
+          },
+          "result": {
+            "title": "Result",
+            "type": "boolean"
+          },
+          "routeId": {
+            "maxLength": 64,
+            "minLength": 3,
+            "title": "Routeid",
+            "type": "string"
+          },
+          "schemaVersion": {
+            "const": 1,
+            "default": 1,
+            "title": "Schemaversion",
+            "type": "integer"
+          },
+          "sourceCompileId": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 3,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sourcecompileid"
+          },
+          "sourceRunId": {
+            "maxLength": 64,
+            "minLength": 3,
+            "title": "Sourcerunid",
+            "type": "string"
+          },
+          "sourceSegmentId": {
+            "maxLength": 64,
+            "minLength": 3,
+            "title": "Sourcesegmentid",
+            "type": "string"
+          },
+          "startAfterStepId": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 3,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Startafterstepid"
+          },
+          "targetCompileId": {
+            "pattern": "^c_[a-f0-9]{24}$",
+            "title": "Targetcompileid",
+            "type": "string"
+          },
+          "threshold": {
+            "title": "Threshold",
+            "type": "number"
+          },
+          "unit": {
+            "enum": [
+              "um",
+              "nm"
+            ],
+            "title": "Unit",
+            "type": "string"
+          },
+          "workflowRunId": {
+            "maxLength": 64,
+            "minLength": 8,
+            "pattern": "^wfr_[A-Za-z0-9_-]+$",
+            "title": "Workflowrunid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "decisionId",
+          "workflowRunId",
+          "routeId",
+          "sourceSegmentId",
+          "sourceRunId",
+          "measurementId",
+          "recipeId",
+          "recipeVersion",
+          "metricId",
+          "measuredValue",
+          "unit",
+          "operator",
+          "threshold",
+          "result",
+          "chosenBranch",
+          "resolvedParameters",
+          "targetCompileId",
+          "branchAttemptId",
+          "branchSegmentId",
+          "createdAt"
+        ],
+        "title": "MeasurementDecisionV1",
         "type": "object"
       },
       "MeasurementListResponse": {
@@ -12109,6 +12505,200 @@
           }
         },
         "summary": "Branch Route",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/routes/{route_id}/measurement-decisions": {
+      "get": {
+        "operationId": "list_measurement_decisions_endpoint_api_v1_workflow_routes__route_id__measurement_decisions_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "route_id",
+            "required": true,
+            "schema": {
+              "title": "Route Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeasurementDecisionListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Measurement Decisions Endpoint",
+        "tags": [
+          "workflow"
+        ]
+      },
+      "post": {
+        "operationId": "create_measurement_decision_endpoint_api_v1_workflow_routes__route_id__measurement_decisions_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "route_id",
+            "required": true,
+            "schema": {
+              "title": "Route Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MeasurementDecisionRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeasurementDecisionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Measurement Decision Endpoint",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/routes/{route_id}/measurement-decisions/{decision_id}": {
+      "get": {
+        "operationId": "get_measurement_decision_endpoint_api_v1_workflow_routes__route_id__measurement_decisions__decision_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "route_id",
+            "required": true,
+            "schema": {
+              "title": "Route Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "decision_id",
+            "required": true,
+            "schema": {
+              "title": "Decision Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeasurementDecisionV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Measurement Decision Endpoint",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/routes/{route_id}/measurement-decisions/{decision_id}/replay": {
+      "post": {
+        "operationId": "replay_measurement_decision_endpoint_api_v1_workflow_routes__route_id__measurement_decisions__decision_id__replay_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "route_id",
+            "required": true,
+            "schema": {
+              "title": "Route Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "decision_id",
+            "required": true,
+            "schema": {
+              "title": "Decision Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeasurementDecisionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Replay Measurement Decision Endpoint",
         "tags": [
           "workflow"
         ]

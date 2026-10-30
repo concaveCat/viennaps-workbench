@@ -34,7 +34,7 @@ from .routes import (
 from .verification import prefix_compatibility, verify_route_plan_compiles
 
 
-SCHEMA_VERSION = "6"
+SCHEMA_VERSION = "7"
 
 
 class WorkflowError(Exception):
@@ -70,7 +70,7 @@ class WorkflowStore:
                     row = preflight.execute(
                         "SELECT value FROM schema_meta WHERE key = 'schema_version'"
                     ).fetchone()
-                    if row is not None and row[0] not in {"1", "2", "3", "4", "5", SCHEMA_VERSION}:
+                    if row is not None and row[0] not in {"1", "2", "3", "4", "5", "6", SCHEMA_VERSION}:
                         raise RuntimeError(
                             f"unsupported workflow schema version {row[0]!r}; "
                             f"expected {SCHEMA_VERSION!r}"
@@ -296,6 +296,13 @@ class WorkflowStore:
                     evidence_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS measurement_decisions (
+                    decision_id TEXT PRIMARY KEY,
+                    route_id TEXT NOT NULL REFERENCES routes(route_id) ON DELETE CASCADE,
+                    document_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS measurement_decisions_route_idx ON measurement_decisions(route_id);
                 CREATE INDEX IF NOT EXISTS measurements_run_idx ON measurements(source_run_id);
                 CREATE INDEX IF NOT EXISTS measurements_recipe_idx ON measurements(recipe_id, recipe_version);
                 CREATE INDEX IF NOT EXISTS measurement_verifications_idx ON measurement_verifications(measurement_id);
@@ -352,7 +359,7 @@ class WorkflowStore:
                     "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
                     (SCHEMA_VERSION,),
                 )
-            elif version_row["value"] in {"3", "4", "5"}:
+            elif version_row["value"] in {"3", "4", "5", "6"}:
                 connection.execute(
                     "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
                     (SCHEMA_VERSION,),
@@ -1376,6 +1383,77 @@ class WorkflowStore:
     def materialize(self, route_id: str, attempt_id: str) -> list[SegmentRefV1]:
         plan = self.get_plan(route_id)
         return materialize_attempt(plan, attempt_id)
+
+    def save_measurement_decision(self, decision: Any) -> Any:
+        """Persist one immutable measurement decision record.
+
+        The document is stored as JSON next to its route/created-at columns so a
+        future schema can still read the row and report why it cannot decode it.
+        """
+
+        from .decisions import MeasurementDecisionV1
+
+        record = (
+            decision
+            if isinstance(decision, MeasurementDecisionV1)
+            else MeasurementDecisionV1.model_validate(decision)
+        )
+        self.get_plan(record.routeId)
+        payload = record.model_dump(mode="json", exclude_none=True)
+        digest = sha256_hex(payload)
+        try:
+            with self._connect() as connection:
+                existing = connection.execute(
+                    "SELECT document_json FROM measurement_decisions WHERE decision_id = ?",
+                    (record.decisionId,),
+                ).fetchone()
+                if existing is not None:
+                    if sha256_hex(json.loads(existing["document_json"])) != digest:
+                        raise WorkflowConflict(
+                            "decisionId already exists with different content"
+                        )
+                    return record
+                connection.execute(
+                    "INSERT INTO measurement_decisions (decision_id, route_id, document_json, created_at) VALUES (?, ?, ?, ?)",
+                    (record.decisionId, record.routeId, self._dump(payload), record.createdAt),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise WorkflowConflict(
+                f"measurement decision conflicts with an existing object: {exc}"
+            ) from exc
+        return record
+
+    def get_measurement_decision(
+        self, decision_id: str, *, route_id: str | None = None
+    ) -> Any:
+        from .decisions import MeasurementDecisionV1
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT route_id, document_json FROM measurement_decisions WHERE decision_id = ?",
+                (decision_id,),
+            ).fetchone()
+        if row is None:
+            raise WorkflowNotFound(f"measurement decision {decision_id!r} does not exist")
+        if route_id is not None and row["route_id"] != route_id:
+            raise WorkflowNotFound(
+                f"measurement decision {decision_id!r} does not belong to route {route_id!r}"
+            )
+        return MeasurementDecisionV1.model_validate(json.loads(row["document_json"]))
+
+    def list_measurement_decisions(self, route_id: str) -> list[Any]:
+        from .decisions import MeasurementDecisionV1
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT document_json FROM measurement_decisions WHERE route_id = ? "
+                "ORDER BY created_at, rowid",
+                (route_id,),
+            ).fetchall()
+        return [
+            MeasurementDecisionV1.model_validate(json.loads(row["document_json"]))
+            for row in rows
+        ]
 
     def save_experiment(self, experiment_id: str, document: dict[str, Any]) -> dict[str, Any]:
         with self._connect() as connection:

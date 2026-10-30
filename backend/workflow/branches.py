@@ -16,6 +16,9 @@ def create_branch(
     compile_id: str,
     start_after_step_id: str,
     changed_step_ids: list[str],
+    *,
+    source_segment_id: str | None = None,
+    submission_key: str | None = None,
 ):
     plan = store.get_plan(route_id)
     target = store.get_compile(compile_id)
@@ -25,11 +28,23 @@ def create_branch(
     if start_after_step_id not in step_ids:
         raise WorkflowConflict("branch startAfterStepId is not in the route")
     prefix_ids = step_ids[: step_ids.index(start_after_step_id) + 1]
-    source = next(
-        (segment for segment in plan.segments
-         if segment.throughStepId == start_after_step_id and segment.status == "succeeded" and segment.endCheckpointRef),
-        None,
-    )
+    if source_segment_id is None:
+        source = next(
+            (segment for segment in plan.segments
+             if segment.throughStepId == start_after_step_id and segment.status == "succeeded" and segment.endCheckpointRef),
+            None,
+        )
+    else:
+        source = next(
+            (segment for segment in plan.segments if segment.segmentId == source_segment_id),
+            None,
+        )
+        if source is not None and (
+            source.throughStepId != start_after_step_id
+            or source.status != "succeeded"
+            or source.endCheckpointRef is None
+        ):
+            source = None
     if source is None:
         raise WorkflowConflict("no succeeded prefix segment provides the branch checkpoint")
     source_attempt = store.get_attempt(source.attemptId)
@@ -41,7 +56,7 @@ def create_branch(
     suffix = uuid.uuid4().hex[:10]
     attempt = AttemptV1(
         attemptId=f"attempt_{suffix}", routeId=route_id, parentAttemptId=None,
-        compileId=compile_id, submissionKey=f"branch_{suffix}",
+        compileId=compile_id, submissionKey=submission_key or f"branch_{suffix}",
         baseCheckpointRef=source.endCheckpointRef, startAfterStepId=start_after_step_id,
         throughStepId=step_ids[-1], changedStepIds=changed_step_ids,
         prefixCompatibility=target_prefix, seedPolicy="shared-run-seed",

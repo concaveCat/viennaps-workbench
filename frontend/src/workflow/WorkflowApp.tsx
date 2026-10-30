@@ -51,6 +51,42 @@ type Measurement = {
   uncertaintyStatus: string;
   bindingEvidence: { methodVersion: string; verifiedAt: string } | null;
 };
+type MeasurementDecision = {
+  schemaVersion: number;
+  decisionId: string;
+  workflowRunId: string;
+  routeId: string;
+  sourceSegmentId: string;
+  sourceCompileId: string;
+  sourceRunId: string;
+  startAfterStepId: string;
+  measurementId: string;
+  measurementStatus: string;
+  measurementBindingStatus: string;
+  recipeId: string;
+  recipeVersion: number;
+  metricId: string;
+  method: string;
+  measuredValue: number;
+  unit: string;
+  operator: string;
+  threshold: number;
+  result: boolean;
+  chosenBranch: 'true' | 'false';
+  resolvedParameters: Record<string, Record<string, unknown>>;
+  targetCompileId: string;
+  branchAttemptId: string;
+  branchSegmentId: string;
+  replayOf: string | null;
+  createdAt: string;
+};
+type MeasurementDecisionResponse = {
+  decision: MeasurementDecision;
+  plan: RoutePlan;
+  workflowRunId: string;
+  measurement: Measurement;
+  resolvedParameters: Record<string, Record<string, unknown>>;
+};
 type Recipe = {
   recipeId: string;
   version: number;
@@ -265,6 +301,19 @@ function errorText(payload: unknown): string {
   return '请求失败';
 }
 
+function parseAuthoredParameters(text: string, label: string): Record<string, Record<string, unknown>> {
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    throw new Error(`${label} 参数必须是合法 JSON，例如 {"step_02":{"duration":0.02}}`);
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`${label} 参数必须是 JSON 对象，例如 {"step_02":{"duration":0.02}}`);
+  }
+  return value as Record<string, Record<string, unknown>>;
+}
+
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
   const text = await response.text();
@@ -301,6 +350,12 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [branchDuration, setBranchDuration] = useState('0.02');
   const [activeRecipeId, setActiveRecipeId] = useState('');
   const [activeRecipeVersion, setActiveRecipeVersion] = useState(1);
+  const [decisions, setDecisions] = useState<MeasurementDecision[]>([]);
+  const [decisionPrefixId, setDecisionPrefixId] = useState('');
+  const [decisionOperator, setDecisionOperator] = useState<'lt' | 'lte' | 'gt' | 'gte' | 'eq'>('gt');
+  const [decisionThreshold, setDecisionThreshold] = useState('0');
+  const [decisionTrueParameters, setDecisionTrueParameters] = useState('{}');
+  const [decisionFalseParameters, setDecisionFalseParameters] = useState('{}');
   const [metricDetail, setMetricDetail] = useState<{ measurement: Measurement; recipe: Recipe; provenance: Provenance } | null>(null);
   const [experimentDoc, setExperimentDoc] = useState<ExperimentDoc | null>(null);
   const [experimentTable, setExperimentTable] = useState<ExperimentTable | null>(null);
@@ -390,7 +445,41 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     return () => window.clearInterval(timer);
   }, [segment]);
 
+  useEffect(() => {
+    const succeeded = (route?.segments ?? []).filter(item => item.status === 'succeeded');
+    setDecisionPrefixId(previous => succeeded.some(item => item.throughStepId === previous)
+      ? previous
+      : (succeeded[succeeded.length - 1]?.throughStepId ?? ''));
+  }, [route]);
+
+  useEffect(() => {
+    const routeId = route?.route.routeId;
+    if (!routeId) {
+      setDecisions([]);
+      return;
+    }
+    void api<{ decisions: MeasurementDecision[] }>(`/api/v1/workflow/routes/${routeId}/measurement-decisions`)
+      .then(data => setDecisions(data.decisions))
+      .catch(() => setDecisions([]));
+  }, [route?.route.routeId]);
+
+  useEffect(() => {
+    const sourceMap = compile?.compile.sourceMap ?? [];
+    const tail = sourceMap[sourceMap.length - 1]?.authoredStepId;
+    if (!tail) return;
+    setDecisionTrueParameters(previous => (!previous.trim() || previous.trim() === '{}')
+      ? JSON.stringify({ [tail]: { duration: 0.03 } })
+      : previous);
+    setDecisionFalseParameters(previous => (!previous.trim() || previous.trim() === '{}')
+      ? JSON.stringify({ [tail]: { duration: 0.2 } })
+      : previous);
+  }, [compile?.compile.sourceMap]);
+
   const activeSteps = useMemo(() => (compile?.compile.project.steps ?? []).filter(step => step.enabled), [compile]);
+  const succeededPrefixes = useMemo(
+    () => (route?.segments ?? []).filter(item => item.status === 'succeeded'),
+    [route],
+  );
   const canAdopt = !!project && !busy;
   const canRoute = !!compile && !busy;
   const canRun = !!segment && segment.status === 'planned' && !busy;
@@ -504,8 +593,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setRoute(previous => previous ? { ...previous, segments: previous.segments.map(item => item.segmentId === result.segment.segmentId ? result.segment : item) } : previous);
   });
 
-  const measure = () => run('measure', async () => {
-    if (!segment?.runId) throw new Error('先完成运行');
+  const ensureRecipe = async (): Promise<{ recipeId: string; recipeVersion: number; metricId: string }> => {
     if (!compile) throw new Error('先采纳工程');
     const metricId = `metric_${compile.flowId}_${recipeMethod}`;
     const recipeId = `recipe_${compile.flowId}_${recipeMethod}`;
@@ -532,6 +620,12 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       }
     }
     if (!recipeSaved) throw new Error('配方版本无法保存');
+    return { recipeId, recipeVersion, metricId };
+  };
+
+  const measure = () => run('measure', async () => {
+    if (!segment?.runId) throw new Error('先完成运行');
+    const { recipeId, recipeVersion } = await ensureRecipe();
     const result = await postJson<Measurement>('/api/v1/workflow/measurements/from-run', {
       recipeId, recipeVersion, runId: segment.runId, stepId: segment.throughStepId,
     });
@@ -545,6 +639,48 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setMetrics(listed.measurements);
     setActiveRecipeId(recipeId);
     setActiveRecipeVersion(recipeVersion);
+  });
+
+  const decideMeasurementBranch = () => run('decision', async () => {
+    if (!route) throw new Error('先创建 Route');
+    if (!decisionPrefixId) throw new Error('没有可用的已成功前缀 Segment');
+    const recipe = activeRecipeId
+      ? { recipeId: activeRecipeId, recipeVersion: activeRecipeVersion }
+      : await ensureRecipe();
+    const trueParameters = parseAuthoredParameters(decisionTrueParameters, 'true 分支');
+    const falseParameters = parseAuthoredParameters(decisionFalseParameters, 'false 分支');
+    const result = await postJson<MeasurementDecisionResponse>(
+      `/api/v1/workflow/routes/${route.route.routeId}/measurement-decisions`,
+      {
+        startAfterStepId: decisionPrefixId,
+        recipeId: recipe.recipeId,
+        recipeVersion: recipe.recipeVersion,
+        operator: decisionOperator,
+        threshold: Number(decisionThreshold) || 0,
+        branches: {
+          true: { parameters: trueParameters },
+          false: { parameters: falseParameters },
+        },
+      },
+    );
+    setRoute(result.plan);
+    setSegment(result.plan.segments.find(item => item.segmentId === result.decision.branchSegmentId) ?? null);
+    setDecisions(previous => [...previous, result.decision]);
+    setMeasurement(result.measurement);
+    setActiveRecipeId(recipe.recipeId);
+    setActiveRecipeVersion(recipe.recipeVersion);
+    setProvenance(null);
+  });
+
+  const replayDecision = (decision: MeasurementDecision) => run('decision-replay', async () => {
+    if (!route) throw new Error('先创建 Route');
+    const result = await postJson<MeasurementDecisionResponse>(
+      `/api/v1/workflow/routes/${route.route.routeId}/measurement-decisions/${decision.decisionId}/replay`, {},
+    );
+    setRoute(result.plan);
+    setSegment(result.plan.segments.find(item => item.segmentId === result.decision.branchSegmentId) ?? null);
+    setDecisions(previous => [...previous, result.decision]);
+    setMeasurement(result.measurement);
   });
 
 
@@ -1152,6 +1288,47 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               <input aria-label="尾步时长" value={branchDuration} onChange={event => setBranchDuration(event.target.value)} />
               <button className="wf-button ghost" disabled={!route || !!busy} onClick={() => void branchLastStep()}>修改尾步并分支</button>
             </div>
+            <div className="wf-decision">
+              <div className="wf-recipe-title">测量驱动分支</div>
+              <select aria-label="决策前缀 Segment" value={decisionPrefixId} onChange={event => setDecisionPrefixId(event.target.value)}>
+                <option value="">自动（最后一个成功 Segment）</option>
+                {succeededPrefixes.map(item => (
+                  <option key={item.segmentId} value={item.throughStepId}>
+                    {item.segmentId.slice(0, 12)} · through {item.throughStepId.slice(0, 10)}
+                  </option>
+                ))}
+              </select>
+              <div className="wf-muted">
+                可用前缀：{succeededPrefixes.length ? succeededPrefixes.map(item => item.throughStepId.slice(0, 10)).join(' / ') : '无（先执行前缀 Segment）'}
+                {' · '}当前 recipe：{activeRecipeId ? `${activeRecipeId} v${activeRecipeVersion}` : '未固定（将按上方配方创建）'}
+              </div>
+              <div className="wf-decision-row">
+                <select aria-label="决策比较符" value={decisionOperator} onChange={event => setDecisionOperator(event.target.value as typeof decisionOperator)}>
+                  <option value="gt">&gt;</option>
+                  <option value="gte">≥</option>
+                  <option value="lt">&lt;</option>
+                  <option value="lte">≤</option>
+                  <option value="eq">=</option>
+                </select>
+                <input aria-label="决策阈值" value={decisionThreshold} onChange={event => setDecisionThreshold(event.target.value)} placeholder="threshold" />
+              </div>
+              <textarea aria-label="true 分支参数 JSON" value={decisionTrueParameters} onChange={event => setDecisionTrueParameters(event.target.value)} placeholder='true 分支：{"step_02":{"duration":0.02}}' />
+              <textarea aria-label="false 分支参数 JSON" value={decisionFalseParameters} onChange={event => setDecisionFalseParameters(event.target.value)} placeholder='false 分支：{"step_02":{"duration":0.05}}' />
+              <button className="wf-button primary" aria-label="测量并生成分支" disabled={!route || !decisionPrefixId || !!busy} onClick={() => void decideMeasurementBranch()}>
+                {busy === 'decision' ? '测量并决策中…' : '测量并生成分支'}
+              </button>
+            </div>
+            {decisions.length > 0 && <table className="wf-table" aria-label="测量决策列表">
+              <thead><tr><th>测量</th><th>条件</th><th>结果</th><th>分支 / 解析参数</th><th>Workflow run</th><th /></tr></thead>
+              <tbody>{decisions.map(item => <tr key={item.decisionId}>
+                <td>{item.measuredValue.toFixed(4)} {item.unit}<br /><code className="wf-mono">{item.measurementId.slice(0, 12)}</code></td>
+                <td><code className="wf-mono">{item.operator} {item.threshold}</code><br /><span className="wf-muted">{item.recipeId} v{item.recipeVersion}</span></td>
+                <td><span className={`wf-status ${item.result ? 'succeeded' : 'failed'}`}>{item.result ? 'true' : 'false'}</span><br />{item.chosenBranch}</td>
+                <td><code className="wf-mono">{JSON.stringify(item.resolvedParameters)}</code>{item.replayOf && <><br /><span className="wf-muted">replay of {item.replayOf.slice(0, 12)}</span></>}</td>
+                <td><code className="wf-mono">{item.workflowRunId}</code><br /><span className="wf-muted">{item.targetCompileId.slice(0, 12)}</span></td>
+                <td><button className="wf-link" aria-label={`重放决策 ${item.decisionId}`} disabled={!!busy} onClick={() => void replayDecision(item)}>重放决策</button></td>
+              </tr>)}</tbody>
+            </table>}
             {segment.status === 'running' && <div className="wf-progress"><i /></div>}
             <div className="wf-recipe">
               <div className="wf-recipe-title">测量配方</div>
