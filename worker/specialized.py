@@ -4,7 +4,10 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from backend.specialized_models import advanced_spec, model_spec, oxidation_advanced_spec
+from backend.specialized_models import (PLASMA_COVERAGE_MODELS, advanced_spec,
+                                       coverage_tolerance_issues, geometric_trench_issues,
+                                       model_spec, nv_factors_issues,
+                                       oxidation_advanced_spec)
 from backend.engine import (ald_surface_diffusion_error, engine_version,
                            oxidation_advanced_supported)
 
@@ -166,6 +169,8 @@ def _coverage_parameters(ps: Any, parameters: dict[str, Any]) -> tuple[Any, dict
     if "coverageTolerance" not in parameters:
         coverage.tolerance = 1e-3
         return coverage, None
+    if messages := coverage_tolerance_issues(parameters["coverageTolerance"]):
+        raise RuntimeError(f"CoverageParameters.tolerance {'; '.join(messages)}")
     coverage.tolerance = float(parameters["coverageTolerance"])
     native_readback = {str(key): [float(value) for value in values]
                        for key, values in coverage.toMetaData().items()}
@@ -197,6 +202,23 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
     if spec is None:
         raise RuntimeError(f"unavailable ViennaPS 4.6.2 model {model_id!r}")
     p = step["nativeParameters"]
+    # Worker-side preflight: replay/direct worker inputs reach this function
+    # without backend.validation. Keep the same safety rules here so an
+    # invalid optional value can never reach a native setter/constructor.
+    if "coverageTolerance" in p:
+        if model_id not in PLASMA_COVERAGE_MODELS:
+            raise RuntimeError(f"{model_id} does not accept nativeParameters.coverageTolerance")
+        if messages := coverage_tolerance_issues(p["coverageTolerance"]):
+            raise RuntimeError(f"{model_id} coverageTolerance {'; '.join(messages)}")
+    if "nvFactors" in p:
+        if model_id != "selectiveEpitaxy":
+            raise RuntimeError(f"{model_id} does not accept nativeParameters.nvFactors")
+        if messages := nv_factors_issues(p["nvFactors"]):
+            raise RuntimeError(f"selectiveEpitaxy nvFactors {'; '.join(messages)}")
+    if model_id == "geometricTrenchDeposition":
+        if problems := geometric_trench_issues(project, step):
+            detail = "; ".join(f"{path}: {message}" for path, message in problems)
+            raise RuntimeError(f"GeometricTrenchDeposition rejected before the native call: {detail}")
     extra: list[Any] = []
     duration = float(step["duration"]) if step.get("duration") is not None else float(p["timeHours"]) * 3600.0
     resolved: dict[str, Any] = {"nativeClass": spec["nativeClass"], "nativeModel": model_id,

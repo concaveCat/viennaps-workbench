@@ -14,8 +14,8 @@ from pydantic import ValidationError
 from .models import Domain3D, Project, ProjectV3, ProjectV4, ProjectV5, ProjectV6, ProjectV7, parse_project
 from .materials import attach_and_reconcile_project_materials, geometry_mask_material_names
 from .rates import has_motion, is_geometry_step, uses_flux, value as step_value
-from .specialized_models import (FLUOROCARBON_MATERIAL_DEFAULTS, model_spec,
-                                 oxidation_advanced_spec)
+from .specialized_models import (FLUOROCARBON_MATERIAL_DEFAULTS, geometric_trench_issues,
+                                 nv_factors_issues, model_spec, oxidation_advanced_spec)
 from .runtime_limits import available_cpu_threads
 from .engine import (EVIDENCE_ENGINE_VERSION, OXIDATION_ADVANCED_RESTRICTED,
                      ald_surface_diffusion_error, ald_surface_diffusion_supported,
@@ -834,33 +834,6 @@ def gpu_project_signature(project: dict[str, Any], step: dict[str, Any]) -> dict
 
 
 
-def _initial_vertical_extent(project: Any) -> float:
-    """Conservative max |z| of the initial geometry.
-
-    GeometricTrenchDeposition evaluates ``a*(1-|z|/trenchDepth)**n+b`` from
-    absolute z. If the initial structure reaches beyond ``trenchDepth``, the
-    base is negative or >1 and a large integer exponent can overflow. Require
-    the native depth to cover the initial vertical span.
-    """
-    geometry = getattr(project, "geometry", {}) or {}
-    if not isinstance(geometry, dict):
-        return 0.0
-    kind = geometry.get("kind")
-    if kind == "plane":
-        return abs(float(geometry.get("height", 0.0)))
-    if kind in {"trench", "hole"}:
-        return max(abs(float(geometry.get("depth", 0.0))),
-                   abs(float(geometry.get("maskHeight", 0.0))))
-    if kind == "fin":
-        return max(abs(float(geometry.get("height", 0.0))),
-                   abs(float(geometry.get("maskHeight", 0.0))))
-    if kind == "stack":
-        base = float(geometry.get("baseHeight", 0.0))
-        return max(abs(base), abs(base) + sum(abs(float(row.get("thickness", 0.0)))
-                                                for row in geometry.get("layers", [])))
-    return 0.0
-
-
 def _advanced_number_issue(path: str, field: dict[str, Any], value: Any) -> FieldIssue | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return FieldIssue(path, "must be a finite JSON number")
@@ -1013,101 +986,18 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
         prefix = f"steps[{index}].nativeParameters"
         params = step.nativeParameters
         if step.nativeModel == "geometricTrenchDeposition":
-            # The native radius formula needs a trustworthy vertical bound.
-            # GDS geometry has no project-level z description we can bound
-            # without parsing the asset, and a continuation state loads a
-            # saved Domain whose actual coordinates are not in the project.
-            if project.geometry.get("kind") == "gds":
-                issues.append(FieldIssue(
-                    f"steps[{index}].nativeModel",
-                    "GeometricTrenchDeposition is not supported with GDS geometry in 2D or 3D; its native "
-                    "radius formula needs a bounded vertical span that the project description does not provide"))
-            if getattr(project, "continuationState", None) is not None:
-                issues.append(FieldIssue(
-                    f"steps[{index}].nativeModel",
-                    "GeometricTrenchDeposition is not supported with a continuation state; the saved Domain's "
-                    "vertical span cannot be validated from the project description"))
-            # The native closed form uses absolute z and the initial-structure
-            # bound below is only valid when this is the first enabled step.
-            # A later step can raise/lower the surface and move it outside the
-            # validated span; reject instead of guessing an operation chain.
-            if any(step_value(previous, "enabled") for previous in project.steps[:index]):
-                issues.append(FieldIssue(
-                    f"steps[{index}].nativeModel",
-                    "GeometricTrenchDeposition must be the first enabled step; its native radius formula is "
-                    "evaluated from absolute z and the validated vertical span cannot account for earlier operations"))
-            # The native closed form is a*(1-|z|/depth)^n+b. A fractional n on
-            # a negative base is NaN; the installed binding does not guard it.
-            n_value = params.get("n")
-            try:
-                n_number = float(n_value)
-            except (TypeError, ValueError):
-                n_number = float("nan")
-            if not n_number.is_integer() or n_number < 1:
-                issues.append(FieldIssue(f"{prefix}.n", "must be an integer >= 1; fractional n can produce a non-finite native radius"))
-            grid_delta = float(project.domain.gridDelta)
-            for key in ("trenchWidth", "depositionRate"):
-                try:
-                    value = float(params.get(key, 0))
-                except (TypeError, ValueError):
-                    value = 0.0
-                if value <= 0.0:
-                    issues.append(FieldIssue(f"{prefix}.{key}", "must be positive"))
-            try:
-                width = float(params.get("trenchWidth", 0))
-            except (TypeError, ValueError):
-                width = 0.0
-            if 0.0 < width < grid_delta - 1e-12:
-                issues.append(FieldIssue(
-                    f"{prefix}.trenchWidth",
-                    f"must be at least one grid interval ({grid_delta:g} um); the native kernel ignores this value, "
-                    "so a sub-grid trench only misrepresents the geometry"))
-            try:
-                depth = float(params.get("trenchDepth", 0))
-            except (TypeError, ValueError):
-                depth = 0.0
-            max_z = _initial_vertical_extent(project)
-            if depth < max_z:
-                issues.append(FieldIssue(
-                    f"{prefix}.trenchDepth",
-                    f"must be at least the initial structure's maximum |z| ({max_z:g} um); "
-                    "a shallower depth puts the native radius formula outside its valid range and can overflow"))
-            if 0.0 < depth < grid_delta - 1e-12:
-                issues.append(FieldIssue(
-                    f"{prefix}.trenchDepth",
-                    f"must be at least one grid interval ({grid_delta:g} um); the native radius divides by this depth"))
-            # TrenchDistribution.getBounds() declares the distribution reach as
-            # +/-depositionRate, but getSignedDistance() uses a local radius of
-            # a*(1-|z|/depth)^n+b (bottomMed at the trench floor). When the
-            # radius exceeds that declared reach by more than three grid cells,
-            # ViennaLS GeometricAdvect indexes outside its candidate window and
-            # aborts with SIGSEGV (reproduced in 2D and 3D). Bound the radius by
-            # the same reach the native distribution advertises.
-            def _number_or_zero(name: str) -> float:
-                try:
-                    return float(params.get(name, 0.0))
-                except (TypeError, ValueError):
-                    return 0.0
-            a_value, b_value = _number_or_zero("a"), _number_or_zero("b")
-            bottom_med = _number_or_zero("bottomMed")
-            rate_value = _number_or_zero("depositionRate")
-            max_radius = max(a_value + b_value, bottom_med)
-            if max_radius <= 0.0:
-                issues.append(FieldIssue(
-                    f"{prefix}.a",
-                    "a+b and bottomMed cannot both be zero; the native distribution would have a zero radius "
-                    "and leave the surface unchanged"))
-            elif rate_value + 3.0 * grid_delta < max_radius - 1e-12:
-                issues.append(FieldIssue(
-                    f"{prefix}.depositionRate",
-                    f"must be at least the native radius ({max_radius:g} um) minus three grid intervals "
-                    f"({3.0 * grid_delta:g} um); the installed ViennaLS GeometricAdvect window is derived from "
-                    "depositionRate and aborts with SIGSEGV outside it"))
+            # Shared with the worker: a direct worker input cannot bypass the
+            # dimension/geometry/depth/reach checks.
+            for suffix, message in geometric_trench_issues(project, step):
+                issues.append(FieldIssue(f"steps[{index}].{suffix}", message))
         for field in spec["fields"]:
             key = field["key"]
             path = f"{prefix}.{key}"
             value = params.get(key)
             kind = field["kind"]
+            if step.nativeModel == "geometricTrenchDeposition":
+                # geometric_trench_issues() validated every numeric argument.
+                continue
             if kind == "number":
                 if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
                     issues.append(FieldIssue(path, "must be a finite JSON number"))
@@ -1162,23 +1052,8 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
             path = f"{prefix}.{key}"
             kind = field["kind"]
             if kind == "nvFactors":
-                if (not isinstance(value, list) or len(value) != 3
-                        or any(isinstance(item, bool) or not isinstance(item, (int, float))
-                               or not math.isfinite(float(item)) for item in value)):
-                    issues.append(FieldIssue(path, "must contain exactly three finite numbers"))
-                    continue
-                if any(not float(field["minimum"]) <= float(item) <= float(field["maximum"])
-                       for item in value):
-                    issues.append(FieldIssue(
-                        path,
-                        f"each factor must be between {field['minimum']} and {field['maximum']}; "
-                        "the native interpolation maps max_i(|factor_i*normal_i|) from [1/sqrt(D), 1] "
-                        "to [rate111, rate100]"))
-                elif not any(float(item) > 0.0 for item in value):
-                    issues.append(FieldIssue(
-                        path,
-                        "must contain at least one positive factor; an all-zero vector drives the native "
-                        "velocity to zero and leaves the surface unchanged"))
+                for message in nv_factors_issues(value):
+                    issues.append(FieldIssue(path, message))
             elif kind == "number":
                 if issue := _advanced_number_issue(path, field, value):
                     issues.append(issue)

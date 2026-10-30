@@ -15,9 +15,9 @@ the catalog cannot change:
   It grows the selectable ``depositMaterial`` top level set, ignores
   ``trenchWidth`` and the process duration, and evaluates its local radius from
   absolute z with the trench top assumed at z=0. Its 3D SIGSEGV audit case is
-  reproduced as a parameter-reach crash (``depositionRate + 3*gridDelta`` below
-  the native radius) that also occurs in 2D, so validation guards the reach
-  rather than hiding the dimension.
+  reproduced as a parameter-reach failure that also occurs in 2D; a rate below
+  ``max(a+b, bottomMed)`` can leave an empty deposited level set, so validation
+  guards the reach with that conservative bound rather than hiding the dimension.
 * ``SelectiveEpitaxy`` binds a separate ``nvFactors`` constructor overload with
   a fixed-size three-vector. The native defaults are dimension-dependent, so
   omitting the key keeps the existing materialRates overload byte-for-byte.
@@ -47,6 +47,7 @@ import viennaps as ps  # noqa: E402
 from backend import storage  # noqa: E402
 from backend.main import app  # noqa: E402
 from backend.hashing import requested_input_hash  # noqa: E402
+from backend.models import ProjectV7  # noqa: E402
 from backend.specialized_models import CATALOG, model_spec  # noqa: E402
 from backend.validation import ProjectInputError, select_engine, validate_project  # noqa: E402
 from stage8_project_factory import make_project  # noqa: E402
@@ -142,12 +143,12 @@ def native_stack(dimension: int, boundary: str = "periodic"):
     return domain
 
 
-def native_plane(dimension: int):
+def native_plane(dimension: int, *, grid: float = 0.2, extent: float = 2.0):
     ps.setDimension(dimension)
     ps.setNumThreads(1)
     ps.Length.setUnit("um")
     ps.Time.setUnit("s")
-    delta, extent = 0.2, 2.0
+    delta = grid
     boundary = ps.BoundaryType.REFLECTIVE_BOUNDARY
     domain = (ps.Domain(delta, extent, boundary=boundary) if dimension == 2
               else ps.Domain(delta, extent, extent, boundary))
@@ -338,7 +339,7 @@ class SpecializedValidationNegatives(unittest.TestCase):
     def test_geometric_parameter_reach_guard_rejects_the_audit_crash_case(self):
         # This is the exact 3D probe from the capability audit: a 2.1 um native
         # radius with depositionRate=0.05 and gridDelta=0.1. It SIGSEGVs in both
-        # 2D and 3D because the ViennaLS candidate window is rate+3*grid wide.
+        # 2D and 3D; the worker now requires rate >= max(a+b, bottomMed).
         for dimension in (2, 3):
             with self.subTest(dimension=dimension):
                 project = geometric_project(dimension)
@@ -351,6 +352,44 @@ class SpecializedValidationNegatives(unittest.TestCase):
                             if issue.path == "steps[0].nativeParameters.depositionRate"]
                 self.assertTrue(messages, [issue.path for issue in ctx.exception.issues])
                 self.assertIn("native radius", messages[0])
+
+    def test_geometric_reach_guard_rejects_the_empty_layer_boundary(self):
+        # Repro from the review: rate 0.15 (and even 0.2, which the kernel
+        # happens to accept) is below the native radius 0.4. The conservative
+        # guard rejects both rather than risking an empty deposited level set.
+        for dimension in (2, 3):
+            for rate in (0.15, 0.2):
+                with self.subTest(dimension=dimension, rate=rate):
+                    project = geometric_plane_project(dimension)
+                    project["domain"]["gridDelta"] = 0.1
+                    project["domain"]["xExtent"] = 2.0
+                    if dimension == 3:
+                        project["domain"]["yExtent"] = 2.0
+                    project["steps"][0]["nativeParameters"].update({
+                        "trenchWidth": 1.0, "trenchDepth": 0.5, "depositionRate": rate,
+                        "bottomMed": 0.1, "a": 0.3, "b": 0.1, "n": 1.0})
+                    with self.assertRaises(ProjectInputError) as ctx:
+                        validate_project(project)
+                    messages = [issue.message for issue in ctx.exception.issues
+                                if issue.path == "steps[0].nativeParameters.depositionRate"]
+                    self.assertTrue(messages, [issue.path for issue in ctx.exception.issues])
+                    self.assertIn("empty", messages[0])
+
+    def test_geometric_fin_vertical_extent_includes_the_mask(self):
+        # 3D fin height 0.8 + mask 0.8 puts the top surface at |z|=1.6, not 0.8.
+        # A native depth of 0.8 passed the old max(height, maskHeight) bound and
+        # reduced the fin to z=0.5 while emptying the substrate level set.
+        project = geometric_project(3)
+        project["geometry"] = {
+            "kind": "fin", "width": 1.0, "height": 0.8, "taperAngle": 0.0,
+            "maskHeight": 0.8, "maskTaperAngle": 0.0, "substrateMaterial": "Si", "maskMaterial": "Mask"}
+        project["steps"][0]["nativeParameters"].update({"trenchDepth": 0.8, "depositionRate": 0.5})
+        with self.assertRaises(ProjectInputError) as ctx:
+            validate_project(project)
+        messages = [issue.message for issue in ctx.exception.issues
+                    if issue.path == "steps[0].nativeParameters.trenchDepth"]
+        self.assertTrue(messages, [(issue.path, issue.message) for issue in ctx.exception.issues])
+        self.assertIn("1.6", messages[0])
 
     def test_geometric_rejects_zero_radius_and_sub_grid_width_depth(self):
         cases = (
@@ -373,7 +412,7 @@ class SpecializedValidationNegatives(unittest.TestCase):
     def test_selective_nv_factors_reject_unknown_length_range_and_all_zero(self):
         for value in ([1, 1], [1, 1, 1, 1], [-0.1, 1, 1], [1.1, 1, 1],
                       [float("nan"), 1, 1], [float("inf"), 1, 1], [0, 0, 0],
-                      "not-a-vector", True):
+                      [10 ** 400, 1, 1], "not-a-vector", True):
             with self.subTest(value=value):
                 project = selective_project(2, nv_factors=value)
                 with self.assertRaises(ProjectInputError) as ctx:
@@ -447,6 +486,43 @@ class SpecializedValidationNegatives(unittest.TestCase):
         self.assertIn("steps[0].nativeParameters.materialPlaneWaferRateByMaterial", paths)
 
 
+class WorkerSafetyPreflight(unittest.TestCase):
+    """Direct worker calls must apply the same safety rules as the API."""
+
+    def normalized(self, project: dict) -> tuple[dict, dict]:
+        normalized = ProjectV7.model_validate(project).model_dump(mode="json", exclude_none=True)
+        return normalized, normalized["steps"][0]
+
+    def test_direct_worker_rejects_unsafe_geometric_trench(self):
+        project = geometric_plane_project(3)
+        project["steps"][0]["nativeParameters"].update({
+            "trenchWidth": 0.4, "trenchDepth": 0.5, "depositionRate": 0.05,
+            "bottomMed": 0.1, "a": 0.1, "b": 2.0, "n": 1.0})
+        normalized, step = self.normalized(project)
+        with self.assertRaises(RuntimeError) as ctx:
+            build_specialized_model(ps, native_plane(3), normalized, step, material_handle, {})
+        message = str(ctx.exception)
+        self.assertIn("GeometricTrenchDeposition rejected", message)
+        self.assertIn("native radius", message)
+
+    def test_direct_worker_rejects_negative_coverage_tolerance(self):
+        for value in (-1.0, 1.5, float("nan")):
+            with self.subTest(value=value):
+                project = plasma_project(2)
+                project["steps"][0]["nativeParameters"]["coverageTolerance"] = value
+                normalized, step = self.normalized(project)
+                with self.assertRaises(RuntimeError) as ctx:
+                    build_specialized_model(ps, None, normalized, step, material_handle, {})
+                self.assertIn("coverageTolerance", str(ctx.exception))
+
+    def test_direct_worker_rejects_oversized_nv_factors(self):
+        project = selective_project(2, nv_factors=[10 ** 400, 1, 1])
+        normalized, step = self.normalized(project)
+        with self.assertRaises(RuntimeError) as ctx:
+            build_specialized_model(ps, None, normalized, step, material_handle, {})
+        self.assertIn("nvFactors", str(ctx.exception))
+
+
 class NativeFaradayCage(unittest.TestCase):
     def test_real_3d_cpu_run_etches_the_exposed_film(self):
         for dimension in (3,):
@@ -513,6 +589,28 @@ class NativeGeometricTrenchDeposition(unittest.TestCase):
         self.assertEqual(type(model).__module__, "viennaps.d3")
         self.assertAlmostEqual(after - before, 0.4, delta=0.02)
         self.assertEqual(actual["nativeGeometricAdvection"]["depositMaterial"], "Al2O3")
+
+    def test_reach_guard_boundary_rate_equals_radius_is_non_empty(self):
+        # rate == max(a+b, bottomMed) == 0.4 is the conservative guard boundary.
+        # Probe 4.6.2/5.8.5: this boundary completes with every level set
+        # populated; rate 0.15/0.2 was empty (0.2 happened to work, 0.15 did not).
+        for dimension in (2, 3):
+            with self.subTest(dimension=dimension):
+                project = geometric_plane_project(dimension)
+                project["domain"]["gridDelta"] = 0.1
+                project["domain"]["xExtent"] = 2.0
+                if dimension == 3:
+                    project["domain"]["yExtent"] = 2.0
+                project["steps"][0]["nativeParameters"].update({
+                    "trenchWidth": 1.0, "trenchDepth": 0.5, "depositionRate": 0.4,
+                    "bottomMed": 0.1, "a": 0.3, "b": 0.1, "n": 1.0})
+                domain = native_plane(dimension, grid=0.1, extent=2.0)
+                domain.duplicateTopLevelSet(ps.Material.Al2O3)
+                before = surface_top(domain, dimension)
+                run_specialized(project, domain)
+                counts = [int(level_set.getNumberOfPoints()) for level_set in domain.getLevelSets()]
+                self.assertTrue(counts and all(count > 0 for count in counts), counts)
+                self.assertGreater(surface_top(domain, dimension), before + 1e-6)
 
     def test_3d_trench_matches_a_direct_native_reference(self):
         project = geometric_project(3)

@@ -87,6 +87,197 @@ FLUOROCARBON_MATERIAL_DEFAULTS = {
 }
 
 
+PLASMA_COVERAGE_MODELS = frozenset({"sf6o2", "cf4o2", "hbro2", "sf6c4f8"})
+GEOMETRIC_TRENCH_ARGUMENT_KEYS = ("trenchWidth", "trenchDepth", "depositionRate",
+                                  "bottomMed", "a", "b", "n")
+GEOMETRIC_TRENCH_GEOMETRIES = frozenset({"plane", "trench", "hole", "fin", "stack"})
+
+
+def _object_value(value: Any, key: str, default: Any = None) -> Any:
+    if isinstance(value, dict):
+        return value.get(key, default)
+    return getattr(value, key, default)
+
+
+def finite_number(value: Any) -> float | None:
+    """Return a finite float or None, including for oversized Python ints."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def nv_factors_issues(value: Any) -> list[str]:
+    """Validate the three native normal-vector factors."""
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        return ["must contain exactly three finite numbers"]
+    numbers: list[float] = []
+    for item in value:
+        number = finite_number(item)
+        if number is None:
+            return ["must contain exactly three finite numbers"]
+        numbers.append(number)
+    if any(number < 0.0 or number > 1.0 for number in numbers):
+        return ["each factor must be between 0.0 and 1.0; the native interpolation maps "
+                "max_i(|factor_i*normal_i|) from [1/sqrt(D), 1] to [rate111, rate100]"]
+    if not any(number > 0.0 for number in numbers):
+        return ["must contain at least one positive factor; an all-zero vector drives the native "
+                "velocity to zero and leaves the surface unchanged"]
+    return []
+
+
+def coverage_tolerance_issues(value: Any) -> list[str]:
+    """Validate the optional native CoverageParameters.tolerance."""
+    number = finite_number(value)
+    if number is None:
+        return ["must be a finite JSON number"]
+    if not 0.0 <= number <= 1.0:
+        return ["must be between 0.0 and 1.0; a negative or non-finite tolerance never converges "
+                "and the native strategy would iterate up to its unsigned maxIterations default"]
+    return []
+
+
+def geometric_trench_vertical_extent(geometry: dict[str, Any]) -> float:
+    """Conservative max |z| of the initial geometry seen by the native radius.
+
+    MakeFin places the mask above the fin, so the fin's vertical span is
+    ``finHeight + maskHeight``. MakeTrench/MakeHole put the mask above z=0 and
+    the opening below it, so their span is ``max(depth, maskHeight)``. Taper
+    angles change lateral width only; the installed constructors do not add
+    vertical extent for a taper.
+    """
+    kind = geometry.get("kind")
+    if kind == "plane":
+        return abs(float(geometry.get("height", 0.0)))
+    if kind in {"trench", "hole"}:
+        return max(abs(float(geometry.get("depth", 0.0))),
+                   abs(float(geometry.get("maskHeight", 0.0))))
+    if kind == "fin":
+        return (abs(float(geometry.get("height", 0.0)))
+                + abs(float(geometry.get("maskHeight", 0.0))))
+    if kind == "stack":
+        base = float(geometry.get("baseHeight", 0.0))
+        return max(abs(base), abs(base) + sum(abs(float(row.get("thickness", 0.0)))
+                                                for row in geometry.get("layers", [])))
+    return 0.0
+
+
+def geometric_trench_issues(project: Any, step: Any) -> list[tuple[str, str]]:
+    """Central safety rule for GeometricTrenchDeposition.
+
+    Both request validation and the worker call this function, so a direct
+    worker input cannot bypass the dimension/geometry/depth/reach checks.
+
+    The installed ViennaLS distribution advertises ``+/-depositionRate`` as its
+    reach but computes a local radius ``a*(1-|z|/depth)^n + b`` (or
+    ``bottomMed`` at the floor). Probing 4.6.2/5.8.5 shows an empty deposited
+    level set once ``rate < radius - 2*gridDelta`` and SIGSEGV further below
+    that. The worker therefore requires ``depositionRate >= max(a+b,
+    bottomMed)``: a deliberately conservative margin that rejects some inputs
+    the native kernel happens to accept, but never leaves an empty layer in the
+    tested 2D/3D plane/trench/hole/fin/stack matrix.
+    """
+    issues: list[tuple[str, str]] = []
+    dimension = _object_value(project, "dimension")
+    if dimension not in (2, 3):
+        issues.append(("nativeModel", "GeometricTrenchDeposition is only available in 2D and 3D"))
+    geometry = _object_value(project, "geometry", {})
+    if not isinstance(geometry, dict):
+        geometry = geometry.model_dump(mode="json", exclude_none=True)
+    kind = geometry.get("kind")
+    if kind == "gds":
+        issues.append(("nativeModel",
+                       "GeometricTrenchDeposition is not supported with GDS geometry in 2D or 3D; its native "
+                       "radius formula needs a bounded vertical span that the project description does not provide"))
+    elif kind not in GEOMETRIC_TRENCH_GEOMETRIES:
+        issues.append(("nativeModel",
+                       f"GeometricTrenchDeposition requires a parametric plane/trench/hole/fin/stack geometry; "
+                       f"got {kind!r}"))
+    if _object_value(project, "continuationState", None) is not None:
+        issues.append(("nativeModel",
+                       "GeometricTrenchDeposition is not supported with a continuation state; the saved Domain's "
+                       "vertical span cannot be validated from the project description"))
+    steps = _object_value(project, "steps", []) or []
+    step_id = _object_value(step, "id")
+    index = next((position for position, candidate in enumerate(steps)
+                  if _object_value(candidate, "id") == step_id), None)
+    if index is not None and any(_object_value(previous, "enabled", False)
+                                 for previous in steps[:index]):
+        issues.append(("nativeModel",
+                       "GeometricTrenchDeposition must be the first enabled step; its native radius formula is "
+                       "evaluated from absolute z and the validated vertical span cannot account for earlier operations"))
+    params = _object_value(step, "nativeParameters", {})
+    if not isinstance(params, dict):
+        issues.append(("nativeParameters", "must be a JSON object"))
+        return issues
+    values: dict[str, float] = {}
+    for key in GEOMETRIC_TRENCH_ARGUMENT_KEYS:
+        number = finite_number(params.get(key))
+        if number is None:
+            issues.append((f"nativeParameters.{key}", "must be a finite JSON number"))
+        else:
+            values[key] = number
+    if len(values) != len(GEOMETRIC_TRENCH_ARGUMENT_KEYS):
+        return issues
+    width = values["trenchWidth"]
+    depth = values["trenchDepth"]
+    rate = values["depositionRate"]
+    bottom = values["bottomMed"]
+    a_value = values["a"]
+    b_value = values["b"]
+    n_value = values["n"]
+    grid_delta = float(_object_value(_object_value(project, "domain", {}), "gridDelta", 0.0))
+    for key in ("trenchWidth", "trenchDepth", "depositionRate"):
+        if 0.0 < values[key] < 1e-6:
+            issues.append((f"nativeParameters.{key}", "must be at least 0.000001"))
+    for key in ("trenchWidth", "trenchDepth", "depositionRate", "bottomMed", "a", "b"):
+        if values[key] > 1_000_000.0:
+            issues.append((f"nativeParameters.{key}", "must be at most 1000000"))
+    if width <= 0.0:
+        issues.append(("nativeParameters.trenchWidth", "must be positive"))
+    if depth <= 0.0:
+        issues.append(("nativeParameters.trenchDepth", "must be positive"))
+    if rate <= 0.0:
+        issues.append(("nativeParameters.depositionRate", "must be positive"))
+    if bottom < 0.0:
+        issues.append(("nativeParameters.bottomMed", "must be non-negative"))
+    if a_value < 0.0:
+        issues.append(("nativeParameters.a", "must be non-negative"))
+    if b_value < 0.0:
+        issues.append(("nativeParameters.b", "must be non-negative"))
+    if (not n_value.is_integer()) or n_value < 1.0 or n_value > 100.0:
+        issues.append(("nativeParameters.n",
+                       "must be an integer between 1 and 100; fractional n can produce a non-finite native radius"))
+    if 0.0 < width < grid_delta - 1e-12:
+        issues.append(("nativeParameters.trenchWidth",
+                       f"must be at least one grid interval ({grid_delta:g} um); the native kernel ignores this value, "
+                       "so a sub-grid trench only misrepresents the geometry"))
+    if 0.0 < depth < grid_delta - 1e-12:
+        issues.append(("nativeParameters.trenchDepth",
+                       f"must be at least one grid interval ({grid_delta:g} um); the native radius divides by this depth"))
+    max_z = geometric_trench_vertical_extent(geometry)
+    if depth < max_z - 1e-12:
+        issues.append(("nativeParameters.trenchDepth",
+                       f"must be at least the initial structure's maximum |z| ({max_z:g} um); "
+                       "a shallower depth puts the native radius formula outside its valid range and can overflow"))
+    top_radius = a_value + b_value
+    if top_radius <= 0.0:
+        issues.append(("nativeParameters.a",
+                       "a+b cannot be zero; a+b and bottomMed must give the duplicated top level set a positive "
+                       "native radius, otherwise the deposition is a silent no-op"))
+        return issues
+    max_radius = max(top_radius, bottom)
+    if rate < max_radius - 1e-12:
+        issues.append(("nativeParameters.depositionRate",
+                       f"must be at least the native radius ({max_radius:g} um); the installed ViennaLS "
+                       "GeometricAdvect window is derived from depositionRate, and a smaller rate leaves the "
+                       "deposited level set empty or aborts with SIGSEGV"))
+    return issues
+
+
 def ibe_fields() -> list[dict[str, Any]]:
     """Native IBEParameters fields shared by ionBeam and faradayCage.
 
@@ -467,9 +658,10 @@ CATALOG: list[dict[str, Any]] = [
     # coordinate, with the trench top assumed at z=0. Validation surfaces these
     # native semantics as a warning instead of pretending they are ordinary
     # deposition parameters. The audit's 3D SIGSEGV was reproduced as a
-    # parameter-reach crash (depositionRate + 3*gridDelta < local radius) that
-    # also occurs in 2D; with that guard enforced, 2D and 3D use the same native
-    # class and all parametric geometry kinds are exercised. GDS remains gated
+    # parameter-reach failure that also occurs in 2D: a rate below
+    # max(a+b, bottomMed) can leave an empty deposited level set and eventually
+    # SIGSEGV. With the shared reach guard enforced, 2D and 3D use the same
+    # native class and all parametric geometry kinds are exercised. GDS remains gated
     # because its vertical span is not described by the project.
     {"id": "geometricTrenchDeposition", "label": "几何沟槽沉积", "nativeClass": "GeometricTrenchDeposition",
      "operation": "deposit", "usesFlux": False, "experimental": True, "dimensions": [2, 3],

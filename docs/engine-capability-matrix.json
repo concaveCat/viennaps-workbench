@@ -643,7 +643,7 @@
       "exposedBy": [
         "model:specialized/geometricTrenchDeposition (schema 7, experimental)"
       ],
-      "notes": "Probe 2026-10-31: the 2026-10-30 3D SIGSEGV was reproduced as a parameter-reach crash (depositionRate + 3*gridDelta below the native radius), not a dimension limitation; the same input aborts in 2D. With that guard in validation, 3D plane/trench/hole/fin/stack complete and match a direct native reference. GDS stays rejected because its vertical span is not described by the project.",
+      "notes": "Probe 2026-10-31: the 2026-10-30 3D SIGSEGV was a parameter-reach crash, not a dimension limitation; it also occurs in 2D. The guard requires depositionRate >= max(a+b, bottomMed) because rate < radius - 2*gridDelta leaves an empty deposited level set. 3D plane/trench/hole/fin/stack complete and match a direct native reference; the fin vertical extent includes finHeight+maskHeight. GDS stays rejected because its vertical span is not described by the project.",
       "members": {
         "exposed": [
           "trenchWidth",

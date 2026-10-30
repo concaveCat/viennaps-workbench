@@ -117,7 +117,7 @@ custom material catalog.
 | Native class | Verified dims | What it actually is | Precondition / risk |
 | --- | --- | --- | --- |
 | `FaradayCageEtching` + `FaradayCageParameters` | 3 only | Ion-beam etch with a Faraday-cage angular filter: `cageAngle` plus a full `IBEParameters` | Probe: 3D finishes in <0.1 s; the identical call on a 2D domain did not return within 40 s (plane-only and trench, with and without `planeWaferRate`) → **engine-side 2D hang**, must be rejected at validation |
-| `GeometricTrenchDeposition` | 2/3 | Closed-form analytic trench fill (`trenchWidth, trenchDepth, depositionRate, bottomMed, a, b, n`), no flux engine | The 2026-10-30 3D SIGSEGV was a parameter-reach crash (`depositionRate + 3*gridDelta <` native radius) that also occurs in 2D; guarded, 3D plane/trench/hole/fin/stack complete and match a direct native reference. GDS stays 422 |
+| `GeometricTrenchDeposition` | 2/3 | Closed-form analytic trench fill (`trenchWidth, trenchDepth, depositionRate, bottomMed, a, b, n`), no flux engine | The 2026-10-30 3D SIGSEGV was a parameter-reach crash that also occurs in 2D; the guard now requires `depositionRate >= max(a+b, bottomMed)` because `rate < radius - 2*gridDelta` leaves an empty deposited level set. 3D plane/trench/hole/fin/stack complete and match a direct native reference. GDS stays 422 |
 | `CSVFileProcess` + `RateGrid` | 2/3 | Rate interpolated from a CSV grid with directional + isotropic components | Needs a new uploaded asset kind and an explicit interpolation mode: the engine only logs `Interpolation mode not set.` and continues. `setCustomInterpolator` is arbitrary Python |
 | `CustomSphereDistribution` | none | Multi-radius sphere distribution | **Blocked (A4).** Re-probe with and without a mask aborts in 2D and 3D (`returnCode -6`): `terminate called after throwing an instance of 'std::runtime_error'` / `what(): Point ID 3 is out of bounds for CustomSphereDistribution with 3 radii!`. It indexes one radius per surface point, so no bounded project-derived parameterization exists. See [`particle-shape-distribution-contract.md`](particle-shape-distribution-contract.md) |
 
@@ -360,7 +360,8 @@ done
 
 # GeometricTrenchDeposition: the 2026-10-30 3D probe aborted with SIGSEGV (rc=139).
 # 2026-10-31 re-probe: the same parameters also abort in 2D; the cause is the
-# native reach window (depositionRate + 3*gridDelta < a+b = 2.1 um), not 3D.
+# native reach (rate 0.05 << a+b = 2.1 um), not 3D; rate >= max(a+b, bottomMed)
+# is now required centrally in validation and the worker.
 timeout 40 .venv/bin/python - <<'PY'
 import viennaps as ps
 ps.setDimension(3); ps.Length.setUnit("um"); ps.Time.setUnit("s")

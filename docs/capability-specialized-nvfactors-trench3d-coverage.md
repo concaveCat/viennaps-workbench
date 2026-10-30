@@ -83,24 +83,31 @@ ps.Process(d, ps.GeometricTrenchDeposition(0.4, 0.5, 0.05, 0.1, 0.1, 2.0, 1.0), 
 ```
 
 Re-probed on 2026-10-31, **the identical call also SIGSEGVs in 2D**
-(`rc=139`). Bisecting the parameters shows the crash is the native distribution
-reach, not the dimension:
+(`rc=139`). Bisecting the parameters shows the failure is the native
+distribution reach, not the dimension:
 
 * `TrenchDistribution::getBounds()` advertises `±depositionRate`.
 * `getSignedDistance()` uses `radius = a*(1-|z|/trenchDepth)^n + b` (or
   `bottomMed` at the floor).
-* When `radius > depositionRate + 3*gridDelta`, ViennaLS `GeometricAdvect`
-  indexes outside its candidate window and aborts in `GOMP_parallel`.
+* Once `radius > depositionRate + 2*gridDelta`, `GeometricAdvect` can emit an
+  **empty deposited level set**; further below the candidate window it aborts
+  with SIGSEGV in `GOMP_parallel`.
 
-Measured with `gridDelta=0.1`, `radius=a+b=0.4`:
+Measured with `gridDelta=0.1`, `radius=a+b=0.4`, `trenchDepth=0.5`:
 
 | `depositionRate` | result |
 | --- | --- |
 | 0.05, 0.08 | SIGSEGV |
-| 0.10, 0.15, 0.20, 0.5 | completes |
+| 0.10, 0.15, 0.19 | completes but leaves the top level set empty |
+| 0.20 (`radius - 2*grid`) | completes, top level set populated |
+| 0.40 (`radius`) | completes, top level set populated |
 
-With `depositionRate=0.5`, `radius=0.7` completes and `radius=0.9` aborts,
-consistent with `rate + 3*grid` = 0.8. The same boundary was reproduced in 2D.
+The earlier `rate + 3*grid` guard accepted the empty-layer cases, so it was
+replaced by the conservative `depositionRate >= max(a+b, bottomMed)`. A
+288-case stress matrix (2D/3D × grid 0.05/0.1/0.2 × plane/trench/fin ×
+`n=1/2/10/100` × different `a/b/bottomMed`) produced no SIGSEGV and no empty
+top level set at that boundary. Inputs between `radius - 2*grid` and `radius`
+that the kernel happens to accept are deliberately rejected.
 
 ### Geometry matrix (guarded default parameters, workbench construction path)
 
@@ -120,19 +127,24 @@ worker never substitutes the 2D class: `type(model).__module__` is
 
 ### Exposed surface and guards
 
-`dimensions` is now `[2, 3]`. Validation adds:
+`dimensions` is now `[2, 3]`. The shared rule
+`backend.specialized_models.geometric_trench_issues()` is called by both
+request validation and `build_specialized_model()`, so a direct worker input
+cannot bypass it:
 
 * `trenchWidth >= gridDelta` (the native kernel ignores this value, so a
   sub-grid width would only misdescribe the geometry);
-* `trenchDepth >= max(initial |z|, gridDelta)`;
-* `n` integer in `[1, 100]` (already present; fractional `n` can make the
-  native radius NaN);
-* `max(a+b, bottomMed) > 0`;
-* `depositionRate + 3*gridDelta >= max(a+b, bottomMed)`.
+* `trenchDepth >= max(initial |z|, gridDelta)`; the vertical extent uses
+  `finHeight + maskHeight` for a fin (the mask sits above the fin), and
+  `max(depth, maskHeight)` for trench/hole (the mask and opening are on
+  opposite sides of z=0). Taper changes lateral width only;
+* `n` integer in `[1, 100]` (fractional `n` can make the native radius NaN);
+* `a+b > 0` (the duplicated top level set must have a positive radius);
+* `depositionRate >= max(a+b, bottomMed)`.
 
-GDS geometry and continuation states keep their 422: the project does not
-describe the saved/native vertical span. The model remains `experimental`
-because no archived Stage 8/9 direct-reference row exists for it.
+GDS geometry, continuation states, and non-first enabled GTD steps keep their
+422. The model remains `experimental` because no archived Stage 8/9
+direct-reference row exists for it.
 
 ## 3. `CoverageParameters.tolerance`
 
@@ -157,7 +169,9 @@ The worker never sets `maxIterations`.
 `hbro2` and `sf6c4f8`; range `[0, 1]`, finite. Omitting it keeps the historical
 hard-coded `1e-3` and adds no worker metadata. An explicit value is applied to
 the same native object and recorded under `nativeCoverageParameters` with the
-`toMetaData()` readback.
+`toMetaData()` readback. The worker re-checks the range before the native
+setter, so a direct worker/replay input cannot send a negative tolerance to the
+native loop.
 
 Measured with a 2D SF6O2 stack, 32 rays, fixed seed:
 
