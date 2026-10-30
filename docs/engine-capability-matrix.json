@@ -35,8 +35,8 @@
   ],
   "summary": {
     "advanced-parameter-or-output-not-exposed": 11,
-    "engine-model-not-exposed": 5,
-    "exposed": 62,
+    "engine-model-not-exposed": 4,
+    "exposed": 63,
     "internal-or-not-user-facing": 18
   },
   "classes": [
@@ -564,16 +564,15 @@
       "exposedBy": [
         "model:specialized/selectiveEpitaxy (schema 7)"
       ],
-      "notes": "Registry material handles are rejected by the native top-material check, so the worker uses the native Material enum identities here only.",
+      "notes": "Registry material handles are rejected by the native top-material check, so the worker uses the native Material enum identities here only. The separate nvFactors overload is exposed as an optional three-vector in [0,1]; omitted keeps the materialRates overload and its dimension-dependent native default.",
       "members": {
         "exposed": [
           "materialRates",
           "rate111",
-          "rate100"
+          "rate100",
+          "nvFactors"
         ],
-        "notExposed": [
-          "nvFactors overload"
-        ]
+        "notExposed": []
       }
     },
     {
@@ -632,21 +631,30 @@
     },
     {
       "className": "GeometricTrenchDeposition",
-      "nativeModule": "viennaps.d2",
+      "nativeModule": "viennaps.d2 / viennaps.d3",
       "kind": "process-model",
       "dimensions": [
-        2
+        2,
+        3
       ],
       "constructor": "GeometricTrenchDeposition(trenchWidth, trenchDepth, depositionRate, bottomMed, a, b, n)",
       "docSummary": "Analytic geometric trench-fill model (closed-form profile, no level-set flux).",
-      "classification": "engine-model-not-exposed",
-      "exposedBy": [],
-      "notes": "Probe 2026-10-30: 2D completes; the identical call on a 3D domain aborts with SIGSEGV after 'Applying geometric model'. 2D only.",
+      "classification": "exposed",
+      "exposedBy": [
+        "model:specialized/geometricTrenchDeposition (schema 7, experimental)"
+      ],
+      "notes": "Probe 2026-10-31: the 2026-10-30 3D SIGSEGV was reproduced as a parameter-reach crash (depositionRate + 3*gridDelta below the native radius), not a dimension limitation; the same input aborts in 2D. With that guard in validation, 3D plane/trench/hole/fin/stack complete and match a direct native reference. GDS stays rejected because its vertical span is not described by the project.",
       "members": {
-        "exposed": [],
-        "notExposed": [
-          "all 7 constructor arguments"
-        ]
+        "exposed": [
+          "trenchWidth",
+          "trenchDepth",
+          "depositionRate",
+          "bottomMed",
+          "a",
+          "b",
+          "n"
+        ],
+        "notExposed": []
       }
     },
     {
@@ -1425,13 +1433,15 @@
       "docSummary": "Coverage solver controls (tolerance, maxIterations, initialized).",
       "classification": "advanced-parameter-or-output-not-exposed",
       "exposedBy": [
-        "worker/specialized.py: ps.CoverageParameters(); coverage.tolerance = 1e-3 (hard-coded)"
+        "worker/specialized.py: ps.CoverageParameters()",
+        "nativeParameters.coverageTolerance (optional; omitted keeps the historical 1e-3)"
       ],
-      "notes": "Hard-coded for sf6o2/cf4o2/hbro2/sf6c4f8; loosening or tightening convergence is not possible from JSON.",
+      "notes": "tolerance is settable per plasma step; the native default is 0.0 and the worker keeps 1e-3 when the key is omitted. maxIterations and initialized remain unexposed.",
       "members": {
-        "exposed": [],
+        "exposed": [
+          "tolerance"
+        ],
         "notExposed": [
-          "tolerance (fixed at 1e-3)",
           "maxIterations",
           "initialized"
         ]

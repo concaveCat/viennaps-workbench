@@ -155,6 +155,36 @@ def _build_plasma_model(ps: Any, model_id: str, spec: dict[str, Any], parameters
     return model, metadata
 
 
+def _coverage_parameters(ps: Any, parameters: dict[str, Any]) -> tuple[Any, dict[str, Any] | None]:
+    """Build the native plasma ``CoverageParameters`` for one step.
+
+    The worker has always pinned tolerance=1e-3 while the native struct default
+    is 0.0. Omitting ``coverageTolerance`` must keep that historical value and
+    add no new metadata; only an explicit request records the readback.
+    """
+    coverage = ps.CoverageParameters()
+    if "coverageTolerance" not in parameters:
+        coverage.tolerance = 1e-3
+        return coverage, None
+    coverage.tolerance = float(parameters["coverageTolerance"])
+    native_readback = {str(key): [float(value) for value in values]
+                       for key, values in coverage.toMetaData().items()}
+    return coverage, {
+        "nativeClass": "CoverageParameters",
+        "nativeMember": "tolerance",
+        "requested": float(parameters["coverageTolerance"]),
+        "effective": float(coverage.tolerance),
+        "nativeDefault": 0.0,
+        "workbenchHistoricalDefault": 1e-3,
+        "source": "explicit",
+        "nativeReadback": native_readback,
+        "coverageInitIterations": (
+            "the native CoverageParameters.maxIterations is left at its default; when tolerance==0 the "
+            "installed FluxProcessStrategy replaces it with 10 initialization iterations, while a positive "
+            "tolerance iterates until every coverage delta metric is <= tolerance"),
+    }
+
+
 def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step: dict[str, Any],
                             material_handle: Any, material_ids: dict[str, int]) -> tuple[Any, list[Any], dict[str, Any], float]:
     """Build an installed native model and its native process parameters.
@@ -182,8 +212,9 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
             material_handle, material_ids)
         if advanced_metadata is not None:
             resolved["nativeAdvancedParameters"] = advanced_metadata
-        coverage = ps.CoverageParameters()
-        coverage.tolerance = 1e-3
+        coverage, coverage_metadata = _coverage_parameters(ps, p)
+        if coverage_metadata is not None:
+            resolved["nativeCoverageParameters"] = coverage_metadata
         extra.append(coverage)
     elif model_id == "cf4o2":
         model, advanced_metadata = _build_plasma_model(
@@ -193,8 +224,9 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
             material_handle, material_ids)
         if advanced_metadata is not None:
             resolved["nativeAdvancedParameters"] = advanced_metadata
-        coverage = ps.CoverageParameters()
-        coverage.tolerance = 1e-3
+        coverage, coverage_metadata = _coverage_parameters(ps, p)
+        if coverage_metadata is not None:
+            resolved["nativeCoverageParameters"] = coverage_metadata
         extra.append(coverage)
     elif model_id == "hbro2":
         model, advanced_metadata = _build_plasma_model(
@@ -204,8 +236,9 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
             material_handle, material_ids)
         if advanced_metadata is not None:
             resolved["nativeAdvancedParameters"] = advanced_metadata
-        coverage = ps.CoverageParameters()
-        coverage.tolerance = 1e-3
+        coverage, coverage_metadata = _coverage_parameters(ps, p)
+        if coverage_metadata is not None:
+            resolved["nativeCoverageParameters"] = coverage_metadata
         extra.append(coverage)
     elif model_id == "sf6c4f8":
         model, advanced_metadata = _build_plasma_model(
@@ -214,8 +247,9 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
             material_handle, material_ids)
         if advanced_metadata is not None:
             resolved["nativeAdvancedParameters"] = advanced_metadata
-        coverage = ps.CoverageParameters()
-        coverage.tolerance = 1e-3
+        coverage, coverage_metadata = _coverage_parameters(ps, p)
+        if coverage_metadata is not None:
+            resolved["nativeCoverageParameters"] = coverage_metadata
         extra.append(coverage)
     elif model_id == "fluorocarbon":
         parameters = ps.FluorocarbonParameters()
@@ -476,7 +510,35 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
         # ViennaPS 4.6.2 requires the native epitaxy enum identity in this
         # overload; registry handles do not satisfy its top-material check.
         rates = [(getattr(ps.Material, name), float(value)) for name, value in sorted(p["materialRates"].items())]
-        model = ps.SelectiveEpitaxy(rates, float(p["rate111"]), float(p["rate100"]))
+        requested_nv = p.get("nvFactors")
+        if requested_nv is None:
+            model = ps.SelectiveEpitaxy(rates, float(p["rate111"]), float(p["rate100"]))
+        else:
+            # The nvFactors overload is a separate native constructor: it leaves
+            # materialRates_ empty, so every epitaxy rate must be applied through
+            # setMaterialRate (the velocity field holds that map by reference).
+            # Do not replace this with the materialRates overload: that would
+            # silently drop the requested factors.
+            factors = [float(value) for value in requested_nv]
+            model = ps.SelectiveEpitaxy(factors, float(p["rate111"]), float(p["rate100"]))
+            for material, value in rates:
+                model.setMaterialRate(material, value)
+            resolved["nativeNvFactors"] = {
+                "nativeClass": "SelectiveEpitaxy",
+                "nativeModule": f"viennaps.d{int(project['dimension'])}",
+                "constructorOverload": ("viennaps.d%d.SelectiveEpitaxy(nvFactors, rate111, rate100)"
+                                        % int(project["dimension"])),
+                "requested": factors,
+                "effective": factors,
+                "nativeDefaultByDimension": {"2": [0.5, 1.0, 0.0], "3": [0.5, 0.0, 1.0]},
+                "materialRatesAppliedAfterConstruction": {
+                    name: float(value) for name, value in sorted(p["materialRates"].items())},
+                "velocityFormula": ("max_i(|nvFactors[i]*normal[i]|) mapped from [1/sqrt(D), 1] "
+                                    "to [rate111, rate100]; the result is clamped to <= 0 by the native model"),
+                "nativeReadback": None,
+                "nativeReadbackReason": ("the installed binding exposes no nvFactors getter; getVelocityField() "
+                                         "returns an unregistered EpitaxyVelocityField that cannot be converted to Python"),
+            }
     elif model_id == "geometricTrenchDeposition":
         # GeometricTrenchDeposition is a ViennaLS geometric-advection
         # distribution. It has no material table and no native mask; the worker

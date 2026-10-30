@@ -1020,8 +1020,8 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
             if project.geometry.get("kind") == "gds":
                 issues.append(FieldIssue(
                     f"steps[{index}].nativeModel",
-                    "GeometricTrenchDeposition is not supported with GDS geometry; its native radius formula "
-                    "needs a bounded vertical span from a parametric 2D structure"))
+                    "GeometricTrenchDeposition is not supported with GDS geometry in 2D or 3D; its native "
+                    "radius formula needs a bounded vertical span that the project description does not provide"))
             if getattr(project, "continuationState", None) is not None:
                 issues.append(FieldIssue(
                     f"steps[{index}].nativeModel",
@@ -1045,6 +1045,7 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
                 n_number = float("nan")
             if not n_number.is_integer() or n_number < 1:
                 issues.append(FieldIssue(f"{prefix}.n", "must be an integer >= 1; fractional n can produce a non-finite native radius"))
+            grid_delta = float(project.domain.gridDelta)
             for key in ("trenchWidth", "depositionRate"):
                 try:
                     value = float(params.get(key, 0))
@@ -1052,6 +1053,15 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
                     value = 0.0
                 if value <= 0.0:
                     issues.append(FieldIssue(f"{prefix}.{key}", "must be positive"))
+            try:
+                width = float(params.get("trenchWidth", 0))
+            except (TypeError, ValueError):
+                width = 0.0
+            if 0.0 < width < grid_delta - 1e-12:
+                issues.append(FieldIssue(
+                    f"{prefix}.trenchWidth",
+                    f"must be at least one grid interval ({grid_delta:g} um); the native kernel ignores this value, "
+                    "so a sub-grid trench only misrepresents the geometry"))
             try:
                 depth = float(params.get("trenchDepth", 0))
             except (TypeError, ValueError):
@@ -1062,6 +1072,37 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
                     f"{prefix}.trenchDepth",
                     f"must be at least the initial structure's maximum |z| ({max_z:g} um); "
                     "a shallower depth puts the native radius formula outside its valid range and can overflow"))
+            if 0.0 < depth < grid_delta - 1e-12:
+                issues.append(FieldIssue(
+                    f"{prefix}.trenchDepth",
+                    f"must be at least one grid interval ({grid_delta:g} um); the native radius divides by this depth"))
+            # TrenchDistribution.getBounds() declares the distribution reach as
+            # +/-depositionRate, but getSignedDistance() uses a local radius of
+            # a*(1-|z|/depth)^n+b (bottomMed at the trench floor). When the
+            # radius exceeds that declared reach by more than three grid cells,
+            # ViennaLS GeometricAdvect indexes outside its candidate window and
+            # aborts with SIGSEGV (reproduced in 2D and 3D). Bound the radius by
+            # the same reach the native distribution advertises.
+            def _number_or_zero(name: str) -> float:
+                try:
+                    return float(params.get(name, 0.0))
+                except (TypeError, ValueError):
+                    return 0.0
+            a_value, b_value = _number_or_zero("a"), _number_or_zero("b")
+            bottom_med = _number_or_zero("bottomMed")
+            rate_value = _number_or_zero("depositionRate")
+            max_radius = max(a_value + b_value, bottom_med)
+            if max_radius <= 0.0:
+                issues.append(FieldIssue(
+                    f"{prefix}.a",
+                    "a+b and bottomMed cannot both be zero; the native distribution would have a zero radius "
+                    "and leave the surface unchanged"))
+            elif rate_value + 3.0 * grid_delta < max_radius - 1e-12:
+                issues.append(FieldIssue(
+                    f"{prefix}.depositionRate",
+                    f"must be at least the native radius ({max_radius:g} um) minus three grid intervals "
+                    f"({3.0 * grid_delta:g} um); the installed ViennaLS GeometricAdvect window is derived from "
+                    "depositionRate and aborts with SIGSEGV outside it"))
         for field in spec["fields"]:
             key = field["key"]
             path = f"{prefix}.{key}"
@@ -1112,6 +1153,35 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
                         for subkey, subvalue in entry.items():
                             if isinstance(subvalue, bool) or not isinstance(subvalue, (int, float)) or not math.isfinite(float(subvalue)) or not field["minimum"] <= float(subvalue) <= field["maximum"]:
                                 issues.append(FieldIssue(f"{path}.{name}.{subkey}", "must be a finite number within the displayed range"))
+
+        optional_fields = {field["key"]: field for field in spec.get("optionalFields", [])}
+        for key, field in optional_fields.items():
+            if key not in params:
+                continue
+            value = params[key]
+            path = f"{prefix}.{key}"
+            kind = field["kind"]
+            if kind == "nvFactors":
+                if (not isinstance(value, list) or len(value) != 3
+                        or any(isinstance(item, bool) or not isinstance(item, (int, float))
+                               or not math.isfinite(float(item)) for item in value)):
+                    issues.append(FieldIssue(path, "must contain exactly three finite numbers"))
+                    continue
+                if any(not float(field["minimum"]) <= float(item) <= float(field["maximum"])
+                       for item in value):
+                    issues.append(FieldIssue(
+                        path,
+                        f"each factor must be between {field['minimum']} and {field['maximum']}; "
+                        "the native interpolation maps max_i(|factor_i*normal_i|) from [1/sqrt(D), 1] "
+                        "to [rate111, rate100]"))
+                elif not any(float(item) > 0.0 for item in value):
+                    issues.append(FieldIssue(
+                        path,
+                        "must contain at least one positive factor; an all-zero vector drives the native "
+                        "velocity to zero and leaves the surface unchanged"))
+            elif kind == "number":
+                if issue := _advanced_number_issue(path, field, value):
+                    issues.append(issue)
 
         if "advanced" in params:
             spec_advanced = spec.get("advanced")

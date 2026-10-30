@@ -24,6 +24,62 @@ def rates(key: str, default: float = 0.0, *, label: str = "材料速率表") -> 
             "minimum": 0.0, "maximum": 1_000_000.0, "step": 0.01, "nativeUnit": None}
 
 
+# ``SelectiveEpitaxy`` binds a third constructor overload that takes only a
+# fixed-size three-vector of normal-vector factors (plus rate111/rate100). The
+# installed header computes ``max_i(|nvFactors[i] * normal[i]|)`` and maps that
+# scalar from [1/sqrt(D), 1] to [rate111, rate100]. Values outside [0, 1] push
+# the interpolation outside that native range, so only the documented range is
+# exposed. The native defaults are dimension-dependent and are NOT [1, 1, 1]:
+# 2D -> [0.5, 1, 0], 3D -> [0.5, 0, 1]. Omitting the key keeps the existing
+# materialRates overload and therefore the exact current request hash/artifacts.
+NV_FACTORS_FIELD: dict[str, Any] = {
+    "key": "nvFactors",
+    "label": "法向方向因子 [x, y, z]",
+    "kind": "nvFactors",
+    "length": 3,
+    "default": None,
+    "minimum": 0.0,
+    "maximum": 1.0,
+    "step": 0.01,
+    "nativeUnit": None,
+    "nativeClass": "SelectiveEpitaxy",
+    "nativeConstructor": "viennaps.d{D}.SelectiveEpitaxy(nvFactors, rate111, rate100)",
+    "nativeDefaultByDimension": {"2": [0.5, 1.0, 0.0], "3": [0.5, 0.0, 1.0]},
+    "defaultNote": ("omit to use the installed materialRates constructor and its native dimension default; "
+                    "an explicit vector uses the separate nvFactors overload and applies materialRates through setMaterialRate"),
+}
+
+
+def coverage_tolerance_field() -> dict[str, Any]:
+    """Optional native ``CoverageParameters.tolerance`` override.
+
+    The worker has always pinned 1e-3 for the four plasma models while the
+    native struct default is 0.0. Omitting the key keeps that historical
+    value; an explicit value is passed to the same native object. Negative,
+    non-finite or >1 values are rejected because the native convergence test
+    is ``delta > tolerance``: a negative/NaN value never converges and the
+    installed strategy then iterates up to the unsigned default
+    (4294967295) instead of the 10-iteration fallback used for tolerance 0.
+    """
+    return {
+        "key": "coverageTolerance",
+        "label": "覆盖率收敛容差",
+        "kind": "number",
+        "default": 0.001,
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "step": 0.0001,
+        "nativeUnit": None,
+        "nativeClass": "CoverageParameters",
+        "nativeMember": "tolerance",
+        "nativeDefault": 0.0,
+        "workbenchHistoricalDefault": 0.001,
+        "defaultSource": "workbench",
+        "defaultNote": ("omit to keep the Worker's historical 1e-3; the native default 0.0 leaves maxIterations "
+                        "at its default and is capped to 10 coverage-initialization iterations"),
+    }
+
+
 FLUOROCARBON_MATERIAL_DEFAULTS = {
     "A_ie": 0.0361, "A_sp": 0.0139, "B_sp": 9.3, "E_a": 0.168,
     "Eth_ie": 4.0, "Eth_sp": 18.0, "K": 0.002789491704544977,
@@ -310,22 +366,26 @@ def oxidation_advanced_spec() -> dict[str, Any]:
 
 CATALOG: list[dict[str, Any]] = [
     {"id": "sf6o2", "label": "SF₆/O₂ 等离子体刻蚀", "nativeClass": "SF6O2Etching", "operation": "etch", "usesFlux": True,
-     "optionalKeys": ["advanced"],
+     "optionalKeys": ["advanced", "coverageTolerance"],
+     "optionalFields": [coverage_tolerance_field()],
      "advanced": _plasma_advanced(PLASMA_FLAT_FIELDS, _FLAT_MAPPING_SF6),
      "fields": list(PLASMA_FLAT_FIELDS)},
     {"id": "cf4o2", "label": "CF₄/O₂ 等离子体刻蚀", "nativeClass": "CF4O2Etching", "operation": "etch", "usesFlux": True,
-     "optionalKeys": ["advanced"],
+     "optionalKeys": ["advanced", "coverageTolerance"],
+     "optionalFields": [coverage_tolerance_field()],
      "advanced": _cf4o2_advanced(),
      "fields": list(CF4O2_FLAT_FIELDS)},
     {"id": "hbro2", "label": "HBr/O₂ 等离子体刻蚀", "nativeClass": "HBrO2Etching", "operation": "etch", "usesFlux": True,
-     "optionalKeys": ["advanced"],
+     "optionalKeys": ["advanced", "coverageTolerance"],
+     "optionalFields": [coverage_tolerance_field()],
      # HBrO2Etching's native defaults differ from PlasmaEtchingParameters():
      # Substrate.A_ie/A_sp/Eth_sp are 5.0/0.5/30.0 instead of 7.0/0.0337/20.0.
      "advanced": _plasma_advanced(PLASMA_FLAT_FIELDS, _FLAT_MAPPING_SF6, default_patches={
          "Substrate.A_ie": 5.0, "Substrate.A_sp": 0.5, "Substrate.Eth_sp": 30.0}),
      "fields": list(PLASMA_FLAT_FIELDS)},
     {"id": "sf6c4f8", "label": "SF₆/C₄F₈ 等离子体刻蚀", "nativeClass": "SF6C4F8Etching", "operation": "etch", "usesFlux": True,
-     "optionalKeys": ["advanced"],
+     "optionalKeys": ["advanced", "coverageTolerance"],
+     "optionalFields": [coverage_tolerance_field()],
      # SF6C4F8Etching has no passivation particle: its surface model
      # dereferences a missing "passivationFlux" flux scalar when the value is
      # positive (SIGSEGV). The model also does not read the Passivation block or
@@ -396,7 +456,8 @@ CATALOG: list[dict[str, Any]] = [
                 number("centerVelocity", 0.05), number("topHeight", 0.6), number("centerWidth", 1.2),
                 number("stabilityFactor", 0.15)]},
     {"id": "selectiveEpitaxy", "label": "选择性外延", "nativeClass": "SelectiveEpitaxy", "operation": "deposit", "usesFlux": False,
-     "depositMaterial": "SiGe", "fields": [rates("materialRates", 0.05, label="外延材料速率表"),
+     "depositMaterial": "SiGe", "optionalKeys": ["nvFactors"], "optionalFields": [NV_FACTORS_FIELD],
+     "fields": [rates("materialRates", 0.05, label="外延材料速率表"),
                 number("rate111", 0.5), number("rate100", 1.0)]},
     # GeometricTrenchDeposition is a ViennaLS geometric-advection distribution,
     # not a velocity-field model: it deposits on the top level set (created by
@@ -405,10 +466,13 @@ CATALOG: list[dict[str, Any]] = [
     # process duration. It evaluates the local radius from the absolute z
     # coordinate, with the trench top assumed at z=0. Validation surfaces these
     # native semantics as a warning instead of pretending they are ordinary
-    # deposition parameters. The installed 3D binding SIGSEGVs in a controlled
-    # probe, so only the verified 2D constructor is exposed.
+    # deposition parameters. The audit's 3D SIGSEGV was reproduced as a
+    # parameter-reach crash (depositionRate + 3*gridDelta < local radius) that
+    # also occurs in 2D; with that guard enforced, 2D and 3D use the same native
+    # class and all parametric geometry kinds are exercised. GDS remains gated
+    # because its vertical span is not described by the project.
     {"id": "geometricTrenchDeposition", "label": "几何沟槽沉积", "nativeClass": "GeometricTrenchDeposition",
-     "operation": "deposit", "usesFlux": False, "experimental": True, "dimensions": [2],
+     "operation": "deposit", "usesFlux": False, "experimental": True, "dimensions": [2, 3],
      "depositMaterialSelectable": True,
      "fields": [number("trenchWidth", 1.0, minimum=0.000001),
                 number("trenchDepth", 4.0, minimum=0.000001),

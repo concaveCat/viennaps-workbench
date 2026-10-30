@@ -42,7 +42,7 @@ what the docstring implies. Empty `dimensions` means the class never sees a doma
 | `SingleParticleProcess` | `model: singleParticle` | 2/3 | CPU_DISK / GPU_DISK, explicit seed + `raysPerPoint` |
 | `DirectionalProcess` | `model: directional` (schema 5+) | 2/3 | scalar overload by default; optional `rateSets` uses the native `Sequence[RateSet]` overload |
 | `MultiParticleProcess` | `model: multiParticle` (schema 7) | 2/3 | declarative ion/neutral species + linear rate coefficients |
-| `SF6O2Etching` | `specialized/sf6o2` | 2/3 | flat 8-argument form or `advanced` → `PlasmaEtchingParameters`; fixed coverage tolerance |
+| `SF6O2Etching` | `specialized/sf6o2` | 2/3 | flat 8-argument form or `advanced` → `PlasmaEtchingParameters`; optional `coverageTolerance` (omitted keeps 1e-3) |
 | `CF4O2Etching` | `specialized/cf4o2` | 2/3 | flat 10-argument form or `advanced` → `CF4O2Parameters` |
 | `HBrO2Etching` | `specialized/hbro2` | 2/3 | flat 8-argument form or `advanced` → `PlasmaEtchingParameters` |
 | `SF6C4F8Etching` | `specialized/sf6c4f8` | 2/3 | flat 6-argument form or `advanced` → `PlasmaEtchingParameters`; no passivation family |
@@ -54,7 +54,7 @@ what the docstring implies. Empty `dimensions` means the class never sees a doma
 | `SingleParticleALD` | `specialized/ald` | 2/3 | + `AtomicLayerProcessParameters`, selectable material |
 | `Oxidation` | `specialized/oxidation` | 2/3 | 17 of 45 `set*` methods + all four orientations (see B5) |
 | `OxideRegrowth` | `specialized/oxideRegrowth` | 2/3 | derives its own `DenseCellSet` |
-| `SelectiveEpitaxy` | `specialized/selectiveEpitaxy` | 2/3 | native `Material` enum only, no `nvFactors` |
+| `SelectiveEpitaxy` | `specialized/selectiveEpitaxy` | 2/3 | native `Material` enum only; optional `nvFactors` three-vector uses the dedicated native overload |
 | `NeutralTransport` | `specialized/neutralTransport` | 2/3 | all 12 parameters |
 
 ### Parameter objects with full coverage (9)
@@ -117,7 +117,7 @@ custom material catalog.
 | Native class | Verified dims | What it actually is | Precondition / risk |
 | --- | --- | --- | --- |
 | `FaradayCageEtching` + `FaradayCageParameters` | 3 only | Ion-beam etch with a Faraday-cage angular filter: `cageAngle` plus a full `IBEParameters` | Probe: 3D finishes in <0.1 s; the identical call on a 2D domain did not return within 40 s (plane-only and trench, with and without `planeWaferRate`) → **engine-side 2D hang**, must be rejected at validation |
-| `GeometricTrenchDeposition` | 2 only | Closed-form analytic trench fill (`trenchWidth, trenchDepth, depositionRate, bottomMed, a, b, n`), no flux engine | Probe: 3D **SIGSEGV** right after “Applying geometric model” → 2D only |
+| `GeometricTrenchDeposition` | 2/3 | Closed-form analytic trench fill (`trenchWidth, trenchDepth, depositionRate, bottomMed, a, b, n`), no flux engine | The 2026-10-30 3D SIGSEGV was a parameter-reach crash (`depositionRate + 3*gridDelta <` native radius) that also occurs in 2D; guarded, 3D plane/trench/hole/fin/stack complete and match a direct native reference. GDS stays 422 |
 | `CSVFileProcess` + `RateGrid` | 2/3 | Rate interpolated from a CSV grid with directional + isotropic components | Needs a new uploaded asset kind and an explicit interpolation mode: the engine only logs `Interpolation mode not set.` and continues. `setCustomInterpolator` is arbitrary Python |
 | `CustomSphereDistribution` | none | Multi-radius sphere distribution | **Blocked (A4).** Re-probe with and without a mask aborts in 2D and 3D (`returnCode -6`): `terminate called after throwing an instance of 'std::runtime_error'` / `what(): Point ID 3 is out of bounds for CustomSphereDistribution with 3 radii!`. It indexes one radius per surface point, so no bounded project-derived parameterization exists. See [`particle-shape-distribution-contract.md`](particle-shape-distribution-contract.md) |
 
@@ -129,7 +129,7 @@ custom material catalog.
 | `PlasmaEtchingParametersSubstrate` | B1: all consumed fields except `B_ie` | `B_ie` (unused by the CPU surface model) | No useful substrate-yield knob remains hidden |
 | `CF4O2Parameters` | B1: `Ions`, `Mask`, `Passivation`, `Si`, `SiGe` (`beta_sigma`/`k_sigma`/`rho`), `gamma_*`, `fluxIncludeSticking` | `SiGe.A_ie/A_sp/Eth_ie/Eth_sp/x` (ignored by native SiGe branch); `k_sigma_SiGe` method | SiGe chemistry is represented by the three fields the native branch reads |
 | `CF4O2ParametersSiGe` | B1: `beta_sigma`, `k_sigma`, `rho` | sputter/yield fields and `x`; `k_sigma_SiGe` method | A full SiGe yield editor is not available because the native branch does not read those fields |
-| `CoverageParameters` | `tolerance = 1e-3` (hard-coded) | `tolerance`, `maxIterations`, `initialized` | Convergence cannot be tightened or loosened |
+| `CoverageParameters` | optional `nativeParameters.coverageTolerance` (omitted keeps the historical `1e-3`) | `maxIterations`, `initialized` | `tolerance` is settable in [0, 1]; native default is `0.0`, which caps coverage initialization at 10 iterations |
 | `RateSet` | `model: directional` `rateSets[]`: 1–8 sets, per-set direction, velocities, masks and visibility | `print()` (debug helper) | Multiple simultaneous directions and per-set masks are now declarative |
 | `Oxidation` advanced setters | 17 of 45: the 13 historical values + `setCFLFactor`, `setMechanicsTolerance`, `setCouplingTolerance`, `setSimplePressureRelaxation` via `steps[].advancedOxidation` | iteration caps, pressure/stokes tolerances, `setSimpleVelocityRelaxation`, `setMaxGridPoints`, `setSolveBounds`, mask mechanics, `GpuMode`/`GpuPreconditioner`, model-level `saveSurfaceMesh`/`saveVolumeMesh` helpers | Each accepted setter has a native surface-hash probe; the excluded ones are inert, unsafe, GPU-only, or have no verified LOCOS output. See [`oxidation-advanced-contract.md`](oxidation-advanced-contract.md) |
 | `SiliconOrientation.Si110` | 4 of 4 (`Si100`, `Si110`, `Si111`, `PolySi`) | — | Native enum value 1; changes the Deal-Grove planar readback and produces distinct 2D/3D surface hashes |
@@ -181,13 +181,14 @@ hashes when unused.
   4. replay reproduces artifact hashes exactly;
   5. `specialized-models` catalog row states `engineVersion 4.6.2`, dimension 3.
 
-### Batch A2 — `GeometricTrenchDeposition` (2D)
+### Batch A2 — `GeometricTrenchDeposition` (2D/3D)
 
 - Acceptance:
-  1. validator rejects `dimension: 3` (engine SIGSEGV);
-  2. 2D trench profile equals a direct native reference within `1e-6 µm`;
+  1. validator rejects the parameter combinations that crash the native reach window (2D and 3D);
+  2. 2D and 3D trench profiles equal a direct native reference within `1e-6 µm`;
   3. run record reports `engine: not-applicable` (no flux engine);
-  4. degenerate parameters (zero rate/width) fail validation instead of hanging.
+  4. degenerate parameters (zero rate/width, sub-grid width/depth, zero radius) fail validation instead of hanging;
+  5. GDS geometry is rejected with 422 because the project does not describe its vertical span.
 
 ### Batch A3 — CSV rate tables (`CSVFileProcess`, `RateGrid`)
 
@@ -357,7 +358,9 @@ PY
   echo "dim=$DIM rc=$?"
 done
 
-# GeometricTrenchDeposition: 2D finishes, 3D aborts with SIGSEGV (rc=139)
+# GeometricTrenchDeposition: the 2026-10-30 3D probe aborted with SIGSEGV (rc=139).
+# 2026-10-31 re-probe: the same parameters also abort in 2D; the cause is the
+# native reach window (depositionRate + 3*gridDelta < a+b = 2.1 um), not 3D.
 timeout 40 .venv/bin/python - <<'PY'
 import viennaps as ps
 ps.setDimension(3); ps.Length.setUnit("um"); ps.Time.setUnit("s")
