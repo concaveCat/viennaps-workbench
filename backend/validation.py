@@ -18,8 +18,8 @@ from .specialized_models import (FLUOROCARBON_MATERIAL_DEFAULTS, model_spec,
                                  oxidation_advanced_spec)
 from .runtime_limits import available_cpu_threads
 from .engine import (EVIDENCE_ENGINE_VERSION, OXIDATION_ADVANCED_RESTRICTED,
-                     ald_surface_diffusion_supported, engine_version,
-                     oxidation_advanced_supported)
+                     ald_surface_diffusion_error, ald_surface_diffusion_supported,
+                     engine_version, oxidation_advanced_supported)
 
 
 # These ViennaPS 4.6.2 combinations either SIGSEGV or produce different final
@@ -832,13 +832,10 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
         engine = engine_version()
         surface_diffusion = step.surfaceDiffusion
         if (step.enabled and step.nativeModel == "ald" and surface_diffusion is not None
-                and surface_diffusion.enabled
-                and not ald_surface_diffusion_supported(engine)):
-            issues.append(FieldIssue(
-                f"steps[{index}].surfaceDiffusion",
-                f"ViennaPS {engine} has a confirmed native hang in the ALD "
-                f"SurfaceDiffusionParameters stencil; the worker process would never return. "
-                f"Use the ViennaPS 4.6.2 runtime, or remove or disable this block."))
+                and surface_diffusion.enabled):
+            gate_message = ald_surface_diffusion_error(engine)
+            if gate_message is not None:
+                issues.append(FieldIssue(f"steps[{index}].surfaceDiffusion", gate_message))
         advanced = step.advancedOxidation
         if step.enabled and step.nativeModel == "oxidation" and advanced is not None:
             fields = {field["key"]: field for field in oxidation_advanced_spec()["fields"]}

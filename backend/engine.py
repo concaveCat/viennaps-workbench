@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
-from typing import Iterable
+from typing import Any, Iterable
 
 
 SUPPORTED_ENGINE_VERSIONS = ("4.6.2", "4.7.0")
@@ -73,6 +73,20 @@ def ald_surface_diffusion_supported(engine: str | None = None) -> bool:
     return not at_least(engine or engine_version(), "4.7.0")
 
 
+def ald_surface_diffusion_error(engine: str | None = None) -> str | None:
+    """Shared rejection message; None when the runtime is safe.
+
+    API validation and the worker builder both call this so a hand-edited
+    worker input cannot reach the native hanging stencil.
+    """
+    version_value = engine or engine_version()
+    if at_least(version_value, "4.7.0"):
+        return (f"ViennaPS {version_value} has a confirmed native hang in the ALD "
+                f"SurfaceDiffusionParameters stencil; the worker process would never "
+                f"return. Use the ViennaPS 4.6.2 runtime, or remove or disable this block.")
+    return None
+
+
 # Setters that are bound but inert (or unbound) on 4.7.0 for the Workbench
 # oxidation configuration. ``probe_oxidation_setters.py`` is the evidence:
 # cflFactor still changes the surface; mechanicsTolerance and
@@ -96,3 +110,51 @@ def is_supported_engine(value: str) -> bool:
 
 def version_label(values: Iterable[str]) -> str:
     return " / ".join(values)
+
+
+def installed_version_map() -> dict[str, str]:
+    viennaps, viennals = runtime_versions()
+    return {"viennaps": viennaps or "unknown", "viennals": viennals or "unknown"}
+
+
+def version_mismatch_message(required: dict[str, str], installed: dict[str, str]) -> str:
+    return (f"requires ViennaPS {required['viennaps']} / ViennaLS {required['viennals']}; "
+            f"installed is {installed['viennaps']} / {installed['viennals']}. "
+            f"Saved runs and native state are never reinterpreted under a different "
+            f"runtime: start the matching ViennaPS {required['viennaps']} runtime.")
+
+
+class EngineVersionMismatch(RuntimeError):
+    """Required engine versions differ from the installed runtime."""
+
+    def __init__(self, required: dict[str, str], installed: dict[str, str] | None = None):
+        self.required_versions = {key: str(required[key]) for key in ("viennaps", "viennals")}
+        self.installed_versions = installed or installed_version_map()
+        self.message = version_mismatch_message(self.required_versions, self.installed_versions)
+        super().__init__(self.message)
+
+    def detail(self) -> dict[str, Any]:
+        return {"message": self.message,
+                "requiredVersions": dict(self.required_versions),
+                "installedVersions": dict(self.installed_versions)}
+
+
+def version_mismatch(required: Any) -> EngineVersionMismatch | None:
+    """Compare a stored ``expectedVersions``/``executionRequirements`` mapping.
+
+    Returns None when the mapping is absent or incomplete (legacy data), so
+    only records that explicitly pin a runtime are gated.
+    """
+    if not isinstance(required, dict):
+        return None
+    wanted = {}
+    for key in ("viennaps", "viennals"):
+        value = required.get(key)
+        if not isinstance(value, str) or not value:
+            return None
+        wanted[key] = value
+    installed = installed_version_map()
+    if (wanted["viennaps"] == installed["viennaps"]
+            and wanted["viennals"] == installed["viennals"]):
+        return None
+    return EngineVersionMismatch(wanted, installed)

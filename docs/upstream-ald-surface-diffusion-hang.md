@@ -71,7 +71,9 @@ combination of the non-default diffusion stencil with the pinned ray setup.
 ## Workaround / current application policy
 
 - Do not pass `SurfaceDiffusionParameters` on 4.7.0: the Workbench rejects an
-  enabled `steps[].surfaceDiffusion` before starting a worker.
+  enabled `steps[].surfaceDiffusion` before starting a worker, and the worker
+  builder repeats the same gate before any native setter for hand-edited
+  input.
 - Stay on ViennaPS 4.6.2 / ViennaLS 5.8.5 where the same request returns in
   ~0.01 s.
 - Default diffusion parameters are a no-op and do not hang, but they also do

@@ -33,6 +33,7 @@ import time
 from pathlib import Path
 
 from . import storage
+from .engine import version_mismatch
 from .runtime_limits import artifact_limit_mib
 
 ROOT = storage.ROOT
@@ -101,6 +102,12 @@ def ensure_materialized(run_dir: Path, step_id: str) -> Path:
     input_path = run_dir / "input.json"
     if not input_path.is_file():
         raise FileNotFoundError("run input is missing")
+    config = storage.read_json(input_path)
+    mismatch = version_mismatch(config.get("expectedVersions") if isinstance(config, dict) else None)
+    if mismatch is not None:
+        # Refuse before staging or spawning a worker: a deferred snapshot is
+        # still a native read of the original run's Domain state.
+        raise mismatch
 
     # One materialisation per run at a time: the JSON write itself is atomic,
     # but the auxiliary artifacts written by save_snapshot are not.

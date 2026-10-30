@@ -42,6 +42,7 @@ from .runtime_limits import (artifact_limit_bytes, artifact_limit_label,
                              artifact_limit_startup_message, deployment_limit_status,
                              deployment_limits_startup_message, cpu_thread_limit)
 from .gpu_devices import cuda_devices
+from .engine import EngineVersionMismatch
 
 
 ROOT = storage.ROOT
@@ -872,6 +873,8 @@ async def snapshot_get(run_id: str, step_id: str) -> dict[str, Any]:
             from . import snapshots as snapshot_store
             snapshot_store.ensure_materialized(run_dir, step_id)
         return read_json(run_dir / filename)
+    except EngineVersionMismatch as exc:
+        raise HTTPException(status_code=409, detail=exc.detail()) from exc
     except (FileNotFoundError, OSError, ValueError) as exc:
         raise HTTPException(status_code=404, detail="snapshot not found") from exc
 
@@ -1311,6 +1314,8 @@ async def run_download(run_id: str):
         return StreamingResponse(stream_zip_async(entries), media_type="application/zip", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
     except HTTPException:
         raise
+    except EngineVersionMismatch as exc:
+        raise HTTPException(status_code=409, detail=exc.detail()) from exc
     except (FileNotFoundError, OSError, ValueError) as exc:
         raise HTTPException(status_code=404, detail="run not found") from exc
 

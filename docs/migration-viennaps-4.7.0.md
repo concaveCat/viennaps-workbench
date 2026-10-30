@@ -108,6 +108,11 @@ return. Use the ViennaPS 4.6.2 runtime, or remove or disable this block.
   stays accepted because it is inert and never reaches the native binding.
 - The field is not silently disabled: the request is rejected, and the error
   names the runtime and the native class.
+- The **worker builder** calls the same `ald_surface_diffusion_error()` helper
+  before constructing `SurfaceDiffusionParameters`. A hand-edited `input.json`
+  that bypasses API validation therefore fails fast with the same message
+  instead of reaching the hanging native path. The direct-worker regression
+  covers 4.7.0 rejection and 4.6.2 acceptance.
 - Request hashes for projects without `surfaceDiffusion` are unchanged
   (`test_omitting_the_object_keeps_the_base_request_hashes`).
 - Worker-side defense: the worker still refuses an inert ALD configuration and
@@ -147,6 +152,16 @@ Old 4.6.2 runs are **never reinterpreted** under 4.7.0:
   execution is intentionally not implemented; the rejection path is explicit
   and tested.
 
+Deferred snapshots follow the same rule. `worker/materialize_snapshot.py`
+regenerates `<step>.json` from the saved native `.vpsd` on first read; both
+`backend/snapshots.ensure_materialized` and the worker compare
+`input.json.expectedVersions` against the installed runtime before staging or
+reading native state. A mismatch returns **409** on snapshot GET and run
+download with `message`, `requiredVersions` and `installedVersions`; no
+snapshot is cached. Runs produced by the matching runtime still materialize
+normally, and an already-cached JSON is served as stored data without a native
+read.
+
 ## 4. Bounded probes
 
 All probes run through `scripts/bounded_child.py` (60 s timeout, 4 GiB RSS
@@ -169,15 +184,15 @@ It reproduces on 4.7.0/5.10.0 only.
 
 ## 5. Test results
 
-`323` tests are collected in this worktree (5 skipped). With the 4.7.0 venv,
+`330` tests are collected in this worktree (5 skipped). With the 4.7.0 venv,
 `VIENNAPS_WORKBENCH_DATA_DIR=$PWD/var/test-v470`, `WORKBENCH_PORT=8767`:
 
 ```
-Ran 321 tests in 163.2s
+Ran 328 tests in 163.1s
 FAILED (failures=3, errors=58, skipped=5)
 ```
 
-That is 255 passed, 3 failed, 58 errored, 5 skipped, plus the 2 excluded native
+That is 262 passed, 3 failed, 58 errored, 5 skipped, plus the 2 excluded native
 ALD cases.
 
 Two native ALD tests (`test_golden_2d_and_3d_...` and
@@ -206,6 +221,9 @@ Focused results after the hardening changes:
 - `tests.test_stage6`: pass; catalog `engineVersion` follows the runtime.
 - `tests.test_engine_cellset`, `test_plasma_advanced`,
   `test_engine_batch1_specialized`, `test_cmp_measured_thickness`: pass.
+- `tests.test_snapshot_runtime_policy`: 5/5 pass (foreign-runtime GET/download,
+  typed direct error, worker pre-read rejection, matching-runtime success).
+- Direct ALD worker gate: 4.7.0 rejection and 4.6.2 acceptance pass.
 
 ## 6. Fixes and files
 
@@ -217,11 +235,14 @@ Focused results after the hardening changes:
   metadata, registry compatibility, `runtimeGate` catalog metadata.
 - `backend/native_build.py` — explicit patched-runtime version set.
 - `backend/main.py`, `backend/supervisor.py` — explicit replay policy/errors.
+- `backend/snapshots.py`, `worker/materialize_snapshot.py` — deferred-snapshot
+  runtime gate before native read; 409 policy detail; matching-runtime read
+  unchanged.
 - `worker/simulate.py` — keyword 2D boundary.
 - `worker/specialized.py` — oxidant enum fallback, guarded/version-checked
   oxidation setters, removed-setter record.
 - Tests and fixtures — version-aware assertions, gated cases, 2D boundary
-  keyword, no-op/disabled acceptance.
+  keyword, no-op/disabled acceptance, direct-worker ALD gate, snapshot policy.
 - `scripts/migration-probes/probe_ald_hang.py`,
   `probe_oxidation_setters.py`, plus the earlier capability probes.
 - `requirements-v470.lock`.

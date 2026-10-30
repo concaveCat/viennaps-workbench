@@ -323,7 +323,8 @@ class SurfaceDiffusionNative(unittest.TestCase):
                 # Native default parameters do not trigger the 4.7.0 hang, so
                 # exercise the worker path directly (bypassing the request
                 # gate) to prove the explicit object is still a no-op there.
-                with patch("backend.validation.engine_version", return_value="4.6.2"):
+                with patch("backend.validation.engine_version", return_value="4.6.2"), \
+                        patch("backend.engine.engine_version", return_value="4.6.2"):
                     explicit = run_worker(normalized(
                         ald_project(dimension, surface_diffusion=dict(NATIVE_DEFAULTS))))
                 self.assertEqual(omitted["heights"], explicit["heights"])
@@ -351,14 +352,43 @@ class SurfaceDiffusionNative(unittest.TestCase):
             build_specialized_model(ps, domain, project, step,
                                     lambda name: material_handle(ps, name), MATERIAL_IDS)
 
+    def test_worker_gate_rejects_the_hanging_config_on_v470(self):
+        # Bypass API validation (as a hand-edited worker input would) and prove
+        # the builder itself fails before constructing the native object.
+        with patch("backend.validation.engine_version", return_value="4.6.2"):
+            project = normalized(ald_project(2, surface_diffusion=self.PARAMS))
+        step = project["steps"][0]
+        domain = make_domain(project)
+        with patch("backend.engine.engine_version", return_value="4.7.0"):
+            with self.assertRaises(RuntimeError) as context:
+                build_specialized_model(ps, domain, project, step,
+                                        lambda name: material_handle(ps, name), MATERIAL_IDS)
+        message = str(context.exception)
+        self.assertIn("4.7.0", message)
+        self.assertIn("SurfaceDiffusionParameters", message)
+        self.assertIn("never return", message)
+
+    def test_worker_accepts_the_config_when_runtime_is_462(self):
+        with patch("backend.validation.engine_version", return_value="4.6.2"):
+            project = normalized(ald_project(2, surface_diffusion=self.PARAMS))
+        step = project["steps"][0]
+        domain = make_domain(project)
+        with patch("backend.engine.engine_version", return_value="4.6.2"):
+            _model, extra, _resolved, _duration = build_specialized_model(
+                ps, domain, project, step,
+                lambda name: material_handle(ps, name), MATERIAL_IDS)
+        self.assertIn("SurfaceDiffusionParameters",
+                      [type(item).__name__ for item in extra])
+
     def test_worker_rejects_a_domain_wide_radius(self):
         with patch("backend.validation.engine_version", return_value="4.6.2"):
             project = normalized(ald_project(2, surface_diffusion={"radius": 0.1}))
         project["steps"][0]["surfaceDiffusion"]["radius"] = 1.7
         domain = make_domain(project)
-        with self.assertRaises(RuntimeError) as context:
-            build_specialized_model(ps, domain, project, project["steps"][0],
-                                    lambda name: material_handle(ps, name), MATERIAL_IDS)
+        with patch("backend.engine.engine_version", return_value="4.6.2"):
+            with self.assertRaises(RuntimeError) as context:
+                build_specialized_model(ps, domain, project, project["steps"][0],
+                                        lambda name: material_handle(ps, name), MATERIAL_IDS)
         self.assertIn("8 grid intervals", str(context.exception))
 
 

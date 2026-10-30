@@ -5,7 +5,8 @@ import math
 from typing import Any
 
 from backend.specialized_models import advanced_spec, model_spec, oxidation_advanced_spec
-from backend.engine import engine_version, oxidation_advanced_supported
+from backend.engine import (ald_surface_diffusion_error, engine_version,
+                           oxidation_advanced_supported)
 
 
 def _set_native_path(target: Any, path: str, value: Any) -> None:
@@ -304,6 +305,12 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
         extra.append(atomic)
         surface_diffusion = step.get("surfaceDiffusion")
         if surface_diffusion is not None and surface_diffusion.get("enabled", True):
+            # Same rule as API validation: a hand-edited worker input must not
+            # reach the known hanging 4.7.0 native stencil. Fail before any
+            # SurfaceDiffusionParameters setter is constructed.
+            gate_message = ald_surface_diffusion_error()
+            if gate_message is not None:
+                raise RuntimeError(gate_message)
             coefficient = float(p["coverageDiffusionCoefficient"])
             if not math.isfinite(coefficient) or coefficient <= 0.0:
                 # ViennaPS 4.6.2 sets the ALP surface-diffusion flag only from
