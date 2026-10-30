@@ -1,6 +1,7 @@
 """Allowlisted ViennaPS 4.6.2 model constructors for schema-7 specialized steps."""
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from backend.specialized_models import advanced_spec, model_spec
@@ -300,6 +301,52 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
             setattr(atomic, key, float(p[key]))
         atomic.numCycles = int(p["numCycles"])
         extra.append(atomic)
+        surface_diffusion = step.get("surfaceDiffusion")
+        if surface_diffusion is not None and surface_diffusion.get("enabled", True):
+            coefficient = float(p["coverageDiffusionCoefficient"])
+            if not math.isfinite(coefficient) or coefficient <= 0.0:
+                # ViennaPS 4.6.2 sets the ALP surface-diffusion flag only from
+                # a positive coverage diffusion coefficient. Without it the
+                # native solver is never built, so the object would be inert.
+                raise RuntimeError("surfaceDiffusion requires coverageDiffusionCoefficient > 0")
+            native = ps.SurfaceDiffusionParameters()
+            effective = {
+                "kNeighbors": int(surface_diffusion.get("kNeighbors", native.kNeighbors)),
+                "normalCutoff": float(surface_diffusion.get("normalCutoff", native.normalCutoff)),
+                "normalizeByLocalScale": bool(surface_diffusion.get(
+                    "normalizeByLocalScale", native.normalizeByLocalScale)),
+                "radius": float(surface_diffusion.get("radius", native.radius)),
+                "sigmaNormal": float(surface_diffusion.get("sigmaNormal", native.sigmaNormal)),
+                "stabilityFactor": float(surface_diffusion.get(
+                    "stabilityFactor", native.stabilityFactor)),
+                "symmetrizeWeights": bool(surface_diffusion.get(
+                    "symmetrizeWeights", native.symmetrizeWeights)),
+            }
+            for key, value in effective.items():
+                setattr(native, key, value)
+            radius_limit = min(2.0, 8.0 * float(project["domain"]["gridDelta"]))
+            if effective["radius"] > radius_limit:
+                raise RuntimeError(
+                    "surfaceDiffusion.radius must not exceed 8 grid intervals "
+                    f"({radius_limit:g} um); radius=0 with kNeighbors keeps the stencil bounded")
+            extra.append(native)
+            # Read the installed binding back instead of trusting the request.
+            recorded = {
+                "nativeClass": "SurfaceDiffusionParameters",
+                "requested": surface_diffusion,
+                "effective": effective,
+                "nativeMetaData": native.toMetaData(),
+                "nativeMetaDataString": native.toMetaDataString(),
+                "coverageDiffusionCoefficient": coefficient,
+                "appliesTo": "ALD coverage scalar on the disk mesh; not the level-set geometry",
+                "nativeFlagSource": "SingleParticleALDParams.coverageDiffusionCoefficient > 0",
+                "nativeInsertionPoint": "Process.setParameters(SurfaceDiffusionParameters)",
+            }
+            for key in ("kNeighbors", "normalCutoff", "normalizeByLocalScale", "radius",
+                        "sigmaNormal", "stabilityFactor", "symmetrizeWeights"):
+                if getattr(native, key) != effective[key]:
+                    raise RuntimeError(f"installed SurfaceDiffusionParameters.{key} did not keep its value")
+            resolved["surfaceDiffusion"] = recorded
     elif model_id == "oxidation":
         model = ps.Oxidation()
         model.setOxidant(getattr(ps.OxidantType, p["oxidant"]))

@@ -346,6 +346,13 @@ def _specialized_model_warnings(project: Any) -> list[str]:
                 f"top level set without a native mask; 4.6.2 ignores trenchWidth, the process duration does not "
                 f"scale the thickness, and the local radius a*(1-|z|/trenchDepth)^n+b is evaluated from absolute "
                 f"z with the trench top assumed at z=0.")
+        surface_diffusion = step_value(step, "surfaceDiffusion")
+        if (model_id == "ald" and surface_diffusion is not None
+                and step_value(surface_diffusion, "enabled", True)):
+            warnings.append(
+                f"steps[{index}].surfaceDiffusion: ViennaPS 4.6.2 builds this Laplacian stencil only inside "
+                f"the ALP strategy and only while coverageDiffusionCoefficient > 0. It smooths the native "
+                f"Coverage scalar that drives the ALD growth rate; it does not smooth the level-set surface.")
     return warnings
 
 
@@ -962,6 +969,19 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
             issues.append(FieldIssue(f"steps[{index}].nativeModel", "installed OxideRegrowth is verified only on a flat stack with top-layer pattern set to none; patterned or non-stack domains can crash ViennaPS 4.6.2"))
         if step.nativeModel == "selectiveEpitaxy" and custom_names & geometry_names:
             issues.append(FieldIssue(f"steps[{index}].nativeModel", "SelectiveEpitaxy has only been verified with installed native epitaxy materials"))
+        surface_diffusion = getattr(step, "surfaceDiffusion", None)
+        if (surface_diffusion is not None and surface_diffusion.enabled
+                and float(surface_diffusion.radius) > 0.0):
+            # The native radius query stores one sparse row per surface point;
+            # a radius spanning the whole domain makes the stencil quadratic in
+            # point count and can exhaust worker memory before the artifact
+            # budget runs. Eight grid spacings keeps it a local smoother.
+            limit = min(2.0, 8.0 * float(project.domain.gridDelta))
+            if float(surface_diffusion.radius) > limit:
+                issues.append(FieldIssue(
+                    f"steps[{index}].surfaceDiffusion.radius",
+                    f"must not exceed 8 grid intervals ({limit:g} um for gridDelta="
+                    f"{float(project.domain.gridDelta):g}); use radius=0 with kNeighbors for a bounded stencil"))
     return issues
 
 

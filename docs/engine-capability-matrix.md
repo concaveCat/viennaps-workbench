@@ -123,7 +123,7 @@ custom material catalog.
 | `CF4O2ParametersSiGe` | B1: `beta_sigma`, `k_sigma`, `rho` | sputter/yield fields and `x`; `k_sigma_SiGe` method | A full SiGe yield editor is not available because the native branch does not read those fields |
 | `CoverageParameters` | `tolerance = 1e-3` (hard-coded) | `tolerance`, `maxIterations`, `initialized` | Convergence cannot be tightened or loosened |
 | `RateSet` | `model: directional` `rateSets[]`: 1–8 sets, per-set direction, velocities, masks and visibility | `print()` (debug helper) | Multiple simultaneous directions and per-set masks are now declarative |
-| `SurfaceDiffusionParameters` | — | 7 members | No workbench code path constructs it; it is a level-set smoothing model, so an insertion point must be evidenced first |
+| `SurfaceDiffusionParameters` | `specialized:ald` `surfaceDiffusion` (7 members) when `coverageDiffusionCoefficient > 0` | level-set/geometry smoothing | 4.6.2 only builds the ALP coverage stencil; it diffuses the `Coverage` scalar, not the surface. See [`ald-surface-diffusion-contract.md`](ald-surface-diffusion-contract.md) |
 | `DenseCellSet` | OxideRegrowth by-product JSON only | generic per-step generation, height/cover/periodic options, filling fractions, user scalars, VTU export, continuation | No project can request a volumetric field of its own |
 | `Oxidation` advanced setters | 13 of ~40 | CFL, coupling/mechanics/Stokes/pressure iterations+tolerances, solve bounds, `maxGridPoints`, simple relaxation, mask contact/traction mechanics, `GpuMode`/`GpuPreconditioner`, model-level `saveSurfaceMesh`/`saveVolumeMesh` helpers (the workbench writes the same meshes through `Domain`), `estimatePlanarOxideThickness` | Separate solver surface; unproven on this host |
 | `SiliconOrientation.Si110` | 3 of 4 | `Si110` | Exists in 4.6.2, missing only because it was never evidenced |
@@ -234,11 +234,19 @@ explicit list (including `[]`) is used verbatim and recorded per set, so no mask
 See [`directional-contract.md`](directional-contract.md). Remaining native overload: the per-material
 `materialRates` mapping, which stays unexposed because the per-set form covers the modelling need.
 
-### Batch B3 — `SurfaceDiffusionParameters`
+### Batch B3 — `SurfaceDiffusionParameters` for ALD coverage smoothing (exposed, ALD only)
 
-- Acceptance: a bounded probe first establishes a legal insertion point; if none exists in 4.6.2 the
-  class is documented as not applicable and stays unexposed; otherwise defaults must be a no-op and
-  `radius`/`sigmaNormal`/`stabilityFactor` carry documented units and bounds.
+`worker/probe_surface_diffusion_native.py` found the real insertion point in the installed 4.6.2
+bindings: `Process.setParameters(SurfaceDiffusionParameters)` is bound in 2D and 3D, but the ALP
+strategy only builds the stencil when `SingleParticleALDParams.coverageDiffusionCoefficient > 0`,
+and that is the only 4.6.2 surface model that reports diffusion coefficients. The stencil smooths the
+native `Coverage` scalar (which sets the ALD growth rate) on the disk mesh — it does **not** smooth
+level-set geometry, and on every other process the object is inert. The optional
+`steps[].surfaceDiffusion` object is therefore accepted only on `specialized:ald` with a positive
+coefficient; ranges and units are documented in
+[`ald-surface-diffusion-contract.md`](ald-surface-diffusion-contract.md). Omitting it leaves the
+historical request hashes byte-identical, explicit native defaults are a behaviour no-op, and 2D/3D
+worker runs match an independent native reference exactly.
 
 ### Batch B4 — generic `DenseCellSet` output
 
