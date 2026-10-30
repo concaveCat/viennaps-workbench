@@ -369,6 +369,19 @@ class Supervisor:
                 shutil.copyfile(source_gds, gds_asset_path)
                 if storage.file_sha256(gds_asset_path) != gds_asset["assetId"]:
                     raise OSError("copied GDS asset does not match its SHA-256 reference")
+            csv_asset_paths: dict[str, Path] = {}
+            for step in enabled_steps:
+                if step.get("model") != "csvProcess":
+                    continue
+                csv_asset_id = step.get("assetId")
+                if not isinstance(csv_asset_id, str) or csv_asset_id in csv_asset_paths:
+                    continue
+                source_csv = storage.resolve_csv_asset(csv_asset_id)
+                copied_csv = run_dir / f"csv-source-{csv_asset_id}.csv"
+                shutil.copyfile(source_csv, copied_csv)
+                if storage.file_sha256(copied_csv) != csv_asset_id:
+                    raise OSError("copied CSV rate asset does not match its SHA-256 reference")
+                csv_asset_paths[csv_asset_id] = copied_csv
             initial_state_path = None
             if state_path is not None:
                 initial_state_path = run_dir / "domain-state.vpsd"
@@ -393,6 +406,8 @@ class Supervisor:
             input_config["customMaterials"] = custom_materials
             if gds_asset_path is not None:
                 input_config["gdsAssetPath"] = str(gds_asset_path)
+            if csv_asset_paths:
+                input_config["csvAssets"] = {asset_id: str(path) for asset_id, path in csv_asset_paths.items()}
             if kind == "flux":
                 input_config["analysisStepId"] = analysis_step_id
             if kind == "slice":
@@ -426,6 +441,7 @@ class Supervisor:
                 "executionHash": None,
                 "normalizedProject": project,
                 "gdsAssetId": gds_asset.get("assetId") if isinstance(gds_asset, dict) else None,
+                "csvAssetIds": sorted(csv_asset_paths) or None,
                 "sliceRequest": slice_request if kind == "slice" else None,
                 "requestedSolver": project["solver"],
                 "selectedGpuDevice": selected_gpu_device,

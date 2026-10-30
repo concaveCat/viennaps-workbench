@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import hashlib
 import json
 import logging
 import os
@@ -48,6 +49,7 @@ ROOT = storage.ROOT
 # otherwise fall back to logging.lastResort and drop the startup line.
 STARTUP_LOGGER = logging.getLogger("uvicorn.error")
 API_GDS_MAX_BODY = 64 * 1024 * 1024
+API_CSV_MAX_BODY = 16 * 1024 * 1024
 APP_VERSION = "0.1.0"
 CAPABILITIES = ROOT / "docs" / "capabilities.json"
 
@@ -111,6 +113,22 @@ class ApiContentTypeMiddleware:
                     await self._reject_oversized(scope, receive, send, maximum=API_GDS_MAX_BODY)
                     return
             # The upload route streams into a temporary file and enforces its own cap.
+            await self.app(scope, receive, send)
+            return
+        if path == "/api/csv-assets" and scope.get("method") == "POST":
+            content_type = next((value.decode("latin1").split(";", 1)[0].strip().lower() for key, value in scope.get("headers", []) if key.lower() == b"content-type"), "")
+            if content_type not in {"text/csv", "text/plain", "application/octet-stream"}:
+                response = JSONResponse(status_code=415, content={"detail": "CSV rate uploads must use text/csv or application/octet-stream"})
+                await response(scope, receive, send)
+                return
+            if content_length is not None:
+                try:
+                    if int(content_length) > API_CSV_MAX_BODY:
+                        await self._reject_oversized(scope, receive, send, maximum=API_CSV_MAX_BODY)
+                        return
+                except ValueError:
+                    await self._reject_oversized(scope, receive, send, maximum=API_CSV_MAX_BODY)
+                    return
             await self.app(scope, receive, send)
             return
         if path == "/api/continuation-package/import" and scope.get("method") == "POST":
@@ -377,6 +395,72 @@ async def gds_asset_get(asset_id: str) -> dict[str, Any]:
         return {**metadata, "assetId": asset_id, **inspect_gds(path.read_bytes())}
     except (FileNotFoundError, OSError, ValueError) as exc:
         raise HTTPException(status_code=404, detail="GDS asset not found or SHA-256 mismatch") from exc
+
+
+@app.get("/api/csv-assets/{asset_id}")
+async def csv_asset_get(asset_id: str) -> dict[str, Any]:
+    from .csv_assets import inspect_rate_csv
+    try:
+        path = storage.resolve_csv_asset(asset_id)
+        metadata_path = storage.csv_asset_metadata_path(asset_id)
+        metadata = read_json(metadata_path) if metadata_path.is_file() else {}
+        dimension = metadata.get("dimension")
+        if type(dimension) is not int or dimension not in (2, 3):
+            raise ValueError("CSV asset metadata does not declare a 2D or 3D rate table")
+        return {**metadata, "assetId": asset_id, **inspect_rate_csv(path.read_bytes(), dimension)}
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail="CSV rate asset not found, invalid or SHA-256 mismatch") from exc
+
+
+@app.post("/api/csv-assets", status_code=201)
+async def csv_asset_upload(request: Request,
+                           file_name: str = Query(default="rates.csv", min_length=1, max_length=255),
+                           dimension: int = Query(...)) -> dict[str, Any]:
+    from .csv_assets import RateCsvError, inspect_rate_csv
+    if dimension not in (2, 3):
+        raise HTTPException(status_code=422, detail="CSV rate tables require dimension=2 or dimension=3")
+    if "/" in file_name or "\\" in file_name or any(ord(value) < 32 for value in file_name):
+        raise HTTPException(status_code=422, detail="CSV file name must be a simple file name")
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > API_CSV_MAX_BODY:
+                raise HTTPException(status_code=413, detail="CSV rate table exceeds the 16 MiB upload limit")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid Content-Length") from exc
+    storage.initialize()
+    temp_dir = Path(tempfile.mkdtemp(prefix="csv-upload-", dir=storage.VAR))
+    upload_path = temp_dir / "upload.csv"
+    size = 0
+    digest = hashlib.sha256()
+    try:
+        with upload_path.open("wb") as output:
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > API_CSV_MAX_BODY:
+                    raise HTTPException(status_code=413, detail="CSV rate table exceeds the 16 MiB upload limit")
+                digest.update(chunk)
+                output.write(chunk)
+        data = upload_path.read_bytes()
+        try:
+            summary = inspect_rate_csv(data, dimension)
+        except (OSError, RateCsvError) as exc:
+            raise HTTPException(status_code=422, detail=f"CSV rate table is invalid: {exc}") from exc
+        asset_id = digest.hexdigest()
+        if asset_id != hashlib.sha256(data).hexdigest():
+            raise HTTPException(status_code=500, detail="CSV upload SHA-256 changed while streaming")
+        destination = storage.csv_asset_path(asset_id)
+        if destination.exists():
+            if storage.file_sha256(destination) != asset_id:
+                raise HTTPException(status_code=500, detail="content-addressed CSV asset store has a SHA-256 mismatch")
+        else:
+            storage.check_disk_preflight(projected_bytes=size)
+            os.replace(upload_path, destination)
+        metadata = {"assetId": asset_id, "fileName": file_name, **summary}
+        atomic_json(storage.csv_asset_metadata_path(asset_id), metadata)
+        return metadata
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 @app.post("/api/gds-assets/{asset_id}/inspect")
@@ -899,6 +983,11 @@ async def continuation_package_export(payload: Any = Body(...)):
     if not isinstance(payload, dict) or set(payload) not in ({"project"}, {"project", "replay"}):
         raise HTTPException(status_code=422, detail="body must contain project and optional replay")
     _project, normalized, _warnings = _project_or_422(payload["project"])
+    if any(step.get("model") == "csvProcess" for step in normalized.get("steps", [])):
+        raise HTTPException(
+            status_code=422,
+            detail="portable project packages do not include uploaded CSV rate assets yet; "
+                   "save and replay the project in this workbench")
     reference = normalized.get("continuationState")
     gds_geometry = normalized.get("geometry", {})
     gds_asset = project_gds_asset(gds_geometry)
@@ -1115,6 +1204,10 @@ def _archive_entries(run_dir: Path, manifest: dict[str, Any]) -> list[tuple[str,
     if isinstance(gds_asset_id, str) and len(gds_asset_id) == 64 and (run_dir / "gds-source.gds").is_file():
         candidates.append((f"assets/{gds_asset_id}.gds", run_dir / "gds-source.gds"))
         candidates.extend((name, run_dir / name) for name in ("gds-selected.gds", "gds-transform.json"))
+    for csv_asset_id in manifest.get("csvAssetIds") or []:
+        source = run_dir / f"csv-source-{csv_asset_id}.csv"
+        if isinstance(csv_asset_id, str) and len(csv_asset_id) == 64 and source.is_file():
+            candidates.append((f"assets/{csv_asset_id}.csv", source))
     if (run_dir / "domain-state.vpsd").is_file():
         candidates.append(("domain-state.vpsd", run_dir / "domain-state.vpsd"))
     flux_result = manifest.get("fluxResult")

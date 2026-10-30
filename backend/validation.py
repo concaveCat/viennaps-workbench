@@ -185,6 +185,9 @@ def validate_project(payload: Any, *, kind: str = "project") -> tuple[Project, l
             warnings.extend(_specialized_model_warnings(project))
         if project.schemaVersion == 7:
             issues.extend(_validate_specialized_steps(project))
+            csv_issues, csv_warnings = _validate_csv_process_steps(project)
+            issues.extend(csv_issues)
+            warnings.extend(csv_warnings)
         if project.dimension == 3:
             issues.extend(_validate_v3_3d_geometry(project))
         else:
@@ -822,6 +825,70 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
 def _catalog_names() -> list[dict[str, Any]]:
     from .materials import material_catalog
     return material_catalog()["materials"]
+
+
+def _validate_csv_process_steps(project: ProjectV7) -> tuple[list[FieldIssue], list[str]]:
+    """Resolve and re-check every uploaded rate table before a worker starts.
+
+    The native engine only logs a warning and continues with a zero velocity
+    field when ``RateGrid::loadFromCSV`` fails, so the workbench treats a
+    missing, mismatched or non-LINEAR-compatible table as a hard 422.
+    """
+    from . import storage
+    from .csv_assets import RateCsvError, inspect_rate_csv
+
+    issues: list[FieldIssue] = []
+    warnings: list[str] = []
+    dimension = int(project.dimension)
+    half_x = float(project.domain.xExtent) / 2.0
+    half_y = float(getattr(project.domain, "yExtent", 0.0)) / 2.0 if dimension == 3 else 0.0
+    for index, step in enumerate(project.steps):
+        if step.model != "csvProcess":
+            continue
+        prefix = f"steps[{index}]"
+        try:
+            path = storage.resolve_csv_asset(step.assetId)
+            metadata_path = storage.csv_asset_metadata_path(step.assetId)
+            metadata = storage.read_json(metadata_path) if metadata_path.is_file() else {}
+            stored_dimension = metadata.get("dimension")
+            summary = inspect_rate_csv(
+                path.read_bytes(),
+                stored_dimension if type(stored_dimension) is int and stored_dimension in (2, 3) else dimension,
+            )
+        except FileNotFoundError:
+            issues.append(FieldIssue(
+                f"{prefix}.assetId",
+                "CSV rate asset is unavailable or its SHA-256 does not match; re-upload the table"))
+            continue
+        except (OSError, ValueError, RateCsvError) as exc:
+            issues.append(FieldIssue(f"{prefix}.assetId", f"CSV rate asset is invalid: {exc}"))
+            continue
+        if summary["dimension"] != dimension:
+            issues.append(FieldIssue(
+                f"{prefix}.assetId",
+                f"rate table was uploaded for {summary['dimension']}D ({','.join(summary['columns'])}); "
+                f"this project is {dimension}D"))
+            continue
+        if summary["x"]["min"] > -half_x or summary["x"]["max"] < half_x:
+            warnings.append(
+                f"{prefix}.assetId: the table's x range [{summary['x']['min']:g}, {summary['x']['max']:g}] "
+                f"does not cover the domain [-{half_x:g}, {half_x:g}] um; native LINEAR extrapolates beyond "
+                "the last sample and IDW always weights the nearest samples")
+        if dimension == 3 and (summary["y"]["min"] > -half_y or summary["y"]["max"] < half_y):
+            warnings.append(
+                f"{prefix}.assetId: the table's y range [{summary['y']['min']:g}, {summary['y']['max']:g}] "
+                f"does not cover the domain [-{half_y:g}, {half_y:g}] um")
+        if step.interpolationMode == "LINEAR" and not summary["linearCompatible"]:
+            if dimension == 2:
+                detail = "2D LINEAR requires at least two rows with strictly increasing x"
+            else:
+                detail = "3D LINEAR requires a complete rectangular x/y grid with at least two distinct x and y values"
+            issues.append(FieldIssue(f"{prefix}.interpolationMode", detail))
+        if step.interpolationMode == "IDW" and int(step.idwNeighbors or 0) > int(summary["rowCount"]):
+            issues.append(FieldIssue(
+                f"{prefix}.idwNeighbors",
+                f"must not exceed the table's {summary['rowCount']} rows"))
+    return issues, warnings
 
 
 def _validate_v3_geometry(project: ProjectV3) -> list[FieldIssue]:

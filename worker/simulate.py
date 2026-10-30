@@ -34,6 +34,7 @@ from backend.gpu_devices import cuda_devices, resolve_gpu_device
 from worker.gds_mask import CONSTRUCTION as GDS_MASK_CONSTRUCTION
 from worker.gds_mask import build_aligned_gds_layer, build_aligned_gds_mask, planar_point_count
 from worker.specialized import build_specialized_model
+from worker.csv_process import build_csv_process
 MATERIAL_CATALOG = json.loads((ROOT / "docs" / "materials-catalog.json").read_text(encoding="utf-8"))
 MATERIAL_ROWS = MATERIAL_CATALOG["materials"]
 MATERIAL_NAMES = {int(row["id"]): row["name"] for row in MATERIAL_ROWS}
@@ -2665,6 +2666,7 @@ def execute(input_path: Path, run_dir: Path) -> None:
             deposition = step["operation"] == "deposit"
             directional = project["schemaVersion"] in (5,6,7) and step.get("model")=="directional"
             specialized = project["schemaVersion"] == 7 and step.get("model") == "specialized"
+            csv_process = project["schemaVersion"] == 7 and step.get("model") == "csvProcess"
             rate = None
             signed_material_rates: dict[str,float] = {}
             multi_actual: dict[str,Any] | None = None
@@ -2715,7 +2717,7 @@ def execute(input_path: Path, run_dir: Path) -> None:
                     "raysPerPoint":"not-applicable",
                     "randomSeed":"not-applicable",
                 }
-            elif step.get("model") != "multiParticle" and not specialized:
+            elif step.get("model") != "multiParticle" and not specialized and not csv_process:
                 rate, signed_material_rates = signed_rates(step)
             particle = uses_flux(step)
             configured_engine = config.get("stepEngines", {}).get(step["id"])
@@ -2735,6 +2737,11 @@ def execute(input_path: Path, run_dir: Path) -> None:
             elif specialized:
                 model, special_process_parameters, specialized_actual, process_duration = build_specialized_model(
                     ps, domain, project, step, lambda name: material_handle(ps, name), MATERIAL_IDS)
+            elif csv_process:
+                model, csv_process_actual = build_csv_process(
+                    ps, project, step, config=config, run_dir=run_dir,
+                    material_handle=lambda name: material_handle(ps, name), material_ids=MATERIAL_IDS)
+                process_duration = float(step["duration"])
             elif step.get("model") == "multiParticle":
                 if gpu_multi_split:
                     model = None
@@ -2760,12 +2767,13 @@ def execute(input_path: Path, run_dir: Path) -> None:
                 else:
                     model = ps.IsotropicProcess(rate=rate, maskMaterial=ps.Material.Mask)
             process = (None if gpu_multi_split else
-                       ps.Process(domain, model, process_duration if specialized else float(step["duration"])))
+                       ps.Process(domain, model, process_duration if (specialized or csv_process) else float(step["duration"])))
             # The 4.6.2 Process default attempts CUDA initialization even for
             # isotropic models. Pin a concrete, verified backend before apply.
             engine = "not-applicable"
             step_seed = None
             selection_reason = ("directional model does not use a stochastic ray flux engine" if directional else
+                                "native CSV rate-grid field does not use a stochastic ray flux engine" if csv_process else
                                 "native model does not use a stochastic ray flux engine" if specialized and not particle else
                                 "isotropic model does not use a ray flux engine")
             if particle:
@@ -2792,8 +2800,8 @@ def execute(input_path: Path, run_dir: Path) -> None:
             if specialized:
                 for process_parameters in special_process_parameters:
                     process.setParameters(process_parameters)
-            actual_parameters: dict[str, Any] = {**advection_actual, "duration": process_duration if specialized else float(step["duration"]), "rate": rate}
-            if project["schemaVersion"] in (4,5,6,7) and not directional and not specialized and step.get("model") != "multiParticle":
+            actual_parameters: dict[str, Any] = {**advection_actual, "duration": process_duration if (specialized or csv_process) else float(step["duration"]), "rate": rate}
+            if project["schemaVersion"] in (4,5,6,7) and not directional and not specialized and not csv_process and step.get("model") != "multiParticle":
                 actual_parameters.update({"rateMode":step["rateMode"],"actualDefaultRate":rate,
                     "actualMaterialRatesByName":signed_material_rates,
                     "actualMaterialRatesById":{str(MATERIAL_IDS[name]):value for name,value in signed_material_rates.items()},
@@ -2834,10 +2842,17 @@ def execute(input_path: Path, run_dir: Path) -> None:
                                                "nativeProcessEngine": engine})
                 actual_parameters.update({"nativeModel": specialized_actual,
                                           "processDurationSeconds": process_duration})
+            elif csv_process:
+                actual_parameters = {"timeStepRatio": float(advection.timeStepRatio),
+                                     "duration": float(step["duration"]),
+                                     "csvProcess": {**csv_process_actual, "actualSeed": step_seed,
+                                                    "actualEngine": engine,
+                                                    "cpuThreads": int(project["solver"]["cpuThreads"]),
+                                                    "processDurationSeconds": process_duration}}
             event(run_dir, {"type": "step-configured", "stepId": step["id"], "operation": step["operation"], "model": step["model"],
                             "noOp": False, "actualEngine": engine, "engineSelectionReason": selection_reason,
                             "requestedEnginePreference": engine_preference, "actualSeed": step_seed, "actualRate": rate,
-                            "duration": process_duration if specialized else step["duration"], "actualParameters": actual_parameters})
+                            "duration": process_duration if (specialized or csv_process) else step["duration"], "actualParameters": actual_parameters})
             intermediate_dir = run_dir / "intermediate" / step["id"]
             intermediate_dir.mkdir(parents=True, exist_ok=True)
             split_result = None

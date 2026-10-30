@@ -16,9 +16,9 @@ def is_geometry_step(step: Any) -> bool:
 
 
 def has_motion(step: Any) -> bool:
-    if value(step, "model") == "specialized":
-        # Native specialized models own their physical rate law. A schema-level
-        # scalar rate is intentionally absent; always execute the model.
+    if value(step, "model") in {"specialized", "csvProcess"}:
+        # Native specialized/CSV models own their physical rate law. A
+        # schema-level scalar rate is intentionally absent; always execute.
         return True
     if value(step, "model") == "multiParticle":
         table = value(step, "rateCoefficients", {}) or {}
