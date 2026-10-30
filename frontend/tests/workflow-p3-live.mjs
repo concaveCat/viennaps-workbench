@@ -32,6 +32,9 @@ try {
   await page.getByText(/binding: verified/).first().waitFor();
 
   await page.getByRole('button', { name: '04 实验' }).click();
+  for (const index of [1, 2, 3]) {
+    await page.getByLabel(`变体 ${index} replicates`).fill('2');
+  }
   await page.getByRole('button', { name: '创建 10 变体实验' }).click();
   await page.getByRole('button', { name: '运行持久化实验' }).click();
   await page.getByText('Experiment status: completed').waitFor({ timeout: 180000 });
@@ -71,7 +74,7 @@ try {
   ]);
   await popup.waitForLoadState();
   const reportText = await popup.locator('body').innerText();
-  for (const text of ['P3 UI report', 'ViennaPS', 'process window selected', '打印 / 保存为 PDF']) {
+  for (const text of ['P3 UI report', 'ViennaPS', 'process window selected', '打印 / 保存为 PDF', 'metric_', 'measurement']) {
     assert.ok(reportText.includes(text), `report must contain ${text}`);
   }
   assert.ok((await popup.locator('svg.report-svg').count()) >= 1);

@@ -406,6 +406,7 @@ class AnalysisCandidateV1(StrictModel):
 class AnalysisCompareRequest(StrictModel):
     candidates: Annotated[list[AnalysisCandidateV1], Field(min_length=2, max_length=4)]
     tolerance: Annotated[float, Field(ge=0, le=1_000_000)] = 1e-6
+    materialTolerance: Annotated[float, Field(ge=0, le=1_000_000)] | None = None
 
 
 class ProcessWindowRequest(StrictModel):
@@ -425,6 +426,7 @@ class ReportRequest(StrictModel):
     experimentId: str | None = None
     runId: str | None = None
     stepId: str | None = None
+    measurementId: str | None = None
     conclusions: Annotated[str, Field(max_length=20_000)] = ""
     lower: float | None = None
     upper: float | None = None
@@ -545,11 +547,16 @@ async def analyze_compare(request: AnalysisCompareRequest) -> dict:
         pairwise = []
         for left in range(len(snapshots)):
             for right in range(left + 1, len(snapshots)):
-                comparison = compare_analysis_snapshots(snapshots[left], snapshots[right], request.tolerance)
+                comparison = compare_analysis_snapshots(
+                    snapshots[left], snapshots[right], request.tolerance, request.materialTolerance,
+                )
                 comparison["left"] = request.candidates[left].label or request.candidates[left].runId
                 comparison["right"] = request.candidates[right].label or request.candidates[right].runId
                 pairwise.append(comparison)
-        return {"candidates": candidates, "pairwise": pairwise, "tolerance": request.tolerance}
+        return {
+            "candidates": candidates, "pairwise": pairwise,
+            "tolerance": request.tolerance, "materialTolerance": request.materialTolerance,
+        }
     return _call(operation)
 
 

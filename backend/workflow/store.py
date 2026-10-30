@@ -1301,6 +1301,15 @@ class WorkflowStore:
             raise WorkflowNotFound(f"segment {segment_id!r} does not exist")
         return SegmentV1.model_validate(self._segment_payload(row))
 
+    def get_segment_by_run_id(self, run_id: str) -> SegmentV1:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM segments WHERE run_id = ? ORDER BY rowid DESC LIMIT 1", (run_id,)
+            ).fetchone()
+        if row is None:
+            raise WorkflowNotFound(f"segment for run {run_id!r} does not exist")
+        return SegmentV1.model_validate(self._segment_payload(row))
+
     def update_attempt_status(self, attempt_id: str, status: str) -> AttemptV1:
         attempt = self.get_attempt(attempt_id)
         allowed = {

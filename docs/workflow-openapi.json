@@ -237,6 +237,19 @@
             "title": "Candidates",
             "type": "array"
           },
+          "materialTolerance": {
+            "anyOf": [
+              {
+                "maximum": 1000000.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Materialtolerance"
+          },
           "tolerance": {
             "default": 1e-06,
             "maximum": 1000000.0,
@@ -4829,6 +4842,17 @@
               }
             ],
             "title": "Lower"
+          },
+          "measurementId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Measurementid"
           },
           "runId": {
             "anyOf": [

@@ -767,6 +767,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       conclusions: reportConclusions,
     };
     if (experimentDoc) payload.experimentId = experimentDoc.experimentId;
+    if (measurement) payload.measurementId = measurement.measurementId;
     if (segment?.runId) { payload.runId = segment.runId; payload.stepId = segment.throughStepId; }
     if (Number.isFinite(lower) && Number.isFinite(upper) && lower < upper) { payload.lower = lower; payload.upper = upper; }
     setReportDocument(await postJson<ReportDocument>('/api/v1/workflow/analysis/report', payload));

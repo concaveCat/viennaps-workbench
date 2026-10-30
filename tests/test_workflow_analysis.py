@@ -12,6 +12,7 @@ import uuid
 os.environ.setdefault("WORKBENCH_PORT", "8767")
 
 from backend.main import app  # noqa: E402
+from backend.workflow.analysis import compare_snapshots, process_window  # noqa: E402
 from tests.test_api_integration import asgi_request, json_body  # noqa: E402
 from tests.test_workflow_adoption import project  # noqa: E402
 
@@ -44,7 +45,7 @@ class AnalysisTests(unittest.IsolatedAsyncioTestCase):
                 "name": "analysis three", "project": base, "flowId": self.adopted["flowId"],
                 "compileId": self.adopted["compileId"], "recipeId": self.recipe_id, "recipeVersion": 1,
                 "variants": [
-                    {"parameters": {"step_etch_01": {"duration": duration}}, "replicates": 1, "seed": 700 + index}
+                    {"parameters": {"step_etch_01": {"duration": duration}}, "replicates": 2, "seed": 700 + index * 10}
                     for index, duration in enumerate((0.02, 0.04, 0.06))
                 ],
                 "maxAttempts": 2,
@@ -65,6 +66,7 @@ class AnalysisTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.3)
         self.assertEqual(self.experiment["status"], "completed", self.experiment)
         self.run_ids = [variant["replicates"][0]["runId"] for variant in self.experiment["variants"]]
+        self.measurement_id = self.experiment["variants"][0]["replicates"][0]["measurementId"]
 
     async def asyncTearDown(self):
         await self.lifespan.__aexit__(None, None, None)
@@ -108,11 +110,13 @@ class AnalysisTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(window_body["factorWindows"])
         self.assertTrue(window_body["candidates"])
         self.assertEqual(window_body["candidates"][0]["status"], "pass")
+        self.assertTrue(all(row["n"] == 2 for row in window_body["rows"]))
 
         report = await asgi_request(
             "/api/v1/workflow/analysis/report", method="POST",
             payload={
                 "title": "P3 acceptance report", "experimentId": self.experiment["experimentId"],
+                "runId": self.run_ids[0], "stepId": self.step_id, "measurementId": self.measurement_id,
                 "conclusions": "window candidate selected", "lower": 0.0001, "upper": 0.0008,
             },
         )
@@ -124,9 +128,54 @@ class AnalysisTests(unittest.IsolatedAsyncioTestCase):
         for text in (
             "P3 acceptance report", self.adopted["flowId"], "ViennaPS", "actual seed",
             self.metric_id, "Process window", "window candidate selected", "report-svg",
+            "Evidence / Provenance", self.measurement_id, "geometry kind",
         ):
             self.assertIn(text, html)
         self.assertIn("打印 / 保存为 PDF", html)
+
+        single = await asgi_request(
+            "/api/v1/workflow/analysis/report", method="POST",
+            payload={"title": "Single run report", "runId": self.run_ids[0], "stepId": self.step_id},
+        )
+        self.assertEqual(single[0], 200, single[2])
+        single_html = json_body(single)["html"]
+        for text in (self.adopted["flowId"], self.metric_id, "geometry kind", "variables", "compileId"):
+            self.assertIn(text, single_html)
+        self.assertNotIn("No compile envelope selected", single_html)
+
+    def test_process_window_rejects_single_sample_candidates(self):
+        document = {
+            "experimentId": "exp_single", "metricId": "m", "unit": "um",
+            "aggregation": {"rows": [
+                {"ordinal": 1, "variantId": "v1", "parameters": {}, "mean": 1.0, "ci95": None, "n": 1, "statisticalStatus": "not_evaluated"},
+                {"ordinal": 2, "variantId": "v2", "parameters": {}, "mean": 2.0, "ci95": None, "n": 1, "statisticalStatus": "not_evaluated"},
+            ]},
+        }
+        result = process_window(document, 0.0, 3.0)
+        self.assertEqual(result["summary"]["notEvaluated"], 2)
+        self.assertEqual(result["summary"]["pass"], 0)
+        self.assertEqual(result["candidates"], [])
+
+    def test_structural_diff_checks_connectivity_and_material_units(self):
+        points = [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]]
+        base = {
+            "dimension": 3, "topology": "triangles", "points": points,
+            "triangles": [[0, 1, 2], [1, 3, 2]], "cellData": {"materialIds": [1, 1]},
+            "materials": {"1": {"name": "Mask", "color": "#fff"}, "2": {"name": "Si", "color": "#ccc"}},
+        }
+        reordered = {**base, "triangles": [[0, 1, 3], [1, 3, 2]]}
+        connectivity = compare_snapshots(base, reordered, 1e-3)
+        self.assertEqual(connectivity["status"], "different")
+        self.assertTrue(any("connectivity" in reason for reason in connectivity["reasons"]))
+        material = {**base, "cellData": {"materialIds": [1, 2]}}
+        mixed = compare_snapshots(base, material, 1e-3)
+        self.assertEqual(mixed["status"], "different")
+        self.assertAlmostEqual(mixed["materialTolerance"], 1e-6)
+        self.assertTrue(any("material" in reason for reason in mixed["reasons"]))
+        line_a = {"dimension": 2, "topology": "lines", "points": [[0, 0, 0], [1, 0, 0], [1, 1, 0]],
+                  "lines": [[0, 1]], "cellData": {"materialIds": [1]}, "materials": {"1": {"name": "Si"}}}
+        line_b = {**line_a, "lines": [[1, 2]]}
+        self.assertEqual(compare_snapshots(line_a, line_b, 1e-6)["status"], "different")
 
     async def test_calibration_least_squares_and_not_validated(self):
         csv_text = "condition,measured,simulated,weight,split\na,1.0,1.0,1,train\nb,2.0,2.0,1,train\nc,3.1,3.0,1,train\nd,4.0,4.0,1,validation\n"
@@ -173,6 +222,32 @@ class AnalysisTests(unittest.IsolatedAsyncioTestCase):
             payload={"name": "bad", "csv": "measured,other\n1,2\n"},
         )
         self.assertEqual(invalid[0], 422, invalid[2])
+
+        malformed = await asgi_request(
+            "/api/v1/workflow/calibration/datasets", method="POST",
+            payload={"name": "bad weight", "csv": "measured,simulated,weight\n1,2,not-a-number\n"},
+        )
+        self.assertEqual(malformed[0], 422, malformed[2])
+
+        zero_power = await asgi_request(
+            "/api/v1/workflow/calibration/datasets", method="POST",
+            payload={"name": "zero power", "csv": "measured,simulated\n5,0\n2,1\n0.7,2\n0.3,4\n"},
+        )
+        self.assertEqual(zero_power[0], 201, zero_power[2])
+        zero_fit = await asgi_request(
+            "/api/v1/workflow/calibration/fit", method="POST",
+            payload={"datasetId": json_body(zero_power)["datasetId"], "model": "power", "method": "nelder-mead"},
+        )
+        self.assertEqual(zero_fit[0], 422, zero_fit[2])
+        self.assertIn("positive simulated", json_body(zero_fit)["detail"])
+        offset_fit = await asgi_request(
+            "/api/v1/workflow/calibration/fit", method="POST",
+            payload={"datasetId": json_body(zero_power)["datasetId"], "model": "power_offset", "method": "nelder-mead"},
+        )
+        self.assertEqual(offset_fit[0], 201, offset_fit[2])
+        offset_body = json_body(offset_fit)
+        self.assertEqual(len(offset_body["parameters"]), 3)
+        self.assertIsNotNone(offset_body["trainResiduals"]["rmse"])
 
 
 if __name__ == "__main__":

@@ -44,20 +44,27 @@ def parse_calibration_csv(text: str) -> list[dict[str, Any]]:
             raise ValueError(f"calibration CSV row {index} has a non-numeric value") from exc
         if not math.isfinite(measured) or not math.isfinite(simulated):
             raise ValueError(f"calibration CSV row {index} must be finite")
+        def value(name: str, default: str = "") -> str:
+            key = fields.get(name)
+            if not key:
+                return default
+            item = raw.get(key, default)
+            return default if item is None else str(item)
+
         weight = 1.0
-        if "weight" in fields and raw.get(fields["weight"], "").strip():
+        if value("weight").strip():
             try:
-                weight = float(raw[fields["weight"]])
+                weight = float(value("weight"))
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"calibration CSV row {index} has a non-numeric weight") from exc
             if not math.isfinite(weight) or weight <= 0:
                 raise ValueError(f"calibration CSV row {index} weight must be positive")
-        split = str(raw.get(fields.get("split", ""), "train") if "split" in fields else "train").strip().lower()
+        split = value("split", "train").strip().lower()
         if split not in {"train", "validation"}:
             raise ValueError(f"calibration CSV row {index} split must be train or validation")
         rows.append({
             "index": index - 1,
-            "condition": str(raw.get(fields.get("condition", ""), "") if "condition" in fields else ""),
+            "condition": value("condition"),
             "measured": measured, "simulated": simulated, "weight": weight, "split": split,
         })
     if not rows:
@@ -118,6 +125,8 @@ def _predict(model: str, parameters: list[float], value: float) -> float:
     if model == "quadratic":
         c = parameters[2] if len(parameters) > 2 else 0.0
         return a * value * value + b * value + c
+    if model in {"power", "power_offset"} and value == 0 and b < 0:
+        return math.inf
     if model == "power":
         return a * (abs(value) ** b) * (1.0 if value >= 0 else -1.0)
     if model == "power_offset":
@@ -133,7 +142,7 @@ def _sse(rows: list[dict[str, Any]], model: str, parameters: list[float]) -> flo
             return math.inf
         try:
             prediction = _predict(model, parameters, float(row["simulated"]))
-        except (OverflowError, ValueError):
+        except (OverflowError, ValueError, ZeroDivisionError):
             return math.inf
         if not math.isfinite(prediction):
             return math.inf
@@ -183,6 +192,8 @@ def _residuals(rows: list[dict[str, Any]], model: str, parameters: list[float]) 
     errors = []
     for row in rows:
         prediction = _predict(model, parameters, float(row["simulated"]))
+        if not math.isfinite(prediction):
+            raise ValueError("calibration model produced a non-finite prediction; use positive simulated values")
         errors.append(prediction - float(row["measured"]))
     if not errors:
         return {"n": 0, "rmse": None, "mae": None, "maxAbs": None, "meanError": None}
@@ -206,6 +217,8 @@ def fit_rows(rows: list[dict[str, Any]], model: str, method: str) -> dict[str, A
     validation = [row for row in rows if row["split"] == "validation"]
     if not train:
         raise ValueError("calibration requires at least one training row")
+    if model == "power" and any(row["simulated"] <= 0 for row in train + validation):
+        raise ValueError("power calibration requires positive simulated values; use power_offset or scale_offset for zero points")
     if MODELS[model]["method"] == "linear" and method == "least-squares":
         parameters = _least_squares(train, model)
         iterations = 0

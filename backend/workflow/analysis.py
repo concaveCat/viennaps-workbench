@@ -108,6 +108,7 @@ def snapshot_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
         "bounds": bounds,
         "materialMeasures": {key: round(value, 9) for key, value in sorted(measures.items())},
         "measureKind": measure_kind,
+        "connectivityHash": hashlib.sha256(json.dumps({"lines": lines, "triangles": triangles}, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),
         "surfaceBounds": snapshot.get("surfaceBounds"),
         "materialTops": snapshot.get("materialTops"),
         "measuredGeometry": snapshot.get("measuredGeometry"),
@@ -133,19 +134,29 @@ def _bounds_delta(left: list[Any], right: list[Any]) -> float:
     return max((abs(float(a) - float(b)) for a, b in zip(left, right)), default=0.0)
 
 
-def compare_snapshots(left: dict[str, Any], right: dict[str, Any], tolerance: float) -> dict[str, Any]:
+def compare_snapshots(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    tolerance: float,
+    material_tolerance: float | None = None,
+) -> dict[str, Any]:
     left_summary = snapshot_summary(left)
     right_summary = snapshot_summary(right)
+    is_3d = left_summary["dimension"] == 3 or right_summary["dimension"] == 3
+    effective_material_tolerance = material_tolerance if material_tolerance is not None else (tolerance * tolerance if is_3d else tolerance)
     reasons: list[str] = []
-    if left_summary["digest"] == right_summary["digest"]:
+    if left_summary["digest"] == right_summary["digest"] and left_summary["connectivityHash"] == right_summary["connectivityHash"]:
         status = "identical"
     else:
         topology_equal = all(
             left_summary[key] == right_summary[key]
             for key in ("dimension", "topology", "pointCount", "lineCount", "triangleCount")
         )
+        connectivity_equal = left_summary["connectivityHash"] == right_summary["connectivityHash"]
         if not topology_equal:
             reasons.append("snapshot topology or element counts differ")
+        if not connectivity_equal:
+            reasons.append("snapshot line/triangle connectivity differs")
         max_delta = _max_point_delta(left, right)
         bounds_delta = _bounds_delta(left_summary["bounds"], right_summary["bounds"])
         if max_delta is not None and max_delta > tolerance:
@@ -157,9 +168,9 @@ def compare_snapshots(left: dict[str, Any], right: dict[str, Any], tolerance: fl
             for key in sorted(set(left_summary["materialMeasures"]) | set(right_summary["materialMeasures"]))
         }
         for key, delta in material_delta.items():
-            if abs(delta) > tolerance:
-                reasons.append(f"material {key} measure delta {delta:.6g} exceeds tolerance")
-        status = "within_tolerance" if topology_equal and not reasons else "different"
+            if abs(delta) > effective_material_tolerance:
+                reasons.append(f"material {key} measure delta {delta:.6g} exceeds material tolerance {effective_material_tolerance:.6g}")
+        status = "within_tolerance" if topology_equal and connectivity_equal and not reasons else "different"
     material_delta = {
         key: round(right_summary["materialMeasures"].get(key, 0.0) - left_summary["materialMeasures"].get(key, 0.0), 9)
         for key in sorted(set(left_summary["materialMeasures"]) | set(right_summary["materialMeasures"]))
@@ -175,6 +186,7 @@ def compare_snapshots(left: dict[str, Any], right: dict[str, Any], tolerance: fl
         "left": left_summary,
         "right": right_summary,
         "tolerance": tolerance,
+        "materialTolerance": effective_material_tolerance,
     }
 
 
@@ -227,7 +239,8 @@ def process_window(document: dict[str, Any], lower: float, upper: float) -> dict
     for row in rows:
         mean, ci = _number(row.get("mean")), _number(row.get("ci95"))
         margin = None if mean is None else min(mean - lower, upper - mean)
-        if mean is None:
+        n = row.get("n")
+        if mean is None or n is None or int(n) < 2 or ci is None:
             status = "not_evaluated"
         elif ci is not None and (mean + ci < lower or mean - ci > upper):
             status = "fail"
@@ -240,7 +253,7 @@ def process_window(document: dict[str, Any], lower: float, upper: float) -> dict
         classified.append({
             "ordinal": row.get("ordinal"), "variantId": row.get("variantId"),
             "parameters": row.get("parameters") or {}, "mean": mean, "ci95": ci,
-            "n": row.get("n"), "status": status,
+            "n": row.get("n"), "statisticalStatus": row.get("statisticalStatus"), "status": status,
             "margin": margin, "unit": row.get("unit"),
         })
     passing = [row for row in classified if row["status"] == "pass"]
@@ -336,52 +349,71 @@ def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
     route = None
     segment = None
     compile = None
-    if run_id:
-        run_dir = storage.run_path(str(run_id))
-        manifest = storage.read_json(run_dir / "manifest.json")
-        if not step_id:
-            listed = manifest.get("snapshots") or []
-            step_id = listed[-1].get("stepId") if listed else None
+    binding = None
+    measurement_id = request.get("measurementId")
+    replicate_ref = None
     if experiment and not run_id:
         for variant in experiment.get("variants") or []:
             replicate = (variant.get("replicates") or [{}])[0]
             if replicate.get("runId"):
                 run_id = replicate["runId"]
-                step_id = step_id or replicate.get("throughStepId")
-                if not step_id and replicate.get("segmentId"):
-                    try:
-                        step_id = store.get_segment(replicate["segmentId"]).throughStepId
-                    except Exception:
-                        step_id = None
+                replicate_ref = replicate
                 measurement = replicate
                 break
-    if experiment and not step_id:
-        for variant in experiment.get("variants") or []:
-            replicate = (variant.get("replicates") or [{}])[0]
-            if replicate.get("segmentId"):
-                try:
-                    segment = store.get_segment(replicate["segmentId"])
-                    step_id = segment.throughStepId
-                    route = store.get_plan(segment.attemptId and store.get_attempt(segment.attemptId).routeId or "")
-                except Exception:
-                    pass
-                break
-    if run_id and manifest is None:
+    if run_id:
         run_dir = storage.run_path(str(run_id))
         manifest = storage.read_json(run_dir / "manifest.json")
+        try:
+            segment = store.get_segment_by_run_id(str(run_id))
+        except Exception:
+            segment = None
+        if segment is not None:
+            step_id = step_id or segment.throughStepId
+            try:
+                compile = store.get_compile(segment.sourceCompileId)
+                route = store.get_plan(store.get_attempt(segment.attemptId).routeId)
+            except Exception:
+                pass
         if not step_id:
             listed = manifest.get("snapshots") or []
             step_id = listed[-1].get("stepId") if listed else None
+    if experiment and not measurement:
+        for variant in experiment.get("variants") or []:
+            for replicate in variant.get("replicates") or []:
+                if run_id and replicate.get("runId") != run_id:
+                    continue
+                if replicate.get("measurementId"):
+                    measurement = replicate
+                    break
+            if measurement:
+                break
+    if measurement_id:
+        measurement = measurement_id
+    if measurement and isinstance(measurement, dict):
+        measurement = measurement.get("measurementId")
+    if isinstance(measurement, str):
+        try:
+            measurement = store.get_measurement(measurement)
+        except Exception:
+            measurement = None
+    elif measurement is not None and not hasattr(measurement, "measurementId"):
+        measurement = None
+    if measurement is None and run_id:
+        try:
+            listed = store.list_measurements(run_id=str(run_id))
+            measurement = listed[0] if listed else None
+        except Exception:
+            measurement = None
+    if measurement is not None:
+        try:
+            provenance = store.list_verifications(measurement.measurementId)
+        except Exception:
+            provenance = None
     if experiment and experiment.get("baseCompileId"):
         try:
             compile = store.get_compile(experiment["baseCompileId"])
         except Exception:
-            compile = None
-    if experiment and measurement and measurement.get("measurementId"):
-        try:
-            measurement = store.get_measurement(measurement["measurementId"])
-        except Exception:
-            measurement = None
+            pass
     if experiment and experiment.get("binding"):
         binding = experiment["binding"]
     elif compile:
@@ -389,8 +421,6 @@ def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
             binding = store.get_binding(compile.compileRecord.geometryBindingId).model_dump(mode="json", exclude_none=True)
         except Exception:
             binding = None
-    else:
-        binding = None
     sections = []
     sections.append("<h2>流程 / Compile</h2>")
     if compile:
@@ -401,6 +431,14 @@ def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
         sections.append("<tr><th>variables</th><td><code>%s</code></td></tr>" % _escape(json.dumps(record.get("variableSet") or [], sort_keys=True)))
         sections.append("<tr><th>seed policy</th><td>%s</td></tr>" % _escape(record.get("seedPolicy")))
         sections.append("</table>")
+        factors = (experiment or {}).get("design", {}).get("factors") or []
+        if factors:
+            sections.append("<h3>Experiment factors</h3><table><tr><th>step</th><th>parameter</th><th>values</th></tr>")
+            for factor in factors:
+                sections.append("<tr><td><code>%s</code></td><td>%s</td><td>%s</td></tr>" % (
+                    _escape(factor.get("stepId")), _escape(factor.get("parameter")),
+                    _escape(json.dumps(factor.get("values") or []))))
+            sections.append("</table>")
         sections.append("<h3>Steps</h3><table><tr><th>#</th><th>stepId</th><th>authored</th><th>path</th></tr>")
         for index, entry in enumerate(compile.sourceMap):
             sections.append("<tr><td>%s</td><td><code>%s</code></td><td>%s</td><td>%s</td></tr>" % (
@@ -440,12 +478,23 @@ def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
     if run_id:
         sections.append("<p>run <code>%s</code> · step <code>%s</code></p>" % (_escape(run_id), _escape(step_id)))
     if measurement:
-        sections.append("<table><tr><th>metric</th><td>%s</td></tr>" % _escape(getattr(measurement, "metricId", "")))
-        sections.append("<tr><th>method</th><td>%s</td></tr>" % _escape(getattr(measurement, "method", "")))
+        sections.append("<table><tr><th>measurement</th><td><code>%s</code></td></tr>" % _escape(getattr(measurement, "measurementId", "")))
+        sections.append("<tr><th>metric</th><td>%s</td></tr>" % _escape(getattr(measurement, "metricId", "")))
+        sections.append("<tr><th>recipe</th><td>%s v%s</td></tr>" % (_escape(getattr(measurement, "recipeId", "")), _escape(getattr(measurement, "recipeVersion", ""))))
+        sections.append("<tr><th>method</th><td>%s · %s</td></tr>" % (_escape(getattr(measurement, "method", "")), _escape(getattr(measurement, "material", ""))))
         sections.append("<tr><th>value</th><td>%s %s</td></tr>" % (_escape(getattr(measurement, "value", None)), _escape(getattr(measurement, "unit", ""))))
+        sections.append("<tr><th>source snapshot</th><td><code>%s</code></td></tr>" % _escape(getattr(measurement, "sourceSnapshotHash", "")))
         sections.append("<tr><th>binding</th><td>%s</td></tr>" % _escape(getattr(measurement, "bindingStatus", "")))
         sections.append("<tr><th>equivalence</th><td>%s</td></tr>" % _escape(getattr(measurement, "equivalenceStatus", "")))
         sections.append("</table>")
+        if provenance:
+            sections.append("<h3>Evidence / Provenance</h3><table><tr><th>verification</th><th>status</th><th>method</th></tr>")
+            for row in provenance:
+                sections.append("<tr><td><code>%s</code></td><td>%s</td><td>%s</td></tr>" % (
+                    _escape(row.verificationId), _escape(row.status), _escape(row.methodVersion)))
+            sections.append("</table>")
+    else:
+        sections.append('<p class="muted">No measurement selected.</p>')
     if experiment:
         sections.append("<h2>实验 / 统计</h2>")
         sections.append("<p>%s · %s · %s conditions</p>" % (
@@ -454,10 +503,11 @@ def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
         aggregation = experiment.get("aggregation") or {}
         rows = aggregation.get("rows") or []
         if rows:
-            sections.append("<table><tr><th>#</th><th>n</th><th>mean</th><th>std</th><th>CI95</th><th>status</th></tr>")
+            sections.append("<table><tr><th>#</th><th>parameters</th><th>n</th><th>mean</th><th>std</th><th>CI95</th><th>status</th></tr>")
             for row in rows:
-                sections.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
-                    _escape(row.get("ordinal")), _escape(row.get("n")), _escape(row.get("mean")),
+                sections.append("<tr><td>%s</td><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+                    _escape(row.get("ordinal")), _escape(json.dumps(row.get("parameters") or {}, sort_keys=True)),
+                    _escape(row.get("n")), _escape(row.get("mean")),
                     _escape(row.get("std")), _escape(row.get("ci95")), _escape(row.get("statisticalStatus"))))
             sections.append("</table>")
             sections.append("<p class='muted'>CI method: %s</p>" % _escape(aggregation.get("ciMethod")))
