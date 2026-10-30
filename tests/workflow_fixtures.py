@@ -110,22 +110,31 @@ def compiled_2d() -> CompiledWorkflowV1:
 
 
 def compiled_2d_zero() -> CompiledWorkflowV1:
+    return _compiled_zero(1)
+
+
+def compiled_2d_zero_two() -> CompiledWorkflowV1:
+    return _compiled_zero(2)
+
+
+def _compiled_zero(count: int) -> CompiledWorkflowV1:
+    steps = [{
+        "id": f"step_zero_{index:02d}",
+        "name": f"no-op {index + 1}",
+        "enabled": True,
+        "operation": "etch",
+        "model": "isotropic",
+        "rateMagnitude": 0.0,
+        "duration": 0.01,
+        "rateMode": "uniform",
+    } for index in range(count)]
     return compile_flow(
         FlowRevisionV1(
             schemaVersion=1,
-            flowId="flow_zero_2d_01",
+            flowId="flow_zero_2d_01" if count == 1 else "flow_zero_2d_02",
             revision=1,
             name="zero-rate 2D flow",
-            steps=[{
-                "id": "step_zero_01",
-                "name": "no-op",
-                "enabled": True,
-                "operation": "etch",
-                "model": "isotropic",
-                "rateMagnitude": 0.0,
-                "duration": 0.01,
-                "rateMode": "uniform",
-            }],
+            steps=steps,
             solver=_solver(),
         ),
         _binding_2d(),

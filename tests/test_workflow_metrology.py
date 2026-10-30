@@ -40,6 +40,7 @@ def recipe(
     parameters: dict | None = None,
     material: str = "Si",
     region: RegionV1 | None = None,
+    dimension: int = 2,
 ) -> MetrologyRecipeV1:
     return MetrologyRecipeV1(
         schemaVersion=1,
@@ -47,7 +48,7 @@ def recipe(
         version=version,
         metricId=metric_id,
         name="metrology recipe",
-        dimension=2,
+        dimension=dimension,
         method=method,
         parameters=parameters or {"kind": "cd_at_height", "height": -1.0, "pairSelection": "outermost"},
         material=material,
@@ -192,6 +193,32 @@ class MetrologyAlgorithmTests(unittest.TestCase):
         self.assertEqual(result.status, "measured")
         self.assertAlmostEqual(result.value, 2000.0)
         self.assertEqual(result.unit, "nm")
+
+    def test_3d_material_top_depth(self):
+        snapshot_3d = {
+            "dimension": 3,
+            "axisMap": {"x": 0, "y": 1, "z": 2},
+            "coordinateUnit": "um",
+            "gridDelta": 0.1,
+            "points": [],
+            "lines": [],
+            "cellData": {"materialIds": []},
+            "materials": {"10": {"name": "Si"}},
+            "materialTops": {"Si": {"medianTopHeight": 0.04, "topHeight": 0.05}},
+        }
+        result = measure_snapshot(
+            recipe(
+                recipe_id="recipe_3d",
+                metric_id="metric_3d",
+                dimension=3,
+                method="etch_depth",
+                parameters={"kind": "etch_depth", "x": 0, "referenceHeight": 0.1},
+            ),
+            metric(metric_id="metric_3d"),
+            snapshot_3d,
+        )
+        self.assertEqual(result.status, "measured")
+        self.assertAlmostEqual(result.value, 0.06)
 
     def test_real_historical_snapshot_is_content_hashed(self):
         snapshot_data = json.loads(REAL_SNAPSHOT.read_text(encoding="utf-8"))

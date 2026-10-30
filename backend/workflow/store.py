@@ -23,6 +23,7 @@ from .models import CompiledWorkflowV1
 from .provenance import VerificationRecordV1
 from .routes import (
     AttemptV1,
+    CheckpointRefV1,
     RoutePlanV1,
     SegmentRefV1,
     SegmentReuseV1,
@@ -1166,7 +1167,46 @@ class WorkflowStore:
             "reuse": [SegmentReuseV1.model_validate(self._reuse_payload(row)) for row in reuse],
         }
 
+    def _reconcile_segment(self, segment_id: str) -> None:
+        from .. import storage
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM segments WHERE segment_id = ?", (segment_id,)
+            ).fetchone()
+        if row is None or row["status"] != "running" or not row["run_id"]:
+            return
+        try:
+            run_dir = storage.run_path(row["run_id"])
+            manifest = storage.read_json(run_dir / "manifest.json")
+        except (FileNotFoundError, OSError, ValueError):
+            return
+        status = manifest.get("status")
+        if status not in {"succeeded", "failed", "cancelled", "timed_out", "interrupted"}:
+            return
+        end_checkpoint = None
+        snapshot = next((item for item in manifest.get("snapshots", []) if item.get("stepId") == row["through_step_id"]), None)
+        state = None if snapshot is None else snapshot.get("nativeState")
+        if isinstance(state, dict) and state.get("stateId"):
+            end_checkpoint = CheckpointRefV1(
+                checkpointId=f"cp_{row['run_id']}_{row['through_step_id']}",
+                runId=row["run_id"],
+                stepId=row["through_step_id"],
+                stateHash=state["stateId"],
+            )
+        terminal = "failed" if status == "timed_out" else status
+        if terminal == "succeeded" and end_checkpoint is None:
+            terminal = "failed"
+        self.finish_segment(
+            segment_id,
+            terminal,
+            end_checkpoint,
+            provenance_input_hash=manifest.get("requestedInputHash"),
+            execution_hash=manifest.get("executionHash"),
+        )
+
     def get_segment(self, segment_id: str) -> SegmentV1:
+        self._reconcile_segment(segment_id)
         with self._connect() as connection:
             row = connection.execute("SELECT * FROM segments WHERE segment_id = ?", (segment_id,)).fetchone()
         if row is None:
@@ -1214,7 +1254,24 @@ class WorkflowStore:
             segment_runs = {row["run_id"] for row in connection.execute("SELECT run_id FROM segments WHERE run_id IS NOT NULL")}
             measurement_runs = {row["source_run_id"] for row in connection.execute("SELECT source_run_id FROM measurements WHERE source_run_id IS NOT NULL")}
             pins = {row["artifact_id"] for row in connection.execute("SELECT artifact_id FROM artifact_pins")}
-        referenced = segment_runs | measurement_runs | pins
+            checkpoint_runs: set[str] = set()
+            for row in connection.execute("SELECT start_checkpoint_json, end_checkpoint_json FROM segments"):
+                for raw in row:
+                    if raw:
+                        try:
+                            run_id = json.loads(raw).get("runId")
+                            if isinstance(run_id, str):
+                                checkpoint_runs.add(run_id)
+                        except (ValueError, TypeError):
+                            pass
+            for row in connection.execute("SELECT base_checkpoint_json FROM attempts WHERE base_checkpoint_json IS NOT NULL"):
+                try:
+                    run_id = json.loads(row["base_checkpoint_json"]).get("runId")
+                    if isinstance(run_id, str):
+                        checkpoint_runs.add(run_id)
+                except (ValueError, TypeError):
+                    pass
+        referenced = segment_runs | measurement_runs | checkpoint_runs | pins
         candidates = []
         for path in sorted(storage.RUNS.iterdir()) if storage.RUNS.is_dir() else []:
             if not path.is_dir() or path.name in referenced:
@@ -1233,6 +1290,29 @@ class WorkflowStore:
     def unpin_artifact(self, artifact_id: str) -> None:
         with self._connect() as connection:
             connection.execute("DELETE FROM artifact_pins WHERE artifact_id = ?", (artifact_id,))
+
+    def resolve_segment_start(self, segment_id: str) -> None:
+        """Fill a successor's start checkpoint from its verified predecessor."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT attempt_id, start_after_step_id, start_checkpoint_json FROM segments WHERE segment_id = ?",
+                (segment_id,),
+            ).fetchone()
+            if row is None:
+                raise WorkflowNotFound(f"segment {segment_id!r} does not exist")
+            if row["start_after_step_id"] is None or row["start_checkpoint_json"] is not None:
+                return
+            predecessor = connection.execute(
+                "SELECT end_checkpoint_json FROM segments WHERE attempt_id = ? AND through_step_id = ? AND end_checkpoint_json IS NOT NULL ORDER BY rowid DESC LIMIT 1",
+                (row["attempt_id"], row["start_after_step_id"]),
+            ).fetchone()
+            if predecessor is None:
+                raise WorkflowConflict("continued Segment has no successful predecessor checkpoint")
+            connection.execute(
+                "UPDATE segments SET start_checkpoint_json = ? WHERE segment_id = ?",
+                (predecessor["end_checkpoint_json"], segment_id),
+            )
 
     def mark_segment_started(self, segment_id: str, run_id: str, segment_project_hash: str) -> None:
         now = self._now()
@@ -1259,6 +1339,9 @@ class WorkflowStore:
         segment_id: str,
         status: str,
         end_checkpoint: CheckpointRefV1 | None,
+        *,
+        provenance_input_hash: str | None = None,
+        execution_hash: str | None = None,
     ) -> None:
         if status not in {"succeeded", "failed", "cancelled", "interrupted"}:
             raise WorkflowConflict(f"invalid terminal segment status {status!r}")
@@ -1271,9 +1354,14 @@ class WorkflowStore:
             if row is None:
                 raise WorkflowNotFound(f"segment {segment_id!r} does not exist")
             connection.execute(
-                "UPDATE segments SET status = ?, end_checkpoint_json = ?, updated_at = ? WHERE segment_id = ?",
-                (status, self._checkpoint_value(None if end_checkpoint is None else end_checkpoint.model_dump(mode="json")), now, segment_id),
+                "UPDATE segments SET status = ?, end_checkpoint_json = ?, provenance_input_hash = COALESCE(?, provenance_input_hash), execution_hash = COALESCE(?, execution_hash), updated_at = ? WHERE segment_id = ?",
+                (status, self._checkpoint_value(None if end_checkpoint is None else end_checkpoint.model_dump(mode="json")), provenance_input_hash, execution_hash, now, segment_id),
             )
+            if end_checkpoint is not None:
+                connection.execute(
+                    "UPDATE segments SET start_checkpoint_json = ? WHERE attempt_id = ? AND start_after_step_id = ? AND start_checkpoint_json IS NULL AND segment_id != ?",
+                    (self._checkpoint_value(end_checkpoint.model_dump(mode="json")), row["attempt_id"], end_checkpoint.stepId, segment_id),
+                )
             attempt_id = row["attempt_id"]
             statuses = [item["status"] for item in connection.execute(
                 "SELECT status FROM segments WHERE attempt_id = ?",

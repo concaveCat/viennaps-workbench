@@ -34,6 +34,17 @@ class EquivalenceTests(unittest.TestCase):
         self.assertEqual(result.status, "failed")
         self.assertTrue(result.reasons)
 
+    def test_connectivity_axis_and_unit_mismatch_fail(self):
+        for mutate in (
+            lambda data: data["lines"].reverse(),
+            lambda data: data["axisMap"].update({"h": 2}),
+            lambda data: data.update({"coordinateUnit": "nm"}),
+        ):
+            left, right = trench(), trench()
+            mutate(right)
+            result = compare_snapshots(protocol(0.02), left, right)
+            self.assertEqual(result.status, "failed")
+
     def test_material_mismatch_fails(self):
         left = trench()
         right = trench()

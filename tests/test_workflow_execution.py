@@ -11,7 +11,9 @@ os.environ.setdefault("WORKBENCH_PORT", "8767")
 
 from backend.main import app  # noqa: E402
 from tests.test_api_integration import asgi_request, json_body  # noqa: E402
-from tests.workflow_fixtures import binding_plan_2d, compiled_2d_zero  # noqa: E402
+from backend.workflow.routes import AttemptV1, RoutePlanV1, RouteV1, SegmentV1  # noqa: E402
+from backend.workflow.hashing import full_project_hash  # noqa: E402
+from tests.workflow_fixtures import binding_plan_2d, compiled_2d_zero, compiled_2d_zero_two  # noqa: E402
 
 
 class WorkflowExecutionTests(unittest.IsolatedAsyncioTestCase):
@@ -69,6 +71,72 @@ class WorkflowExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(segment["endCheckpointRef"])
         self.assertEqual(segment["endCheckpointRef"]["stepId"], segment["throughStepId"])
         self.assertRegex(segment["segmentProjectHash"], r"^[a-f0-9]{64}$")
+
+
+    async def test_two_segment_continuation_resolves_checkpoint(self):
+        compiled = compiled_2d_zero_two()
+        registered = await asgi_request(
+            "/api/v1/workflow/compiles",
+            method="POST",
+            payload=compiled.model_dump(mode="json", exclude_none=True),
+        )
+        self.assertEqual(registered[0], 201, registered[2])
+        suffix = uuid.uuid4().hex[:6]
+        step_ids = [step.id for step in compiled.project.steps]
+        attempt = AttemptV1(
+            attemptId=f"twoA{suffix}", routeId=f"twoR{suffix}",
+            compileId=compiled.compileRecord.compileId, submissionKey=f"twoS{suffix}",
+            startAfterStepId=None, throughStepId=step_ids[-1],
+            seedPolicy="shared-run-seed", runSeed=compiled.project.solver.random.seed,
+            flowDigest=compiled.compileRecord.fullProjectHash, status="planned",
+        )
+        s1 = SegmentV1(
+            segmentId=f"twoS{suffix}1", attemptId=attempt.attemptId,
+            sourceCompileId=compiled.compileRecord.compileId,
+            segmentProjectHash=full_project_hash(compiled.project),
+            startAfterStepId=None, throughStepId=step_ids[0],
+            startCheckpointRef=None, endCheckpointRef=None,
+            runId=f"twoR{suffix}1", provenanceInputHash="0" * 64,
+            flowDigest=compiled.compileRecord.fullProjectHash,
+            executionHash="0" * 64, status="planned",
+        )
+        s2 = SegmentV1(
+            segmentId=f"twoS{suffix}2", attemptId=attempt.attemptId,
+            sourceCompileId=compiled.compileRecord.compileId,
+            segmentProjectHash=full_project_hash(compiled.project),
+            startAfterStepId=step_ids[0], throughStepId=step_ids[1],
+            startCheckpointRef=None, endCheckpointRef=None,
+            runId=f"twoR{suffix}2", provenanceInputHash="0" * 64,
+            flowDigest=compiled.compileRecord.fullProjectHash,
+            executionHash="0" * 64, status="planned",
+        )
+        plan = RoutePlanV1(
+            route=RouteV1(routeId=attempt.routeId, flowId="flow_zero_2d_02", name="two segment", headAttemptId=attempt.attemptId),
+            stepOrder=step_ids, attempts=[attempt], segments=[s1, s2], reuse=[],
+        )
+        created = await asgi_request("/api/v1/workflow/routes", method="POST", payload=plan.model_dump(mode="json", exclude_none=True))
+        self.assertEqual(created[0], 201, created[2])
+
+        async def run_and_wait(segment_id: str):
+            started = await asgi_request(f"/api/v1/workflow/segments/{segment_id}/execute", method="POST", payload={})
+            self.assertEqual(started[0], 200, started[2])
+            deadline = asyncio.get_running_loop().time() + 30.0
+            while asyncio.get_running_loop().time() < deadline:
+                response = await asgi_request(f"/api/v1/workflow/segments/{segment_id}")
+                self.assertEqual(response[0], 200, response[2])
+                body = json_body(response)
+                if body["status"] in {"succeeded", "failed", "cancelled", "interrupted"}:
+                    return body
+                await asyncio.sleep(0.2)
+            self.fail("segment did not finish")
+
+        first = await run_and_wait(s1.segmentId)
+        self.assertEqual(first["status"], "succeeded", first)
+        second = await asgi_request(f"/api/v1/workflow/segments/{s2.segmentId}")
+        self.assertEqual(second[0], 200, second[2])
+        self.assertIsNotNone(json_body(second)["startCheckpointRef"])
+        final = await run_and_wait(s2.segmentId)
+        self.assertEqual(final["status"], "succeeded", final)
 
     async def test_execute_rejects_non_planned_segment(self):
         started = await asgi_request(

@@ -61,7 +61,7 @@ class MetrologyRecipeV1(StrictModel):
     version: Annotated[int, Field(ge=1)]
     metricId: Id
     name: Annotated[str, Field(min_length=1, max_length=80)]
-    dimension: Literal[2]
+    dimension: Literal[2, 3]
     method: Literal["cd_at_height", "etch_depth"]
     parameters: MetrologyParametersV1
     material: Annotated[str, Field(min_length=1, max_length=80)]
@@ -127,6 +127,8 @@ def snapshot_content_hash(snapshot: dict[str, Any]) -> str:
         "lines": snapshot.get("lines"),
         "cellData": snapshot.get("cellData"),
         "materials": snapshot.get("materials"),
+        "materialTops": snapshot.get("materialTops"),
+        "measuredRemoval": snapshot.get("measuredRemoval"),
     }
     return sha256_hex(payload)
 
@@ -208,11 +210,40 @@ def measure_snapshot(
 
     if recipe.metricId != metric.metricId:
         raise ValueError("recipe metricId does not match the metric definition")
+    if snapshot.get("dimension") == 3:
+        if recipe.dimension != 3 or recipe.method != "etch_depth":
+            return _result(
+                recipe, metric, snapshot,
+                source_run_id=source_run_id, source_step_id=source_step_id, source_state_id=source_state_id,
+                status="unsupported_dimension", reason="3D metrology v1 supports material top-height depth only",
+            )
+        tops = snapshot.get("materialTops") or {}
+        top = tops.get(recipe.material)
+        if not isinstance(top, dict):
+            return _result(
+                recipe, metric, snapshot,
+                source_run_id=source_run_id, source_step_id=source_step_id, source_state_id=source_state_id,
+                status="material_not_found", reason=f"material {recipe.material!r} has no 3D top-height summary",
+            )
+        height = top.get("medianTopHeight", top.get("topHeight"))
+        if not isinstance(height, (int, float)):
+            return _result(
+                recipe, metric, snapshot,
+                source_run_id=source_run_id, source_step_id=source_step_id, source_state_id=source_state_id,
+                status="no_intersection", reason="3D material top-height summary has no finite height",
+            )
+        assert isinstance(recipe.parameters, EtchDepthParametersV1)
+        depth = recipe.parameters.referenceHeight - float(height)
+        return _result(
+            recipe, metric, snapshot,
+            source_run_id=source_run_id, source_step_id=source_step_id, source_state_id=source_state_id,
+            status="measured", value=_convert(depth, metric.unit), intersections=[float(height)],
+        )
     if snapshot.get("dimension") != 2:
         return _result(
             recipe, metric, snapshot,
             source_run_id=source_run_id, source_step_id=source_step_id, source_state_id=source_state_id,
-            status="unsupported_dimension", reason="P0-3 metrology supports 2D snapshots only",
+            status="unsupported_dimension", reason="P0-3 metrology supports 2D and 3D-depth snapshots only",
         )
     if snapshot.get("coordinateUnit") != "um":
         return _result(

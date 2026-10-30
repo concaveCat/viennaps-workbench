@@ -44,6 +44,16 @@ def compare_snapshots(protocol: ComparisonProtocolV1, left: dict[str, Any], righ
         reasons.append("P0 equivalence supports 2D snapshots only")
     if left.get("topology") != right.get("topology"):
         reasons.append("topology differs")
+    if left.get("axisMap") != right.get("axisMap"):
+        reasons.append("axisMap differs")
+    if left.get("coordinateUnit") != right.get("coordinateUnit"):
+        reasons.append("coordinateUnit differs")
+    if left.get("gridDelta") != right.get("gridDelta"):
+        reasons.append("gridDelta differs")
+    if left.get("lines") != right.get("lines"):
+        reasons.append("line connectivity differs")
+    if left.get("materials") != right.get("materials"):
+        reasons.append("material catalog differs")
     left_points = left.get("points") or []
     right_points = right.get("points") or []
     if len(left_points) != len(right_points):

@@ -293,3 +293,38 @@ button, input { font: inherit; }
   .wf-run { grid-column: auto; }
   .wf-card { min-height: auto; }
 }
+
+.wf-legacy {
+  margin-left: 8px;
+  border: 1px solid var(--wf-line);
+  background: transparent;
+  color: var(--wf-muted);
+  border-radius: 7px;
+  padding: 5px 9px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.wf-legacy:hover { color: var(--wf-teal); border-color: var(--wf-teal-dim); }
+
+.wf-zone-nav {
+  display: flex;
+  gap: 6px;
+  margin-top: 18px;
+  padding: 5px;
+  border: 1px solid var(--wf-line);
+  border-radius: 10px;
+  background: rgba(8, 20, 33, 0.72);
+  width: fit-content;
+}
+.wf-zone-nav button {
+  border: 0;
+  background: transparent;
+  color: var(--wf-muted);
+  border-radius: 7px;
+  padding: 7px 11px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.wf-zone-nav button.active { background: var(--wf-teal); color: #04211e; font-weight: 650; }
+.wf-hidden { display: none; }
+.wf-wide { grid-column: 1 / -1; min-height: 220px; }

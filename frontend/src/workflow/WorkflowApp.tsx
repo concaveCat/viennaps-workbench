@@ -84,7 +84,7 @@ function postJson<T>(path: string, body: unknown): Promise<T> {
   });
 }
 
-export default function WorkflowApp() {
+export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => void }) {
   const [health, setHealth] = useState<Health | null>(null);
   const [gds, setGds] = useState<GdsAsset | null>(null);
   const [project, setProject] = useState<{ name?: string; dimension?: number; steps?: ProjectStep[]; geometry?: { kind?: string; assetId?: string } } | null>(null);
@@ -94,6 +94,7 @@ export default function WorkflowApp() {
   const [measurement, setMeasurement] = useState<Measurement | null>(null);
   const [provenance, setProvenance] = useState<Provenance | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const [zone, setZone] = useState<'setup' | 'flow' | 'run' | 'experiment' | 'analyze' | 'report'>('setup');
   const [error, setError] = useState('');
   const gdsInput = useRef<HTMLInputElement>(null);
   const projectInput = useRef<HTMLInputElement>(null);
@@ -200,9 +201,10 @@ export default function WorkflowApp() {
     await postJson('/api/v1/workflow/metrics', {
       schemaVersion: 1, metricId, name: 'P0 CD / depth', unit: 'um', description: 'workflow UI default recipe',
     });
+    const dimension = compile?.dimension ?? 2;
     await postJson('/api/v1/workflow/metrology-recipes', {
-      schemaVersion: 1, recipeId, version: 1, metricId, name: 'P0 depth at x=0', dimension: 2,
-      method: 'etch_depth', parameters: { kind: 'etch_depth', x: 0, referenceHeight: 0 },
+      schemaVersion: 1, recipeId, version: 1, metricId, name: 'P0 depth', dimension,
+      method: 'etch_depth', parameters: { kind: 'etch_depth', x: 0, referenceHeight: dimension === 3 ? 0.1 : 0 },
       material: 'Si',
     });
     const result = await postJson<Measurement>('/api/v1/workflow/measurements/from-run', {
@@ -227,13 +229,21 @@ export default function WorkflowApp() {
           <span className={health?.status === 'ok' ? 'wf-dot ok' : 'wf-dot'} />
           {health?.status === 'ok' ? '本机服务已连接' : '服务未连接'}
           {health?.activeRunId && <code>{health.activeRunId.slice(0, 8)}</code>}
+          {onOpenLegacy && <button type="button" className="wf-legacy" onClick={onOpenLegacy}>传统工作区</button>}
         </div>
       </header>
 
       {error && <div className="wf-error">{error}</div>}
 
+      <nav className="wf-zone-nav" aria-label="Workflow zones">
+        {[
+          ['setup', '01 工程'], ['flow', '02 流程'], ['run', '03 运行'],
+          ['experiment', '04 实验'], ['analyze', '05 分析'], ['report', '06 报告'],
+        ].map(([id, label]) => <button key={id} className={zone === id ? 'active' : ''} onClick={() => setZone(id as typeof zone)}>{label}</button>)}
+      </nav>
+
       <main className="wf-grid">
-        <section className="wf-card wf-setup">
+        <section className={`wf-card wf-setup ${zone === 'setup' ? '' : 'wf-hidden'}`}>
           <div className="wf-card-head"><span>01</span><h2>工程接入</h2></div>
           <p className="wf-muted">先上传 GDS，再导入工程 JSON。工程里的 assetId 必须与上传文件一致。</p>
           <input ref={gdsInput} type="file" accept=".gds,.gdsii" hidden onChange={event => { const file = event.target.files?.[0]; if (file) void uploadGds(file); }} />
@@ -252,7 +262,7 @@ export default function WorkflowApp() {
           {compile && <div className="wf-summary success"><strong>Compile 已冻结</strong><span>{compile.stepCount} 步 · {compile.compileId.slice(0, 12)}…</span></div>}
         </section>
 
-        <section className="wf-card wf-flow">
+        <section className={`wf-card wf-flow ${zone === 'flow' ? '' : 'wf-hidden'}`}>
           <div className="wf-card-head"><span>02</span><h2>流程 / Route</h2></div>
           {!compile && <div className="wf-empty">采纳工程后显示编译后的步骤。</div>}
           {compile && <>
@@ -273,7 +283,7 @@ export default function WorkflowApp() {
           {route && <div className="wf-summary"><strong>{route.route.name}</strong><span>{route.segments.length} Segment · {route.stepOrder.length} Step · head {route.route.headAttemptId.slice(0, 10)}…</span></div>}
         </section>
 
-        <section className="wf-card wf-run">
+        <section className={`wf-card wf-run ${zone === 'run' ? '' : 'wf-hidden'}`}>
           <div className="wf-card-head"><span>03</span><h2>运行 / 测量</h2></div>
           {!segment && <div className="wf-empty">创建 Route 后可执行 Segment。</div>}
           {segment && <>
@@ -286,7 +296,7 @@ export default function WorkflowApp() {
             <button className="wf-button ghost" disabled={!canMeasure} onClick={() => void measure()}>
               {busy === 'measure' ? '测量中…' : '测量并绑定 Provenance'}
             </button>
-            {segment.status === 'succeeded' && <div className="wf-muted">运行完成后可测量；P0-3 计量当前只支持 2D 快照。</div>}
+            {segment.status === 'succeeded' && <div className="wf-muted">运行完成后可测量；2D 支持 CD/深度，3D 支持材料顶高深度。</div>}
           </>}
           {measurement && <div className="wf-summary">
             <strong>Measurement · {measurement.status}</strong>
@@ -298,6 +308,21 @@ export default function WorkflowApp() {
             {provenance.verifications.map(item => <div className="wf-verify" key={item.verificationId}><span className={`wf-status ${item.status}`}>{item.status}</span><code>{item.verificationId.slice(0, 10)}…</code><span>{item.evidence.methodVersion}</span></div>)}
           </div>}
         </section>
+        {zone === 'experiment' && <section className="wf-card wf-wide">
+          <div className="wf-card-head"><span>04</span><h2>Experiment</h2></div>
+          <p className="wf-muted">P0 的实验对象与队列尚未接入。当前可用 Route 的单次执行与 Measurement；DOE 将复用同一 Compile / Segment / Measurement 契约。</p>
+          <div className="wf-summary"><strong>当前可执行条件</strong><span>{compile ? `${compile.stepCount} 步已编译` : '尚未采纳工程'} · {segment ? segment.status : '无 Segment'}</span></div>
+        </section>}
+        {zone === 'analyze' && <section className="wf-card wf-wide">
+          <div className="wf-card-head"><span>05</span><h2>Analyze</h2></div>
+          <p className="wf-muted">分析区当前展示 Measurement 与 Provenance；数值等价独立于绑定状态。</p>
+          {measurement ? <div className="wf-summary"><strong>{measurement.status}</strong><span>{measurement.value === null ? measurement.reason : `${measurement.value.toFixed(4)} ${measurement.unit}`}</span><span>binding {measurement.bindingStatus} · equivalence {measurement.equivalenceStatus}</span></div> : <div className="wf-empty">完成一次运行与测量后显示指标。</div>}
+        </section>}
+        {zone === 'report' && <section className="wf-card wf-wide">
+          <div className="wf-card-head"><span>06</span><h2>Report</h2></div>
+          <p className="wf-muted">报告导出仍待实现；这里汇总本次工作流的可追溯对象。</p>
+          <div className="wf-summary"><strong>Workflow summary</strong><span>Flow {compile?.flowId ?? '—'}</span><span>Compile {compile?.compileId ?? '—'}</span><span>Run {segment?.runId ?? '—'}</span><span>Measurement {measurement?.measurementId ?? '—'}</span><span>Binding {measurement?.bindingStatus ?? '—'}</span></div>
+        </section>}
       </main>
 
       <footer className="wf-footer">

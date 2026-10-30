@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import unittest
+from pathlib import Path
 
 from backend.main import app
 
@@ -23,6 +25,9 @@ class WorkflowOpenApiTests(unittest.TestCase):
             self.assertIn(path, paths)
         self.assertIn("RoutePlanV1", schema["components"]["schemas"])
         self.assertIn("MeasurementResultV1", schema["components"]["schemas"])
+        static = json.loads((Path(__file__).resolve().parents[1] / "docs" / "workflow-openapi.json").read_text(encoding="utf-8"))
+        self.assertEqual(static["info"]["title"], schema["info"]["title"])
+        self.assertEqual(set(static["paths"]), set(paths))
 
 
 if __name__ == "__main__":

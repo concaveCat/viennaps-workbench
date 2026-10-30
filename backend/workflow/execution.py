@@ -72,9 +72,13 @@ def build_segment_project(store: WorkflowStore, segment_id: str) -> ProjectV7:
 
 def _finish_from_manifest(store: WorkflowStore, segment_id: str, run_id: str, status: str) -> None:
     end_checkpoint: CheckpointRefV1 | None = None
+    provenance_input_hash = None
+    execution_hash = None
     try:
         run_dir = storage.run_path(run_id)
         manifest = storage.read_json(run_dir / "manifest.json")
+        provenance_input_hash = manifest.get("requestedInputHash")
+        execution_hash = manifest.get("executionHash")
         segment = store.get_segment(segment_id)
         row = next((item for item in manifest.get("snapshots", []) if item.get("stepId") == segment.throughStepId), None)
         state = None if row is None else row.get("nativeState")
@@ -87,8 +91,16 @@ def _finish_from_manifest(store: WorkflowStore, segment_id: str, run_id: str, st
             )
     except (FileNotFoundError, OSError, ValueError):
         end_checkpoint = None
-    final_status = status if status != "succeeded" or end_checkpoint is not None else "failed"
-    store.finish_segment(segment_id, final_status, end_checkpoint)
+    final_status = "failed" if status == "timed_out" else status
+    if final_status == "succeeded" and end_checkpoint is None:
+        final_status = "failed"
+    store.finish_segment(
+        segment_id,
+        final_status,
+        end_checkpoint,
+        provenance_input_hash=provenance_input_hash,
+        execution_hash=execution_hash,
+    )
 
 
 def _monitor(store: WorkflowStore, supervisor: Any, segment_id: str, run_id: str) -> None:
@@ -110,6 +122,14 @@ def execute_segment(store: WorkflowStore, supervisor: Any, segment_id: str) -> t
     segment = store.get_segment(segment_id)
     if segment.status != "planned":
         raise WorkflowConflict(f"segment {segment_id!r} is not planned")
+    plan = store.get_plan(store.get_attempt(segment.attemptId).routeId)
+    if plan.route.legacyUnverified:
+        raise WorkflowConflict("legacy unverified route cannot be executed")
+    store.resolve_segment_start(segment_id)
+    try:
+        store._verify_plan_compiles(plan)
+    except Exception as exc:
+        raise WorkflowConflict(f"route compatibility verification failed: {exc}") from exc
     project = build_segment_project(store, segment_id)
     normalized = project.model_dump(mode="json", exclude_none=True)
     try:
