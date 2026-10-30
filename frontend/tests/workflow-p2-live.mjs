@@ -24,9 +24,9 @@ page.on('pageerror', error => errors.push(error.message));
 
 try {
   await page.goto(`${baseUrl}/`);
-  await page.getByText('本机服务已连接').waitFor();
+  await page.getByText('ViennaPS Workbench').first().waitFor();
   await page.locator('input[type=file]').nth(0).setInputFiles(layoutPath);
-  await page.getByText(/GDS · two-structure-two-layer\.gds/).waitFor();
+  await page.locator('.spx-file-name').filter({ hasText: 'two-structure-two-layer.gds' }).waitFor();
   await page.locator('input[type=file]').nth(1).setInputFiles(projectPath);
   await page.getByRole('button', { name: '采纳为 Workflow' }).click();
   await page.getByText('Compile 已冻结').waitFor();

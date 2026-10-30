@@ -77,7 +77,7 @@ page.on('pageerror', error => errors.push(error.message));
 
 try {
   await page.goto(`${baseUrl}/`);
-  await page.getByText('本机服务已连接').waitFor();
+  await page.getByText('ViennaPS Workbench').first().waitFor();
   await page.locator('input[type=file]').nth(1).setInputFiles(projectPath);
   await page.getByRole('button', { name: '采纳为 Workflow' }).click();
   await page.getByText('Compile 已冻结').waitFor();

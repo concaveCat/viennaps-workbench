@@ -16,7 +16,7 @@ page.on('pageerror', error => errors.push(error.message));
 
 try {
   await page.goto(`${baseUrl}/`);
-  await page.getByText('本机服务已连接').waitFor();
+  await page.getByText('ViennaPS Workbench').first().waitFor();
   await page.locator('input[type=file]').nth(1).setInputFiles(projectPath);
   await page.getByRole('button', { name: '采纳为 Workflow' }).click();
   await page.getByText('Compile 已冻结').waitFor();
@@ -36,8 +36,8 @@ try {
 
   await page.getByRole('button', { name: '传统工作区' }).click();
   await page.locator('.activity-rail').waitFor({ timeout: 15000 });
-  await page.getByRole('button', { name: '返回 Workflow Studio' }).click();
-  await page.getByText('Workflow Studio').waitFor({ timeout: 15000 });
+  await page.getByRole('button', { name: '返回 ViennaPS Workbench' }).click();
+  await page.getByText('ViennaPS Workbench').first().waitFor({ timeout: 15000 });
   assert.deepEqual(errors, []);
   console.log(JSON.stringify({ status: 'passed', baseUrl, screenshot, errors }));
 } finally {
