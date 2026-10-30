@@ -226,6 +226,15 @@ class SpecializedValidationNegatives(unittest.TestCase):
                 self.assertTrue(any(key in issue.path for issue in ctx.exception.issues),
                                 [issue.path for issue in ctx.exception.issues])
 
+    def test_geometric_trench_depth_covers_the_initial_vertical_span(self):
+        project = geometric_project(2)
+        project["geometry"] = {"kind": "plane", "height": 8.0, "substrateMaterial": "Si"}
+        project["steps"][0]["nativeParameters"].update({"trenchDepth": 0.000001, "n": 100})
+        with self.assertRaises(ProjectInputError) as ctx:
+            validate_project(project)
+        self.assertTrue(any("trenchDepth" in issue.path for issue in ctx.exception.issues),
+                        [issue.path for issue in ctx.exception.issues])
+
     def test_geometric_deposition_requires_a_deposit_material(self):
         project = geometric_project(2)
         project["steps"][0].pop("depositMaterial")
