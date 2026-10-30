@@ -25,9 +25,9 @@
     3
   ],
   "summary": {
-    "advanced-parameter-or-output-not-exposed": 11,
+    "advanced-parameter-or-output-not-exposed": 10,
     "engine-model-not-exposed": 7,
-    "exposed": 60,
+    "exposed": 61,
     "internal-or-not-user-facing": 18
   },
   "classes": [
@@ -2726,7 +2726,7 @@
       ],
       "risk": "high",
       "status": "implemented-backend-api",
-      "notes": "The bounded probe found the real insertion point: the ALP strategy builds the stencil only for SingleParticleALD with coverageDiffusionCoefficient > 0, and diffuses the Coverage scalar (not the level-set geometry). Exposed as the optional steps[].surfaceDiffusion object on specialized:ald; every other model and a zero coefficient are rejected as inert.",
+      "notes": "The bounded probe found the real insertion point: the ALP strategy builds the stencil only for SingleParticleALD with coverageDiffusionCoefficient > 0, and diffuses the Coverage scalar (not the level-set geometry). Exposed as the optional steps[].surfaceDiffusion object on specialized:ald. Every other model is rejected as inert even when the object is disabled; a zero coverageDiffusionCoefficient is rejected only when surfaceDiffusion is enabled, because a disabled token is a no-op.",
       "acceptanceCriteria": [
         "A bounded probe records which process/model accepts surface diffusion and what it changes on a trench.",
         "If no legal insertion point exists in 4.6.2, the class is documented as not applicable and stays unexposed.",

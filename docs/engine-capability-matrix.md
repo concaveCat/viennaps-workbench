@@ -19,9 +19,9 @@ behaviour changed.
 
 | Classification | Meaning | Count |
 | --- | --- | --- |
-| `exposed` | Reachable from a submitted project today, with its user-facing parameters | 60 |
+| `exposed` | Reachable from a submitted project today, with its user-facing parameters | 61 |
 | `engine-model-not-exposed` | A real native process model with no step, catalog entry or API field | 7 |
-| `advanced-parameter-or-output-not-exposed` | Only a strict subset is reachable, or the object is output-only | 12 |
+| `advanced-parameter-or-output-not-exposed` | Only a strict subset is reachable, or the object is output-only | 10 |
 | `internal-or-not-user-facing` | Native plumbing, base classes, callbacks, writer/enum utilities | 18 |
 | `absent-in-engine` | Not in ViennaPS at all; SPX (Sentaurus Process Explorer) reference only | 8 rows in `spxOnly` |
 
@@ -88,7 +88,7 @@ Fields shared with flat inputs use the flat catalog defaults (for example
 
 ### Geometry, output and material surface
 
-(60 `exposed` rows in the matrix overall, including the 18 models above.)
+(61 `exposed` rows in the matrix overall, including the 18 models above.)
 
 `MakePlane`, `MakeTrench`, `MakeHole` (`FULL` only), `MakeFin` (native + boolean construction),
 multi-layer `stack` (composed from `MakePlane` + `GeometryFactory`), `GeometryFactory`,
@@ -242,8 +242,9 @@ strategy only builds the stencil when `SingleParticleALDParams.coverageDiffusion
 and that is the only 4.6.2 surface model that reports diffusion coefficients. The stencil smooths the
 native `Coverage` scalar (which sets the ALD growth rate) on the disk mesh — it does **not** smooth
 level-set geometry, and on every other process the object is inert. The optional
-`steps[].surfaceDiffusion` object is therefore accepted only on `specialized:ald` with a positive
-coefficient; ranges and units are documented in
+`steps[].surfaceDiffusion` object is therefore accepted only on `specialized:ald`; a positive
+coefficient is required when the object is enabled, while a disabled token is an inert no-op. Ranges
+and units are documented in
 [`ald-surface-diffusion-contract.md`](ald-surface-diffusion-contract.md). Omitting it leaves the
 historical request hashes byte-identical, explicit native defaults are a behaviour no-op, and 2D/3D
 worker runs match an independent native reference exactly.
