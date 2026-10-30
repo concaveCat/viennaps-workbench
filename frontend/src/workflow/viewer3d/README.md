@@ -70,7 +70,8 @@ import WorkflowViewer3D from './viewer3d/WorkflowViewer3D';
 
 ### 4. 2D / 3D 分支
 
-`dimension` 决定用哪个渲染器，数据维度以 snapshot 的 `dimension` 为准：
+`dimension` 决定用哪个渲染器；如果快照里的几何与它不符（例如 3D 视图拿到没有三角形的
+快照），不会硬渲染，而是走 `onStepUnavailable`：
 
 - `3`：vtk.js（动态 `import()`，不进首屏 bundle）。三角网格 + 材料色 + 线框/表面 +
   正交/透视 + 沿 X/Y/Z 的裁剪面 + 朝向坐标轴。
