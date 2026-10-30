@@ -831,11 +831,13 @@ def _validate_csv_process_steps(project: ProjectV7) -> tuple[list[FieldIssue], l
     """Resolve and re-check every uploaded rate table before a worker starts.
 
     The native engine only logs a warning and continues with a zero velocity
-    field when ``RateGrid::loadFromCSV`` fails, so the workbench treats a
-    missing, mismatched or non-LINEAR-compatible table as a hard 422.
+    field when ``RateGrid::loadFromCSV`` fails, and a non-canonical table (BOM,
+    tabs, Unicode whitespace) can disagree with this parser or crash LINEAR.
+    Every table is therefore re-canonicalized here; a stored asset that is not
+    in canonical form is a hard 422 and must be re-uploaded.
     """
     from . import storage
-    from .csv_assets import RateCsvError, inspect_rate_csv
+    from .csv_assets import RateCsvError, canonicalize_rate_csv
 
     issues: list[FieldIssue] = []
     warnings: list[str] = []
@@ -851,8 +853,9 @@ def _validate_csv_process_steps(project: ProjectV7) -> tuple[list[FieldIssue], l
             metadata_path = storage.csv_asset_metadata_path(step.assetId)
             metadata = storage.read_json(metadata_path) if metadata_path.is_file() else {}
             stored_dimension = metadata.get("dimension")
-            summary = inspect_rate_csv(
-                path.read_bytes(),
+            raw = path.read_bytes()
+            canonical, summary = canonicalize_rate_csv(
+                raw,
                 stored_dimension if type(stored_dimension) is int and stored_dimension in (2, 3) else dimension,
             )
         except FileNotFoundError:
@@ -863,21 +866,36 @@ def _validate_csv_process_steps(project: ProjectV7) -> tuple[list[FieldIssue], l
         except (OSError, ValueError, RateCsvError) as exc:
             issues.append(FieldIssue(f"{prefix}.assetId", f"CSV rate asset is invalid: {exc}"))
             continue
+        if canonical != raw:
+            issues.append(FieldIssue(
+                f"{prefix}.assetId",
+                "stored CSV rate asset is not in the canonical ASCII/LF format required by the native reader; "
+                "re-upload the table"))
+            continue
         if summary["dimension"] != dimension:
             issues.append(FieldIssue(
                 f"{prefix}.assetId",
                 f"rate table was uploaded for {summary['dimension']}D ({','.join(summary['columns'])}); "
                 f"this project is {dimension}D"))
             continue
-        if summary["x"]["min"] > -half_x or summary["x"]["max"] < half_x:
+        offset_x = float(step.offset[0])
+        offset_y = float(step.offset[1])
+        query_min_x = -half_x + offset_x
+        query_max_x = half_x + offset_x
+        if summary["x"]["min"] > query_min_x or summary["x"]["max"] < query_max_x:
             warnings.append(
                 f"{prefix}.assetId: the table's x range [{summary['x']['min']:g}, {summary['x']['max']:g}] "
-                f"does not cover the domain [-{half_x:g}, {half_x:g}] um; native LINEAR extrapolates beyond "
-                "the last sample and IDW always weights the nearest samples")
-        if dimension == 3 and (summary["y"]["min"] > -half_y or summary["y"]["max"] < half_y):
-            warnings.append(
-                f"{prefix}.assetId: the table's y range [{summary['y']['min']:g}, {summary['y']['max']:g}] "
-                f"does not cover the domain [-{half_y:g}, {half_y:g}] um")
+                f"does not cover the native lookup range [{query_min_x:g}, {query_max_x:g}] um "
+                f"(domain [-{half_x:g}, {half_x:g}] plus offset {offset_x:g}); native LINEAR extrapolates "
+                "beyond the last sample and IDW always weights the nearest samples")
+        if dimension == 3:
+            query_min_y = -half_y + offset_y
+            query_max_y = half_y + offset_y
+            if summary["y"]["min"] > query_min_y or summary["y"]["max"] < query_max_y:
+                warnings.append(
+                    f"{prefix}.assetId: the table's y range [{summary['y']['min']:g}, {summary['y']['max']:g}] "
+                    f"does not cover the native lookup range [{query_min_y:g}, {query_max_y:g}] um "
+                    f"(domain [-{half_y:g}, {half_y:g}] plus offset {offset_y:g})")
         if step.interpolationMode == "LINEAR" and not summary["linearCompatible"]:
             if dimension == 2:
                 detail = "2D LINEAR requires at least two rows with strictly increasing x"

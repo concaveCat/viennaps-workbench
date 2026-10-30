@@ -35,6 +35,7 @@ from worker.gds_mask import CONSTRUCTION as GDS_MASK_CONSTRUCTION
 from worker.gds_mask import build_aligned_gds_layer, build_aligned_gds_mask, planar_point_count
 from worker.specialized import build_specialized_model
 from worker.csv_process import build_csv_process
+from worker.mask_materials import protected_material_names
 MATERIAL_CATALOG = json.loads((ROOT / "docs" / "materials-catalog.json").read_text(encoding="utf-8"))
 MATERIAL_ROWS = MATERIAL_CATALOG["materials"]
 MATERIAL_NAMES = {int(row["id"]): row["name"] for row in MATERIAL_ROWS}
@@ -1661,22 +1662,6 @@ def make_v3_geometry(ps: Any, domain: Any, project: dict[str,Any], *, config: di
     else:
         ps.MakeHole(domain=domain,holeRadius=float(g["radius"]),holeDepth=float(g["depth"]),holeTaperAngle=float(g["taperAngle"]),maskHeight=float(g["maskHeight"]),maskTaperAngle=float(g["maskTaperAngle"]),holeShape=ps.HoleShape.FULL,material=material_handle(ps,g["substrateMaterial"]),maskMaterial=material_handle(ps,g.get("maskMaterial","Mask"))).apply()
     return None
-
-
-def protected_material_names(project: dict[str,Any], step: dict[str,Any] | None = None) -> list[str]:
-    if project["schemaVersion"] in (4,5,6,7) and step is not None and step.get("rateMode")=="material":
-        return []
-    g=project["geometry"]
-    if g["kind"] in ("trench","hole") and float(g.get("maskHeight",0))>0:
-        return [g.get("maskMaterial","Mask")]
-    if g["kind"]=="stack":
-        values = [layer["material"] for layer in g["layers"] if layer["role"]=="mask"]
-        if g.get("gdsMask", {}).get("protectsEtch"):
-            values.append(g["gdsMask"]["material"])
-        return list(dict.fromkeys(values))
-    if g["kind"]=="gds":
-        return list(dict.fromkeys(layer["material"] for layer in g["layers"] if layer.get("mask", False)))
-    return []
 
 
 def material_surface_domain(ps: Any, domain: Any, requested: dict[str, Any]) -> tuple[Any, list[int]]:
