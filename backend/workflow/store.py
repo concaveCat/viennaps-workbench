@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -34,7 +35,7 @@ from .routes import (
 from .verification import prefix_compatibility, verify_route_plan_compiles
 
 
-SCHEMA_VERSION = "8"
+SCHEMA_VERSION = "9"
 
 
 class WorkflowError(Exception):
@@ -70,7 +71,7 @@ class WorkflowStore:
                     row = preflight.execute(
                         "SELECT value FROM schema_meta WHERE key = 'schema_version'"
                     ).fetchone()
-                    if row is not None and row[0] not in {"1", "2", "3", "4", "5", "6", "7", SCHEMA_VERSION}:
+                    if row is not None and row[0] not in {"1", "2", "3", "4", "5", "6", "7", "8", SCHEMA_VERSION}:
                         raise RuntimeError(
                             f"unsupported workflow schema version {row[0]!r}; "
                             f"expected {SCHEMA_VERSION!r}"
@@ -250,6 +251,15 @@ class WorkflowStore:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS library_items (
+                    item_id TEXT PRIMARY KEY,
+                    category TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS geometry_bindings (
                     binding_id TEXT PRIMARY KEY,
                     binding_json TEXT NOT NULL,
@@ -311,6 +321,7 @@ class WorkflowStore:
                 CREATE INDEX IF NOT EXISTS measurements_run_idx ON measurements(source_run_id);
                 CREATE INDEX IF NOT EXISTS measurements_recipe_idx ON measurements(recipe_id, recipe_version);
                 CREATE INDEX IF NOT EXISTS measurement_verifications_idx ON measurement_verifications(measurement_id);
+                CREATE INDEX IF NOT EXISTS library_items_category_idx ON library_items(category);
                 CREATE TABLE IF NOT EXISTS schema_meta (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
@@ -364,7 +375,7 @@ class WorkflowStore:
                     "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
                     (SCHEMA_VERSION,),
                 )
-            elif version_row["value"] in {"3", "4", "5", "6", "7"}:
+            elif version_row["value"] in {"3", "4", "5", "6", "7", "8"}:
                 connection.execute(
                     "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
                     (SCHEMA_VERSION,),
@@ -2042,6 +2053,173 @@ class WorkflowStore:
                 continue
             summaries.append(self._definition_summary(definition, updated_at=row["updated_at"]))
         return summaries
+
+    # ------------------------------------------------------------------
+    # Reusable library objects (schema 9)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _library_item_document(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schemaVersion": 1,
+            "itemId": row["item_id"],
+            "category": row["category"],
+            "name": row["name"],
+            "description": row["description"],
+            "payload": json.loads(row["payload_json"]),
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
+
+    @staticmethod
+    def _library_item_content(document: Mapping[str, Any]) -> tuple[Any, ...]:
+        """Content identity: timestamps never make two items different."""
+
+        return (
+            document.get("category"),
+            document.get("name"),
+            document.get("description") or "",
+            document.get("payload"),
+        )
+
+    def save_library_item(
+        self,
+        document: Mapping[str, Any],
+        *,
+        max_per_category: int | None = None,
+    ) -> dict[str, Any]:
+        """Create one library item, idempotently per ``itemId``.
+
+        Re-saving identical content returns the stored row unchanged. The same
+        id with different content is a conflict instead of a silent overwrite.
+        """
+
+        item_id = str(document.get("itemId") or "")
+        category = str(document.get("category") or "")
+        if not item_id or not category:
+            raise WorkflowValidation("library item requires itemId and category")
+        payload = document.get("payload")
+        if not isinstance(payload, dict):
+            raise WorkflowValidation("library item payload must be an object")
+        content = self._library_item_content(document)
+        timestamp = str(document.get("createdAt") or self._now())
+        updated = str(document.get("updatedAt") or timestamp)
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT * FROM library_items WHERE item_id = ?", (item_id,)
+            ).fetchone()
+            if existing is not None:
+                stored = self._library_item_document(existing)
+                if self._library_item_content(stored) != content:
+                    raise WorkflowConflict(
+                        f"library item {item_id!r} already exists with different content"
+                    )
+                return stored
+            if max_per_category is not None:
+                (count,) = connection.execute(
+                    "SELECT COUNT(*) FROM library_items WHERE category = ?", (category,)
+                ).fetchone()
+                if count >= max_per_category:
+                    raise WorkflowValidation(
+                        f"library category {category!r} already holds {count} items; "
+                        f"the limit is {max_per_category}"
+                    )
+            connection.execute(
+                "INSERT INTO library_items"
+                " (item_id, category, name, description, payload_json, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    item_id,
+                    category,
+                    str(document.get("name") or ""),
+                    str(document.get("description") or ""),
+                    self._dump(payload),
+                    timestamp,
+                    updated,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM library_items WHERE item_id = ?", (item_id,)
+            ).fetchone()
+        return self._library_item_document(row)
+
+    def update_library_item(self, document: Mapping[str, Any]) -> dict[str, Any]:
+        """Replace the editable fields of an existing item.
+
+        ``itemId``, ``category`` and ``createdAt`` are immutable. Re-sending the
+        stored content is a no-op: the original ``updatedAt`` is preserved so an
+        editor retry does not look like an edit.
+        """
+
+        item_id = str(document.get("itemId") or "")
+        if not item_id:
+            raise WorkflowValidation("library item requires itemId")
+        payload = document.get("payload")
+        if not isinstance(payload, dict):
+            raise WorkflowValidation("library item payload must be an object")
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT * FROM library_items WHERE item_id = ?", (item_id,)
+            ).fetchone()
+            if existing is None:
+                raise WorkflowNotFound(f"library item {item_id!r} does not exist")
+            stored = self._library_item_document(existing)
+            if existing["category"] != str(document.get("category") or existing["category"]):
+                raise WorkflowConflict(
+                    f"library item {item_id!r} category is immutable"
+                )
+            if self._library_item_content(stored) == self._library_item_content(document):
+                return stored
+            connection.execute(
+                "UPDATE library_items SET name = ?, description = ?, payload_json = ?,"
+                " updated_at = ? WHERE item_id = ?",
+                (
+                    str(document.get("name") or ""),
+                    str(document.get("description") or ""),
+                    self._dump(payload),
+                    str(document.get("updatedAt") or self._now()),
+                    item_id,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM library_items WHERE item_id = ?", (item_id,)
+            ).fetchone()
+        return self._library_item_document(row)
+
+    def get_library_item(self, item_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM library_items WHERE item_id = ?", (item_id,)
+            ).fetchone()
+        if row is None:
+            raise WorkflowNotFound(f"library item {item_id!r} does not exist")
+        return self._library_item_document(row)
+
+    def list_library_items(self, category: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM library_items"
+        parameters: tuple[Any, ...] = ()
+        if category is not None:
+            query += " WHERE category = ?"
+            parameters = (category,)
+        query += " ORDER BY updated_at DESC, rowid DESC"
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [self._library_item_document(row) for row in rows]
+
+    def count_library_items(self, category: str) -> int:
+        with self._connect() as connection:
+            (count,) = connection.execute(
+                "SELECT COUNT(*) FROM library_items WHERE category = ?", (category,)
+            ).fetchone()
+        return int(count)
+
+    def delete_library_item(self, item_id: str) -> None:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM library_items WHERE item_id = ?", (item_id,)
+            )
+            if cursor.rowcount == 0:
+                raise WorkflowNotFound(f"library item {item_id!r} does not exist")
 
     def register_binding(self, binding) -> Any:
         payload = binding.model_dump(mode="json", exclude_none=True)

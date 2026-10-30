@@ -40,6 +40,8 @@ class WorkflowOpenApiTests(unittest.TestCase):
             "/api/v1/workflow/library/bundles/{bundle_id}",
             "/api/v1/workflow/library/bundles/{bundle_id}/import",
             "/api/v1/workflow/library/import",
+            "/api/v1/workflow/library/items",
+            "/api/v1/workflow/library/items/{item_id}",
         ):
             self.assertIn(path, paths)
         self.assertIn("RoutePlanV1", schema["components"]["schemas"])
@@ -53,6 +55,10 @@ class WorkflowOpenApiTests(unittest.TestCase):
             "LibraryBundleV1-Input",
             "LibraryBundleV1-Output",
             "LibraryImportResultV1",
+            "LibraryItemV1",
+            "LibraryItemCreateRequest",
+            "LibraryItemUpdateRequest",
+            "LibraryItemListResponse",
         ):
             self.assertIn(name, schema["components"]["schemas"])
         for name in (

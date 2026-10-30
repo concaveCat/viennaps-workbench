@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from datetime import datetime, timezone
@@ -48,6 +48,15 @@ from .library import (
     LibraryImportResultV1,
     build_bundle,
     import_bundle,
+)
+from .library_items import (
+    MAX_LIBRARY_ITEM_DESCRIPTION,
+    MAX_LIBRARY_ITEM_NAME,
+    MAX_LIBRARY_ITEMS_PER_CATEGORY,
+    LibraryCategory,
+    LibraryItemV1,
+    create_library_item,
+    update_library_item,
 )
 from .models import CompileDiffV1, CompiledWorkflowV1, GeometryBindingV1
 from .modules import (
@@ -456,6 +465,27 @@ class LibraryBundleImportRequest(StrictModel):
 class LibraryDirectImportRequest(StrictModel):
     bundle: LibraryBundleV1
     policy: Literal["reject", "clone"] = "reject"
+
+
+class LibraryItemCreateRequest(StrictModel):
+    """Create one reusable library object; ``itemId`` is server-generated."""
+
+    category: LibraryCategory
+    name: Annotated[str, Field(min_length=1, max_length=MAX_LIBRARY_ITEM_NAME)]
+    description: Annotated[str, Field(max_length=MAX_LIBRARY_ITEM_DESCRIPTION)] = ""
+    payload: dict[str, Any]
+
+
+class LibraryItemUpdateRequest(StrictModel):
+    """Replace the editable fields of an item; category and id are immutable."""
+
+    name: Annotated[str, Field(min_length=1, max_length=MAX_LIBRARY_ITEM_NAME)]
+    description: Annotated[str, Field(max_length=MAX_LIBRARY_ITEM_DESCRIPTION)] = ""
+    payload: dict[str, Any]
+
+
+class LibraryItemListResponse(StrictModel):
+    items: list[LibraryItemV1]
 
 
 class ExpandFlowDefinitionRequest(StrictModel):
@@ -1379,6 +1409,58 @@ async def import_library_document(request: LibraryDirectImportRequest) -> Librar
         store.save_library_bundle(request.bundle)
         return result
     return _call(operation)
+
+
+@router.get("/library/items", response_model=LibraryItemListResponse)
+async def list_library_items(category: LibraryCategory | None = None) -> LibraryItemListResponse:
+    rows = _call(lambda: get_store().list_library_items(category))
+    return LibraryItemListResponse(
+        items=[LibraryItemV1.model_validate(row) for row in rows]
+    )
+
+
+@router.post("/library/items", response_model=LibraryItemV1, status_code=201)
+async def post_library_item(request: LibraryItemCreateRequest) -> LibraryItemV1:
+    def operation():
+        item = create_library_item(
+            category=request.category,
+            name=request.name,
+            description=request.description,
+            payload=request.payload,
+        )
+        return get_store().save_library_item(
+            item.model_dump(mode="json"),
+            max_per_category=MAX_LIBRARY_ITEMS_PER_CATEGORY,
+        )
+
+    return LibraryItemV1.model_validate(_call(operation))
+
+
+@router.get("/library/items/{item_id}", response_model=LibraryItemV1)
+async def get_library_item(item_id: str) -> LibraryItemV1:
+    return LibraryItemV1.model_validate(_call(lambda: get_store().get_library_item(item_id)))
+
+
+@router.put("/library/items/{item_id}", response_model=LibraryItemV1)
+async def put_library_item(item_id: str, request: LibraryItemUpdateRequest) -> LibraryItemV1:
+    def operation():
+        store = get_store()
+        existing = LibraryItemV1.model_validate(store.get_library_item(item_id))
+        updated = update_library_item(
+            existing,
+            name=request.name,
+            description=request.description,
+            payload=request.payload,
+        )
+        return store.update_library_item(updated.model_dump(mode="json"))
+
+    return LibraryItemV1.model_validate(_call(operation))
+
+
+@router.delete("/library/items/{item_id}", status_code=204)
+async def delete_library_item(item_id: str) -> Response:
+    _call(lambda: get_store().delete_library_item(item_id))
+    return Response(status_code=204)
 
 
 @router.post("/flows/definitions/{definition_id}/expand", response_model=ExpandedFlowV1)

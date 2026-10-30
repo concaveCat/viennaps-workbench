@@ -811,9 +811,9 @@ class LibraryStoreTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             LibraryBundleV1.model_validate(mismatched)
 
-    def test_store_schema_is_eight_and_bundles_roundtrip(self):
-        self.assertEqual(SCHEMA_VERSION, "8")
-        self.assertEqual(self.source.schema_version(), "8")
+    def test_store_schema_is_current_and_bundles_roundtrip(self):
+        self.assertEqual(SCHEMA_VERSION, "9")
+        self.assertEqual(self.source.schema_version(), SCHEMA_VERSION)
         bundle = self._export()
         stored = self.source.save_library_bundle(bundle)
         self.assertEqual(stored["bundleId"], bundle.bundleId)
@@ -834,7 +834,7 @@ class LibraryStoreTests(unittest.TestCase):
             )
         upgraded = WorkflowStore(path)
         upgraded.initialize()
-        self.assertEqual(upgraded.schema_version(), "8")
+        self.assertEqual(upgraded.schema_version(), SCHEMA_VERSION)
         self.assertEqual(upgraded.list_library_bundles(), [])
 
     def test_failed_preflight_leaves_no_partial_writes(self):

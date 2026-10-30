@@ -4837,6 +4837,154 @@
         "title": "LibraryImportResultV1",
         "type": "object"
       },
+      "LibraryItemCreateRequest": {
+        "additionalProperties": false,
+        "description": "Create one reusable library object; ``itemId`` is server-generated.",
+        "properties": {
+          "category": {
+            "enum": [
+              "material",
+              "process",
+              "flow",
+              "experiment"
+            ],
+            "title": "Category",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "maxLength": 2000,
+            "title": "Description",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "payload": {
+            "additionalProperties": true,
+            "title": "Payload",
+            "type": "object"
+          }
+        },
+        "required": [
+          "category",
+          "name",
+          "payload"
+        ],
+        "title": "LibraryItemCreateRequest",
+        "type": "object"
+      },
+      "LibraryItemListResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/LibraryItemV1"
+            },
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "LibraryItemListResponse",
+        "type": "object"
+      },
+      "LibraryItemUpdateRequest": {
+        "additionalProperties": false,
+        "description": "Replace the editable fields of an item; category and id are immutable.",
+        "properties": {
+          "description": {
+            "default": "",
+            "maxLength": 2000,
+            "title": "Description",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "payload": {
+            "additionalProperties": true,
+            "title": "Payload",
+            "type": "object"
+          }
+        },
+        "required": [
+          "name",
+          "payload"
+        ],
+        "title": "LibraryItemUpdateRequest",
+        "type": "object"
+      },
+      "LibraryItemV1": {
+        "additionalProperties": false,
+        "description": "One reusable library object, independent of any run.\n\nOnly structural rules live here. Category-specific payload validation is\nintentionally a write-path concern (see ``validate_library_payload``) so a\nstored item stays readable even when the world around it changed.",
+        "properties": {
+          "category": {
+            "enum": [
+              "material",
+              "process",
+              "flow",
+              "experiment"
+            ],
+            "title": "Category",
+            "type": "string"
+          },
+          "createdAt": {
+            "title": "Createdat",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "maxLength": 2000,
+            "title": "Description",
+            "type": "string"
+          },
+          "itemId": {
+            "pattern": "^item_[a-f0-9]{24}$",
+            "title": "Itemid",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "payload": {
+            "additionalProperties": true,
+            "title": "Payload",
+            "type": "object"
+          },
+          "schemaVersion": {
+            "const": 1,
+            "default": 1,
+            "title": "Schemaversion",
+            "type": "integer"
+          },
+          "updatedAt": {
+            "title": "Updatedat",
+            "type": "string"
+          }
+        },
+        "required": [
+          "itemId",
+          "category",
+          "name",
+          "payload",
+          "createdAt",
+          "updatedAt"
+        ],
+        "title": "LibraryItemV1",
+        "type": "object"
+      },
       "LibraryModuleImportV1": {
         "additionalProperties": false,
         "properties": {
@@ -12678,6 +12826,225 @@
           }
         },
         "summary": "Import Library Document",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/library/items": {
+      "get": {
+        "operationId": "list_library_items_api_v1_workflow_library_items_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "category",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "material",
+                    "process",
+                    "flow",
+                    "experiment"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Category"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LibraryItemListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Library Items",
+        "tags": [
+          "workflow"
+        ]
+      },
+      "post": {
+        "operationId": "post_library_item_api_v1_workflow_library_items_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LibraryItemCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LibraryItemV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Post Library Item",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/library/items/{item_id}": {
+      "delete": {
+        "operationId": "delete_library_item_api_v1_workflow_library_items__item_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "item_id",
+            "required": true,
+            "schema": {
+              "title": "Item Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Library Item",
+        "tags": [
+          "workflow"
+        ]
+      },
+      "get": {
+        "operationId": "get_library_item_api_v1_workflow_library_items__item_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "item_id",
+            "required": true,
+            "schema": {
+              "title": "Item Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LibraryItemV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Library Item",
+        "tags": [
+          "workflow"
+        ]
+      },
+      "put": {
+        "operationId": "put_library_item_api_v1_workflow_library_items__item_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "item_id",
+            "required": true,
+            "schema": {
+              "title": "Item Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LibraryItemUpdateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LibraryItemV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Library Item",
         "tags": [
           "workflow"
         ]
