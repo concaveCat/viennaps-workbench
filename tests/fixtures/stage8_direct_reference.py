@@ -150,6 +150,17 @@ def make_model(step: dict[str, Any], domain: Any, project: dict[str, Any]):
         atomic = ps.AtomicLayerProcessParameters()
         for key in ("pulseTime", "purgePulseTime", "coverageTimeStep", "purgeTimeStep"): setattr(atomic, key, float(p[key]))
         atomic.numCycles = int(p["numCycles"]); extra.append(atomic)
+        surface_diffusion = step.get("surfaceDiffusion")
+        if surface_diffusion is not None and surface_diffusion.get("enabled", True):
+            if float(p["coverageDiffusionCoefficient"]) <= 0.0:
+                raise ValueError("surfaceDiffusion requires coverageDiffusionCoefficient > 0")
+            native = ps.SurfaceDiffusionParameters()
+            defaults = {key: getattr(native, key) for key in (
+                "kNeighbors", "normalCutoff", "normalizeByLocalScale", "radius",
+                "sigmaNormal", "stabilityFactor", "symmetrizeWeights")}
+            for key, default in defaults.items():
+                setattr(native, key, type(default)(surface_diffusion.get(key, default)))
+            extra.append(native)
     elif kind == "oxidation":
         model = ps.Oxidation()
         model.setOxidant(getattr(ps.OxidantType, p["oxidant"])); model.setOrientation(getattr(ps.SiliconOrientation, p["orientation"]))

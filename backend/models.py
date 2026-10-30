@@ -858,6 +858,41 @@ class MultiParticleStepV7(StrictModel):
         return self
 
 
+class SurfaceDiffusionV7(StrictModel):
+    """Native ``SurfaceDiffusionParameters`` smoothing of ALD coverage.
+
+    ViennaPS 4.6.2 builds this Laplacian stencil only inside the ALP strategy,
+    and the ALP flag is set solely by a positive
+    ``SingleParticleALDParams.coverageDiffusionCoefficient``. It therefore
+    smooths the scalar coverage field (which drives the ALD growth rate), not
+    the level-set geometry, and is accepted only on ``specialized:ald`` steps.
+    Defaults are the installed native struct defaults, so materializing them is
+    a behaviour no-op relative to omitting the object.
+    """
+
+    enabled: bool = True
+    kNeighbors: Annotated[Integer, Field(ge=1, le=64)] = 16
+    normalCutoff: Annotated[Number, Field(ge=-1, le=1)] = 0.25
+    normalizeByLocalScale: bool = True
+    radius: Annotated[Number, Field(ge=0, le=2)] = 0.0
+    sigmaNormal: Annotated[Number, Field(gt=0, le=10)] = 0.35
+    stabilityFactor: Annotated[Number, Field(gt=0, le=1)] = 1.0
+    symmetrizeWeights: bool = True
+
+    @model_validator(mode="after")
+    def check_disabled_matches_defaults(self) -> "SurfaceDiffusionV7":
+        if not self.enabled:
+            defaults = type(self)()
+            overridden = sorted(
+                key for key in self.model_fields_set
+                if key != "enabled" and getattr(self, key) != getattr(defaults, key))
+            if overridden:
+                raise ValueError(
+                    "disabled surfaceDiffusion must not override "
+                    f"{overridden}; omit the object instead")
+        return self
+
+
 class SpecializedStepV7(StrictModel):
     id: Annotated[str, Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")]
     name: Annotated[str, Field(min_length=1, max_length=80)]
@@ -868,6 +903,7 @@ class SpecializedStepV7(StrictModel):
     duration: Annotated[Number, Field(ge=0.01, le=600)] | None = None
     depositMaterial: str | None = None
     nativeParameters: dict[str, Any]
+    surfaceDiffusion: SurfaceDiffusionV7 | None = None
 
     @model_validator(mode="after")
     def check_specialized_shape(self):
@@ -894,6 +930,25 @@ class SpecializedStepV7(StrictModel):
         if set(self.nativeParameters) - optional_parameters != expected_parameters:
             raise ValueError(f"{self.nativeModel} nativeParameters must contain exactly {sorted(expected_parameters)}"
                              + (f" (optional: {sorted(optional_parameters)})" if optional_parameters else ""))
+        if self.surfaceDiffusion is not None and self.surfaceDiffusion.enabled:
+            # ViennaPS 4.6.2 only builds the surface-diffusion stencil for the
+            # ALD surface model, and only when its native coverage diffusion
+            # coefficient is positive. Accepting this object anywhere else
+            # would create a knob that silently does nothing.
+            if self.nativeModel != "ald":
+                raise ValueError(
+                    "surfaceDiffusion is only available for specialized:ald; "
+                    f"{self.nativeModel} has no native surface-diffusion flag")
+            coefficient = self.nativeParameters.get("coverageDiffusionCoefficient")
+            try:
+                finite = isinstance(coefficient, (int, float)) and not isinstance(coefficient, bool) \
+                    and math.isfinite(float(coefficient)) and float(coefficient) > 0.0
+            except (TypeError, ValueError):
+                finite = False
+            if not finite:
+                raise ValueError(
+                    "enabled surfaceDiffusion requires nativeParameters.coverageDiffusionCoefficient > 0; "
+                    "ViennaPS 4.6.2 never builds the stencil for zero")
         return self
 
 

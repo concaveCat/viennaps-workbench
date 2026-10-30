@@ -1496,13 +1496,14 @@
         3
       ],
       "constructor": "SurfaceDiffusionParameters()",
-      "docSummary": "Level-set surface diffusion smoothing (radius, normals, stability).",
+      "docSummary": "Surface diffusion Laplacian stencil for a scalar field on the disk mesh (radius, normals, stability).",
       "classification": "advanced-parameter-or-output-not-exposed",
-      "exposedBy": [],
-      "notes": "No workbench code path constructs it. Exposing it needs a verified native entry point first: it is a level-set smoothing model, not a process parameter, and its interaction with each process is unevidenced.",
+      "exposedBy": [
+        "steps[].surfaceDiffusion on specialized:ald when coverageDiffusionCoefficient > 0"
+      ],
+      "notes": "The installed 4.6.2 setter is Process.setParameters(SurfaceDiffusionParameters), but the ALP strategy only builds the stencil when SingleParticleALDParams.coverageDiffusionCoefficient > 0, and that is the only 4.6.2 model that reports diffusion coefficients. It smooths the ALD Coverage scalar on the disk mesh, not the level-set surface; on every other process it is inert. See docs/ald-surface-diffusion-contract.md and worker/probe_surface_diffusion_native.py.",
       "members": {
-        "exposed": [],
-        "notExposed": [
+        "exposed": [
           "radius",
           "sigmaNormal",
           "normalCutoff",
@@ -1510,7 +1511,8 @@
           "normalizeByLocalScale",
           "symmetrizeWeights",
           "stabilityFactor"
-        ]
+        ],
+        "notExposed": []
       }
     },
     {
@@ -2717,13 +2719,14 @@
     },
     {
       "id": "B3",
-      "title": "SurfaceDiffusionParameters for level-set smoothing",
+      "title": "SurfaceDiffusionParameters for ALD coverage smoothing",
       "classification": "advanced-parameter-or-output-not-exposed",
       "items": [
         "SurfaceDiffusionParameters"
       ],
       "risk": "high",
-      "notes": "No workbench code path constructs it. It is a level-set smoothing model, so the first deliverable is an experiment that shows where it can legally be inserted, not an API field.",
+      "status": "implemented-backend-api",
+      "notes": "The bounded probe found the real insertion point: the ALP strategy builds the stencil only for SingleParticleALD with coverageDiffusionCoefficient > 0, and diffuses the Coverage scalar (not the level-set geometry). Exposed as the optional steps[].surfaceDiffusion object on specialized:ald; every other model and a zero coefficient are rejected as inert.",
       "acceptanceCriteria": [
         "A bounded probe records which process/model accepts surface diffusion and what it changes on a trench.",
         "If no legal insertion point exists in 4.6.2, the class is documented as not applicable and stays unexposed.",
