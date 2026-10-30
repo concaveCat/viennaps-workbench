@@ -195,6 +195,62 @@
         "title": "AdvectionSettingsV7",
         "type": "object"
       },
+      "AnalysisCandidateV1": {
+        "additionalProperties": false,
+        "properties": {
+          "label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          },
+          "runId": {
+            "title": "Runid",
+            "type": "string"
+          },
+          "stepId": {
+            "title": "Stepid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "runId",
+          "stepId"
+        ],
+        "title": "AnalysisCandidateV1",
+        "type": "object"
+      },
+      "AnalysisCompareRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "candidates": {
+            "items": {
+              "$ref": "#/components/schemas/AnalysisCandidateV1"
+            },
+            "maxItems": 4,
+            "minItems": 2,
+            "title": "Candidates",
+            "type": "array"
+          },
+          "tolerance": {
+            "default": 1e-06,
+            "maximum": 1000000.0,
+            "minimum": 0.0,
+            "title": "Tolerance",
+            "type": "number"
+          }
+        },
+        "required": [
+          "candidates"
+        ],
+        "title": "AnalysisCompareRequest",
+        "type": "object"
+      },
       "AppendAttemptRequest": {
         "additionalProperties": false,
         "properties": {
@@ -648,6 +704,64 @@
           "height"
         ],
         "title": "CDAtHeightParametersV1",
+        "type": "object"
+      },
+      "CalibrationDatasetRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "csv": {
+            "maxLength": 2000000,
+            "minLength": 1,
+            "title": "Csv",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "csv"
+        ],
+        "title": "CalibrationDatasetRequest",
+        "type": "object"
+      },
+      "CalibrationFitRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "datasetId": {
+            "title": "Datasetid",
+            "type": "string"
+          },
+          "method": {
+            "enum": [
+              "least-squares",
+              "nelder-mead"
+            ],
+            "title": "Method",
+            "type": "string"
+          },
+          "model": {
+            "enum": [
+              "scale",
+              "scale_offset",
+              "quadratic",
+              "power",
+              "power_offset"
+            ],
+            "title": "Model",
+            "type": "string"
+          }
+        },
+        "required": [
+          "datasetId",
+          "model",
+          "method"
+        ],
+        "title": "CalibrationFitRequest",
         "type": "object"
       },
       "Camera3D": {
@@ -4241,6 +4355,30 @@
         "title": "PrefixCompatibilityV1",
         "type": "object"
       },
+      "ProcessWindowRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "experimentId": {
+            "title": "Experimentid",
+            "type": "string"
+          },
+          "lower": {
+            "title": "Lower",
+            "type": "number"
+          },
+          "upper": {
+            "title": "Upper",
+            "type": "number"
+          }
+        },
+        "required": [
+          "experimentId",
+          "lower",
+          "upper"
+        ],
+        "title": "ProcessWindowRequest",
+        "type": "object"
+      },
       "ProjectV7": {
         "additionalProperties": false,
         "description": "Schema 7 is the unified extension point for advanced native capabilities.",
@@ -4659,6 +4797,115 @@
           "material"
         ],
         "title": "RemoveMaterialStepV5",
+        "type": "object"
+      },
+      "ReportRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "conclusions": {
+            "default": "",
+            "maxLength": 20000,
+            "title": "Conclusions",
+            "type": "string"
+          },
+          "experimentId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Experimentid"
+          },
+          "lower": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lower"
+          },
+          "runId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runid"
+          },
+          "stepId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stepid"
+          },
+          "title": {
+            "default": "Workflow report",
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Title",
+            "type": "string"
+          },
+          "upper": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Upper"
+          }
+        },
+        "title": "ReportRequest",
+        "type": "object"
+      },
+      "ReportResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "createdAt": {
+            "title": "Createdat",
+            "type": "string"
+          },
+          "html": {
+            "title": "Html",
+            "type": "string"
+          },
+          "reportId": {
+            "title": "Reportid",
+            "type": "string"
+          },
+          "sha256": {
+            "title": "Sha256",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reportId",
+          "title",
+          "html",
+          "sha256",
+          "createdAt"
+        ],
+        "title": "ReportResponse",
         "type": "object"
       },
       "RouteFromCompileRequest": {
@@ -7519,6 +7766,186 @@
         "summary": "Specialized Models"
       }
     },
+    "/api/v1/workflow/analysis/candidates/{run_id}/{step_id}/view": {
+      "get": {
+        "operationId": "analyze_candidate_view_api_v1_workflow_analysis_candidates__run_id___step_id__view_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "step_id",
+            "required": true,
+            "schema": {
+              "title": "Step Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Analyze Candidate View Api V1 Workflow Analysis Candidates  Run Id   Step Id  View Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Analyze Candidate View",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/analysis/compare": {
+      "post": {
+        "operationId": "analyze_compare_api_v1_workflow_analysis_compare_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AnalysisCompareRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Analyze Compare Api V1 Workflow Analysis Compare Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Analyze Compare",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/analysis/process-window": {
+      "post": {
+        "operationId": "analyze_process_window_api_v1_workflow_analysis_process_window_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProcessWindowRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Analyze Process Window Api V1 Workflow Analysis Process Window Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Analyze Process Window",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/analysis/report": {
+      "post": {
+        "operationId": "analyze_report_api_v1_workflow_analysis_report_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReportResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Analyze Report",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
     "/api/v1/workflow/artifact-refs": {
       "get": {
         "operationId": "list_artifact_refs_api_v1_workflow_artifact_refs_get",
@@ -7776,6 +8203,180 @@
           }
         },
         "summary": "Cancel Attempt",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/calibration/datasets": {
+      "post": {
+        "operationId": "create_calibration_dataset_api_v1_workflow_calibration_datasets_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CalibrationDatasetRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Calibration Dataset Api V1 Workflow Calibration Datasets Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Calibration Dataset",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/calibration/datasets/{dataset_id}": {
+      "get": {
+        "operationId": "get_calibration_dataset_api_v1_workflow_calibration_datasets__dataset_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "dataset_id",
+            "required": true,
+            "schema": {
+              "title": "Dataset Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Calibration Dataset Api V1 Workflow Calibration Datasets  Dataset Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Calibration Dataset",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/calibration/fit": {
+      "post": {
+        "operationId": "fit_calibration_api_v1_workflow_calibration_fit_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CalibrationFitRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Fit Calibration Api V1 Workflow Calibration Fit Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Fit Calibration",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/calibration/fits/{fit_id}": {
+      "get": {
+        "operationId": "get_calibration_fit_api_v1_workflow_calibration_fits__fit_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "fit_id",
+            "required": true,
+            "schema": {
+              "title": "Fit Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Calibration Fit Api V1 Workflow Calibration Fits  Fit Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Calibration Fit",
         "tags": [
           "workflow"
         ]

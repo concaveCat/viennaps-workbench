@@ -378,3 +378,13 @@ button, input { font: inherit; }
 .wf-clip-list button.active { color: var(--wf-text); border-color: var(--wf-accent); }
 .wf-doe-row { display: grid; grid-template-columns: 1fr 1fr 1.4fr; gap: 6px; }
 .wf-card-subhead { color: var(--wf-muted); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; margin-top: 6px; }
+
+.wf-compare-controls { display: flex; align-items: center; gap: 14px; margin: 8px 0; font-size: 11px; color: var(--wf-muted); }
+.wf-compare-controls input[type=range] { vertical-align: middle; }
+.wf-compare-controls select { background: var(--wf-panel-2); color: var(--wf-text); border: 1px solid var(--wf-line); border-radius: 6px; padding: 5px; }
+.wf-compare-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin: 8px 0 14px; }
+.wf-compare-grid figure { margin: 0; border: 1px solid var(--wf-line); border-radius: 9px; padding: 8px; background: rgba(8, 20, 33, 0.55); }
+.wf-compare-grid figcaption { display: flex; flex-direction: column; gap: 2px; font-size: 10px; color: var(--wf-muted); margin-bottom: 5px; }
+.wf-compare-grid figcaption strong { color: var(--wf-text); font-size: 11px; }
+.wf-compare-canvas { width: 100%; height: 200px; background: #07121d; border-radius: 6px; }
+textarea { width: 100%; min-height: 80px; background: var(--wf-panel-2); color: var(--wf-text); border: 1px solid var(--wf-line); border-radius: 8px; padding: 8px; font-size: 11px; resize: vertical; }

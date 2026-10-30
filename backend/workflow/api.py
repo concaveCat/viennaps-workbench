@@ -16,8 +16,10 @@ from .. import snapshots, storage
 from ..models import ProjectV7, StepV7, StrictModel
 from .metrology import MeasurementResultV1, MetrologyRecipeV1, MetricDefinitionV1, SnapshotPayloadV1, snapshot_content_hash
 from .adoption import adopt_project, first_route
+from .analysis import build_report, candidate_view, compare_snapshots as compare_analysis_snapshots, load_snapshot, process_window, snapshot_summary
+from .calibration import create_dataset, run_fit
 from .branches import create_branch
-from .equivalence import ComparisonProtocolV1, EquivalenceResultV1, compare_snapshots
+from .equivalence import ComparisonProtocolV1, EquivalenceResultV1, compare_snapshots as compare_equivalence_snapshots
 from .execution import execute_segment
 from .experiments import (
     apply_experiment_retention,
@@ -395,6 +397,58 @@ class FromTemplateRequest(StrictModel):
     mode: Literal["replace", "append"] = "replace"
 
 
+class AnalysisCandidateV1(StrictModel):
+    runId: str
+    stepId: str
+    label: str | None = None
+
+
+class AnalysisCompareRequest(StrictModel):
+    candidates: Annotated[list[AnalysisCandidateV1], Field(min_length=2, max_length=4)]
+    tolerance: Annotated[float, Field(ge=0, le=1_000_000)] = 1e-6
+
+
+class ProcessWindowRequest(StrictModel):
+    experimentId: str
+    lower: float
+    upper: float
+
+    @model_validator(mode="after")
+    def ordered_limits(self) -> "ProcessWindowRequest":
+        if not self.lower < self.upper:
+            raise ValueError("process window lower must be smaller than upper")
+        return self
+
+
+class ReportRequest(StrictModel):
+    title: Annotated[str, Field(min_length=1, max_length=120)] = "Workflow report"
+    experimentId: str | None = None
+    runId: str | None = None
+    stepId: str | None = None
+    conclusions: Annotated[str, Field(max_length=20_000)] = ""
+    lower: float | None = None
+    upper: float | None = None
+
+
+class ReportResponse(StrictModel):
+    reportId: str
+    title: str
+    html: str
+    sha256: str
+    createdAt: str
+
+
+class CalibrationDatasetRequest(StrictModel):
+    name: Annotated[str, Field(min_length=1, max_length=80)]
+    csv: Annotated[str, Field(min_length=1, max_length=2_000_000)]
+
+
+class CalibrationFitRequest(StrictModel):
+    datasetId: str
+    model: Literal["scale", "scale_offset", "quadratic", "power", "power_offset"]
+    method: Literal["least-squares", "nelder-mead"]
+
+
 class ExperimentRetentionRequest(StrictModel):
     mode: Literal["keep-all", "release-runs"]
 
@@ -471,6 +525,94 @@ def _call(operation):
         return operation()
     except (WorkflowError, ValidationError) as exc:
         raise _http_error(exc) from exc
+
+
+@router.post("/analysis/compare", response_model=dict)
+async def analyze_compare(request: AnalysisCompareRequest) -> dict:
+    def operation():
+        candidates = []
+        snapshots = []
+        for candidate in request.candidates:
+            try:
+                snapshot = load_snapshot(candidate.runId, candidate.stepId)
+            except (FileNotFoundError, OSError, ValueError) as exc:
+                raise WorkflowNotFound(f"snapshot for run {candidate.runId!r} step {candidate.stepId!r} is unavailable") from exc
+            snapshots.append(snapshot)
+            candidates.append({
+                "runId": candidate.runId, "stepId": candidate.stepId,
+                "label": candidate.label, "summary": snapshot_summary(snapshot),
+            })
+        pairwise = []
+        for left in range(len(snapshots)):
+            for right in range(left + 1, len(snapshots)):
+                comparison = compare_analysis_snapshots(snapshots[left], snapshots[right], request.tolerance)
+                comparison["left"] = request.candidates[left].label or request.candidates[left].runId
+                comparison["right"] = request.candidates[right].label or request.candidates[right].runId
+                pairwise.append(comparison)
+        return {"candidates": candidates, "pairwise": pairwise, "tolerance": request.tolerance}
+    return _call(operation)
+
+
+@router.get("/analysis/candidates/{run_id}/{step_id}/view", response_model=dict)
+async def analyze_candidate_view(run_id: str, step_id: str) -> dict:
+    def operation():
+        try:
+            return candidate_view(load_snapshot(run_id, step_id))
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            raise WorkflowNotFound(f"snapshot for run {run_id!r} step {step_id!r} is unavailable") from exc
+    return _call(operation)
+
+
+@router.post("/analysis/process-window", response_model=dict)
+async def analyze_process_window(request: ProcessWindowRequest) -> dict:
+    def operation():
+        document = get_store().get_experiment(request.experimentId)
+        return process_window(document, request.lower, request.upper)
+    return _call(operation)
+
+
+@router.post("/analysis/report", response_model=ReportResponse)
+async def analyze_report(request: ReportRequest) -> ReportResponse:
+    def operation():
+        return build_report(get_store(), request.model_dump(mode="json"))
+    return _call(operation)
+
+
+@router.post("/calibration/datasets", response_model=dict, status_code=201)
+async def create_calibration_dataset(request: CalibrationDatasetRequest) -> dict:
+    def operation():
+        store = get_store()
+        document = create_dataset(request.name, request.csv)
+        store.save_calibration_dataset(document)
+        return document
+    try:
+        return _call(operation)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/calibration/datasets/{dataset_id}", response_model=dict)
+async def get_calibration_dataset(dataset_id: str) -> dict:
+    return _call(lambda: get_store().get_calibration_dataset(dataset_id))
+
+
+@router.post("/calibration/fit", response_model=dict, status_code=201)
+async def fit_calibration(request: CalibrationFitRequest) -> dict:
+    def operation():
+        store = get_store()
+        dataset = store.get_calibration_dataset(request.datasetId)
+        result = run_fit(dataset, request.model, request.method)
+        store.save_calibration_fit(result)
+        return result
+    try:
+        return _call(operation)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/calibration/fits/{fit_id}", response_model=dict)
+async def get_calibration_fit(fit_id: str) -> dict:
+    return _call(lambda: get_store().get_calibration_fit(fit_id))
 
 
 @router.post("/comparison-protocols", response_model=ComparisonProtocolV1, status_code=201)
@@ -550,7 +692,7 @@ async def equivalence_check(request: EquivalenceCheckRequest) -> EquivalenceResu
         store.register_comparison_protocol(request.protocol)
         left_payload = request.left.model_dump(mode="json", exclude_none=True)
         right_payload = request.right.model_dump(mode="json", exclude_none=True)
-        result = compare_snapshots(request.protocol, left_payload, right_payload).model_copy(update={
+        result = compare_equivalence_snapshots(request.protocol, left_payload, right_payload).model_copy(update={
             "leftRunId": request.leftRunId,
             "rightRunId": request.rightRunId,
             "leftSegmentId": request.leftSegmentId,

@@ -189,6 +189,17 @@ class WorkflowStore:
                     document_json TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS calibration_datasets (
+                    dataset_id TEXT PRIMARY KEY,
+                    document_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS calibration_fits (
+                    fit_id TEXT PRIMARY KEY,
+                    dataset_id TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS layout_assets (
                     layout_id TEXT PRIMARY KEY,
                     asset_id TEXT NOT NULL,
@@ -1356,6 +1367,40 @@ class WorkflowStore:
              "updatedAt": row["updated_at"]}
             for row in rows
         ]
+
+    def save_calibration_dataset(self, document: dict[str, Any]) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO calibration_datasets (dataset_id, document_json, created_at) VALUES (?, ?, ?)",
+                (document["datasetId"], self._dump(document), document.get("createdAt", self._now())),
+            )
+        return document
+
+    def get_calibration_dataset(self, dataset_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT document_json FROM calibration_datasets WHERE dataset_id = ?", (dataset_id,)
+            ).fetchone()
+        if row is None:
+            raise WorkflowNotFound(f"calibration dataset {dataset_id!r} does not exist")
+        return json.loads(row["document_json"])
+
+    def save_calibration_fit(self, document: dict[str, Any]) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO calibration_fits (fit_id, dataset_id, result_json, created_at) VALUES (?, ?, ?, ?)",
+                (document["fitId"], document["datasetId"], self._dump(document), document.get("createdAt", self._now())),
+            )
+        return document
+
+    def get_calibration_fit(self, fit_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT result_json FROM calibration_fits WHERE fit_id = ?", (fit_id,)
+            ).fetchone()
+        if row is None:
+            raise WorkflowNotFound(f"calibration fit {fit_id!r} does not exist")
+        return json.loads(row["result_json"])
 
     def register_layout(self, layout_id: str, asset_id: str, file_name: str, document: dict[str, Any]) -> dict[str, Any]:
         with self._connect() as connection:

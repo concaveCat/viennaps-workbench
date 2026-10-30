@@ -113,6 +113,64 @@ type ExperimentDoc = {
   variants: Array<{ ordinal: number; replicates: Array<{ status: string; value?: number | null; unit?: string; runId?: string; seed?: number; attemptCount?: number; statisticalSample?: boolean }> }>;
   project?: { steps: Array<{ id: string }> };
 };
+type SnapshotSummary = {
+  runId: string;
+  stepId: string;
+  dimension: number;
+  topology: string;
+  digest: string;
+  pointCount: number;
+  lineCount: number;
+  triangleCount: number;
+  bounds: number[];
+  materialMeasures: Record<string, number>;
+  measureKind: string;
+};
+type CompareResult = {
+  candidates: Array<{ runId: string; stepId: string; label: string | null; summary: SnapshotSummary }>;
+  pairwise: Array<{
+    left: string; right: string; status: string; leftDigest: string; rightDigest: string;
+    maxPointDelta: number | null; boundsDelta: number; materialDelta: Record<string, number>;
+    reasons: string[]; tolerance: number;
+  }>;
+};
+type CandidateView = {
+  dimension: number;
+  topology: string;
+  points: number[][];
+  lines: number[][];
+  triangles: number[][];
+  materialIds: number[];
+  lineMaterialIds: number[];
+  triangleMaterialIds: number[];
+  materials: Record<string, { name?: string; color?: string }>;
+  pointCount: number;
+  lineCount: number;
+  triangleCount: number;
+  bounds: number[];
+  sampledPointCount: number;
+};
+type ProcessWindowResult = {
+  summary: { total: number; pass: number; fail: number; uncertain: number; notEvaluated: number };
+  factorWindows: Array<{ stepId: string; parameter: string; min: number | null; max: number | null }>;
+  candidates: Array<{ ordinal: number; mean: number | null; ci95: number | null; status: string; margin: number | null; parameters: Record<string, Record<string, number>> }>;
+  rows: Array<{ ordinal: number; mean: number | null; ci95: number | null; status: string }>;
+  lower: number;
+  upper: number;
+};
+type CalibrationDataset = { datasetId: string; name: string; trainCount: number; validationCount: number; sha256: string };
+type CalibrationFit = {
+  fitId: string;
+  model: string;
+  method: string;
+  parameterNames: string[];
+  parameters: number[];
+  iterations: number;
+  validationStatus: string;
+  trainResiduals: { n: number; rmse: number | null; mae: number | null; maxAbs: number | null };
+  validationResiduals: { n: number; rmse: number | null; mae: number | null; maxAbs: number | null };
+};
+type ReportDocument = { reportId: string; title: string; html: string; sha256: string; createdAt: string };
 type ExperimentTable = {
   experimentId: string;
   status: string;
@@ -174,7 +232,6 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [route, setRoute] = useState<RoutePlan | null>(null);
   const [segment, setSegment] = useState<RoutePlan['segments'][number] | null>(null);
   const [measurement, setMeasurement] = useState<Measurement | null>(null);
-  const [experiments, setExperiments] = useState<Array<{ index: number; routeId: string; segmentId: string; status: string; runId: string | null }>>([]);
   const [templates, setTemplates] = useState<TemplateSummary[]>([]);
   const [templateId, setTemplateId] = useState('');
   const [recipeMethod, setRecipeMethod] = useState<'cd_at_height' | 'etch_depth'>('etch_depth');
@@ -213,6 +270,23 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [tableMax, setTableMax] = useState('');
   const [tableSort, setTableSort] = useState('ordinal');
   const [retentionInfo, setRetentionInfo] = useState<{ releasable: string[]; protected: Array<{ runId: string; reasons: string[] }> } | null>(null);
+  const [compareCandidates, setCompareCandidates] = useState<Array<{ runId: string; stepId: string; label: string }>>([]);
+  const [comparison, setComparison] = useState<CompareResult | null>(null);
+  const [candidateViews, setCandidateViews] = useState<Record<string, CandidateView>>({});
+  const [syncZoom, setSyncZoom] = useState(1);
+  const [syncAxis, setSyncAxis] = useState<'xy' | 'xz' | 'yz'>('xy');
+  const [windowLower, setWindowLower] = useState('');
+  const [windowUpper, setWindowUpper] = useState('');
+  const [windowResult, setWindowResult] = useState<ProcessWindowResult | null>(null);
+  const [reportTitle, setReportTitle] = useState('Workflow report');
+  const [reportConclusions, setReportConclusions] = useState('');
+  const [reportDocument, setReportDocument] = useState<ReportDocument | null>(null);
+  const [calibrationCsv, setCalibrationCsv] = useState('');
+  const [calibrationName, setCalibrationName] = useState('calibration');
+  const [calibrationModel, setCalibrationModel] = useState('scale_offset');
+  const [calibrationMethod, setCalibrationMethod] = useState<'least-squares' | 'nelder-mead'>('least-squares');
+  const [calibrationDataset, setCalibrationDataset] = useState<CalibrationDataset | null>(null);
+  const [calibrationFit, setCalibrationFit] = useState<CalibrationFit | null>(null);
   const [previousCompile, setPreviousCompile] = useState<CompileInfo | null>(null);
   const [compileDiff, setCompileDiff] = useState<{ addedStepIds: string[]; removedStepIds: string[]; movedStepIds: string[]; changedStepIds: string[]; affectedStepIds: string[]; details?: Array<{ stepId: string; before: Record<string, unknown>; after: Record<string, unknown> }> } | null>(null);
   const [templateVariable, setTemplateVariable] = useState('0.02');
@@ -629,7 +703,6 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const waitSegment = async (segmentId: string) => {
     for (let i = 0; i < 300; i += 1) {
       const current = await api<RoutePlan['segments'][number]>(`/api/v1/workflow/segments/${segmentId}`);
-      setExperiments(previous => previous.map(item => item.segmentId === segmentId ? { ...item, status: current.status, runId: current.runId } : item));
       if (['succeeded', 'failed', 'cancelled', 'interrupted'].includes(current.status)) return current;
       await sleep(500);
     }
@@ -644,25 +717,120 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setMetricDetail({ measurement: item, recipe, provenance });
   });
 
-  const downloadReport = () => {
-    const lines = [
-      '<!doctype html><meta charset="utf-8"><title>P0 Workflow Report</title>',
-      '<style>body{font-family:system-ui;padding:32px;line-height:1.5}table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:6px 10px}</style>',
-      `<h1>${compile?.projectName ?? 'Workflow'} — P0 report</h1>`,
-      `<p>Compile: ${compile?.compileId ?? '—'}<br>Route: ${route?.route.routeId ?? '—'}<br>Run: ${segment?.runId ?? '—'}</p>`,
-      '<h2>Experiment variants</h2><table><tr><th>#</th><th>Status</th><th>Run</th></tr>',
-      ...experiments.map(item => `<tr><td>${item.index}</td><td>${item.status}</td><td>${item.runId ?? '—'}</td></tr>`),
-      '</table>',
-      '<h2>Measurement</h2>',
-      `<p>${measurement ? `${measurement.status}: ${measurement.value ?? '—'} ${measurement.unit} · binding ${measurement.bindingStatus} · equivalence ${measurement.equivalenceStatus}` : '—'}</p>`,
-    ];
-    const url = URL.createObjectURL(new Blob([lines.join('')], { type: 'text/html' }));
+  const loadExperimentCandidates = () => {
+    if (!experimentDoc) return;
+    const steps = (compile?.compile.project.steps ?? []).filter(step => step.enabled);
+    const stepId = steps[steps.length - 1]?.id ?? '';
+    const rows = experimentDoc.variants.slice(0, 3).map(variant => {
+      const replicate = variant.replicates.find(item => item.runId) ?? variant.replicates[0];
+      return { runId: replicate?.runId ?? '', stepId, label: `V${variant.ordinal}` };
+    }).filter(row => row.runId && row.stepId);
+    setCompareCandidates(rows);
+  };
+
+  const addCurrentCandidate = () => {
+    if (!segment?.runId) return;
+    setCompareCandidates(previous => [
+      ...previous.filter(item => item.runId !== segment.runId),
+      { runId: segment.runId!, stepId: segment.throughStepId, label: 'current' },
+    ].slice(0, 3));
+  };
+
+  const runComparison = () => run('compare', async () => {
+    const candidates = compareCandidates.filter(item => item.runId && item.stepId);
+    if (candidates.length < 2) throw new Error('至少需要两个候选');
+    const result = await postJson<CompareResult>('/api/v1/workflow/analysis/compare', {
+      candidates, tolerance: 1e-4,
+    });
+    setComparison(result);
+    const views = await Promise.all(candidates.map(item => api<CandidateView>(
+      `/api/v1/workflow/analysis/candidates/${item.runId}/${item.stepId}/view`,
+    )));
+    setCandidateViews(Object.fromEntries(candidates.map((item, index) => [`${item.runId}:${item.stepId}`, views[index]])));
+  });
+
+  const computeProcessWindow = () => run('window', async () => {
+    if (!experimentDoc) throw new Error('先创建实验');
+    const lower = Number(windowLower);
+    const upper = Number(windowUpper);
+    if (!Number.isFinite(lower) || !Number.isFinite(upper) || lower >= upper) throw new Error('填写有效的窗口上下限');
+    setWindowResult(await postJson<ProcessWindowResult>('/api/v1/workflow/analysis/process-window', {
+      experimentId: experimentDoc.experimentId, lower, upper,
+    }));
+  });
+
+  const generateReport = () => run('report', async () => {
+    const lower = Number(windowLower);
+    const upper = Number(windowUpper);
+    const payload: Record<string, unknown> = {
+      title: reportTitle || `${compile?.projectName ?? 'Workflow'} report`,
+      conclusions: reportConclusions,
+    };
+    if (experimentDoc) payload.experimentId = experimentDoc.experimentId;
+    if (segment?.runId) { payload.runId = segment.runId; payload.stepId = segment.throughStepId; }
+    if (Number.isFinite(lower) && Number.isFinite(upper) && lower < upper) { payload.lower = lower; payload.upper = upper; }
+    setReportDocument(await postJson<ReportDocument>('/api/v1/workflow/analysis/report', payload));
+  });
+
+  const openReport = () => {
+    if (!reportDocument) return;
+    const url = URL.createObjectURL(new Blob([reportDocument.html], { type: 'text/html' }));
+    window.open(url, '_blank');
+    window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  };
+
+  const downloadReportHtml = () => {
+    if (!reportDocument) return;
+    const url = URL.createObjectURL(new Blob([reportDocument.html], { type: 'text/html' }));
     const anchor = document.createElement('a');
     anchor.href = url;
-    anchor.download = 'p0-workflow-report.html';
+    anchor.download = `${reportDocument.reportId}.html`;
     anchor.click();
     URL.revokeObjectURL(url);
   };
+
+  const loadCalibrationFile = async (file: File) => {
+    setCalibrationCsv(await file.text());
+    setCalibrationName(file.name.replace(/\.[^.]+$/, ''));
+    setCalibrationDataset(null);
+    setCalibrationFit(null);
+  };
+
+  const createCalibrationDataset = () => run('calibration', async () => {
+    if (!calibrationCsv.trim()) throw new Error('先导入 CSV');
+    const dataset = await postJson<CalibrationDataset>('/api/v1/workflow/calibration/datasets', {
+      name: calibrationName || 'calibration', csv: calibrationCsv,
+    });
+    setCalibrationDataset(dataset);
+    setCalibrationFit(null);
+  });
+
+  const fitCalibration = () => run('calibration', async () => {
+    if (!calibrationDataset) throw new Error('先创建数据集');
+    setCalibrationFit(await postJson<CalibrationFit>('/api/v1/workflow/calibration/fit', {
+      datasetId: calibrationDataset.datasetId, model: calibrationModel, method: calibrationMethod,
+    }));
+  });
+
+  const analysisViewBox = useMemo(() => {
+    const views = Object.values(candidateViews);
+    if (!views.length) return '0 0 1 1';
+    let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+    for (const view of views) {
+      for (const point of view.points) {
+        const x = syncAxis === 'yz' ? point[1] : point[0];
+        const y = syncAxis === 'xy' ? point[1] : point[2];
+        x0 = Math.min(x0, x); x1 = Math.max(x1, x);
+        y0 = Math.min(y0, y); y1 = Math.max(y1, y);
+      }
+    }
+    if (!Number.isFinite(x0) || !Number.isFinite(y0)) return '0 0 1 1';
+    const padding = Math.max((x1 - x0) * 0.08, (y1 - y0) * 0.08, 1e-6);
+    const width = Math.max(x1 - x0 + padding * 2, 1e-6);
+    const height = Math.max(y1 - y0 + padding * 2, 1e-6);
+    const zoom = Math.max(0.25, syncZoom);
+    return `${x0 - padding + width * (1 - 1 / zoom) / 2} ${-(y1 + padding) + height * (1 - 1 / zoom) / 2} ${width / zoom} ${height / zoom}`;
+  }, [candidateViews, syncAxis, syncZoom]);
 
   return (
     <div className="wf-shell">
@@ -923,14 +1091,94 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         </section>}
         {zone === 'analyze' && <section className="wf-card wf-wide">
           <div className="wf-card-head"><span>05</span><h2>Analyze</h2></div>
-          <p className="wf-muted">分析区当前展示 Measurement 与 Provenance；数值等价独立于绑定状态。</p>
+          <p className="wf-muted">候选快照对比、结构 diff、process window 与基础标定；数值等价独立于绑定状态。</p>
           {measurement ? <div className="wf-summary"><strong>{measurement.status}</strong><span>{measurement.value === null ? measurement.reason : `${measurement.value.toFixed(4)} ${measurement.unit}`}</span><span>binding {measurement.bindingStatus} · equivalence {measurement.equivalenceStatus}</span></div> : <div className="wf-empty">完成一次运行与测量后显示指标。</div>}
-          {experiments.length > 0 && <table className="wf-table"><thead><tr><th>Variant</th><th>Status</th><th>Run</th></tr></thead><tbody>{experiments.map(item => <tr key={item.segmentId}><td>{item.index}</td><td>{item.status}</td><td><code>{item.runId ?? '—'}</code></td></tr>)}</tbody></table>}
+          <div className="wf-card-subhead">候选 / 多视图</div>
+          <div className="wf-template-row">
+            <button className="wf-button ghost" disabled={!experimentDoc || !!busy} onClick={loadExperimentCandidates}>载入实验前 3 个候选</button>
+            <button className="wf-button ghost" disabled={!segment?.runId || !!busy} onClick={addCurrentCandidate}>加入当前 Run</button>
+            <button className="wf-button primary" disabled={compareCandidates.length < 2 || !!busy} onClick={() => void runComparison()}>比较并加载视图</button>
+          </div>
+          {compareCandidates.length > 0 && <table className="wf-table"><thead><tr><th>候选</th><th>Run</th><th>Step</th></tr></thead><tbody>{compareCandidates.map(item => <tr key={item.runId}><td>{item.label}</td><td><code>{item.runId.slice(0, 10)}…</code></td><td><code>{item.stepId.slice(0, 10)}…</code></td></tr>)}</tbody></table>}
+          {comparison && <div className="wf-compare-controls">
+            <label>同步缩放 <input aria-label="同步缩放" type="range" min="0.5" max="3" step="0.1" value={syncZoom} onChange={event => setSyncZoom(Number(event.target.value))} /></label>
+            <select aria-label="同步轴" value={syncAxis} onChange={event => setSyncAxis(event.target.value as typeof syncAxis)}>
+              <option value="xy">XY</option>
+              <option value="xz">XZ</option>
+              <option value="yz">YZ</option>
+            </select>
+          </div>}
+          {comparison && <div className="wf-compare-grid">
+            {comparison.candidates.map((candidate, index) => {
+              const view = candidateViews[`${candidate.runId}:${candidate.stepId}`];
+              return <figure key={`${candidate.runId}:${candidate.stepId}`}>
+                <figcaption><strong>{candidate.label ?? `candidate ${index + 1}`}</strong><span>{candidate.summary.dimension}D · {candidate.summary.measureKind} · {JSON.stringify(candidate.summary.materialMeasures)}</span></figcaption>
+                {view ? <svg viewBox={analysisViewBox} className="wf-compare-canvas" role="img" aria-label={`候选 ${index + 1} 视图`}>
+                  {view.dimension === 2 ? view.lines.map((line, lineIndex) => {
+                    const a = view.points[line[0]];
+                    const b = view.points[line[1]];
+                    if (!a || !b) return null;
+                    const material = view.lineMaterialIds[lineIndex] ?? -1;
+                    return <line key={lineIndex} x1={a[0]} y1={-a[1]} x2={b[0]} y2={-b[1]} stroke={view.materials[String(material)]?.color ?? '#64d2ff'} strokeWidth={2} vectorEffect="non-scaling-stroke" />;
+                  }) : view.points.map((point, pointIndex) => {
+                    const x = syncAxis === 'yz' ? point[1] : point[0];
+                    const y = syncAxis === 'xy' ? point[1] : point[2];
+                    const material = view.materialIds[pointIndex] ?? -1;
+                    return <circle key={pointIndex} cx={x} cy={-y} r={1.2} fill={view.materials[String(material)]?.color ?? '#64d2ff'} />;
+                  })}
+                </svg> : <div className="wf-empty">视图加载中…</div>}
+              </figure>;
+            })}
+          </div>}
+          {comparison && <table className="wf-table"><thead><tr><th>Pair</th><th>Status</th><th>max point Δ</th><th>bounds Δ</th><th>material Δ</th><th>Reasons</th></tr></thead><tbody>{comparison.pairwise.map((row, index) => <tr key={index}><td>{row.left} ↔ {row.right}</td><td><span className={`wf-status ${row.status}`}>{row.status}</span></td><td>{row.maxPointDelta === null ? '—' : row.maxPointDelta.toExponential(3)}</td><td>{row.boundsDelta.toExponential(3)}</td><td>{JSON.stringify(row.materialDelta)}</td><td>{row.reasons.join('; ') || '—'}</td></tr>)}</tbody></table>}
+          <div className="wf-card-subhead">Process Window</div>
+          <div className="wf-template-row">
+            <input aria-label="窗口下限" value={windowLower} onChange={event => setWindowLower(event.target.value)} placeholder="lower" />
+            <input aria-label="窗口上限" value={windowUpper} onChange={event => setWindowUpper(event.target.value)} placeholder="upper" />
+            <button className="wf-button primary" disabled={!experimentDoc || !!busy} onClick={() => void computeProcessWindow()}>计算窗口</button>
+          </div>
+          {windowResult && <>
+            <div className="wf-summary"><strong>Window</strong><span>pass {windowResult.summary.pass} · fail {windowResult.summary.fail} · uncertain {windowResult.summary.uncertain} · n/e {windowResult.summary.notEvaluated}</span><span>[{windowResult.lower}, {windowResult.upper}]</span></div>
+            <table className="wf-table"><thead><tr><th>#</th><th>Mean</th><th>CI95</th><th>Status</th><th>Margin</th></tr></thead><tbody>{windowResult.rows.map(row => <tr key={row.ordinal}><td>{row.ordinal}</td><td>{row.mean === null ? '—' : row.mean.toExponential(4)}</td><td>{row.ci95 === null ? '—' : row.ci95.toExponential(3)}</td><td>{row.status}</td><td>{windowResult.candidates.find(item => item.ordinal === row.ordinal)?.margin?.toExponential(3) ?? '—'}</td></tr>)}</tbody></table>
+            {windowResult.factorWindows.length > 0 && <div className="wf-muted">factor windows: {windowResult.factorWindows.map(item => `${item.stepId}/${item.parameter} [${item.min ?? '—'}, ${item.max ?? '—'}]`).join(' · ')}</div>}
+          </>}
+          <div className="wf-card-subhead">基础标定</div>
+          <input aria-label="标定 CSV 文件" type="file" accept=".csv,text/csv" onChange={event => { const file = event.target.files?.[0]; if (file) void loadCalibrationFile(file); }} />
+          <div className="wf-template-row">
+            <select aria-label="标定模型" value={calibrationModel} onChange={event => setCalibrationModel(event.target.value)}>
+              <option value="scale">scale (1p)</option>
+              <option value="scale_offset">scale + offset (2p)</option>
+              <option value="quadratic">quadratic (3p)</option>
+              <option value="power">power (2p)</option>
+              <option value="power_offset">power + offset (3p)</option>
+            </select>
+            <select aria-label="标定方法" value={calibrationMethod} onChange={event => setCalibrationMethod(event.target.value as typeof calibrationMethod)}>
+              <option value="least-squares">least-squares</option>
+              <option value="nelder-mead">nelder-mead</option>
+            </select>
+            <button className="wf-button ghost" disabled={!calibrationCsv || !!busy} onClick={() => void createCalibrationDataset()}>创建数据集</button>
+            <button className="wf-button primary" disabled={!calibrationDataset || !!busy} onClick={() => void fitCalibration()}>拟合</button>
+          </div>
+          {calibrationDataset && <div className="wf-muted">dataset {calibrationDataset.name} · train {calibrationDataset.trainCount} / validation {calibrationDataset.validationCount} · {calibrationDataset.sha256.slice(0, 12)}…</div>}
+          {calibrationFit && <>
+            <div className="wf-summary"><strong>{calibrationFit.model} / {calibrationFit.method}</strong><span>{calibrationFit.parameterNames.map((name, index) => `${name}=${calibrationFit.parameters[index].toPrecision(5)}`).join(' · ')}</span><span className={calibrationFit.validationStatus === 'validated' ? 'wf-status verified' : 'wf-status'}>{calibrationFit.validationStatus}</span></div>
+            <table className="wf-table"><thead><tr><th>Split</th><th>n</th><th>RMSE</th><th>MAE</th><th>Max abs</th></tr></thead><tbody>
+              <tr><td>train</td><td>{calibrationFit.trainResiduals.n}</td><td>{calibrationFit.trainResiduals.rmse?.toPrecision(5) ?? '—'}</td><td>{calibrationFit.trainResiduals.mae?.toPrecision(5) ?? '—'}</td><td>{calibrationFit.trainResiduals.maxAbs?.toPrecision(5) ?? '—'}</td></tr>
+              <tr><td>validation</td><td>{calibrationFit.validationResiduals.n}</td><td>{calibrationFit.validationResiduals.rmse?.toPrecision(5) ?? '—'}</td><td>{calibrationFit.validationResiduals.mae?.toPrecision(5) ?? '—'}</td><td>{calibrationFit.validationResiduals.maxAbs?.toPrecision(5) ?? '—'}</td></tr>
+            </tbody></table>
+          </>}
         </section>}
         {zone === 'report' && <section className="wf-card wf-wide">
           <div className="wf-card-head"><span>06</span><h2>Report</h2></div>
-          <p className="wf-muted">生成包含 Flow、Compile、Run、变体与 Measurement 的 HTML 报告；等价状态与绑定状态分开记录。</p>
-          <button className="wf-button primary" onClick={downloadReport}>下载 HTML 报告</button>
+          <p className="wf-muted">服务端 HTML 报告包含 Flow/Compile、Clip、变量、引擎版本、种子、指标、视图、process window 与结论；浏览器打印可保存 PDF。</p>
+          <div className="wf-template-row">
+            <input aria-label="报告标题" value={reportTitle} onChange={event => setReportTitle(event.target.value)} />
+            <button className="wf-button primary" disabled={!!busy} onClick={() => void generateReport()}>{busy === 'report' ? '生成中…' : '生成 HTML 报告'}</button>
+            <button className="wf-button ghost" disabled={!reportDocument} onClick={openReport}>打开报告</button>
+            <button className="wf-button ghost" disabled={!reportDocument} onClick={downloadReportHtml}>下载 HTML</button>
+          </div>
+          <textarea aria-label="报告结论" value={reportConclusions} onChange={event => setReportConclusions(event.target.value)} placeholder="结论 / 候选选择说明" />
+          {reportDocument && <div className="wf-summary"><strong>{reportDocument.reportId}</strong><span>{reportDocument.createdAt}</span><span><code>{reportDocument.sha256.slice(0, 16)}…</code></span></div>}
           <div className="wf-summary"><strong>Workflow summary</strong><span>Flow {compile?.flowId ?? '—'}</span><span>Compile {compile?.compileId ?? '—'}</span><span>Run {segment?.runId ?? '—'}</span><span>Measurement {measurement?.measurementId ?? '—'}</span><span>Binding {measurement?.bindingStatus ?? '—'}</span></div>
         </section>}
       </main>
