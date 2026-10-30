@@ -105,10 +105,16 @@ class GdsStackMaskPhysics(unittest.TestCase):
         self.assertEqual(diagnostics["gridSource"], "simulation-domain", name)
         self.assertIs(diagnostics["wrapLowerLevelSet"], True, name)
         self.assertEqual(diagnostics["retainedRegion"], retained, name)
-        self.assertEqual(diagnostics["construction"],
-                         "native-extrude-capped-surface-regrid-union-v1", name)
-        for key in ("alignedMaskPointCount", "extrudedPointCount",
-                    "sourceSurfacePointCount", "sourceSurfaceTriangleCount"):
+        self.assertIn(diagnostics["construction"],
+                      {"native-extrude-capped-surface-regrid-union-v1",
+                       "native-layer-to-levelset-regrid-union-v1"}, name)
+        if diagnostics["construction"] == "native-layer-to-levelset-regrid-union-v1":
+            self.assertGreater(diagnostics["nativeBodyPointCount"], 0, name)
+        else:
+            for key in ("extrudedPointCount",):
+                self.assertGreater(diagnostics[key], 0, f"{name}: {key} must be positive")
+        for key in ("alignedMaskPointCount", "sourceSurfacePointCount",
+                    "sourceSurfaceTriangleCount"):
             self.assertGreater(diagnostics[key], 0, f"{name}: {key} must be positive")
         self.assertEqual(diagnostics["alignedMaskPointCount"], report["maskPoints"], name)
 

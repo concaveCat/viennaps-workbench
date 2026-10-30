@@ -511,6 +511,46 @@ class StackV7(StackV3):
     gdsMask: GDSMaskPatternV7 | None = None
 
 
+class GDSBlurV7(StrictModel):
+    """Optional native GDS proximity blur (``GDSGeometry.addBlur``).
+
+    This is the installed layout proximity blur: Gaussian sigmas on an exposure
+    grid, a normalized weighted sum and one threshold contour. It is **not** a
+    resist model, OPC or three-dimensional lithography simulation. ``sigmas``
+    use the native unit (grid intervals, i.e. ``sigma * gridDelta`` um), exactly
+    like the shipped ``examples/GDSReader/GDSReader.py``. ``delta`` is the
+    exposure grid spacing and defaults to the project gridDelta.
+    """
+
+    enabled: bool = True
+    sigmas: Annotated[list[Annotated[Number, Field(gt=0)]],
+                      Field(min_length=1, max_length=4)] = Field(default_factory=list)
+    weights: Annotated[list[Annotated[Number, Field(ge=0)]],
+                       Field(min_length=1, max_length=4)] = Field(default_factory=list)
+    threshold: Annotated[Number, Field(gt=0, lt=1)] = 0.5
+    delta: Annotated[Number, Field(gt=0)] | None = None
+    gridRefine: Annotated[Integer, Field(ge=1, le=8)] = 4
+
+    @model_validator(mode="after")
+    def checked_sampling(self):
+        if not self.enabled:
+            return self
+        if not self.sigmas or not self.weights:
+            raise ValueError("GDS blur requires nonempty sigmas and weights")
+        if len(self.sigmas) != len(self.weights):
+            raise ValueError("GDS blur sigmas and weights must have the same length")
+        total = 0.0
+        for weight in self.weights:
+            if not math.isfinite(weight):
+                raise ValueError("GDS blur weights must be finite")
+            total += weight
+            if not math.isfinite(total):
+                raise ValueError("GDS blur weights sum exceeds the finite range")
+        if total <= 0:
+            raise ValueError("GDS blur weights must have a positive sum")
+        return self
+
+
 class GDSGeometryV7(StrictModel):
     kind: Literal["gds"]
     assetId: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
@@ -519,6 +559,7 @@ class GDSGeometryV7(StrictModel):
     unitScale: Annotated[Number, Field(gt=0, le=1000000)] = 1
     position: Vector3 = [0, 0, 0]
     layers: Annotated[list[GDSLayerV7], Field(min_length=1, max_length=64)]
+    blur: GDSBlurV7 | None = None
 
     @model_validator(mode="after")
     def unique_layers(self):
@@ -1304,6 +1345,20 @@ class ProjectV7(ProjectV6):
                 if min(abs(start), abs(end)) > self.domain.yExtent / 2 or max(abs(start), abs(end)) > self.domain.yExtent / 2:
                     raise ValueError("fin extrusion extent must fit inside the 3D y domain")
         elif geometry["kind"] == "gds":
+            blur = geometry.get("blur")
+            if blur is not None and blur.get("enabled", True):
+                exposure_delta = (float(blur.get("delta"))
+                                  if blur.get("delta") is not None else float(delta))
+                if not math.isfinite(exposure_delta) or exposure_delta <= 0:
+                    raise ValueError("geometry.blur.delta must be finite and positive")
+                if exposure_delta > float(delta) + 1e-12:
+                    raise ValueError(
+                        "geometry.blur.delta is the exposure grid spacing and cannot be coarser than gridDelta")
+                int(blur.get("gridRefine", 4))
+                # The real exposure-grid budget depends on the GDS layout and
+                # is enforced by backend.validation, which can read the asset.
+                # Do not estimate it from the simulation domain here: a 2D
+                # layout can be much taller than xExtent.
             if self.dimension == 2:
                 if abs(geometry["position"][2]) > 1e-12:
                     raise ValueError("2D GDS position must use [x,h,0]")

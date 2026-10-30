@@ -182,7 +182,8 @@ def validate_project(payload: Any, *, kind: str = "project") -> tuple[Project, l
     delta = project.domain.gridDelta
     extent = project.domain.xExtent
     if project.schemaVersion in (3,4,5,6,7):
-        issues.extend(_validate_materials(project))
+        issues.extend(_validate_materials(
+            project, enforce_gds_domain=kind in ("simulate", "preview", "flux")))
         warnings.extend(_planarize_warnings(project))
         warnings.extend(_gds_boolean_warnings(project))
         warnings.extend(_directional_rate_set_warnings(project))
@@ -485,7 +486,8 @@ def _gds_boolean_warnings(project: Any) -> list[str]:
     return warnings
 
 
-def _validate_materials(project: ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 | ProjectV7) -> list[FieldIssue]:
+def _validate_materials(project: ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 | ProjectV7, *,
+                        enforce_gds_domain: bool = False) -> list[FieldIssue]:
     try:
         from .materials import material_catalog
         catalog=material_catalog()
@@ -530,6 +532,74 @@ def _validate_materials(project: ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 |
             # path would extrude to an empty body and fail at run time.
             available_pairs = set(library.effective_layer_datatypes(g["structure"]))
             mask_pairs = set(library.effective_mask_layer_datatypes(g["structure"]))
+            # A GDS layer body is inserted on its layout grid. If the layout is
+            # wider than the simulation domain, ViennaPS 4.6.2 does not clip it:
+            # insertNextLevelSetAsMaterial crashes the worker with SIGSEGV. The
+            # bounds below are pure Python and only cover direct elements; any
+            # SREF/AREF layout returns None and keeps the native worker guard.
+            blur = g.get("blur")
+            blur_enabled = isinstance(blur, dict) and blur.get("enabled", True)
+            padding_margin = 2.0 * float(project.domain.gridDelta) if blur_enabled else 0.0
+            layout_bounds = (library.selected_layout_bounds_um(
+                g["structure"], unit_scale=float(g["unitScale"]),
+                position_um=g["position"][:2])
+                if (enforce_gds_domain or blur_enabled) else None)
+            if blur_enabled:
+                # The installed blur allocates a fine exposure grid over the
+                # *padded native layout*, not over the simulation domain. A 2D
+                # layout can be thousands of micrometres tall while xExtent is
+                # small, so budget both actual GDS axes.
+                from .gds import MAX_GDS_BLUR_CELLS, blur_exposure_cell_count
+                if layout_bounds is None:
+                    issues.append(FieldIssue(
+                        "geometry.blur",
+                        "GDS blur cannot size its native exposure grid because the selected "
+                        "structure has no provable XY layout bounds (SREF/AREF references or "
+                        "invalid placement); flatten the layout or disable blur"))
+                else:
+                    grid_delta = float(project.domain.gridDelta)
+                    exposure_delta = (float(blur.get("delta"))
+                                      if blur.get("delta") is not None else grid_delta)
+                    bounds_with_padding = (layout_bounds[0] - padding_margin,
+                                           layout_bounds[1] - padding_margin,
+                                           layout_bounds[2] + padding_margin,
+                                           layout_bounds[3] + padding_margin)
+                    cells = blur_exposure_cell_count(
+                        bounds_with_padding, grid_delta=grid_delta,
+                        exposure_delta=exposure_delta,
+                        grid_refine=int(blur.get("gridRefine", 4)),
+                        sigma_count=len(blur.get("sigmas") or []))
+                    if cells > MAX_GDS_BLUR_CELLS:
+                        width_x = bounds_with_padding[2] - bounds_with_padding[0]
+                        width_y = bounds_with_padding[3] - bounds_with_padding[1]
+                        issues.append(FieldIssue(
+                            "geometry.blur",
+                            "GDS blur exposure grid would allocate "
+                            f"{cells:,} cells on the padded layout "
+                            f"({width_x:g} x {width_y:g} um); the limit is "
+                            f"{MAX_GDS_BLUR_CELLS:,} cells. Increase delta, reduce "
+                            "gridRefine/sigmas, or shrink the layout"))
+            if layout_bounds is not None and enforce_gds_domain:
+                bounds = layout_bounds
+                tolerance = max(1e-7, float(project.domain.gridDelta) * 1e-6)
+                half_x = float(project.domain.xExtent) / 2.0 - padding_margin
+                outside = (bounds[0] < -half_x - tolerance
+                           or bounds[2] > half_x + tolerance)
+                if project.dimension == 3:
+                    half_y = float(project.domain.yExtent) / 2.0 - padding_margin
+                    outside = outside or (bounds[1] < -half_y - tolerance
+                                          or bounds[3] > half_y + tolerance)
+                if outside:
+                    margin_text = (f" and leave {padding_margin:g} um of native blur padding"
+                                   if padding_margin else "")
+                    issues.append(FieldIssue(
+                        "geometry.assetId",
+                        "GDS layout bounds "
+                        f"[{bounds[0]:g}, {bounds[2]:g}]"
+                        + (f" x [{bounds[1]:g}, {bounds[3]:g}]" if project.dimension == 3 else "")
+                        + f" exceed the simulation domain (xExtent={float(project.domain.xExtent):g}"
+                        + (f", yExtent={float(project.domain.yExtent):g}" if project.dimension == 3 else "")
+                        + f"); enlarge the domain or move the layout so it fits inside{margin_text}"))
             for step_index, step in enumerate(project.steps):
                 if not is_geometry_step(step) or step_value(step, "model") != "gdsBoolean":
                     continue

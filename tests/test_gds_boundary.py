@@ -163,6 +163,15 @@ class GdsFullBoundsPreview(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(constructions[7]["planarGridPadding"], DELTA)
         self.assertGreater(constructions[7]["planarPointCount"], 0)
         self.assertGreater(constructions[7]["alignedLayerPointCount"], 0)
+        # Layer 7 is the full-bounds polygon: its body comes from the padded
+        # native 3D layerToLevelSet. Layer 1 hits the installed 4.6.2 empty
+        # native body for base 0.2, so it must use the measured fallback.
+        self.assertEqual(constructions[7]["construction"], "native-layer-to-levelset-v1")
+        self.assertIs(constructions[7]["nativeBodyUsed"], True)
+        self.assertGreater(constructions[7]["nativeBodyPointCount"], 0)
+        self.assertEqual(constructions[1]["construction"],
+                         "native-extrude-capped-surface-regrid-union-v1")
+        self.assertIs(constructions[1]["nativeBodyUsed"], False)
 
     async def test_2d_full_bounds_layer_preview_succeeds(self):
         project = gds_project(2, self.asset_id,
