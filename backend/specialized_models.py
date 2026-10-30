@@ -252,6 +252,59 @@ def _cf4o2_advanced() -> dict[str, Any]:
     return advanced
 
 
+# ``steps[].advancedOxidation`` is a top-level optional object on a
+# specialized:oxidation step, analogous to ``steps[].surfaceDiffusion``. Every
+# row below is a setter that was proven on the installed 4.6.2 binding to
+# change the returned surface deterministically; see
+# docs/oxidation-advanced-contract.md for the probe evidence. Defaults are the
+# installed native defaults, so materialising the block is a behaviour no-op.
+OXIDATION_ADVANCED_FIELDS: list[dict[str, Any]] = [
+    {"key": "cflFactor", "label": "CFL 系数", "kind": "number", "default": 0.499,
+     "minimum": 0.01, "maximum": 0.499, "step": 0.001, "nativeUnit": None,
+     "nativeSetter": "Oxidation.setCFLFactor",
+     "minimumNote": "installed native clamps to [0.001, 0.499]; the Workbench floor is 0.01 to keep bounded-child runs tractable"},
+    {"key": "mechanicsTolerance", "label": "力学收敛容差", "kind": "number", "default": 0.01,
+     "minimum": 0.01, "maximum": 0.2, "step": 0.001, "nativeUnit": None,
+     "nativeSetter": "Oxidation.setMechanicsTolerance",
+     "minimumNote": "values below the installed default can stop the mechanics coupling from converging; only looser values are accepted"},
+    {"key": "couplingTolerance", "label": "扩散-变形耦合容差", "kind": "number", "default": 0.05,
+     "minimum": 0.05, "maximum": 0.5, "step": 0.001, "nativeUnit": None,
+     "nativeSetter": "Oxidation.setCouplingTolerance",
+     "minimumNote": "must be at least mechanicsTolerance; the native validator warns when it is tighter"},
+    {"key": "simplePressureRelaxation", "label": "SIMPLE 压力松弛", "kind": "number", "default": 0.5,
+     "minimum": 0.01, "maximum": 1.0, "step": 0.01, "nativeUnit": None,
+     "nativeSetter": "Oxidation.setSimplePressureRelaxation"},
+]
+
+OXIDATION_ADVANCED_NATIVE_CLASS = "Oxidation"
+OXIDATION_ADVANCED_LOCATION = "steps[].advancedOxidation"
+
+
+def oxidation_advanced_spec() -> dict[str, Any]:
+    return {
+        "location": OXIDATION_ADVANCED_LOCATION,
+        "nativeClass": OXIDATION_ADVANCED_NATIVE_CLASS,
+        "requiresNativeModel": "oxidation",
+        "objectShape": "strict object; unknown keys are rejected",
+        "defaultsSource": "installed viennaps 4.6.2 Oxidation member defaults",
+        "fields": deepcopy(OXIDATION_ADVANCED_FIELDS),
+        "excluded": [
+            {"member": "setGpuMode", "reason": "CPU-only batch; GPU oxidation has no host evidence"},
+            {"member": "setGpuPreconditioner", "reason": "GPU-only"},
+            {"member": "setMaxGridPoints", "reason": "a solver cap, not a physics control; below the solve region it raises RuntimeError, above it is inert"},
+            {"member": "setSolveBounds / clearSolveBounds", "reason": "raw Cartesian index bounds; a controlled probe hit 'Cartesian solve region is empty' at valid-looking bounds"},
+            {"member": "setCouplingIterations", "reason": "explicit default 30 is inert; lowering it to 1 fails to converge"},
+            {"member": "setMechanicsIterations", "reason": "explicit default 200 is inert; lowering it to 1 fails to converge"},
+            {"member": "setPressureIterations / setStokesIterations", "reason": "explicit defaults 500 are inert; lowering pressure to 1 fails to converge"},
+            {"member": "setPressureTolerance / setStokesTolerance", "reason": "changing them requires a coupled mechanicsTolerance adjustment; not exposed as independent knobs"},
+            {"member": "setSimpleVelocityRelaxation", "reason": "no surface change above 1e-8 um in the controlled 2D/3D probes"},
+            {"member": "setMaskParameters and setMask* mechanics setters", "reason": "no verified LOCOS output on this host; the controlled 2D probe collapsed the oxide level set, so mask mechanics stays unexposed"},
+            {"member": "estimatePlanarOxideThickness", "reason": "read-only helper, not a setter; used as a native readback"},
+            {"member": "OxidationParameters / psOxidation / psProcessContext", "reason": "not bound by the installed Python module"},
+        ],
+    }
+
+
 CATALOG: list[dict[str, Any]] = [
     {"id": "sf6o2", "label": "SF₆/O₂ 等离子体刻蚀", "nativeClass": "SF6O2Etching", "operation": "etch", "usesFlux": True,
      "optionalKeys": ["advanced"],
@@ -321,8 +374,10 @@ CATALOG: list[dict[str, Any]] = [
                 number("purgePulseTime", 0), number("coverageTimeStep", 0.01), number("purgeTimeStep", 1),
                 number("numCycles", 1, minimum=1, maximum=10000, step=1)]},
     {"id": "oxidation", "label": "硅热氧化", "nativeClass": "Oxidation", "operation": "native", "usesFlux": False,
+     "advancedOxidation": oxidation_advanced_spec(),
      "fields": [enum("oxidant", "Dry", [("Dry", "Dry · O₂"), ("Wet", "Wet · H₂O")], label="氧化剂"),
-                enum("orientation", "Si100", [("Si100", "Si (100)"), ("Si111", "Si (111)"), ("PolySi", "多晶硅")], label="晶向"),
+                enum("orientation", "Si100", [("Si100", "Si (100)"), ("Si110", "Si (110)"),
+                                             ("Si111", "Si (111)"), ("PolySi", "多晶硅")], label="晶向"),
                 number("temperatureC", 1000, minimum=800, maximum=1200, step=1, unit="°C"),
                 number("pressureAtm", 1, minimum=0.000001, unit="atm"), number("timeHours", 0.001, minimum=0.000003, maximum=0.1666667, unit="h"),
                 number("timeStepHours", 0.0001, minimum=0.000001, unit="h"), number("transferCoefficientUmHr", 0.1, unit="µm/hr"),

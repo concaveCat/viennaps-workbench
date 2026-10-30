@@ -62,11 +62,14 @@ def materialize(input_path: Path, run_dir: Path, step_id: str) -> dict[str, Any]
     extra_outputs = [row for row in metadata.get("outputs", [])
                      if row.get("kind") not in {"levelSet", "levelSetMesh", "volumeMesh", "nativeMetadata",
                                                 "surfaceMesh", "cellSet", "cellSetSummary"}]
+    extra = ({"oxidation": metadata["oxidation"]}
+             if isinstance(metadata.get("oxidation"), dict) else None)
     produced = sim.save_snapshot(
         ps, domain, run_dir,
         run_id=metadata.get("runId") or config.get("runId") or "",
         step_id=step_id, step_name=metadata["name"], step_index=int(metadata["stepIndex"]),
         requested=project, no_op=bool(metadata.get("noOp", False)),
+        extra=extra,
         extra_outputs=extra_outputs or None,
         # The measured top/removal record is a property of the step that was
         # executed, not of the re-read Domain, so replay the recorded value to

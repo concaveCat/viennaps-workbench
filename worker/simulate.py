@@ -3329,8 +3329,16 @@ def execute(input_path: Path, run_dir: Path) -> None:
                 native_specialized_outputs.append(output_artifact(
                     artifact_path, run_dir, run_id, step["id"], "nativeCellSet", "JSON",
                     association="native DenseCellSet scalar grid; not projected onto surface mesh", nativeUnit=None))
+            snapshot_extra = None
+            if specialized and step["nativeModel"] == "oxidation" and isinstance(
+                    specialized_actual.get("advancedOxidation"), dict):
+                # Keep historical snapshots byte-identical when the optional
+                # block is omitted; only an explicit advanced object adds this
+                # manifest section.
+                snapshot_extra = {"oxidation": specialized_actual["advancedOxidation"]}
             with phase(f"stepSnapshot:{step['id']}"):
                 metadata = save_snapshot(ps, domain, run_dir, run_id=run_id, step_id=step["id"], step_name=step["name"], step_index=index, requested=project,
+                                         extra=snapshot_extra,
                                          extra_outputs=native_specialized_outputs or None,
                                          step=step, previous_tops=snapshots[-1].get("materialTops"),
                                          defer_payload=LAZY_SNAPSHOTS)

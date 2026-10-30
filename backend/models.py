@@ -893,6 +893,34 @@ class SurfaceDiffusionV7(StrictModel):
         return self
 
 
+class OxidationAdvancedV7(StrictModel):
+    """Optional native solver controls for ``specialized:oxidation``.
+
+    The installed ViennaPS 4.6.2 ``Oxidation`` binding exposes many setters but
+    no getters. This block carries only members proven to change the returned
+    surface deterministically. Defaults are the installed native defaults, so an
+    explicitly materialised block is a behaviour no-op relative to omitting it
+    (the request hash still changes because the request text differs).
+
+    Tightening ``mechanicsTolerance`` below the native default (0.01) or
+    ``couplingTolerance`` below 0.05 is not exposed: controlled probes stopped
+    converging. ``couplingTolerance`` must stay at least ``mechanicsTolerance``
+    because the native validator already warns about that ordering.
+    """
+
+    cflFactor: Annotated[Number, Field(ge=0.01, le=0.499)] = 0.499
+    mechanicsTolerance: Annotated[Number, Field(ge=0.01, le=0.2)] = 0.01
+    couplingTolerance: Annotated[Number, Field(ge=0.05, le=0.5)] = 0.05
+    simplePressureRelaxation: Annotated[Number, Field(ge=0.01, le=1.0)] = 0.5
+
+    @model_validator(mode="after")
+    def check_coupled_tolerances(self) -> "OxidationAdvancedV7":
+        if float(self.couplingTolerance) < float(self.mechanicsTolerance):
+            raise ValueError(
+                "couplingTolerance must be greater than or equal to mechanicsTolerance")
+        return self
+
+
 class SpecializedStepV7(StrictModel):
     id: Annotated[str, Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")]
     name: Annotated[str, Field(min_length=1, max_length=80)]
@@ -904,6 +932,7 @@ class SpecializedStepV7(StrictModel):
     depositMaterial: str | None = None
     nativeParameters: dict[str, Any]
     surfaceDiffusion: SurfaceDiffusionV7 | None = None
+    advancedOxidation: OxidationAdvancedV7 | None = None
 
     @model_validator(mode="after")
     def check_specialized_shape(self):
@@ -930,6 +959,13 @@ class SpecializedStepV7(StrictModel):
         if set(self.nativeParameters) - optional_parameters != expected_parameters:
             raise ValueError(f"{self.nativeModel} nativeParameters must contain exactly {sorted(expected_parameters)}"
                              + (f" (optional: {sorted(optional_parameters)})" if optional_parameters else ""))
+        if self.advancedOxidation is not None:
+            # Placement is oxidation-only whenever the object exists, even if
+            # every field still carries its native default.
+            if self.nativeModel != "oxidation":
+                raise ValueError(
+                    "advancedOxidation is only available for specialized:oxidation; "
+                    f"{self.nativeModel} has no native Oxidation solver controls")
         if self.surfaceDiffusion is not None:
             # Placement is ALD-only whenever the object exists, including a
             # disabled token: there is no other 4.6.2 process with a native

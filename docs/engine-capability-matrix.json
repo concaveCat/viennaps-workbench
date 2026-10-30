@@ -476,17 +476,17 @@
         2,
         3
       ],
-      "constructor": "Oxidation() + setOxidant/setOrientation/setTemperature/setPressure/setTime/setTimeStep/setTransferCoefficient/setInitialOxideThickness/setReactionActivationVolume/setDiffusionActivationVolume/setSiliconMaterial/setOxideMaterial/setMaskMaterial",
+      "constructor": "Oxidation() + setOxidant/setOrientation (Si100/Si110/Si111/PolySi)/setTemperature/setPressure/setTime/setTimeStep/setCFLFactor/setTransferCoefficient/setInitialOxideThickness/setReactionActivationVolume/setDiffusionActivationVolume/setMechanicsTolerance/setCouplingTolerance/setSimplePressureRelaxation/setSiliconMaterial/setOxideMaterial/setMaskMaterial",
       "docSummary": "Thermal silicon oxidation with a diffusion-reaction oxide solver and optional mask mechanics.",
       "classification": "exposed",
       "exposedBy": [
         "model:specialized/oxidation (schema 7, operation=native)"
       ],
-      "notes": "Duration is derived from timeHours; the step-level duration field is rejected for this model.",
+      "notes": "Duration is derived from timeHours; the step-level duration field is rejected for this model. B5 adds the optional steps[].advancedOxidation object with the four solver setters proven to change the native surface (cflFactor, mechanicsTolerance, couplingTolerance, simplePressureRelaxation) plus Si110. Omitted block => historical request hashes unchanged. Excluded with probe evidence: GPU mode, maxGridPoints, solve bounds, iteration caps, pressure/stokes tolerance, simpleVelocityRelaxation, mask mechanics and the model-level save helpers. See docs/oxidation-advanced-contract.md.",
       "members": {
         "exposed": [
           "oxidant (Dry/Wet)",
-          "orientation (Si100/Si111/PolySi)",
+          "orientation (Si100/Si110/Si111/PolySi)",
           "temperature",
           "pressure",
           "time",
@@ -495,21 +495,24 @@
           "initialOxideThickness",
           "reactionActivationVolume",
           "diffusionActivationVolume",
-          "silicon/oxide/mask material"
+          "silicon/oxide/mask material",
+          "setCFLFactor (advancedOxidation.cflFactor)",
+          "setMechanicsTolerance (advancedOxidation.mechanicsTolerance)",
+          "setCouplingTolerance (advancedOxidation.couplingTolerance)",
+          "setSimplePressureRelaxation (advancedOxidation.simplePressureRelaxation)",
+          "estimatePlanarOxideThickness (read-only native readback)"
         ],
         "notExposed": [
-          "SiliconOrientation.Si110",
-          "setCFLFactor",
-          "setCouplingIterations/Tolerance",
-          "setMechanicsIterations/Tolerance",
-          "setStokes/Pressure iterations+tolerances",
-          "setSimpleVelocityRelaxation / setSimplePressureRelaxation",
-          "setMaxGridPoints",
-          "setSolveBounds / clearSolveBounds",
-          "setMask* (bending bounds, contact load/release, traction, unilateral contact, smoother omega)",
-          "setGpuMode / setGpuPreconditioner",
-          "model-level saveSurfaceMesh / saveVolumeMesh helpers (the workbench writes the same meshes through Domain)",
-          "estimatePlanarOxideThickness"
+          "setCouplingIterations (explicit default inert; lowered value fails to converge)",
+          "setMechanicsIterations (explicit default inert; lowered value fails to converge)",
+          "setPressureIterations / setStokesIterations (explicit defaults inert; lowered pressure fails)",
+          "setPressureTolerance / setStokesTolerance (needs a coupled mechanicsTolerance adjustment)",
+          "setSimpleVelocityRelaxation (no surface change above 1e-8 um in the controlled probes)",
+          "setMaxGridPoints (solver cap; below the solve region it raises, above it is inert)",
+          "setSolveBounds / clearSolveBounds (raw Cartesian indices; controlled probe hit empty solve region)",
+          "setMaskParameters / setMask* mechanics (no verified LOCOS surface on this host)",
+          "setGpuMode / setGpuPreconditioner (CPU-only batch; GPU oxidation unverified)",
+          "model-level saveSurfaceMesh / saveVolumeMesh helpers (the workbench writes through Domain)"
         ]
       }
     },
@@ -2264,16 +2267,15 @@
       "exposedBy": [
         "model:specialized/oxidation/orientation"
       ],
-      "notes": "Si110 exists in 4.6.2 but is missing from the workbench enum; adding it needs an oxidation evidence run.",
+      "notes": "B5 exposes all four values. Si110 has native enum value 1, changes the planar Deal-Grove readback and produces a distinct 2D and 3D surface hash.",
       "members": {
         "exposed": [
           "Si100",
+          "Si110",
           "Si111",
           "PolySi"
         ],
-        "notExposed": [
-          "Si110"
-        ]
+        "notExposed": []
       }
     },
     {
@@ -2754,19 +2756,21 @@
     {
       "id": "B5",
       "title": "Oxidation advanced setters and Si110",
-      "classification": "advanced-parameter-or-output-not-exposed",
+      "classification": "exposed",
       "items": [
         "Oxidation",
         "SiliconOrientation"
       ],
       "risk": "high",
-      "notes": "Mask mechanics, coupling/mechanics/stokes tolerances, solve bounds and GPU mode are a separate solver surface. Si110 is missing from the enum purely because it was never evidenced.",
+      "notes": "Si110 plus the optional steps[].advancedOxidation object. Four solver setters are exposed only after controlled native probes showed a deterministic surface-hash change: cflFactor, mechanicsTolerance, couplingTolerance and simplePressureRelaxation. GPU mode, maxGridPoints, solve bounds, iteration caps, pressure/stokes tolerance, simpleVelocityRelaxation, mask mechanics and the legacy OxidationParameters names stay out with recorded evidence. Defaults are installed-native defaults and materialising them is a behaviour no-op.",
       "acceptanceCriteria": [
-        "Si110 is added only after a dry/wet oxidation run reproduces a direct native reference.",
-        "Advanced setters are grouped and opt-in; defaults reproduce the current oxidation artifacts exactly.",
-        "Mask-mechanics fields require a mask level set; a run without one is a 422.",
-        "GPU oxidation stays out until a host GPU evidence run exists for it."
-      ]
+        "Si110 exists in the installed enum, changes the planar native readback and produces distinct 2D/3D surface hashes.",
+        "Advanced setters are grouped in strict steps[].advancedOxidation; omitted block keeps historical request hashes and artifacts.",
+        "Every accepted setter has a controlled native probe showing a deterministic surface-hash change.",
+        "Excluded/inert members are rejected by the strict schema, not silently ignored; no raw native object or pointer is accepted.",
+        "Mask mechanics and GPU oxidation stay out until a verified host run exists."
+      ],
+      "status": "implemented-backend-api"
     },
     {
       "id": "C1",
