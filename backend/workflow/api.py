@@ -20,10 +20,13 @@ from .branches import create_branch
 from .equivalence import ComparisonProtocolV1, EquivalenceResultV1, compare_snapshots
 from .execution import execute_segment
 from .experiments import (
+    apply_experiment_retention,
     create_doe_document,
     create_experiment_document,
     experiment_csv,
     experiment_table,
+    resolve_experiment_base,
+    retention_preview,
     start_experiment,
 )
 from .layouts import build_clip_gds, canonical_clip_hash, extract_clip_polygons, save_asset, structure_bounds
@@ -183,6 +186,7 @@ class CreateExperimentRequest(StrictModel):
     name: str
     project: ProjectV7
     flowId: str
+    compileId: str | None = None
     recipeId: str
     recipeVersion: int
     variants: Annotated[list[ExperimentVariantSpecV1], Field(min_length=1, max_length=256)]
@@ -200,6 +204,7 @@ class DoeRequest(StrictModel):
     name: str
     project: ProjectV7
     flowId: str
+    compileId: str | None = None
     recipeId: str
     recipeVersion: int
     factors: Annotated[list[DoeFactorV1], Field(min_length=1, max_length=5)]
@@ -388,6 +393,10 @@ class FromTemplateRequest(StrictModel):
     flowId: str | None = None
     variables: dict[str, float | int | str] = Field(default_factory=dict)
     mode: Literal["replace", "append"] = "replace"
+
+
+class ExperimentRetentionRequest(StrictModel):
+    mode: Literal["keep-all", "release-runs"]
 
 
 class ProtocolSummaryV1(StrictModel):
@@ -716,6 +725,7 @@ async def get_compile(compile_id: str) -> CompiledWorkflowV1:
 async def adopt_project_endpoint(request: AdoptProjectRequest) -> AdoptProjectResponse:
     def operation():
         flow, binding, compiled = adopt_project(request.project.model_dump(mode="json", exclude_none=True), flow_id=request.flowId)
+        get_store().register_binding(binding)
         get_store().register_compile(compiled)
         return AdoptProjectResponse(
             flowId=flow.flowId,
@@ -747,15 +757,20 @@ async def create_experiment(request: CreateExperimentRequest) -> dict:
         store = get_store()
         recipe = store.get_recipe(request.recipeId, request.recipeVersion)
         metric = store.get_metric(recipe.metricId)
+        project, flow_id, base_compile_id, binding = resolve_experiment_base(
+            store, request.project.model_dump(mode="json", exclude_none=True),
+            request.flowId, request.compileId,
+        )
         document = create_experiment_document(
             name=request.name,
-            project=request.project.model_dump(mode="json", exclude_none=True),
-            flow_id=request.flowId,
+            project=project,
+            flow_id=flow_id,
             recipe_id=request.recipeId,
             recipe_version=request.recipeVersion,
             variants=[item.model_dump(mode="json") for item in request.variants],
             metric_id=metric.metricId, unit=metric.unit,
             max_attempts=request.maxAttempts, cost_per_run_usd=request.costPerRunUsd,
+            base_compile_id=base_compile_id, binding=binding,
         )
         return store.save_experiment(document["experimentId"], document)
     return _call(operation)
@@ -767,11 +782,15 @@ async def create_doe(request: DoeRequest) -> dict:
         store = get_store()
         recipe = store.get_recipe(request.recipeId, request.recipeVersion)
         metric = store.get_metric(recipe.metricId)
+        project, flow_id, base_compile_id, binding = resolve_experiment_base(
+            store, request.project.model_dump(mode="json", exclude_none=True),
+            request.flowId, request.compileId,
+        )
         try:
             document = create_doe_document(
                 name=request.name,
-                project=request.project.model_dump(mode="json", exclude_none=True),
-                flow_id=request.flowId,
+                project=project,
+                flow_id=flow_id,
                 recipe_id=request.recipeId,
                 recipe_version=request.recipeVersion,
                 factors=[item.model_dump(mode="json") for item in request.factors],
@@ -781,6 +800,8 @@ async def create_doe(request: DoeRequest) -> dict:
                 unit=metric.unit,
                 max_attempts=request.maxAttempts,
                 cost_per_run_usd=request.costPerRunUsd,
+                base_compile_id=base_compile_id,
+                binding=binding,
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -792,6 +813,24 @@ async def create_doe(request: DoeRequest) -> dict:
 async def get_experiment_aggregate(experiment_id: str) -> dict:
     document = _call(lambda: get_store().get_experiment(experiment_id))
     return document.get("aggregation") or {"rows": []}
+
+
+@router.post("/experiments/{experiment_id}/retention/preview", response_model=dict)
+async def preview_experiment_retention(experiment_id: str, request: ExperimentRetentionRequest) -> dict:
+    def operation():
+        store = get_store()
+        document = store.get_experiment(experiment_id)
+        return retention_preview(store, document)
+    return _call(operation)
+
+
+@router.post("/experiments/{experiment_id}/retention", response_model=dict)
+async def update_experiment_retention(experiment_id: str, request: ExperimentRetentionRequest) -> dict:
+    def operation():
+        store = get_store()
+        document = store.get_experiment(experiment_id)
+        return apply_experiment_retention(store, document, request.mode)
+    return _call(operation)
 
 
 @router.get("/experiments/{experiment_id}/table", response_model=dict)
@@ -977,6 +1016,7 @@ async def compile_clip(clip_id: str, request: ClipCompileRequest) -> AdoptProjec
         flow, binding, compiled = adopt_project(
             payload, flow_id=request.flowId, geometry_source=source,
         )
+        get_store().register_binding(binding)
         get_store().register_compile(compiled)
         return AdoptProjectResponse(
             flowId=flow.flowId, bindingId=binding.bindingId,
@@ -1022,6 +1062,7 @@ async def adopt_template(request: FromTemplateRequest) -> AdoptProjectResponse:
             flow_id=request.flowId,
             steps=steps,
         )
+        get_store().register_binding(binding)
         get_store().register_compile(compiled)
         return AdoptProjectResponse(
             flowId=flow.flowId, bindingId=binding.bindingId,

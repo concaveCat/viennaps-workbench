@@ -108,6 +108,8 @@ try {
   const experiment = (await getJson('/api/v1/workflow/experiments')).experiments[0];
   const document = await getJson(`/api/v1/workflow/experiments/${experiment.experimentId}`);
   assert.equal(document.kind, 'doe');
+  assert.equal(document.binding.geometrySource.clipId, clips.find(item => item.name === 'clip C').clipId);
+  assert.equal(document.binding.geometrySource.layoutId, clips.find(item => item.name === 'clip C').layoutId);
   assert.equal(document.design.conditionCount, 8);
   assert.equal(document.queue.succeeded, 8);
   assert.equal(document.aggregation.rows.length, 8);

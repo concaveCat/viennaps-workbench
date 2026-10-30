@@ -208,6 +208,11 @@ class WorkflowStore:
                     template_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS geometry_bindings (
+                    binding_id TEXT PRIMARY KEY,
+                    binding_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS comparison_protocols (
                     protocol_id TEXT NOT NULL,
                     version INTEGER NOT NULL,
@@ -1469,6 +1474,35 @@ class WorkflowStore:
             for row in rows
         ]
 
+    def register_binding(self, binding) -> Any:
+        payload = binding.model_dump(mode="json", exclude_none=True)
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT binding_json FROM geometry_bindings WHERE binding_id = ?",
+                (binding.bindingId,),
+            ).fetchone()
+            if existing is not None:
+                if sha256_hex(json.loads(existing["binding_json"])) != sha256_hex(payload):
+                    raise WorkflowConflict("geometry binding already exists with different content")
+                return binding
+            connection.execute(
+                "INSERT INTO geometry_bindings (binding_id, binding_json, created_at) VALUES (?, ?, ?)",
+                (binding.bindingId, self._dump(payload), self._now()),
+            )
+        return binding
+
+    def get_binding(self, binding_id: str):
+        from .models import GeometryBindingV1
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT binding_json FROM geometry_bindings WHERE binding_id = ?",
+                (binding_id,),
+            ).fetchone()
+        if row is None:
+            raise WorkflowNotFound(f"geometry binding {binding_id!r} does not exist")
+        return GeometryBindingV1.model_validate(json.loads(row["binding_json"]))
+
     def register_comparison_protocol(self, protocol) -> Any:
         payload = protocol.model_dump(mode="json", exclude_none=True)
         with self._connect() as connection:
@@ -1575,6 +1609,41 @@ class WorkflowStore:
                 (record_id, artifact_id, owner_type, owner_id, capability, reason, self._now()),
             )
         return {"recordId": record_id, "artifactId": artifact_id, "ownerType": owner_type, "ownerId": owner_id, "capability": capability}
+
+    def artifact_dependencies(self, artifact_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            refs = connection.execute(
+                "SELECT owner_type, owner_id, required_for FROM artifact_refs WHERE artifact_id = ?",
+                (artifact_id,),
+            ).fetchall()
+            measurements = connection.execute(
+                "SELECT measurement_id FROM measurements WHERE source_run_id = ?", (artifact_id,)
+            ).fetchall()
+            segment_owners = connection.execute(
+                "SELECT segment_id FROM segments WHERE run_id = ?", (artifact_id,)
+            ).fetchall()
+            segments = connection.execute("SELECT segment_id, start_checkpoint_json, end_checkpoint_json FROM segments").fetchall()
+            pins = connection.execute(
+                "SELECT 1 FROM artifact_pins WHERE artifact_id = ?", (artifact_id,)
+            ).fetchone()
+        checkpoint_owners = []
+        for row in segments:
+            for raw in (row["start_checkpoint_json"], row["end_checkpoint_json"]):
+                if not raw:
+                    continue
+                try:
+                    payload = json.loads(raw)
+                except (TypeError, ValueError):
+                    continue
+                if payload.get("runId") == artifact_id:
+                    checkpoint_owners.append(row["segment_id"])
+        return {
+            "refs": [{"ownerType": row["owner_type"], "ownerId": row["owner_id"], "requiredFor": row["required_for"]} for row in refs],
+            "measurements": [row["measurement_id"] for row in measurements],
+            "segmentOwners": [row["segment_id"] for row in segment_owners],
+            "checkpointOwners": sorted(set(checkpoint_owners)),
+            "pinned": pins is not None,
+        }
 
     def gc_dry_run(self) -> dict[str, Any]:
         from .. import storage

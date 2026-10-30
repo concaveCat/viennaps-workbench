@@ -1676,6 +1676,17 @@
       "CreateExperimentRequest": {
         "additionalProperties": false,
         "properties": {
+          "compileId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Compileid"
+          },
           "costPerRunUsd": {
             "default": 0.0,
             "maximum": 1000000.0,
@@ -1855,6 +1866,17 @@
       "DoeRequest": {
         "additionalProperties": false,
         "properties": {
+          "compileId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Compileid"
+          },
           "costPerRunUsd": {
             "default": 0.0,
             "maximum": 1000000.0,
@@ -2596,6 +2618,24 @@
           "status"
         ],
         "title": "ExecutionEvidenceV1",
+        "type": "object"
+      },
+      "ExperimentRetentionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "enum": [
+              "keep-all",
+              "release-runs"
+            ],
+            "title": "Mode",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode"
+        ],
+        "title": "ExperimentRetentionRequest",
         "type": "object"
       },
       "ExperimentVariantSpecV1": {
@@ -8554,6 +8594,114 @@
           }
         },
         "summary": "Export Experiment Csv",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/experiments/{experiment_id}/retention": {
+      "post": {
+        "operationId": "update_experiment_retention_api_v1_workflow_experiments__experiment_id__retention_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "experiment_id",
+            "required": true,
+            "schema": {
+              "title": "Experiment Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExperimentRetentionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update Experiment Retention Api V1 Workflow Experiments  Experiment Id  Retention Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Experiment Retention",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/experiments/{experiment_id}/retention/preview": {
+      "post": {
+        "operationId": "preview_experiment_retention_api_v1_workflow_experiments__experiment_id__retention_preview_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "experiment_id",
+            "required": true,
+            "schema": {
+              "title": "Experiment Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExperimentRetentionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Preview Experiment Retention Api V1 Workflow Experiments  Experiment Id  Retention Preview Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Preview Experiment Retention",
         "tags": [
           "workflow"
         ]

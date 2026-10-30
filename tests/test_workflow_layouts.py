@@ -8,6 +8,8 @@ from pathlib import Path
 
 os.environ.setdefault("WORKBENCH_PORT", "8767")
 
+import asyncio  # noqa: E402
+
 from backend import storage  # noqa: E402
 from backend.main import app  # noqa: E402
 from tests.test_api_integration import asgi_request, json_body  # noqa: E402
@@ -47,6 +49,76 @@ class LayoutClipTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response[0], 201, response[2])
         return json_body(response)
+
+    async def _wait_experiment(self, experiment_id: str, timeout: float = 60.0) -> dict:
+        deadline = asyncio.get_running_loop().time() + timeout
+        document = {}
+        while asyncio.get_running_loop().time() < deadline:
+            response = await asgi_request(f"/api/v1/workflow/experiments/{experiment_id}")
+            document = json_body(response)
+            if document.get("status") in {"completed", "failed"}:
+                return document
+            await asyncio.sleep(0.3)
+        self.fail(f"experiment did not finish: {document.get('status')}")
+
+    async def test_clip_compile_binding_is_reused_by_experiment_runs(self):
+        import uuid
+
+        clip = await self._clip(
+            "binding clip", "CELL_A", 1,
+            {"x0": -0.1, "y0": -0.1, "x1": 2.1, "y1": 1.1},
+        )
+        compiled = await asgi_request(
+            f"/api/v1/workflow/clips/{clip['clipId']}/compile", method="POST",
+            payload={"project": project(), "flowId": "flow_clip_experiment"},
+        )
+        self.assertEqual(compiled[0], 201, compiled[2])
+        compiled_body = json_body(compiled)
+        binding = compiled_body["binding"]
+        suffix = uuid.uuid4().hex[:6]
+        metric_id = f"metric_clip_{suffix}"
+        recipe_id = f"recipe_clip_{suffix}"
+        for path, payload in (
+            ("/api/v1/workflow/metrics", {"schemaVersion": 1, "metricId": metric_id, "name": "depth", "unit": "um"}),
+            ("/api/v1/workflow/metrology-recipes", {
+                "schemaVersion": 1, "recipeId": recipe_id, "version": 1, "metricId": metric_id,
+                "name": "depth", "dimension": 2, "method": "etch_depth",
+                "parameters": {"kind": "etch_depth", "x": 0, "referenceHeight": 0}, "material": "Si",
+            }),
+        ):
+            await asgi_request(path, method="POST", payload=payload)
+        created = await asgi_request(
+            "/api/v1/workflow/experiments", method="POST",
+            payload={
+                "name": "clip experiment", "project": project(), "flowId": "flow_clip_experiment",
+                "compileId": compiled_body["compileId"], "recipeId": recipe_id, "recipeVersion": 1,
+                "variants": [{"parameters": {}, "replicates": 1, "seed": 91}],
+            },
+        )
+        self.assertEqual(created[0], 201, created[2])
+        document = json_body(created)
+        self.assertEqual(document["bindingId"], binding["bindingId"])
+        self.assertEqual(document["binding"]["geometrySource"]["clipId"], clip["clipId"])
+        started = await asgi_request(
+            f"/api/v1/workflow/experiments/{document['experimentId']}/run", method="POST", payload={}
+        )
+        self.assertEqual(started[0], 200, started[2])
+        final = await self._wait_experiment(document["experimentId"])
+        self.assertEqual(final["status"], "completed", final)
+        replicate = final["variants"][0]["replicates"][0]
+        self.assertEqual(replicate["status"], "succeeded", replicate)
+        self.assertTrue(replicate["statisticalSample"])
+        manifest = storage.read_json(storage.run_path(replicate["runId"]) / "manifest.json")
+        self.assertEqual(manifest["normalizedProject"]["geometry"]["kind"], "gds")
+        self.assertEqual(manifest["normalizedProject"]["geometry"]["assetId"], clip["gdsAssetId"])
+        self.assertEqual(manifest["normalizedProject"]["domain"]["xExtent"], binding["domain"]["xExtent"])
+        route = json_body(await asgi_request(f"/api/v1/workflow/routes/{replicate['routeId']}"))["plan"]
+        segment = next(item for item in route["segments"] if item["segmentId"] == replicate["segmentId"])
+        run_compile = json_body(await asgi_request(f"/api/v1/workflow/compiles/{segment['sourceCompileId']}"))
+        self.assertEqual(run_compile["compileRecord"]["geometryBindingId"], binding["bindingId"])
+        self.assertEqual(run_compile["compileRecord"]["geometryBindingHash"], compiled_body["compile"]["compileRecord"]["geometryBindingHash"])
+        self.assertEqual(run_compile["project"]["geometry"]["kind"], "gds")
+        self.assertEqual(run_compile["project"]["geometry"]["assetId"], clip["gdsAssetId"])
 
     async def test_hierarchical_reference_flattens_into_layout_bounds(self):
         source = Path(__file__).resolve().parents[1] / "docs" / "stage5-evidence" / "hierarchical-reference.gds"
@@ -144,7 +216,8 @@ class LayoutClipTests(unittest.IsolatedAsyncioTestCase):
 
         listing = await asgi_request(f"/api/v1/workflow/clips?layout_id={self.layout['layoutId']}")
         self.assertEqual(listing[0], 200, listing[2])
-        self.assertEqual(len(json_body(listing)["clips"]), 3)
+        listed_ids = {clip["clipId"] for clip in json_body(listing)["clips"]}
+        self.assertTrue({clip_a["clipId"], clip_b["clipId"], clip_c["clipId"]} <= listed_ids)
 
 
 if __name__ == "__main__":

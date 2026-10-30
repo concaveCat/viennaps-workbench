@@ -14,11 +14,24 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from pydantic import TypeAdapter
+
+from ..models import SolverV7, StepV7
+from ..supervisor import ActiveRunError
 from .adoption import adopt_project, first_route
-from .execution import execute_segment
+from .compiler import compile_flow
+from .execution import SegmentBusy, execute_segment
+from .models import FlowRevisionV1, GeometryBindingV1
 from .store import WorkflowConflict, WorkflowNotFound, WorkflowStore
 
 DEFAULT_ESTIMATED_SECONDS = 1.0
+_T95_TWO_SIDED = {
+    1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365,
+    8: 2.306, 9: 2.262, 10: 2.228, 11: 2.201, 12: 2.179, 13: 2.160, 14: 2.145,
+    15: 2.131, 16: 2.120, 17: 2.110, 18: 2.101, 19: 2.093, 20: 2.086,
+    21: 2.080, 22: 2.074, 23: 2.069, 24: 2.064, 25: 2.060, 26: 2.056,
+    27: 2.052, 28: 2.048, 29: 2.045, 30: 2.042,
+}
 _ALLOWED_FACTORS = {
     "duration", "rateMagnitude", "stickingProbability", "sourceExponent",
 }
@@ -35,6 +48,27 @@ def _apply_parameters(project: dict[str, Any], parameters: dict[str, Any]) -> di
         if isinstance(overrides, dict):
             step.update(overrides)
     return clone
+
+
+def authored_project(compiled: Any) -> dict[str, Any]:
+    """Restore authored step ids while keeping the compiled geometry/domain."""
+
+    payload = compiled.project.model_dump(mode="json", exclude_none=True)
+    steps = []
+    for index, entry in enumerate(compiled.sourceMap):
+        step = compiled.project.steps[index].model_dump(mode="json", exclude_none=True)
+        step["id"] = entry.authoredStepId
+        steps.append(step)
+    payload["steps"] = steps
+    return payload
+
+
+def resolve_experiment_base(store: WorkflowStore, project: dict[str, Any], flow_id: str, compile_id: str | None):
+    if not compile_id:
+        return project, flow_id, None, None
+    compiled = store.get_compile(compile_id)
+    binding = store.get_binding(compiled.compileRecord.geometryBindingId)
+    return authored_project(compiled), compiled.compileRecord.flowId, compiled.compileRecord.compileId, binding
 
 
 def _replicates(document: dict[str, Any]):
@@ -90,7 +124,10 @@ def _aggregate(document: dict[str, Any]) -> dict[str, Any]:
         count = len(values)
         mean = statistics.fmean(values) if count else None
         standard_deviation = statistics.stdev(values) if count >= 2 else (0.0 if count == 1 else None)
-        ci95 = 1.96 * standard_deviation / math.sqrt(count) if count >= 2 and standard_deviation is not None else None
+        ci95 = None
+        if count >= 2 and standard_deviation is not None:
+            critical = _T95_TWO_SIDED.get(count - 1, 1.96)
+            ci95 = critical * standard_deviation / math.sqrt(count)
         rows.append({
             "variantId": variant.get("variantId"),
             "ordinal": variant.get("ordinal"),
@@ -107,6 +144,9 @@ def _aggregate(document: dict[str, Any]) -> dict[str, Any]:
     return {
         "metricId": document.get("metricId"),
         "unit": unit,
+        "ciMethod": "student-t 95% two-sided",
+        "assumptions": ["independent replicates", "approximately normal observations"],
+        "sampleSource": "successful replicates with statisticalSample=true",
         "rows": rows,
         "generatedAt": _now(),
     }
@@ -126,29 +166,75 @@ def _execute_replicate(
     variant: dict[str, Any],
     replicate: dict[str, Any],
 ) -> None:
-    replicate["attemptCount"] = int(replicate.get("attemptCount") or 0) + 1
-    replicate["status"] = "running"
-    replicate["startedAt"] = _now()
-    replicate.pop("reason", None)
-    _save(store, document)
     try:
         project = _apply_parameters(document["project"], variant.get("parameters") or {})
         project.setdefault("solver", {})["random"] = {"mode": "fixed", "seed": int(replicate["seed"])}
-        _flow, _binding, compiled = adopt_project(project, flow_id=document["flowId"])
+        if document.get("binding"):
+            binding = GeometryBindingV1.model_validate(document["binding"])
+            steps = [TypeAdapter(StepV7).validate_python(step) for step in project["steps"]]
+            solver = SolverV7.model_validate(project["solver"])
+            flow = FlowRevisionV1(
+                schemaVersion=1, flowId=document["flowId"], revision=1,
+                name=document["name"], steps=steps, solver=solver,
+            )
+            compiled = compile_flow(flow, binding)
+            store.register_binding(binding)
+        else:
+            _flow, binding, compiled = adopt_project(project, flow_id=document["flowId"])
+            store.register_binding(binding)
         store.register_compile(compiled)
         plan = first_route(compiled, name=f"{document['name']} · v{variant['ordinal']}")
         store.create_plan(plan)
         segment = plan.segments[0]
-        replicate["routeId"] = plan.route.routeId
-        replicate["segmentId"] = segment.segmentId
+        replicate.update({
+            "status": "queued", "routeId": plan.route.routeId,
+            "segmentId": segment.segmentId,
+        })
+        replicate.pop("reason", None)
         _save(store, document)
-        _segment, run_id = execute_segment(store, supervisor, segment.segmentId)
-        replicate["runId"] = run_id
-        for _ in range(1800):
-            current = store.get_segment(segment.segmentId)
-            if current.status in {"succeeded", "failed", "cancelled", "interrupted"}:
+    except Exception as exc:
+        replicate.update({"status": "failed", "reason": f"preparation failed: {exc}", "finishedAt": _now()})
+        _save(store, document)
+        return
+
+    # Waiting for the single supervisor slot is not an execution attempt.
+    while True:
+        try:
+            _segment, run_id = execute_segment(store, supervisor, segment.segmentId)
+            break
+        except (ActiveRunError, SegmentBusy):
+            replicate["status"] = "queued"
+            replicate["reason"] = "waiting for an available run slot"
+            _save(store, document)
+            time.sleep(1.0)
+        except Exception as exc:
+            replicate.update({"status": "failed", "reason": f"start failed: {exc}", "finishedAt": _now()})
+            _save(store, document)
+            return
+
+    replicate["attemptCount"] = int(replicate.get("attemptCount") or 0) + 1
+    replicate["status"] = "running"
+    replicate["startedAt"] = _now()
+    replicate["runId"] = run_id
+    replicate.pop("reason", None)
+    _save(store, document)
+    try:
+        timeout_seconds = float((document.get("project", {}).get("solver") or {}).get("timeoutSeconds") or 60)
+        deadline = time.monotonic() + max(30.0, timeout_seconds + 30.0)
+        current = store.get_segment(segment.segmentId)
+        while current.status in {"planned", "running", "cancelling"}:
+            if time.monotonic() > deadline:
+                try:
+                    supervisor.cancel(run_id)
+                except Exception:
+                    pass
+                time.sleep(1.0)
+                current = store.get_segment(segment.segmentId)
+                if current.status in {"planned", "running", "cancelling"}:
+                    raise RuntimeError("segment exceeded its run timeout budget")
                 break
             time.sleep(0.2)
+            current = store.get_segment(segment.segmentId)
         if current.status != "succeeded":
             raise RuntimeError(f"segment finished with {current.status}")
         recipe = store.get_recipe(document["recipeId"], document["recipeVersion"])
@@ -264,6 +350,13 @@ def _new_replicate(seed: int) -> dict[str, Any]:
     }
 
 
+def _apply_base(document: dict[str, Any], base_compile_id: str | None, binding: Any) -> None:
+    document["baseCompileId"] = base_compile_id
+    document["bindingId"] = binding.bindingId if binding is not None else None
+    document["binding"] = binding.model_dump(mode="json", exclude_none=True) if binding is not None else None
+    document["retention"] = {"mode": "keep-all", "updatedAt": _now()}
+
+
 def create_experiment_document(
     *,
     name: str,
@@ -276,6 +369,8 @@ def create_experiment_document(
     unit: str = "um",
     max_attempts: int = 1,
     cost_per_run_usd: float = 0.0,
+    base_compile_id: str | None = None,
+    binding: Any = None,
 ) -> dict[str, Any]:
     experiment_id = f"exp_{uuid.uuid4().hex[:16]}"
     rows = []
@@ -308,6 +403,7 @@ def create_experiment_document(
         "createdAt": _now(),
         "updatedAt": _now(),
     }
+    _apply_base(document, base_compile_id, binding)
     document["queue"] = _queue_summary(document)
     document["aggregation"] = _aggregate(document)
     return document
@@ -327,13 +423,19 @@ def create_doe_document(
     unit: str = "um",
     max_attempts: int = 2,
     cost_per_run_usd: float = 0.0,
+    base_compile_id: str | None = None,
+    binding: Any = None,
 ) -> dict[str, Any]:
     step_by_id = {str(step.get("id")): step for step in project.get("steps") or []}
     validated: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
     for factor in factors:
         step_id = str(factor["stepId"])
         parameter = str(factor["parameter"])
         values = factor["values"]
+        if (step_id, parameter) in seen:
+            raise ValueError(f"DOE factors must be unique per (stepId, parameter): {step_id}/{parameter}")
+        seen.add((step_id, parameter))
         if step_id not in step_by_id:
             raise ValueError(f"DOE factor step {step_id!r} does not exist in the project")
         if parameter not in _ALLOWED_FACTORS:
@@ -343,6 +445,8 @@ def create_doe_document(
         normalized = [float(value) for value in values]
         if not normalized or any(not math.isfinite(value) for value in normalized):
             raise ValueError(f"DOE factor {parameter!r} values must be finite")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError(f"DOE factor {parameter!r} values must be unique")
         validated.append({"stepId": step_id, "parameter": parameter, "values": normalized})
     combos = list(itertools.product(*[factor["values"] for factor in validated]))
     if len(combos) > 256:
@@ -384,6 +488,7 @@ def create_doe_document(
         "createdAt": _now(),
         "updatedAt": _now(),
     }
+    _apply_base(document, base_compile_id, binding)
     document["queue"] = _queue_summary(document)
     document["aggregation"] = _aggregate(document)
     return document
@@ -459,3 +564,99 @@ def experiment_csv(document: dict[str, Any]) -> str:
                 summary.get("min"), summary.get("max"),
             ])
     return buffer.getvalue()
+
+
+def _owned_ids(document: dict[str, Any]) -> tuple[set[str], set[str]]:
+    measurements: set[str] = set()
+    segments: set[str] = set()
+    for _variant, replicate in _replicates(document):
+        if replicate.get("measurementId"):
+            measurements.add(str(replicate["measurementId"]))
+        if replicate.get("segmentId"):
+            segments.add(str(replicate["segmentId"]))
+    return measurements, segments
+
+
+def retention_preview(store: WorkflowStore, document: dict[str, Any]) -> dict[str, Any]:
+    experiment_id = document["experimentId"]
+    own_measurements, own_segments = _owned_ids(document)
+    releasable: list[str] = []
+    protected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for _variant, replicate in _replicates(document):
+        run_id = replicate.get("runId")
+        if not run_id or run_id in seen:
+            continue
+        seen.add(run_id)
+        dependencies = store.artifact_dependencies(str(run_id))
+        reasons: list[str] = []
+        if dependencies["pinned"]:
+            reasons.append("artifact is pinned")
+        for ref in dependencies["refs"]:
+            if ref["ownerType"] == "experiment" and ref["ownerId"] in {
+                experiment_id, f"{experiment_id}:{replicate['replicateId']}",
+            }:
+                continue
+            reasons.append(f"referenced by {ref['ownerType']} {ref['ownerId']} ({ref['requiredFor']})")
+        for measurement_id in dependencies["measurements"]:
+            if measurement_id not in own_measurements:
+                reasons.append(f"measurement {measurement_id} is not owned by this experiment")
+        for segment_id in dependencies["segmentOwners"]:
+            if segment_id not in own_segments:
+                reasons.append(f"segment {segment_id} is not owned by this experiment")
+        for segment_id in dependencies["checkpointOwners"]:
+            if segment_id not in own_segments:
+                reasons.append(f"checkpoint reused by segment {segment_id}")
+        if reasons:
+            protected.append({"runId": run_id, "reasons": reasons})
+        else:
+            releasable.append(str(run_id))
+    return {
+        "experimentId": experiment_id,
+        "mode": "release-runs",
+        "releasable": releasable,
+        "protected": protected,
+    }
+
+
+def apply_experiment_retention(store: WorkflowStore, document: dict[str, Any], mode: str) -> dict[str, Any]:
+    if mode not in {"keep-all", "release-runs"}:
+        raise ValueError("retention mode must be keep-all or release-runs")
+    experiment_id = document["experimentId"]
+    preview = retention_preview(store, document)
+    if mode == "release-runs":
+        for _variant, replicate in _replicates(document):
+            run_id = replicate.get("runId")
+            if not run_id or run_id not in preview["releasable"]:
+                continue
+            store.abandon_capability(
+                str(run_id), "experiment", experiment_id, "experiment",
+                "experiment retention policy released run artifacts",
+            )
+            store.abandon_capability(
+                str(run_id), "experiment", f"{experiment_id}:{replicate['replicateId']}", "replicate",
+                "experiment retention policy released replicate artifacts",
+            )
+            if replicate.get("measurementId"):
+                store.abandon_capability(
+                    str(run_id), "measurement", str(replicate["measurementId"]), "remeasure",
+                    "experiment retention keeps the metric value, not the run",
+                )
+            if replicate.get("segmentId"):
+                for capability in ("report", "continue"):
+                    store.abandon_capability(
+                        str(run_id), "segment", str(replicate["segmentId"]), capability,
+                        "experiment retention keeps the metric value, not the run",
+                    )
+            replicate["retentionReleased"] = True
+    else:
+        for _variant, replicate in _replicates(document):
+            run_id = replicate.get("runId")
+            if not run_id:
+                continue
+            store.register_artifact_ref(str(run_id), "experiment", experiment_id, "experiment")
+            store.register_artifact_ref(str(run_id), "experiment", f"{experiment_id}:{replicate['replicateId']}", "replicate")
+            replicate["retentionReleased"] = False
+    document["retention"] = {"mode": mode, "updatedAt": _now()}
+    _save(store, document)
+    return {**preview, "mode": mode, "applied": True}

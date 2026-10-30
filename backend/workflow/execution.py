@@ -7,6 +7,7 @@ import time
 from typing import Any
 
 from .. import snapshots, storage
+from ..supervisor import ActiveRunError
 from ..models import DomainStateRef, FixedRandom, ProjectV7
 from ..validation import ProjectInputError, validate_project
 from .hashing import full_project_hash
@@ -126,6 +127,10 @@ def _monitor(store: WorkflowStore, supervisor: Any, segment_id: str, run_id: str
         time.sleep(0.2)
 
 
+class SegmentBusy(WorkflowConflict):
+    """The supervisor is already running another job; retry later."""
+
+
 def execute_segment(store: WorkflowStore, supervisor: Any, segment_id: str) -> tuple[SegmentV1, str]:
     segment = store.get_segment(segment_id)
     if segment.status != "planned":
@@ -142,6 +147,8 @@ def execute_segment(store: WorkflowStore, supervisor: Any, segment_id: str) -> t
     normalized = project.model_dump(mode="json", exclude_none=True)
     try:
         started = supervisor.start("simulate", normalized)
+    except ActiveRunError as exc:
+        raise SegmentBusy(f"segment run could not start: {exc}") from exc
     except Exception as exc:
         raise WorkflowConflict(f"segment run could not start: {exc}") from exc
     run_id = started["runId"]

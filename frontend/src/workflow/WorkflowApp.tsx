@@ -107,7 +107,9 @@ type ExperimentDoc = {
   recipeVersion: number;
   design?: { conditionCount: number; logicalRunCount: number; replicates: number };
   queue?: { total: number; pending: number; running: number; succeeded: number; failed: number; retries: number; estimatedSecondsRemaining: number; estimatedCostUsd: number };
-  aggregation?: { rows: Array<{ ordinal: number; n: number; mean: number | null; std: number | null; ci95: number | null; unit: string; statisticalStatus: string }> };
+  aggregation?: { rows: Array<{ ordinal: number; n: number; mean: number | null; std: number | null; ci95: number | null; unit: string; statisticalStatus: string }>; ciMethod?: string };
+  retention?: { mode: string };
+  baseCompileId?: string | null;
   variants: Array<{ ordinal: number; replicates: Array<{ status: string; value?: number | null; unit?: string; runId?: string; seed?: number; attemptCount?: number; statisticalSample?: boolean }> }>;
   project?: { steps: Array<{ id: string }> };
 };
@@ -210,6 +212,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [tableMin, setTableMin] = useState('');
   const [tableMax, setTableMax] = useState('');
   const [tableSort, setTableSort] = useState('ordinal');
+  const [retentionInfo, setRetentionInfo] = useState<{ releasable: string[]; protected: Array<{ runId: string; reasons: string[] }> } | null>(null);
   const [previousCompile, setPreviousCompile] = useState<CompileInfo | null>(null);
   const [compileDiff, setCompileDiff] = useState<{ addedStepIds: string[]; removedStepIds: string[]; movedStepIds: string[]; changedStepIds: string[]; affectedStepIds: string[]; details?: Array<{ stepId: string; before: Record<string, unknown>; after: Record<string, unknown> }> } | null>(null);
   const [templateVariable, setTemplateVariable] = useState('0.02');
@@ -452,8 +455,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       replicates: row.replicates,
       seed: row.seed,
     }));
-    const doc = await postJson<typeof experimentDoc>('/api/v1/workflow/experiments', {
+    const doc = await postJson<ExperimentDoc>('/api/v1/workflow/experiments', {
       name: `${compile.projectName} · 10 variants`, project, flowId: compile.flowId,
+      compileId: compile.compileId,
       recipeId: activeRecipeId, recipeVersion: activeRecipeVersion, variants,
     });
     setExperimentDoc(doc);
@@ -584,12 +588,30 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     if (!factors.length) throw new Error('至少配置一个因子');
     const document = await postJson<ExperimentDoc>('/api/v1/workflow/experiments/doe', {
       name: `${compile.projectName} · DOE`, project, flowId: compile.flowId,
+      compileId: compile.compileId,
       recipeId: activeRecipeId, recipeVersion: activeRecipeVersion, factors,
       replicates: doeReplicates, seed: Number(doeSeed) || 20261029,
       maxAttempts: 2, costPerRunUsd: Number(doeCost) || 0,
     });
     setExperimentDoc(document);
     setExperimentTable(null);
+  });
+
+  const previewRetention = () => run('retention', async () => {
+    if (!experimentDoc) throw new Error('先创建实验');
+    const info = await postJson<{ releasable: string[]; protected: Array<{ runId: string; reasons: string[] }> }>(
+      `/api/v1/workflow/experiments/${experimentDoc.experimentId}/retention/preview`, { mode: 'release-runs' },
+    );
+    setRetentionInfo(info);
+  });
+
+  const applyRetention = (mode: 'keep-all' | 'release-runs') => run('retention', async () => {
+    if (!experimentDoc) throw new Error('先创建实验');
+    await postJson(`/api/v1/workflow/experiments/${experimentDoc.experimentId}/retention`, { mode });
+    setExperimentDoc(await api<ExperimentDoc>(`/api/v1/workflow/experiments/${experimentDoc.experimentId}`));
+    setRetentionInfo(await api<{ releasable: string[]; protected: Array<{ runId: string; reasons: string[] }> }>(
+      `/api/v1/workflow/experiments/${experimentDoc.experimentId}/retention/preview`,
+    ));
   });
 
   const loadExperimentTable = () => run('table', async () => {
@@ -890,6 +912,14 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             <a className="wf-button ghost" href={`/api/v1/workflow/experiments/${experimentDoc.experimentId}/export.csv`} download>导出 CSV</a>
           </div>}
           {experimentTable && <table className="wf-table"><thead><tr><th>#</th><th>n</th><th>Mean</th><th>Std</th><th>CI95</th><th>Status</th></tr></thead><tbody>{experimentTable.rows.map(row => <tr key={row.ordinal}><td>{row.ordinal}</td><td>{row.n}</td><td>{row.mean === null ? '—' : row.mean.toFixed(6)}</td><td>{row.std === null ? '—' : row.std.toFixed(6)}</td><td>{row.ci95 === null ? '—' : row.ci95.toFixed(6)}</td><td>{row.statisticalStatus}</td></tr>)}</tbody></table>}
+          {experimentDoc && <div className="wf-card-subhead">保留策略</div>}
+          {experimentDoc && <div className="wf-template-row">
+            <button className="wf-button ghost" disabled={!!busy} onClick={() => void previewRetention()}>预览释放</button>
+            <button className="wf-button ghost" disabled={!!busy} onClick={() => void applyRetention('release-runs')}>应用 release-runs</button>
+            <button className="wf-button ghost" disabled={!!busy} onClick={() => void applyRetention('keep-all')}>恢复 keep-all</button>
+            <span className="wf-muted">当前 {experimentDoc.retention?.mode ?? 'keep-all'}</span>
+          </div>}
+          {retentionInfo && <div className="wf-summary"><strong>Retention</strong><span>可释放 {retentionInfo.releasable.length} run</span><span>受保护 {retentionInfo.protected.length} run</span></div>}
         </section>}
         {zone === 'analyze' && <section className="wf-card wf-wide">
           <div className="wf-card-head"><span>05</span><h2>Analyze</h2></div>

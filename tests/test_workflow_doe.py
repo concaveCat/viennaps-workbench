@@ -14,8 +14,12 @@ import uuid
 os.environ.setdefault("WORKBENCH_PORT", "8767")
 
 from backend.main import app  # noqa: E402
+from unittest.mock import patch  # noqa: E402
+
+from backend.supervisor import ActiveRunError  # noqa: E402
 from backend.workflow.api import get_store  # noqa: E402
-from backend.workflow.experiments import resume_experiments  # noqa: E402
+from backend.workflow.experiments import _aggregate, retention_preview, resume_experiments  # noqa: E402
+from backend.workflow.execution import SegmentBusy  # noqa: E402
 from tests.test_api_integration import asgi_request, json_body  # noqa: E402
 from tests.test_workflow_adoption import project  # noqa: E402
 
@@ -138,6 +142,132 @@ class DoeTests(unittest.IsolatedAsyncioTestCase):
         candidates = {item["artifactId"] for item in dry_body["candidates"]}
         self.assertTrue(set(run_ids).isdisjoint(candidates), "GC must not select experiment runs")
         self.assertEqual(len(set(run_ids)), 81)
+
+    async def _create_manual(self, variants: int = 1) -> dict:
+        payload = {
+            "name": "manual queue", "project": two_step_project(), "flowId": "flow_manual_p2",
+            "recipeId": self.recipe_id, "recipeVersion": 1,
+            "variants": [{"parameters": {}, "replicates": 1, "seed": 100 + index} for index in range(variants)],
+            "maxAttempts": 2,
+        }
+        response = await asgi_request("/api/v1/workflow/experiments", method="POST", payload=payload)
+        self.assertEqual(response[0], 201, response[2])
+        return json_body(response)
+
+    async def test_duplicate_doe_factor_is_rejected(self):
+        payload = {
+            "name": "duplicate", "project": two_step_project(), "flowId": "flow_doe_dup",
+            "recipeId": self.recipe_id, "recipeVersion": 1,
+            "factors": [
+                {"stepId": "step_etch_01", "parameter": "duration", "values": [0.01, 0.02]},
+                {"stepId": "step_etch_01", "parameter": "duration", "values": [0.03, 0.04]},
+            ],
+            "replicates": 1,
+        }
+        response = await asgi_request("/api/v1/workflow/experiments/doe", method="POST", payload=payload)
+        self.assertEqual(response[0], 422, response[2])
+
+    def test_ci95_uses_student_t_for_small_samples(self):
+        document = {
+            "metricId": "metric", "unit": "um",
+            "variants": [{
+                "variantId": "var_ci", "ordinal": 1, "parameters": {},
+                "replicates": [
+                    {"status": "succeeded", "statisticalSample": True, "value": value}
+                    for value in (1.0, 2.0, 3.0)
+                ],
+            }],
+        }
+        aggregation = _aggregate(document)
+        row = aggregation["rows"][0]
+        self.assertAlmostEqual(row["mean"], 2.0)
+        self.assertAlmostEqual(row["std"], 1.0)
+        self.assertAlmostEqual(row["ci95"], 4.303 / (3 ** 0.5), places=6)
+        self.assertEqual(aggregation["ciMethod"], "student-t 95% two-sided")
+
+    async def test_busy_supervisor_wait_is_not_an_execution_attempt(self):
+        document = await self._create_manual()
+        import backend.workflow.experiments as experiments_module
+
+        real_execute = experiments_module.execute_segment
+        calls = {"busy": 0}
+
+        def flaky(store, supervisor, segment_id):
+            if calls["busy"] < 2:
+                calls["busy"] += 1
+                raise SegmentBusy("another run holds the supervisor")
+            return real_execute(store, supervisor, segment_id)
+
+        with patch.object(experiments_module, "execute_segment", flaky):
+            started = await asgi_request(
+                f"/api/v1/workflow/experiments/{document['experimentId']}/run", method="POST", payload={}
+            )
+            self.assertEqual(started[0], 200, started[2])
+            final = await self._wait(document["experimentId"])
+        self.assertEqual(final["status"], "completed", final)
+        self.assertEqual(calls["busy"], 2)
+        replicate = final["variants"][0]["replicates"][0]
+        self.assertEqual(replicate["attemptCount"], 1)
+        self.assertEqual(final["queue"]["retries"], 0)
+
+    async def test_retention_releases_runs_but_keeps_metrics_and_pins(self):
+        document = await self._create_manual(variants=2)
+        started = await asgi_request(
+            f"/api/v1/workflow/experiments/{document['experimentId']}/run", method="POST", payload={}
+        )
+        self.assertEqual(started[0], 200, started[2])
+        final = await self._wait(document["experimentId"])
+        self.assertEqual(final["status"], "completed", final)
+        run_ids = [variant["replicates"][0]["runId"] for variant in final["variants"]]
+        self.assertEqual(len(run_ids), 2)
+        pinned = await asgi_request(f"/api/v1/workflow/artifacts/{run_ids[0]}/pin", method="POST", payload={})
+        self.assertEqual(pinned[0], 200, pinned[2])
+
+        store = get_store()
+        with patch.object(store, "artifact_dependencies", return_value={
+            "refs": [], "measurements": [], "segmentOwners": [],
+            "checkpointOwners": ["segment_other"], "pinned": False,
+        }):
+            protected = retention_preview(store, store.get_experiment(document["experimentId"]))
+        self.assertEqual(len(protected["protected"]), 2)
+        self.assertTrue(all("checkpoint" in reason for row in protected["protected"] for reason in row["reasons"]))
+
+        preview = await asgi_request(
+            f"/api/v1/workflow/experiments/{document['experimentId']}/retention/preview",
+            method="POST", payload={"mode": "release-runs"},
+        )
+        self.assertEqual(preview[0], 200, preview[2])
+        preview_body = json_body(preview)
+        self.assertIn(run_ids[0], {row["runId"] for row in preview_body["protected"]})
+        self.assertIn(run_ids[1], preview_body["releasable"])
+
+        applied = await asgi_request(
+            f"/api/v1/workflow/experiments/{document['experimentId']}/retention",
+            method="POST", payload={"mode": "release-runs"},
+        )
+        self.assertEqual(applied[0], 200, applied[2])
+        self.assertEqual(store.list_artifact_refs(run_ids[1]), [])
+        self.assertNotEqual(store.list_artifact_refs(run_ids[0]), [])
+        measurements = await asgi_request(f"/api/v1/workflow/measurements?run_id={run_ids[1]}")
+        self.assertEqual(measurements[0], 200, measurements[2])
+        self.assertEqual(len(json_body(measurements)["measurements"]), 1)
+        updated = json_body(await asgi_request(f"/api/v1/workflow/experiments/{document['experimentId']}"))
+        self.assertEqual(updated["retention"]["mode"], "release-runs")
+        self.assertTrue(all(row["mean"] is not None for row in updated["aggregation"]["rows"]))
+
+        dry = json_body(await asgi_request("/api/v1/workflow/gc/dry-run", method="POST", payload={}))
+        candidates = {row["artifactId"] for row in dry["candidates"]}
+        self.assertIn(run_ids[1], candidates)
+        self.assertNotIn(run_ids[0], candidates)
+
+        restored = await asgi_request(
+            f"/api/v1/workflow/experiments/{document['experimentId']}/retention",
+            method="POST", payload={"mode": "keep-all"},
+        )
+        self.assertEqual(restored[0], 200, restored[2])
+        dry = json_body(await asgi_request("/api/v1/workflow/gc/dry-run", method="POST", payload={}))
+        candidates = {row["artifactId"] for row in dry["candidates"]}
+        self.assertNotIn(run_ids[1], candidates)
 
     async def test_restart_resumes_queue_without_adding_statistical_samples(self):
         document = await self._create_doe(replicates=1)
