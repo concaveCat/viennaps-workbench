@@ -2347,11 +2347,112 @@ def _gds_boolean_operand(ps: Any, domain: Any, project: dict[str, Any], step: di
     return operand, transform
 
 
+def surface_axis_bounds(domain: Any, dimension: int) -> list[list[float]]:
+    """Return the surface extent used by particle-shape diagnostics."""
+    mesh = domain.getSurfaceMesh(addInterfaces=True, sharpCorners=False, minNodeDistanceFactor=0.01)
+    points = mesh.getNodes()
+    if not points:
+        raise RuntimeError("the native surface mesh is empty; the particle-shape offset removed every point")
+    return [[float(min(point[axis] for point in points)), float(max(point[axis] for point in points))]
+            for axis in range(dimension)]
+
+
+def apply_particle_shape(ps: Any, domain: Any, project: dict[str, Any], step: dict[str, Any]) -> dict[str, Any]:
+    """Run the native no-mask Box/Sphere geometric-advection distribution.
+
+    The installed 4.6.2 masked overload is not reachable from a project: every
+    masked deposition probe SIGSEGVs (2D and 3D, material mask and raw
+    viennals mask alike), and a masked etch silently leaves the surface
+    untouched. The step therefore always constructs the no-mask overload and
+    records that decision instead of pretending to support a mask.
+    """
+    dimension = int(project["dimension"])
+    grid_delta = float(project["domain"]["gridDelta"])
+    shape = str(step["shape"])
+    sign = -1.0 if step["operation"] == "etch" else 1.0
+    requested: dict[str, Any]
+    if shape == "box":
+        axes = [float(value) for value in step["halfAxes"]]
+        if len(axes) != dimension:
+            raise RuntimeError(f"particleShape box needs {dimension} half-axes, got {axes}")
+        for axis in axes:
+            if not math.isfinite(axis) or axis <= 0.0 or axis < grid_delta - 1e-12:
+                raise RuntimeError(
+                    f"particleShape half-axis {axis} must be finite and at least one grid interval "
+                    f"({grid_delta} um); native geometric advection is unsafe below that")
+        signed = [sign * value for value in axes]
+        # The native binding always takes a fixed-size 3 array; 2D consumes
+        # only the first two entries, so the third stays outside the project
+        # surface and cannot silently select a 3D shape.
+        native_half_axes = signed + [0.0] if dimension == 2 else signed
+        model = ps.BoxDistribution(native_half_axes)
+        requested = {"halfAxes": axes}
+        native_class = "BoxDistribution"
+        expected_offset = max(axes)
+    else:
+        radius = float(step["radius"])
+        if not math.isfinite(radius) or radius <= 0.0 or radius < grid_delta - 1e-12:
+            raise RuntimeError(
+                f"particleShape radius {radius} must be finite and at least one grid interval "
+                f"({grid_delta} um); native geometric advection is unsafe below that")
+        signed_radius = sign * radius
+        model = ps.SphereDistribution(signed_radius)
+        requested = {"radius": radius}
+        native_class = "SphereDistribution"
+        native_half_axes = None
+        expected_offset = radius
+    before = surface_axis_bounds(domain, dimension)
+    counts_before = [int(level_set.getNumberOfPoints()) for level_set in domain.getLevelSets()]
+    # The geometric process strategy ignores the duration entirely; measure it
+    # as zero so the run record never implies a rate.
+    ps.Process(domain, model, 0.0).apply()
+    after = surface_axis_bounds(domain, dimension)
+    if before == after:
+        raise RuntimeError(
+            "native particle-shape distribution left the surface unchanged; refusing to record a "
+            "silent no-op (check that the magnitude exceeds the grid resolution)")
+    mapping = domain.getMaterialMap()
+    return {
+        "geometryOperation": "particleShape",
+        "nativeClass": native_class,
+        "nativeConstructor": (f"viennaps.d{dimension}.{native_class}("
+                              + ("halfAxes" if shape == "box" else "radius") + ")"),
+        "dimension": dimension,
+        "operation": step["operation"],
+        "shape": shape,
+        **requested,
+        **({"nativeSignedHalfAxesUm": signed} if shape == "box" else {"nativeSignedRadiusUm": signed_radius}),
+        **({"nativeHalfAxesUm": native_half_axes} if shape == "box" else {}),
+        "expectedOffsetUm": expected_offset,
+        "surfaceBoundsBeforeUm": before,
+        "surfaceBoundsAfterUm": after,
+        "levelSetPointCountsBefore": counts_before,
+        "levelSetPointCountsAfter": [int(level_set.getNumberOfPoints()) for level_set in domain.getLevelSets()],
+        "materialIdsByLevelSetIndex": [int(mapping.getMaterialIdAtIdx(i)) for i in range(mapping.size())],
+        "gridDeltaUm": grid_delta,
+        "nativeMask": {
+            "mode": "none",
+            "supported": False,
+            "reason": ("ViennaPS 4.6.2 masked geometric advection is unsafe: material/raw viennals-mask "
+                       "deposition SIGSEGVs in 2D and 3D, and a masked etch can silently leave the surface "
+                       "unchanged; this step therefore constructs the no-mask overload"),
+        },
+        "nativeProcessDurationSeconds": 0.0,
+        "nativeDurationIgnored": ("the process duration is ignored: GeometricProcessStrategy calls "
+                                  "GeometricAdvect without consulting it, so the displacement equals the "
+                                  "radius/half-axes"),
+        "scopedSurface": ("the top/exposed level set only; deposition grows the top level-set material and "
+                          "etch intersects every lower level set with the new surface"),
+    }
+
+
 def apply_geometry_operation(ps: Any, domain: Any, project: dict[str, Any], step: dict[str, Any],
                              previous_tops: dict[str, Any] | None = None, *,
                              config: dict[str, Any] | None = None,
                              run_dir: Path | None = None) -> dict[str, Any]:
     model = step["model"]
+    if model == "particleShape":
+        return apply_particle_shape(ps, domain, project, step)
     if model == "removeMaterial":
         material = material_handle(ps, step["material"])
         domain.removeMaterial(material)

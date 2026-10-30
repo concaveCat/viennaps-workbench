@@ -1063,7 +1063,47 @@ class CsvProcessStepV7(StrictModel):
         return self
 
 
-StepV7 = Annotated[Union[StepV5, MultiParticleStepV7, SpecializedStepV7, GdsBooleanStepV7, CsvProcessStepV7], Field(discriminator="model")]
+ShapeAxis = Annotated[Number, Field(gt=0, le=2)]
+
+
+class ParticleShapeStepV7(StrictModel):
+    """Native ``BoxDistribution`` / ``SphereDistribution`` geometry offset.
+
+    These are ViennaLS geometric-advection distributions, not velocity models:
+    ``ps.Process(domain, model, duration)`` ignores the duration and moves the
+    exposed surface by exactly one radius / half-axis set. The installed 4.6.2
+    binding SIGSEGVs on the masked deposition path in 2D and 3D, so this step
+    deliberately has no mask field: the worker always constructs the no-mask
+    overload. ``operation`` only selects the sign (deposit grows, etch erodes);
+    individual half-axes are positive magnitudes.
+    """
+
+    id: Annotated[str, Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")]
+    name: Annotated[str, Field(min_length=1, max_length=80)]
+    enabled: bool
+    operation: Literal["etch", "deposit"]
+    model: Literal["particleShape"]
+    shape: Literal["box", "sphere"]
+    radius: ShapeAxis | None = None
+    halfAxes: Annotated[list[ShapeAxis], Field(min_length=2, max_length=3)] | None = None
+
+    @model_validator(mode="after")
+    def check_shape_parameters(self) -> "ParticleShapeStepV7":
+        if self.shape == "sphere":
+            if self.radius is None:
+                raise ValueError("sphere particleShape requires radius")
+            if self.halfAxes is not None:
+                raise ValueError("halfAxes applies only to shape=box")
+        else:
+            if self.halfAxes is None:
+                raise ValueError("box particleShape requires halfAxes")
+            if self.radius is not None:
+                raise ValueError("radius applies only to shape=sphere")
+        return self
+
+
+StepV7 = Annotated[Union[StepV5, MultiParticleStepV7, SpecializedStepV7, GdsBooleanStepV7, CsvProcessStepV7,
+                         ParticleShapeStepV7], Field(discriminator="model")]
 
 
 class DomainStateRef(StrictModel):
@@ -1292,6 +1332,16 @@ class ProjectV7(ProjectV6):
                 raise ValueError("GDS mask height must span at least two grid intervals")
             if abs(mask["baseHeight"] + mask["position"][2]) / delta > 1_000_000:
                 raise ValueError("GDS mask base height exceeds the application coordinate budget")
+        for index, step in enumerate(self.steps):
+            if isinstance(step, ParticleShapeStepV7) and step.shape == "box":
+                # The native BoxDistribution binding always takes three axes;
+                # 2D only consumes the first two. The project surface therefore
+                # carries exactly the axes the dimension uses, so a 2D file can
+                # never silently contain an unused third half-axis.
+                if len(step.halfAxes) != self.dimension:
+                    raise ValueError(
+                        f"steps[{index}].halfAxes must contain {self.dimension} values "
+                        f"({'[x, h]' if self.dimension == 2 else '[x, y, z]'}) for a {self.dimension}D project")
         for index, step in enumerate(self.steps):
             if not isinstance(step, GdsBooleanStepV7):
                 continue

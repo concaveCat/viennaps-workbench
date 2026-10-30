@@ -189,6 +189,8 @@ def validate_project(payload: Any, *, kind: str = "project") -> tuple[Project, l
             csv_issues, csv_warnings = _validate_csv_process_steps(project)
             issues.extend(csv_issues)
             warnings.extend(csv_warnings)
+            issues.extend(_validate_particle_shape_steps(project))
+            warnings.extend(_particle_shape_warnings(project))
         if project.dimension == 3:
             issues.extend(_validate_v3_3d_geometry(project))
         else:
@@ -384,6 +386,69 @@ def _directional_rate_set_warnings(project: Any) -> list[str]:
     return warnings
 
 
+def _validate_particle_shape_steps(project: Any) -> list[FieldIssue]:
+    """Reject the native particle-shape configurations that are not safe.
+
+    ``BoxDistribution`` / ``SphereDistribution`` are ViennaLS geometric
+    advection distributions. Measured 4.6.2 behaviour (one bounded subprocess
+    per case, see docs/particle-shape-distribution-contract.md):
+
+    * an active half-axis or radius of exactly 0 SIGSEGVs;
+    * an active magnitude below one grid interval logs "smaller than the grid
+      Delta" and can break the distribution;
+    * any masked deposition SIGSEGVs in 2D and 3D, so no mask is exposed;
+    * mixed-sign half-axes can delete the surface or SIGSEGV, so the sign comes
+      from ``operation`` and every native axis is positive.
+    """
+    issues: list[FieldIssue] = []
+    delta = float(project.domain.gridDelta)
+    boundary = getattr(project.domain, "boundaryXY", None) or getattr(project.domain, "xBoundary", None)
+    for index, step in enumerate(project.steps):
+        if step_value(step, "model") != "particleShape":
+            continue
+        if boundary != "reflective":
+            issues.append(FieldIssue(
+                f"steps[{index}].model",
+                "particleShape uses ViennaLS GeometricAdvect, whose periodic-boundary support is "
+                "still a native TODO; use reflective lateral boundaries for this step"))
+        if step_value(step, "shape") == "box":
+            values = step_value(step, "halfAxes") or []
+            path = f"steps[{index}].halfAxes"
+        else:
+            values = [step_value(step, "radius")]
+            path = f"steps[{index}].radius"
+        for axis_index, value in enumerate(values):
+            axis_path = f"{path}[{axis_index}]" if step_value(step, "shape") == "box" else path
+            if float(value) < delta - 1e-12:
+                issues.append(FieldIssue(
+                    axis_path,
+                    f"must be at least one grid interval ({delta:g} um); a half-axis or radius below "
+                    "gridDelta triggers the native 'smaller than the grid Delta' warning and is not "
+                    "resolved by the level set"))
+    return issues
+
+
+def _particle_shape_warnings(project: Any) -> list[str]:
+    """State what a particleShape step is and is not in native 4.6.2.
+
+    The native object is a geometric advection distribution: it offsets the
+    exposed surface by exactly one radius / half-axis set and ignores the
+    process duration. It is not a flux or velocity process, and the masked
+    overload is not exposed because it crashes in both dimensions.
+    """
+    warnings: list[str] = []
+    for index, step in enumerate(project.steps):
+        if step_value(step, "model") != "particleShape":
+            continue
+        shape = "BoxDistribution" if step_value(step, "shape") == "box" else "SphereDistribution"
+        warnings.append(
+            f"steps[{index}]: particleShape 使用原生 viennaps.{shape}（ViennaLS 几何推进），"
+            "对当前整个暴露表面做一次形态学膨胀/收缩，位移等于半径/半轴，原生 Process 忽略持续时间。"
+            "它不是通量或速度刻蚀/沉积模型；4.6.2 的掩膜沉积路径在 2D/3D 均 SIGSEGV，因此该步骤不提供掩膜字段"
+            "（详见 docs/particle-shape-distribution-contract.md）。")
+    return warnings
+
+
 def _gds_boolean_warnings(project: Any) -> list[str]:
     """State what a GDS boolean does not model.
 
@@ -540,7 +605,7 @@ def _validate_materials(project: ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 |
                     for name in sticking:
                         if name not in names:
                             issues.append(FieldIssue(f"steps[{i}].species[{species_index}].stickingProbabilityByMaterial.{name}",f"unknown or unavailable material {name!r}"))
-        if step_value(step,"operation")=="deposit":
+        if not is_geometry_step(step) and step_value(step,"operation")=="deposit":
             name=step_value(step,"depositMaterial")
             if name not in names: issues.append(FieldIssue(f"steps[{i}].depositMaterial", f"unknown or unavailable material {name!r}"))
             if step_value(step,"enabled") and has_motion(step):
