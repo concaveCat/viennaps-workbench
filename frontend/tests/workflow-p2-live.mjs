@@ -85,6 +85,14 @@ try {
   await page.getByRole('button', { name: '测量', exact: true }).click();
   await page.getByText(/绑定 \(binding\)：已绑定/).first().waitFor();
 
+  // 03 timeline spans every executed segment: the project's initial structure
+  // plus the continuation segment's own starting state, and every segment row
+  // can jump straight to its through-step structure.
+  await page.locator('.wf-structure-timeline').waitFor();
+  assert.equal(await page.locator('.wf-step-chip[data-step-id="initial"]').count(), 2);
+  assert.equal(await page.locator('.wf-step-chip').filter({ hasText: 'Segment 2 起始' }).count(), 1);
+  assert.equal(await page.locator('.wf-segment-structure:not([disabled])').count(), 2);
+
   await page.getByRole('button', { name: '04 实验' }).click();
   const valueRows = [[0, '0.01,0.02'], [1, '0.01,0.02'], [2, '0.01,0.02']];
   for (const [index] of valueRows) {
@@ -99,8 +107,10 @@ try {
   // Results come first; the inputs fold away after a run and reopen on demand.
   await page.locator('.wf-experiment-inputs > summary').click();
   await page.getByRole('button', { name: '筛选 / 排序' }).click();
-  await page.locator('.wf-table').last().locator('tbody tr').first().waitFor();
-  assert.equal(await page.locator('.wf-table').last().locator('tbody tr').count(), 8);
+  const statsTable = page.locator('table.wf-table').filter({ hasText: '统计状态' });
+  await statsTable.waitFor();
+  await statsTable.locator('tbody tr').first().waitFor();
+  assert.equal(await statsTable.locator('tbody tr').count(), 8);
   const csv = await page.getByRole('link', { name: '导出 CSV' }).getAttribute('href');
   assert.match(csv ?? '', /\/experiments\/exp_[a-f0-9]+\/export\.csv$/);
 

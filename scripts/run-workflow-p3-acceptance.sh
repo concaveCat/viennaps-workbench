@@ -16,4 +16,6 @@ for _ in $(seq 1 30); do
   sleep 0.5
 done
 cd frontend
-WORKBENCH_URL="http://127.0.0.1:$PORT" WORKFLOW_SCREENSHOT="${WORKFLOW_SCREENSHOT:-/tmp/workflow-p3.png}" node tests/workflow-p3-live.mjs
+WORKBENCH_URL="http://127.0.0.1:$PORT" WORKFLOW_SCREENSHOT="${WORKFLOW_SCREENSHOT:-/tmp/workflow-p3.png}" \
+  WORKFLOW_STRUCTURE_SCREENSHOT="${WORKFLOW_STRUCTURE_SCREENSHOT:-$ROOT/var/workflow-p3-structure.png}" \
+  node tests/workflow-p3-live.mjs

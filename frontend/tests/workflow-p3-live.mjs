@@ -29,6 +29,24 @@ try {
   await page.getByRole('button', { name: '测量', exact: true }).click();
   await page.getByText(/绑定 \(binding\)：已绑定/).first().waitFor();
 
+  // 03 structure timeline: the initial structure and every executed step are
+  // visible chips, not a hidden dropdown. Switching back to the initial
+  // structure keeps the 2D canvas and the measurement marker alive.
+  await page.locator('.wf-structure-timeline').waitFor();
+  const stepChips = page.locator('.wf-step-chip');
+  assert.ok(await stepChips.count() >= 2, 'timeline must show the initial structure plus at least one step');
+  const initialChip = page.locator('.wf-step-chip[data-step-id="initial"]').first();
+  await initialChip.waitFor();
+  await initialChip.click();
+  await page.locator('.wf-structure-canvas').waitFor();
+  await page.locator('.wf-marker').first().waitFor();
+  assert.equal(await initialChip.getAttribute('aria-selected'), 'true');
+  assert.ok(await page.locator('.wf-structure-legend i').count() >= 1, '2D legend must stay visible after switching steps');
+  await page.screenshot({
+    path: process.env.WORKFLOW_STRUCTURE_SCREENSHOT ?? '/tmp/workflow-p3-structure.png',
+    fullPage: true,
+  });
+
   await page.getByRole('button', { name: '04 实验', exact: true }).click();
   for (const index of [1, 2, 3]) {
     await page.getByLabel(`变体 ${index} replicates`).fill('2');
