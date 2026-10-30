@@ -5,7 +5,8 @@ import math
 from typing import Any
 
 from backend.specialized_models import (PLASMA_COVERAGE_MODELS, advanced_spec,
-                                       coverage_tolerance_issues, geometric_trench_issues,
+                                       coverage_tolerance_issues, faraday_cage_2d_engine_error,
+                                       geometric_trench_issues,
                                        model_spec, nv_factors_issues,
                                        oxidation_advanced_spec)
 from backend.engine import (ald_surface_diffusion_error, engine_version,
@@ -191,11 +192,17 @@ def _coverage_parameters(ps: Any, parameters: dict[str, Any]) -> tuple[Any, dict
 
 
 def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step: dict[str, Any],
-                            material_handle: Any, material_ids: dict[str, int]) -> tuple[Any, list[Any], dict[str, Any], float]:
+                            material_handle: Any, material_ids: dict[str, int],
+                            *, flux_engine: str | None = None) -> tuple[Any, list[Any], dict[str, Any], float]:
     """Build an installed native model and its native process parameters.
 
     The model ID is an application allowlist key; submitted JSON never selects
     an arbitrary Python attribute or constructor.
+
+    ``flux_engine`` is the engine the caller is about to pin on ``ps.Process``.
+    It is required for 2D ``faradayCage``: the shared CPU_DISK gate rejects an
+    omitted or non-CPU engine before any native object is constructed, because
+    the AUTO/GPU 2D kernel hangs for part of the cageAngle/tiltAngle matrix.
     """
     model_id = step["nativeModel"]
     spec = model_spec(model_id)
@@ -205,6 +212,10 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
     # Worker-side preflight: replay/direct worker inputs reach this function
     # without backend.validation. Keep the same safety rules here so an
     # invalid optional value can never reach a native setter/constructor.
+    if model_id == "faradayCage" and int(project["dimension"]) == 2:
+        gate_message = faraday_cage_2d_engine_error(flux_engine)
+        if gate_message is not None:
+            raise RuntimeError(f"FaradayCageEtching rejected before the native call: {gate_message}")
     if "coverageTolerance" in p:
         if model_id not in PLASMA_COVERAGE_MODELS:
             raise RuntimeError(f"{model_id} does not accept nativeParameters.coverageTolerance")
@@ -320,6 +331,10 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
         resolved["nativeParameterContainer"] = {
             "nativeClass": "FaradayCageParameters",
             "ibeParametersClass": "IBEParameters",
+            "dimension": int(project["dimension"]),
+            "fluxEngine": flux_engine,
+            "fluxEngineGate": ("CPU_DISK only in 2D" if int(project["dimension"]) == 2
+                               else "not restricted; 3D behaviour is unchanged"),
             "cageAngle": float(parameters.cageAngle),
             "ibeParameters": {key: float(getattr(parameters.ibeParams, key)) for key in (
                 "meanEnergy", "sigmaEnergy", "thresholdEnergy", "thetaRMin", "thetaRMax", "minAngle",

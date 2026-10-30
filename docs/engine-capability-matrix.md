@@ -116,7 +116,7 @@ custom material catalog.
 
 | Native class | Verified dims | What it actually is | Precondition / risk |
 | --- | --- | --- | --- |
-| `FaradayCageEtching` + `FaradayCageParameters` | 3 only | Ion-beam etch with a Faraday-cage angular filter: `cageAngle` plus a full `IBEParameters` | Probe: 3D finishes in <0.1 s; the identical call on a 2D domain did not return within 40 s (plane-only and trench, with and without `planeWaferRate`) → **engine-side 2D hang**, must be rejected at validation |
+| `FaradayCageEtching` + `FaradayCageParameters` | 2 (CPU_DISK only) / 3 | Ion-beam etch with a Faraday-cage angular filter: `cageAngle` plus a full `IBEParameters` | The original "engine-side 2D hang" was not dimensional: those probes left `Process` on AUTO, which resolves to the GPU kernel. With CPU_DISK pinned, `worker/probe_faraday_2d.py --matrix safe-2d` completes all 117 cageAngle/tiltAngle pairs (cage 0–180°, tilt −90–180°) plus the key IBE, geometry, grid, duration, ray and thread variants with no timeout, crash or empty level set; the only non-OK cases are the deliberate `thresholdEnergy == meanEnergy` probe, which aborts the native ray trace with a clean error. The same matrix on AUTO/GPU_DISK hangs for a large region (e.g. cage 0.2/10/30/45 at tilt 0/30). 2D is therefore exposed only with `solver.enginePreference: cpu`; AUTO/GPU requests are a 422 before the worker starts. Negative `tiltAngle` is a native no-op (also in 3D) and is warned in 2D. |
 | `GeometricTrenchDeposition` | 2/3 | Closed-form analytic trench fill (`trenchWidth, trenchDepth, depositionRate, bottomMed, a, b, n`), no flux engine | The 2026-10-30 3D SIGSEGV was a parameter-reach crash that also occurs in 2D; the guard now requires `depositionRate >= max(a+b, bottomMed)` because `rate < radius - 2*gridDelta` leaves an empty deposited level set. 3D plane/trench/hole/fin/stack complete and match a direct native reference. GDS stays 422 |
 | `CSVFileProcess` + `RateGrid` | 2/3 | Rate interpolated from a CSV grid with directional + isotropic components | Needs a new uploaded asset kind and an explicit interpolation mode: the engine only logs `Interpolation mode not set.` and continues. `setCustomInterpolator` is arbitrary Python |
 | `CustomSphereDistribution` | none | Multi-radius sphere distribution | **Blocked (A4).** Re-probe with and without a mask aborts in 2D and 3D (`returnCode -6`): `terminate called after throwing an instance of 'std::runtime_error'` / `what(): Point ID 3 is out of bounds for CustomSphereDistribution with 3 radii!`. It indexes one radius per surface point, so no bounded project-derived parameterization exists. See [`particle-shape-distribution-contract.md`](particle-shape-distribution-contract.md) |
@@ -175,11 +175,11 @@ hashes when unused.
 - Model fields: `cageAngle` + the existing `ionBeam` parameter group (reuse the `IBEParameters` block).
 - Mask materials come from the geometry, exactly like `ionBeam`.
 - Acceptance:
-  1. validator rejects `dimension: 2` with a clear 422 before the worker starts;
-  2. 3D trench + mask surface equals a direct native reference within `1e-6 µm`;
+  1. 2D is admitted only with the pinned `CPU_DISK` engine (AUTO/GPU is a 422 before the worker starts); 3D is unchanged;
+  2. 2D/3D surface equals a direct native reference within `1e-6 µm`;
   3. an independent native Faraday reference (cage source directions, not ordinary normal-incidence IBE) matches within `1e-6 µm`;
   4. replay reproduces artifact hashes exactly;
-  5. `specialized-models` catalog row states `engineVersion 4.6.2`, dimension 3.
+  5. `specialized-models` catalog row states `engineVersion 4.6.2`, dimensions 2/3 and the 2D CPU-only engine restriction.
 
 ### Batch A2 — `GeometricTrenchDeposition` (2D/3D)
 
@@ -340,23 +340,29 @@ for name in ("FaradayCageEtching", "GeometricTrenchDeposition", "CSVFileProcess"
 PY
 ```
 
-The two load-bearing negative results:
+The two load-bearing negative results, with the corrected FaradayCage reading:
 
 ```bash
-# FaradayCageEtching: 3D returns in <0.1 s, 2D never returns (rc=124 from timeout)
-for DIM in 3 2; do
-  timeout 40 .venv/bin/python - "$DIM" <<'PY'
-import sys, viennaps as ps
-ps.setDimension(int(sys.argv[1])); ps.Length.setUnit("um"); ps.Time.setUnit("s")
-d = ps.Domain(0.1, 1.0, 1.0) if sys.argv[1] == "3" else ps.Domain(0.1, 2.0)
+# FaradayCageEtching 2D: the 2026-10-30 audit left Process on AUTO, which
+# resolves to the GPU kernel. That AUTO/GPU run never returns for cage 0.2 at
+# tilt 0 (rc=124). Pinning CPU_DISK makes the identical call finish in <0.01 s,
+# and the whole catalog cage/tilt matrix finishes too:
+timeout 40 .venv/bin/python - <<'PY'
+import viennaps as ps
+ps.setDimension(2); ps.Length.setUnit("um"); ps.Time.setUnit("s")
+d = ps.Domain(0.1, 2.0)
 ps.MakePlane(d, 0.0, ps.Material.Si, False).apply()
 p = ps.FaradayCageParameters(); p.cageAngle = 0.2
 p.ibeParams.meanEnergy, p.ibeParams.sigmaEnergy, p.ibeParams.exponent = 100.0, 10.0, 100.0
-ps.Process(d, ps.FaradayCageEtching(p, [ps.Material.Mask]), 0.005).apply()
-print("ok", sys.argv[1])
+process = ps.Process(d, ps.FaradayCageEtching(p, [ps.Material.Mask]), 0.005)
+process.setFluxEngineType(ps.FluxEngineType.CPU_DISK)
+process.apply()
+print("ok 2 CPU_DISK")
 PY
-  echo "dim=$DIM rc=$?"
-done
+# Full bounded matrix through the real worker model builder (60 s per case):
+.venv/bin/python -m worker.probe_faraday_2d --matrix safe-2d --timeout 60
+.venv/bin/python -m worker.probe_faraday_2d --matrix control-3d --timeout 60
+.venv/bin/python -m worker.probe_faraday_2d --matrix gpu-2d --timeout 20   # known-hanging control
 
 # GeometricTrenchDeposition: the 2026-10-30 3D probe aborted with SIGSEGV (rc=139).
 # 2026-10-31 re-probe: the same parameters also abort in 2D; the cause is the

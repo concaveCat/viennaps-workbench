@@ -2990,7 +2990,8 @@ def calculate_single_flux(ps: Any, domain: Any, project: dict[str, Any], step: d
     process_duration = float(step.get("duration") or 0.0)
     if step["model"] == "specialized":
         model, special_process_parameters, specialized_actual, process_duration = build_specialized_model(
-            ps, domain, project, step, lambda name: material_handle(ps, name), MATERIAL_IDS)
+            ps, domain, project, step, lambda name: material_handle(ps, name), MATERIAL_IDS,
+            flux_engine=engine)
         rate = None
     elif step["model"] == "multiParticle":
         ion_count = sum(row.get("kind") == "ion" for row in step.get("species", []))
@@ -3686,7 +3687,8 @@ def execute(input_path: Path, run_dir: Path) -> None:
                 pass
             elif specialized:
                 model, special_process_parameters, specialized_actual, process_duration = build_specialized_model(
-                    ps, domain, project, step, lambda name: material_handle(ps, name), MATERIAL_IDS)
+                    ps, domain, project, step, lambda name: material_handle(ps, name), MATERIAL_IDS,
+                    flux_engine=configured_engine)
             elif csv_process:
                 model, csv_process_actual = build_csv_process(
                     ps, project, step, config=config, run_dir=run_dir,

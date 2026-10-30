@@ -728,6 +728,13 @@ class Stage9GpuMatrixTests(unittest.TestCase):
                 with self.subTest(model=spec["id"], dimension=dimension):
                     project = make_project(spec["id"], dimension)
                     project["solver"]["enginePreference"] = "gpu"
+                    if spec["id"] == "faradayCage" and dimension == 2:
+                        # 2D FaradayCage is pinned to CPU_DISK because the
+                        # AUTO/GPU kernel hangs for part of the cage/tilt
+                        # matrix; the shared gate must reject the GPU request.
+                        with self.assertRaises(ProjectInputError):
+                            validate_project(project, kind="simulate")
+                        continue
                     parsed, _ = validate_project(project, kind="simulate")
                     normalized = parsed.model_dump(mode="json", exclude_none=True)
                     self.assertEqual(select_engine(normalized, normalized["steps"][0]),
