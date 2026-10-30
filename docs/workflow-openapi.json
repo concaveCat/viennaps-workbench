@@ -1726,6 +1726,20 @@
             "title": "Materialdefinitionshash",
             "type": "string"
           },
+          "moduleRevisions": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/ModuleRevisionRefV1"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Modulerevisions"
+          },
           "overrides": {
             "items": {
               "additionalProperties": true,
@@ -2854,6 +2868,13 @@
             "title": "Moduleinstances",
             "type": "array"
           },
+          "moduleRevisions": {
+            "items": {
+              "$ref": "#/components/schemas/ModuleRevisionRefV1"
+            },
+            "title": "Modulerevisions",
+            "type": "array"
+          },
           "revision": {
             "minimum": 1.0,
             "title": "Revision",
@@ -2951,6 +2972,18 @@
             "minLength": 1,
             "title": "Moduleinstanceidpath",
             "type": "string"
+          },
+          "moduleRevision": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Modulerevision"
           },
           "parameterProvenance": {
             "additionalProperties": {
@@ -3322,6 +3355,18 @@
             "pattern": "^[A-Za-z][A-Za-z0-9_-]*$",
             "title": "Moduleid",
             "type": "string"
+          },
+          "moduleRevision": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Modulerevision"
           },
           "parameters": {
             "additionalProperties": true,
@@ -4861,6 +4906,11 @@
             "title": "Moduleid",
             "type": "string"
           },
+          "moduleRevision": {
+            "minimum": 1.0,
+            "title": "Modulerevision",
+            "type": "integer"
+          },
           "parameters": {
             "additionalProperties": {
               "anyOf": [
@@ -4884,7 +4934,8 @@
         },
         "required": [
           "instancePath",
-          "moduleId"
+          "moduleId",
+          "moduleRevision"
         ],
         "title": "ModuleInstanceV1",
         "type": "object"
@@ -4964,6 +5015,30 @@
           "name"
         ],
         "title": "ModuleParameterV1",
+        "type": "object"
+      },
+      "ModuleRevisionRefV1": {
+        "additionalProperties": false,
+        "description": "One concrete module revision used by an expansion or compile.",
+        "properties": {
+          "moduleId": {
+            "maxLength": 64,
+            "minLength": 3,
+            "pattern": "^[A-Za-z][A-Za-z0-9_-]*$",
+            "title": "Moduleid",
+            "type": "string"
+          },
+          "revision": {
+            "minimum": 1.0,
+            "title": "Revision",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "moduleId",
+          "revision"
+        ],
+        "title": "ModuleRevisionRefV1",
         "type": "object"
       },
       "ModuleSummaryV1": {

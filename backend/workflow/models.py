@@ -98,6 +98,13 @@ class FlowRevisionV1(StrictModel):
         return self
 
 
+class ModuleRevisionRefV1(StrictModel):
+    """One concrete module revision used by an expansion or compile."""
+
+    moduleId: Annotated[str, Field(min_length=3, max_length=64, pattern=r"^[A-Za-z][A-Za-z0-9_-]*$")]
+    revision: Annotated[int, Field(ge=1)]
+
+
 class CompileRecordV1(StrictModel):
     compileId: Annotated[str, Field(pattern=r"^c_[a-f0-9]{24}$")]
     compilerVersion: Annotated[str, Field(min_length=1, max_length=32)]
@@ -108,6 +115,7 @@ class CompileRecordV1(StrictModel):
     geometryBindingHash: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
     variableSet: list[dict[str, Any]] = Field(default_factory=list)
     overrides: list[dict[str, Any]] = Field(default_factory=list)
+    moduleRevisions: list[ModuleRevisionRefV1] | None = None
     materialCatalogVersion: Annotated[str, Field(min_length=1, max_length=32)]
     materialDefinitionsHash: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
     defaultValuesVersion: Annotated[str, Field(min_length=1, max_length=32)]
@@ -148,6 +156,7 @@ class CompiledWorkflowV1(StrictModel):
             seed_policy=self.compileRecord.seedPolicy,
             step_id_policy=self.compileRecord.stepIdPolicy,
             engine_versions=self.compileRecord.engineVersions,
+            module_revisions=self.compileRecord.moduleRevisions,
         )
         if expected_compile_id != self.compileRecord.compileId:
             raise ValueError("compile record fields do not match compileId")

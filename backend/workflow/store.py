@@ -20,7 +20,7 @@ from .metrology import (
 )
 from ..models import parse_project
 from .models import CompiledWorkflowV1
-from .modules import FlowDefinitionV2, ModuleV1
+from .modules import FlowDefinitionV2, ModuleV1, flow_definition_pins, module_step_pins
 from .provenance import VerificationRecordV1
 from .routes import (
     AttemptV1,
@@ -34,7 +34,7 @@ from .routes import (
 from .verification import prefix_compatibility, verify_route_plan_compiles
 
 
-SCHEMA_VERSION = "5"
+SCHEMA_VERSION = "6"
 
 
 class WorkflowError(Exception):
@@ -70,7 +70,7 @@ class WorkflowStore:
                     row = preflight.execute(
                         "SELECT value FROM schema_meta WHERE key = 'schema_version'"
                     ).fetchone()
-                    if row is not None and row[0] not in {"1", "2", "3", "4", SCHEMA_VERSION}:
+                    if row is not None and row[0] not in {"1", "2", "3", "4", "5", SCHEMA_VERSION}:
                         raise RuntimeError(
                             f"unsupported workflow schema version {row[0]!r}; "
                             f"expected {SCHEMA_VERSION!r}"
@@ -228,6 +228,14 @@ class WorkflowStore:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS module_revisions (
+                    module_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    module_json TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (module_id, revision)
+                );
                 CREATE TABLE IF NOT EXISTS flow_definitions (
                     definition_id TEXT PRIMARY KEY,
                     flow_id TEXT NOT NULL,
@@ -297,6 +305,13 @@ class WorkflowStore:
                 );
                 """
             )
+            # Databases written by schema 5 stored only the current module. Seed
+            # the retained history from it so pins and expansion have a baseline.
+            connection.execute(
+                "INSERT OR IGNORE INTO module_revisions"
+                " (module_id, revision, module_json, content_hash, created_at)"
+                " SELECT module_id, revision, module_json, content_hash, created_at FROM modules"
+            )
             route_columns = {row[1] for row in connection.execute("PRAGMA table_info(routes)")}
             if "legacy_unverified" not in route_columns:
                 connection.execute("ALTER TABLE routes ADD COLUMN legacy_unverified INTEGER NOT NULL DEFAULT 0")
@@ -337,7 +352,7 @@ class WorkflowStore:
                     "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
                     (SCHEMA_VERSION,),
                 )
-            elif version_row["value"] in {"3", "4"}:
+            elif version_row["value"] in {"3", "4", "5"}:
                 connection.execute(
                     "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
                     (SCHEMA_VERSION,),
@@ -1550,15 +1565,21 @@ class WorkflowStore:
         """Create or update one module after the caller validated its content.
 
         ``moduleId`` is the stable identity. Re-posting identical content is
-        idempotent; a validated change overwrites the row and bumps the stored
-        revision. Steps already expanded by compile records keep their own
-        hashes, so an edit never rewrites history.
+        idempotent; a validated change appends a new retained revision and makes
+        it current. Older revisions remain resolvable so pinned calls and old
+        compile provenance keep referring to the exact content they expanded.
         """
 
         payload = module.model_dump(mode="json", exclude_none=True)
         digest = sha256_hex(payload)
         now = self._now()
         with self._connect() as connection:
+            for module_id, revision in module_step_pins(module):
+                if self._module_revision_row(connection, module_id, revision) is None:
+                    raise WorkflowValidation(
+                        f"module {module.moduleId!r} pins {module_id!r} revision {revision}, "
+                        "which is not retained"
+                    )
             row = connection.execute(
                 "SELECT * FROM modules WHERE module_id = ?", (module.moduleId,)
             ).fetchone()
@@ -1568,6 +1589,7 @@ class WorkflowStore:
                     " VALUES (?, ?, ?, ?, ?, ?)",
                     (module.moduleId, self._dump(payload), digest, 1, now, now),
                 )
+                self._insert_module_revision(connection, module.moduleId, 1, payload, digest, now)
                 return self._module_summary(module, revision=1, updated_at=now)
             if row["content_hash"] == digest:
                 return self._module_summary(module, revision=row["revision"], updated_at=row["updated_at"])
@@ -1577,7 +1599,30 @@ class WorkflowStore:
                 " WHERE module_id = ?",
                 (self._dump(payload), digest, revision, now, module.moduleId),
             )
+            self._insert_module_revision(connection, module.moduleId, revision, payload, digest, now)
         return self._module_summary(module, revision=revision, updated_at=now)
+
+    @staticmethod
+    def _module_revision_row(connection: sqlite3.Connection, module_id: str, revision: int):
+        return connection.execute(
+            "SELECT module_json FROM module_revisions WHERE module_id = ? AND revision = ?",
+            (module_id, revision),
+        ).fetchone()
+
+    def _insert_module_revision(
+        self,
+        connection: sqlite3.Connection,
+        module_id: str,
+        revision: int,
+        payload: dict[str, Any],
+        digest: str,
+        created_at: str,
+    ) -> None:
+        connection.execute(
+            "INSERT OR REPLACE INTO module_revisions"
+            " (module_id, revision, module_json, content_hash, created_at) VALUES (?, ?, ?, ?, ?)",
+            (module_id, revision, self._dump(payload), digest, created_at),
+        )
 
     @staticmethod
     def _module_summary(module: ModuleV1, *, revision: int, updated_at: str) -> dict[str, Any]:
@@ -1590,17 +1635,39 @@ class WorkflowStore:
             "updatedAt": updated_at,
         }
 
-    def get_module(self, module_id: str) -> ModuleV1:
+    def get_module(self, module_id: str, revision: int | None = None) -> ModuleV1:
         with self._connect() as connection:
-            row = connection.execute(
-                "SELECT module_json FROM modules WHERE module_id = ?", (module_id,)
-            ).fetchone()
+            if revision is None:
+                row = connection.execute(
+                    "SELECT module_json FROM modules WHERE module_id = ?", (module_id,)
+                ).fetchone()
+            else:
+                row = self._module_revision_row(connection, module_id, revision)
         if row is None:
-            raise WorkflowNotFound(f"module {module_id!r} does not exist")
+            if revision is None:
+                raise WorkflowNotFound(f"module {module_id!r} does not exist")
+            raise WorkflowNotFound(f"module {module_id!r} revision {revision} does not exist")
         try:
             return ModuleV1.model_validate(json.loads(row["module_json"]))
         except (ValueError, TypeError) as exc:
             raise WorkflowValidation(f"stored module {module_id!r} is invalid") from exc
+
+    def module_history(self) -> dict[str, dict[int, ModuleV1]]:
+        """Return every retained module revision grouped by module id."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT module_id, revision, module_json FROM module_revisions"
+                " ORDER BY module_id, revision"
+            ).fetchall()
+        history: dict[str, dict[int, ModuleV1]] = {}
+        for row in rows:
+            try:
+                module = ModuleV1.model_validate(json.loads(row["module_json"]))
+            except (ValueError, TypeError):
+                continue
+            history.setdefault(row["module_id"], {})[int(row["revision"])] = module
+        return history
 
     def module_documents(self) -> list[ModuleV1]:
         with self._connect() as connection:
@@ -1642,6 +1709,12 @@ class WorkflowStore:
         digest = sha256_hex(payload)
         now = self._now()
         with self._connect() as connection:
+            for module_id, revision in flow_definition_pins(definition):
+                if self._module_revision_row(connection, module_id, revision) is None:
+                    raise WorkflowValidation(
+                        f"flow definition {definition.definitionId!r} pins module "
+                        f"{module_id!r} revision {revision}, which is not retained"
+                    )
             row = connection.execute(
                 "SELECT * FROM flow_definitions WHERE definition_id = ?",
                 (definition.definitionId,),

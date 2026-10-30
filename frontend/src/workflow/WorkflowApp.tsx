@@ -768,7 +768,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     if (!project) throw new Error('先导入工程 JSON');
     const result = await postJson<CompileInfo>(
       `/api/v1/workflow/flows/definitions/${activeDefinitionId}/compile`,
-      { project, flowId: compile?.flowId, variables: readDefinitionVariables() },
+      { project, variables: readDefinitionVariables() },
     );
     if (compile) setPreviousCompile(compile);
     setCompile(result); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);

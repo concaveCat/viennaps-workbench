@@ -14,6 +14,7 @@ from .models import (
     CompileRecordV1,
     FlowRevisionV1,
     GeometryBindingV1,
+    ModuleRevisionRefV1,
     ParameterProvenanceV1,
     SourceMapEntryV1,
 )
@@ -59,11 +60,13 @@ def _template_project(flow: FlowRevisionV1, binding: GeometryBindingV1) -> Proje
 def _compiled_steps(
     flow: FlowRevisionV1,
     placements: dict[str, tuple[str, str]] | None = None,
+    flow_paths: dict[str, str] | None = None,
 ) -> tuple[list[Any], list[SourceMapEntryV1]]:
     adapter = TypeAdapter(StepV7)
     compiled: list[Any] = []
     source_map: list[SourceMapEntryV1] = []
     placements = placements or {}
+    flow_paths = flow_paths or {}
 
     for step in flow.steps:
         module_path, iteration_key = placements.get(step.id, ("root", "i0"))
@@ -80,7 +83,7 @@ def _compiled_steps(
         source_map.append(
             SourceMapEntryV1(
                 stepId=step_id,
-                flowPath=f"{module_path}/{step.id}",
+                flowPath=flow_paths.get(step.id, f"{module_path}/{step.id}"),
                 authoredStepId=step.id,
                 moduleInstanceIdPath=module_path,
                 iterationKey=iteration_key,
@@ -94,6 +97,16 @@ def _compiled_steps(
     return compiled, source_map
 
 
+def _module_revisions_payload(
+    values: list[dict[str, Any]] | list[ModuleRevisionRefV1] | None,
+) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for value in values or []:
+        payload = value.model_dump(mode="json", exclude_none=True) if hasattr(value, "model_dump") else dict(value)
+        entries.append({"moduleId": str(payload["moduleId"]), "revision": int(payload["revision"])})
+    return sorted(entries, key=lambda entry: (entry["moduleId"], entry["revision"]))
+
+
 def compile_flow(
     flow: FlowRevisionV1,
     binding: GeometryBindingV1,
@@ -101,8 +114,10 @@ def compile_flow(
     compiler_version: str = COMPILER_VERSION,
     engine_versions: dict[str, str] | None = None,
     placements: dict[str, tuple[str, str]] | None = None,
+    flow_paths: dict[str, str] | None = None,
     variable_set: list[dict[str, Any]] | None = None,
     overrides: list[dict[str, Any]] | None = None,
+    module_revisions: list[dict[str, Any]] | list[ModuleRevisionRefV1] | None = None,
 ) -> CompiledWorkflowV1:
     """Compile a literal-step flow and a geometry binding into ProjectV7.
 
@@ -112,8 +127,12 @@ def compile_flow(
     ``placements`` is the P4-1 extension: it maps an authored step id to the
     module instance path and iteration key produced by module/loop expansion.
     Omitting it keeps the P0 behavior (root instance, first iteration).
-    ``variable_set``/``overrides`` are provenance only; they never change step
-    ids.
+    ``flow_paths`` optionally carries the authored path for module/loop steps so
+    the SourceMap keeps the path from the expansion instead of guessing it from
+    the flattened authored id. ``variable_set``/``overrides`` are provenance
+    only; they never change step ids. ``module_revisions`` records the concrete
+    module versions that produced the expanded steps; omitting it keeps the P0
+    compile identity unchanged.
     """
 
     flow = flow.model_copy(deep=True)
@@ -121,7 +140,7 @@ def compile_flow(
 
     template = _template_project(flow, binding)
     normalized_geometry = dict(template.geometry)
-    steps, source_map = _compiled_steps(flow, placements)
+    steps, source_map = _compiled_steps(flow, placements, flow_paths)
 
     if binding.dimension == 3:
         project = ProjectV7(
@@ -150,12 +169,17 @@ def compile_flow(
             materialDefinitions=binding.materialDefinitions,
         )
 
+    module_revisions = _module_revisions_payload(module_revisions)
     flow_payload = flow.model_dump(mode="json", exclude_none=True)
     if placements:
         flow_payload["placements"] = {
             authored: {"moduleInstanceIdPath": path, "iterationKey": key}
             for authored, (path, key) in sorted(placements.items())
         }
+    if flow_paths:
+        flow_payload["flowPaths"] = dict(sorted(flow_paths.items()))
+    if module_revisions:
+        flow_payload["moduleRevisions"] = module_revisions
     flow_hash = sha256_hex(flow_payload)
     binding_hash = sha256_hex(binding.model_dump(mode="json", exclude_none=True))
     material_hash = sha256_hex(
@@ -177,6 +201,7 @@ def compile_flow(
         seed_policy="shared-run-seed",
         step_id_policy=STEP_ID_POLICY,
         engine_versions=engine_versions,
+        module_revisions=module_revisions,
     )
     record = CompileRecordV1(
         compileId=compile_id,
@@ -191,6 +216,7 @@ def compile_flow(
         defaultValuesVersion=binding.defaultValuesVersion,
         variableSet=variable_set,
         overrides=overrides,
+        moduleRevisions=module_revisions or None,
         engineVersions=engine_versions,
         stepIdPolicy=STEP_ID_POLICY,
         fullProjectHash=project_hash,

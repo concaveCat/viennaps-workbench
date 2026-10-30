@@ -22,8 +22,10 @@ def adopt_project(
     geometry_source: dict[str, Any] | None = None,
     revision: int = 1,
     placements: dict[str, tuple[str, str]] | None = None,
+    flow_paths: dict[str, str] | None = None,
     variable_set: list[dict[str, Any]] | None = None,
     overrides: list[dict[str, Any]] | None = None,
+    module_revisions: list[dict[str, Any]] | None = None,
 ) -> tuple[FlowRevisionV1, GeometryBindingV1, Any]:
     try:
         project = parse_project(project_payload)
@@ -74,8 +76,10 @@ def adopt_project(
         flow,
         binding,
         placements=placements,
+        flow_paths=flow_paths,
         variable_set=variable_set,
         overrides=overrides,
+        module_revisions=module_revisions,
     )
     return flow, binding, compiled
 

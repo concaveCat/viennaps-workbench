@@ -45,6 +45,7 @@ def compile_record_id(
     seed_policy: str,
     step_id_policy: str,
     engine_versions: dict[str, str],
+    module_revisions: list[dict[str, Any]] | None = None,
 ) -> str:
     identity = {
         "compilerVersion": compiler_version,
@@ -57,4 +58,13 @@ def compile_record_id(
         "stepIdPolicy": step_id_policy,
         "engineVersions": engine_versions,
     }
+    # Keep the P0 identity byte-for-byte stable when no modules are involved.
+    if module_revisions:
+        normalized = []
+        for value in module_revisions:
+            payload = value.model_dump(mode="json", exclude_none=True) if hasattr(value, "model_dump") else dict(value)
+            normalized.append({"moduleId": str(payload["moduleId"]), "revision": int(payload["revision"])})
+        identity["moduleRevisions"] = sorted(
+            normalized, key=lambda entry: (entry["moduleId"], entry["revision"])
+        )
     return f"c_{sha256_hex(identity)[:24]}"

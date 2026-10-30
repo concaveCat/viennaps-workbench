@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import unittest
 import uuid
 
 os.environ.setdefault("WORKBENCH_PORT", "8767")
 
+from backend import storage  # noqa: E402
 from backend.main import app  # noqa: E402
 from backend.workflow.modules import (  # noqa: E402
     MAX_EXPANDED_STEPS,
     MAX_EXPANSION_DEPTH,
+    ExpressionError,
+    ModuleV1,
     evaluate_expression,
 )
+from backend.workflow.store import SCHEMA_VERSION, WorkflowStore  # noqa: E402
 from tests.test_api_integration import asgi_request, json_body  # noqa: E402
 
 SOLVER = {
@@ -496,6 +501,7 @@ class WorkflowModuleTests(unittest.IsolatedAsyncioTestCase):
         )
         expanded = await self.expand(definition_id)
         expanded_authored = [step["authoredStepId"] for step in expanded["steps"]]
+        expanded_paths = [step["flowPath"] for step in expanded["steps"]]
 
         first = await self.post(
             f"/api/v1/workflow/flows/definitions/{definition_id}/compile",
@@ -507,6 +513,10 @@ class WorkflowModuleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [entry["authoredStepId"] for entry in first_body["compile"]["sourceMap"]],
             expanded_authored,
+        )
+        self.assertEqual(
+            [entry["flowPath"] for entry in first_body["compile"]["sourceMap"]],
+            expanded_paths,
         )
         self.assertEqual(
             [step["id"] for step in first_body["authoredSteps"]], expanded_authored
@@ -554,6 +564,193 @@ class WorkflowModuleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             changed_body["compile"]["compileRecord"]["variableSet"][0]["value"], 0.4
+        )
+
+    async def test_module_revision_pin_keeps_old_expansion_and_compile(self):
+        module_id = f"mod_p41_revision_{self.suffix}"
+        await self.save_module(
+            module(
+                module_id,
+                [etch_step("etch_revision_a", rateMagnitude="${rate}", duration=0.1)],
+                parameters=[{"name": "rate", "default": 0.1, "unit": "um/s"}],
+            )
+        )
+        flow_id = f"flow_p41_revision_{self.suffix}"
+        pinned_id = f"def_p41_pinned_{self.suffix}"
+        pinned = definition(
+            pinned_id,
+            flow_id,
+            [
+                {
+                    "kind": "module-call",
+                    "instanceId": "call_revision",
+                    "moduleId": module_id,
+                    "moduleRevision": 1,
+                    "parameters": {"rate": 0.1},
+                }
+            ],
+        )
+        await self.save_definition(pinned)
+
+        expanded = await self.expand(pinned_id)
+        self.assertEqual(
+            expanded["moduleRevisions"], [{"moduleId": module_id, "revision": 1}]
+        )
+        self.assertEqual(expanded["moduleInstances"][0]["moduleRevision"], 1)
+        self.assertEqual(expanded["steps"][0]["moduleRevision"], 1)
+        self.assertEqual(expanded["steps"][0]["step"]["duration"], 0.1)
+
+        first = await self.post(
+            f"/api/v1/workflow/flows/definitions/{pinned_id}/compile", {"project": project()}
+        )
+        self.assertEqual(first[0], 201, first[2])
+        first_body = json_body(first)
+        self.assertEqual(
+            first_body["compile"]["compileRecord"]["moduleRevisions"],
+            [{"moduleId": module_id, "revision": 1}],
+        )
+        self.assertEqual(
+            [step["duration"] for step in first_body["compile"]["project"]["steps"]], [0.1]
+        )
+
+        # Editing the module appends revision 2 but must not rewrite revision 1.
+        await self.save_module(
+            module(
+                module_id,
+                [etch_step("etch_revision_a", rateMagnitude="${rate}", duration=0.2)],
+                parameters=[{"name": "rate", "default": 0.1, "unit": "um/s"}],
+            )
+        )
+        unpinned_id = f"def_p41_unpinned_{self.suffix}"
+        await self.save_definition(
+            definition(
+                unpinned_id,
+                flow_id,
+                [
+                    {
+                        "kind": "module-call",
+                        "instanceId": "call_revision",
+                        "moduleId": module_id,
+                        "parameters": {"rate": 0.1},
+                    }
+                ],
+            )
+        )
+        latest = await self.expand(unpinned_id)
+        self.assertEqual(
+            latest["moduleRevisions"], [{"moduleId": module_id, "revision": 2}]
+        )
+        self.assertEqual(latest["moduleInstances"][0]["moduleRevision"], 2)
+        self.assertEqual(latest["steps"][0]["step"]["duration"], 0.2)
+
+        still_pinned = await self.expand(pinned_id)
+        self.assertEqual(still_pinned["steps"][0]["step"]["duration"], 0.1)
+        repeated = await self.post(
+            f"/api/v1/workflow/flows/definitions/{pinned_id}/compile", {"project": project()}
+        )
+        self.assertEqual(repeated[0], 201, repeated[2])
+        self.assertEqual(json_body(repeated)["compileId"], first_body["compileId"])
+
+        missing_pin = definition(
+            f"def_p41_missing_pin_{self.suffix}",
+            flow_id,
+            [
+                {
+                    "kind": "module-call",
+                    "instanceId": "call_missing",
+                    "moduleId": module_id,
+                    "moduleRevision": 99,
+                }
+            ],
+        )
+        response = await self.post("/api/v1/workflow/flows/definitions", missing_pin)
+        self.assertEqual(response[0], 422, response[2])
+        self.assertIn("not retained", json_body(response)["detail"])
+
+    async def test_expression_resource_limits_are_rejected(self):
+        for expression in (
+            "(((((((2 ** 64) ** 64) ** 64) ** 64) ** 64) ** 64) ** 64)",
+            "2 ** 64 ** 64",
+            "9" * 500,
+            "1e999",
+            "0 ** -1",
+        ):
+            with self.subTest(expression=expression[:32]):
+                with self.assertRaises(ExpressionError):
+                    evaluate_expression(expression, {})
+
+        definition_id = f"def_p41_limit_expr_{self.suffix}"
+        await self.save_definition(
+            definition(
+                definition_id,
+                f"flow_p41_limit_expr_{self.suffix}",
+                [
+                    {
+                        "kind": "step",
+                        "step": etch_step(
+                            "step_limit_expr_01",
+                            rateMagnitude="${(((((((2 ** 64) ** 64) ** 64) ** 64) ** 64) ** 64) ** 64)}",
+                        ),
+                    }
+                ],
+            )
+        )
+        response = await self.post(
+            f"/api/v1/workflow/flows/definitions/{definition_id}/expand", {"variables": {}}
+        )
+        self.assertEqual(response[0], 422, response[2])
+
+    async def test_compile_uses_definition_solver_and_rejects_flow_id_override(self):
+        definition_id = f"def_p41_solver_{self.suffix}"
+        flow_id = f"flow_p41_solver_{self.suffix}"
+        solver = dict(SOLVER)
+        solver["timeStepRatio"] = 0.5
+        payload = definition(
+            definition_id,
+            flow_id,
+            [{"kind": "step", "step": etch_step("step_solver_01")}],
+        )
+        payload["solver"] = solver
+        await self.save_definition(payload)
+
+        compiled = await self.post(
+            f"/api/v1/workflow/flows/definitions/{definition_id}/compile", {"project": project()}
+        )
+        self.assertEqual(compiled[0], 201, compiled[2])
+        self.assertEqual(
+            json_body(compiled)["compile"]["project"]["solver"]["timeStepRatio"], 0.5
+        )
+
+        mismatch = await self.post(
+            f"/api/v1/workflow/flows/definitions/{definition_id}/compile",
+            {"project": project(), "flowId": f"flow_p41_other_{self.suffix}"},
+        )
+        self.assertEqual(mismatch[0], 422, mismatch[2])
+        self.assertIn("flowId", json_body(mismatch)["detail"])
+
+    def test_schema_five_database_backfills_module_revision_history(self):
+        module_id = f"mod_p41_legacy_{self.suffix}"
+        path = storage.VAR / f"test-p41-schema5-{self.suffix}.sqlite3"
+        store = WorkflowStore(path)
+        store.initialize()
+        store.save_module(
+            ModuleV1.model_validate(
+                module(module_id, [etch_step("etch_legacy_a")])
+            )
+        )
+        # Reproduce a schema-5 database: only the current module row existed.
+        with sqlite3.connect(path) as connection:
+            connection.execute("DROP TABLE module_revisions")
+            connection.execute("UPDATE schema_meta SET value = '5' WHERE key = 'schema_version'")
+        migrated = WorkflowStore(path)
+        migrated.initialize()
+        self.assertEqual(migrated.schema_version(), SCHEMA_VERSION)
+        self.assertEqual(
+            list(migrated.module_history()[module_id]), [1]
+        )
+        self.assertEqual(
+            migrated.get_module(module_id, revision=1).name,
+            f"{module_id} module",
         )
 
 

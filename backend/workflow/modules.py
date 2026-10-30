@@ -29,7 +29,7 @@ from pydantic import Field, TypeAdapter, ValidationError, model_validator
 
 from ..models import SolverV7, StepV7, StrictModel
 from .ids import STEP_ID_POLICY, sha256_hex, stable_step_id
-from .models import FlowRevisionV1, ParameterProvenanceV1
+from .models import FlowRevisionV1, ModuleRevisionRefV1, ParameterProvenanceV1
 
 MAX_EXPANDED_STEPS = 500
 MAX_EXPANSION_DEPTH = 24
@@ -38,6 +38,7 @@ MAX_MODULE_STEPS = 100
 MAX_EXPRESSION_LENGTH = 512
 MAX_EXPRESSION_NODES = 64
 MAX_POWER_EXPONENT = 64
+MAX_INTEGER_BITS = 256
 
 Identifier = Annotated[str, Field(min_length=3, max_length=64, pattern=r"^[A-Za-z][A-Za-z0-9_-]*$")]
 FlowId = Annotated[str, Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")]
@@ -63,6 +64,10 @@ class UnknownVariableError(ExpressionError):
 
 class UnknownModuleError(ModuleError):
     """A module-call references a module that is not registered."""
+
+
+class UnknownModuleRevisionError(UnknownModuleError):
+    """A module-call pins a revision that has not been retained."""
 
 
 class ExpansionLimitError(ModuleError):
@@ -115,12 +120,18 @@ def _parse_expression(expression: str) -> ast.Expression:
         raise _expression_error(expression, f"expression exceeds {MAX_EXPRESSION_LENGTH} characters")
     try:
         tree = ast.parse(expression, mode="eval")
-    except SyntaxError as exc:
-        raise _expression_error(expression, exc.msg) from exc
-    nodes = list(ast.walk(tree))
+        nodes = list(ast.walk(tree))
+    except (SyntaxError, ValueError, RecursionError, MemoryError) as exc:
+        raise _expression_error(expression, getattr(exc, "msg", "expression is too deeply nested")) from exc
     if len(nodes) > MAX_EXPRESSION_NODES:
         raise _expression_error(expression, f"expression exceeds {MAX_EXPRESSION_NODES} syntax nodes")
     return tree
+
+
+def _check_integer(expression: str, value: Any) -> Any:
+    if isinstance(value, int) and not isinstance(value, bool) and value.bit_length() > MAX_INTEGER_BITS:
+        raise _expression_error(expression, f"integer result exceeds {MAX_INTEGER_BITS} bits")
+    return value
 
 
 def _numeric(expression: str, value: Any) -> int | float:
@@ -128,7 +139,7 @@ def _numeric(expression: str, value: Any) -> int | float:
         raise _expression_error(expression, f"expected a number but got {type(value).__name__}")
     if isinstance(value, float) and not math.isfinite(value):
         raise _expression_error(expression, "non-finite number")
-    return value
+    return _check_integer(expression, value)
 
 
 def _check_result(expression: str, value: Any) -> ScalarValue:
@@ -137,7 +148,7 @@ def _check_result(expression: str, value: Any) -> ScalarValue:
     if isinstance(value, (int, float)):
         if isinstance(value, float) and not math.isfinite(value):
             raise _expression_error(expression, "result is not finite")
-        return value
+        return _check_integer(expression, value)
     raise _expression_error(expression, f"unsupported result type {type(value).__name__}")
 
 
@@ -148,7 +159,9 @@ def _eval_node(expression: str, node: ast.AST, variables: Mapping[str, Any]) -> 
         value = node.value
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise _expression_error(expression, "only numeric literals are allowed")
-        return value
+        if isinstance(value, float) and not math.isfinite(value):
+            raise _expression_error(expression, "non-finite number")
+        return _check_integer(expression, value)
     if isinstance(node, ast.Name):
         if node.id not in variables:
             raise UnknownVariableError(
@@ -157,7 +170,9 @@ def _eval_node(expression: str, node: ast.AST, variables: Mapping[str, Any]) -> 
         value = variables[node.id]
         if isinstance(value, (list, dict, tuple)) or value is None:
             raise _expression_error(expression, f"variable {node.id!r} is not a scalar")
-        return value
+        if isinstance(value, float) and not math.isfinite(value):
+            raise _expression_error(expression, "non-finite number")
+        return _check_integer(expression, value)
     if isinstance(node, ast.BinOp):
         operation = _BINARY_OPERATORS.get(type(node.op))
         if operation is None:
@@ -169,13 +184,15 @@ def _eval_node(expression: str, node: ast.AST, variables: Mapping[str, Any]) -> 
         if isinstance(node.op, ast.Div) and right == 0:
             raise _expression_error(expression, "division by zero")
         try:
-            return operation(left, right)
-        except OverflowError as exc:
+            return _check_integer(expression, operation(left, right))
+        except ZeroDivisionError as exc:
+            raise _expression_error(expression, "division by zero") from exc
+        except (OverflowError, MemoryError) as exc:
             raise _expression_error(expression, "arithmetic overflow") from exc
     if isinstance(node, ast.UnaryOp):
         operand = _numeric(expression, _eval_node(expression, node.operand, variables))
         if isinstance(node.op, ast.USub):
-            return -operand
+            return _check_integer(expression, -operand)
         if isinstance(node.op, ast.UAdd):
             return operand
         raise _expression_error(expression, f"unsupported unary operator {type(node.op).__name__}")
@@ -189,8 +206,8 @@ def _eval_node(expression: str, node: ast.AST, variables: Mapping[str, Any]) -> 
             raise _expression_error(expression, f"{node.func.id} received the wrong argument count")
         arguments = [_eval_node(expression, argument, variables) for argument in node.args]
         try:
-            return function(*arguments)
-        except (TypeError, ValueError) as exc:
+            return _check_integer(expression, function(*arguments))
+        except (TypeError, ValueError, OverflowError, MemoryError) as exc:
             raise _expression_error(expression, str(exc)) from exc
     raise _expression_error(expression, f"unsupported syntax {type(node).__name__}")
 
@@ -201,7 +218,7 @@ def evaluate_expression(expression: str, variables: Mapping[str, Any]) -> Scalar
     tree = _parse_expression(expression)
     try:
         return _check_result(expression, _eval_node(expression, tree, variables))
-    except RecursionError as exc:
+    except (RecursionError, MemoryError) as exc:
         raise _expression_error(expression, "expression is too deeply nested") from exc
 
 
@@ -311,6 +328,11 @@ class ModuleV1(StrictModel):
                 parameters = step.get("parameters", {})
                 if not isinstance(parameters, dict):
                     raise ValueError(f"module step {step_id!r} parameters must be a mapping")
+                revision = step.get("moduleRevision")
+                if revision is not None and (
+                    isinstance(revision, bool) or not isinstance(revision, int) or revision < 1
+                ):
+                    raise ValueError(f"module step {step_id!r} moduleRevision must be a positive integer")
             elif "model" not in step:
                 raise ValueError(f"module step {step_id!r} must declare a model or a moduleId")
         if len(step_ids) != len(set(step_ids)):
@@ -334,6 +356,7 @@ class FlowNodeModuleCallV1(StrictModel):
     kind: Literal["module-call"]
     instanceId: Identifier
     moduleId: Identifier
+    moduleRevision: Annotated[int, Field(ge=1)] | None = None
     parameters: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -402,6 +425,7 @@ class ResolvedVariableV1(StrictModel):
 class ModuleInstanceV1(StrictModel):
     instancePath: Annotated[str, Field(min_length=1, max_length=256)]
     moduleId: Identifier
+    moduleRevision: Annotated[int, Field(ge=1)]
     parameters: dict[str, ScalarValue] = Field(default_factory=dict)
 
 
@@ -420,6 +444,7 @@ class ExpandedStepV1(StrictModel):
     iterationKey: Annotated[str, Field(min_length=1, max_length=32, pattern=r"^i[0-9]+$")]
     moduleId: Identifier | None = None
     moduleInstanceId: Identifier | None = None
+    moduleRevision: Annotated[int, Field(ge=1)] | None = None
     step: dict[str, Any]
     parameterProvenance: dict[str, ParameterProvenanceV1] = Field(default_factory=dict)
     variableRefs: list[str] = Field(default_factory=list)
@@ -435,7 +460,38 @@ class ExpandedFlowV1(StrictModel):
     variables: list[ResolvedVariableV1] = Field(default_factory=list)
     iterations: list[IterationV1] = Field(default_factory=list)
     moduleInstances: list[ModuleInstanceV1] = Field(default_factory=list)
+    moduleRevisions: list[ModuleRevisionRefV1] = Field(default_factory=list)
     maxDepth: Annotated[int, Field(ge=0)]
+
+
+def flow_definition_pins(definition: FlowDefinitionV2) -> list[tuple[str, int]]:
+    """Return every explicit ``(moduleId, moduleRevision)`` pin in a definition."""
+
+    pins: set[tuple[str, int]] = set()
+
+    def walk(nodes: Iterable[FlowNodeV1]) -> None:
+        for node in nodes:
+            if isinstance(node, FlowNodeModuleCallV1):
+                if node.moduleRevision is not None:
+                    pins.add((node.moduleId, node.moduleRevision))
+            elif isinstance(node, FlowNodeRepeatV1):
+                walk(node.body)
+
+    walk(definition.nodes)
+    return sorted(pins)
+
+
+def module_step_pins(module: ModuleV1) -> list[tuple[str, int]]:
+    """Return explicit module revision pins contained in a module's steps."""
+
+    pins: set[tuple[str, int]] = set()
+    for step in module.steps:
+        if "moduleId" not in step:
+            continue
+        revision = step.get("moduleRevision")
+        if revision is not None:
+            pins.add((str(step["moduleId"]), int(revision)))
+    return sorted(pins)
 
 
 # ---------------------------------------------------------------------------
@@ -495,6 +551,7 @@ class _Expansion:
         self.steps: list[ExpandedStepV1] = []
         self.iterations: list[IterationV1] = []
         self.module_instances: list[ModuleInstanceV1] = []
+        self.module_revisions: set[tuple[str, int]] = set()
         self.max_seen_depth = 0
 
     # -- step level ---------------------------------------------------------
@@ -506,6 +563,7 @@ class _Expansion:
         *,
         module_id: str | None,
         module_instance_id: str | None,
+        module_revision: int | None = None,
     ) -> None:
         if len(self.steps) >= self.max_steps:
             raise ExpansionLimitError(
@@ -537,7 +595,7 @@ class _Expansion:
                 _, kind, source, field_refs = _resolve_text(raw_value, scope.variables)
             else:
                 field_refs = []
-                _collect_references(raw_value, references)
+                _collect_references(raw_value, field_refs)
                 kind = "expression" if field_refs else "literal"
                 source = None
             references.update(field_refs)
@@ -565,6 +623,7 @@ class _Expansion:
                 iterationKey=scope.iteration_key,
                 moduleId=module_id,
                 moduleInstanceId=module_instance_id,
+                moduleRevision=module_revision,
                 step=payload,
                 parameterProvenance=provenance,
                 variableRefs=sorted(references),
@@ -589,11 +648,22 @@ class _Expansion:
             raise ExpansionLimitError(
                 f"module nesting at {scope.flow_path} exceeds the depth limit {self.max_depth}"
             )
-        module = self.modules.get(node.moduleId)
-        if module is None:
+        versions = self.modules.get(node.moduleId)
+        if not versions:
             raise UnknownModuleError(
                 f"unknown module {node.moduleId!r} referenced at {scope.flow_path}"
             )
+        if node.moduleRevision is None:
+            revision = max(versions)
+            module = versions[revision]
+        else:
+            revision = node.moduleRevision
+            module = versions.get(revision)
+            if module is None:
+                raise UnknownModuleRevisionError(
+                    f"module {node.moduleId!r} has no retained revision {revision} "
+                    f"(available: {sorted(versions)}) referenced at {scope.flow_path}"
+                )
         if node.moduleId in scope.module_stack:
             chain = " -> ".join([*scope.module_stack, node.moduleId])
             raise ModuleError(f"module cycle detected: {chain}")
@@ -613,10 +683,12 @@ class _Expansion:
             module_stack=(*scope.module_stack, node.moduleId),
         )
         self.max_seen_depth = max(self.max_seen_depth, instance_scope.depth)
+        self.module_revisions.add((module.moduleId, revision))
         self.module_instances.append(
             ModuleInstanceV1(
                 instancePath=instance_path,
                 moduleId=node.moduleId,
+                moduleRevision=revision,
                 parameters=parameters,
             )
         )
@@ -626,6 +698,7 @@ class _Expansion:
                     kind="module-call",
                     instanceId=entry["id"],
                     moduleId=entry["moduleId"],
+                    moduleRevision=entry.get("moduleRevision"),
                     parameters=entry.get("parameters", {}),
                 )
                 self.expand_module_call(nested, instance_scope)
@@ -635,6 +708,7 @@ class _Expansion:
                     instance_scope,
                     module_id=module.moduleId,
                     module_instance_id=node.instanceId,
+                    module_revision=revision,
                 )
 
     def expand_repeat(self, node: FlowNodeRepeatV1, scope: _Scope) -> None:
@@ -706,10 +780,29 @@ class _Expansion:
         return bound
 
 
-def _module_catalog(modules: Iterable[ModuleV1] | Mapping[str, ModuleV1]) -> dict[str, ModuleV1]:
+def _module_catalog(
+    modules: Iterable[ModuleV1]
+    | Mapping[str, ModuleV1]
+    | Mapping[str, Mapping[int, ModuleV1]],
+) -> dict[str, dict[int, ModuleV1]]:
+    """Normalize a module set or revision history into ``moduleId -> revisions``.
+
+    A plain list/mapping is treated as revision 1, which keeps direct library
+    callers compatible. The store passes its full retained history so pinned
+    revisions resolve without consulting "latest".
+    """
+
+    catalog: dict[str, dict[int, ModuleV1]] = {}
     if isinstance(modules, Mapping):
-        return dict(modules)
-    return {module.moduleId: module for module in modules}
+        for module_id, value in modules.items():
+            if isinstance(value, Mapping):
+                catalog[module_id] = {int(revision): module for revision, module in value.items()}
+            else:
+                catalog[module_id] = {1: value}
+        return catalog
+    for module in modules:
+        catalog[module.moduleId] = {1: module}
+    return catalog
 
 
 def _resolved_variables(
@@ -741,7 +834,9 @@ def _resolved_variables(
 
 def expand_flow_definition(
     definition: FlowDefinitionV2,
-    modules: Iterable[ModuleV1] | Mapping[str, ModuleV1],
+    modules: Iterable[ModuleV1]
+    | Mapping[str, ModuleV1]
+    | Mapping[str, Mapping[int, ModuleV1]],
     *,
     variables: Mapping[str, Any] | None = None,
     max_steps: int = MAX_EXPANDED_STEPS,
@@ -780,6 +875,10 @@ def expand_flow_definition(
         variables=resolved_variables,
         iterations=expansion.iterations,
         moduleInstances=expansion.module_instances,
+        moduleRevisions=[
+            ModuleRevisionRefV1(moduleId=module_id, revision=revision)
+            for module_id, revision in sorted(expansion.module_revisions)
+        ],
         maxDepth=expansion.max_seen_depth,
     )
 

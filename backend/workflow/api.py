@@ -1235,7 +1235,7 @@ def _expand_definition(definition_id: str, variables: dict[str, float | int | st
     definition = store.get_flow_definition(definition_id)
     try:
         expanded = expand_flow_definition(
-            definition, store.module_documents(), variables=variables
+            definition, store.module_history(), variables=variables
         )
     except ValueError as exc:
         raise WorkflowValidation(str(exc)) from exc
@@ -1301,6 +1301,11 @@ async def compile_definition(
     def operation():
         store = get_store()
         definition, expanded = _expand_definition(definition_id, request.variables)
+        if request.flowId is not None and request.flowId != definition.flowId:
+            raise WorkflowValidation(
+                f"flowId {request.flowId!r} does not match the definition flowId "
+                f"{definition.flowId!r}; stable step ids depend on it"
+            )
         try:
             flow, placements = to_flow_revision(definition, expanded)
         except ValueError as exc:
@@ -1309,6 +1314,9 @@ async def compile_definition(
         payload["steps"] = [
             step.model_dump(mode="json", exclude_none=True) for step in flow.steps
         ]
+        # The definition owns the execution solver; the project only supplies
+        # geometry/binding context.
+        payload["solver"] = flow.solver.model_dump(mode="json", exclude_none=True)
         variable_set = [
             variable.model_dump(mode="json", exclude_none=True)
             for variable in expanded.variables
@@ -1317,15 +1325,22 @@ async def compile_definition(
             {"name": name, "value": value, "source": "request"}
             for name, value in sorted(request.variables.items())
         ]
+        module_revisions = [
+            value.model_dump(mode="json", exclude_none=True)
+            for value in expanded.moduleRevisions
+        ]
+        flow_paths = {step.authoredStepId: step.flowPath for step in expanded.steps}
         try:
             adopted_flow, binding, compiled = adopt_project(
                 payload,
-                flow_id=request.flowId or definition.flowId,
+                flow_id=definition.flowId,
                 steps=flow.steps,
                 revision=definition.revision,
                 placements=placements,
+                flow_paths=flow_paths,
                 variable_set=variable_set,
                 overrides=overrides,
+                module_revisions=module_revisions,
             )
         except ValueError as exc:
             raise WorkflowValidation(str(exc)) from exc
