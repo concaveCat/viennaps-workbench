@@ -184,6 +184,38 @@ class WorkflowStore:
                 CREATE INDEX IF NOT EXISTS attempts_route_idx ON attempts(route_id);
                 CREATE INDEX IF NOT EXISTS segments_attempt_idx ON segments(attempt_id);
                 CREATE INDEX IF NOT EXISTS reuse_attempt_idx ON reuse(attempt_id);
+                CREATE TABLE IF NOT EXISTS comparison_protocols (
+                    protocol_id TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    protocol_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (protocol_id, version)
+                );
+                CREATE TABLE IF NOT EXISTS equivalence_checks (
+                    check_id TEXT PRIMARY KEY,
+                    protocol_id TEXT NOT NULL,
+                    protocol_version INTEGER NOT NULL,
+                    left_hash TEXT NOT NULL,
+                    right_hash TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS artifact_refs (
+                    artifact_id TEXT NOT NULL,
+                    owner_type TEXT NOT NULL,
+                    owner_id TEXT NOT NULL,
+                    required_for TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (artifact_id, owner_type, owner_id, required_for)
+                );
+                CREATE TABLE IF NOT EXISTS deletion_records (
+                    record_id TEXT PRIMARY KEY,
+                    artifact_id TEXT NOT NULL,
+                    capability TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS artifact_pins (
                     artifact_id TEXT PRIMARY KEY,
                     pinned_at TEXT NOT NULL
@@ -1247,6 +1279,106 @@ class WorkflowStore:
         plan = self.get_plan(route_id)
         return materialize_attempt(plan, attempt_id)
 
+    def register_comparison_protocol(self, protocol) -> Any:
+        payload = protocol.model_dump(mode="json", exclude_none=True)
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT protocol_json FROM comparison_protocols WHERE protocol_id = ? AND version = ?",
+                (protocol.protocolId, protocol.version),
+            ).fetchone()
+            if existing is not None:
+                if sha256_hex(json.loads(existing["protocol_json"])) != sha256_hex(payload):
+                    raise WorkflowConflict("comparison protocol already exists with different content")
+                return protocol
+            connection.execute(
+                "INSERT INTO comparison_protocols (protocol_id, version, protocol_json, created_at) VALUES (?, ?, ?, ?)",
+                (protocol.protocolId, protocol.version, self._dump(payload), self._now()),
+            )
+        return protocol
+
+    def get_comparison_protocol(self, protocol_id: str, version: int | None = None) -> Any:
+        from .equivalence import ComparisonProtocolV1
+
+        with self._connect() as connection:
+            if version is None:
+                row = connection.execute(
+                    "SELECT protocol_json FROM comparison_protocols WHERE protocol_id = ? ORDER BY version DESC LIMIT 1",
+                    (protocol_id,),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT protocol_json FROM comparison_protocols WHERE protocol_id = ? AND version = ?",
+                    (protocol_id, version),
+                ).fetchone()
+        if row is None:
+            raise WorkflowNotFound(f"comparison protocol {protocol_id!r} does not exist")
+        return ComparisonProtocolV1.model_validate(json.loads(row["protocol_json"]))
+
+    def list_comparison_protocols(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT protocol_id, version, protocol_json, created_at FROM comparison_protocols ORDER BY protocol_id, version DESC"
+            ).fetchall()
+        return [
+            {
+                "protocolId": row["protocol_id"],
+                "version": row["version"],
+                "methodVersion": json.loads(row["protocol_json"]).get("methodVersion"),
+                "createdAt": row["created_at"],
+            }
+            for row in rows
+        ]
+
+    def record_equivalence(self, result) -> Any:
+        check_id = f"eq_{uuid.uuid4().hex}"
+        stored = result.model_copy(update={"checkId": check_id})
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO equivalence_checks (check_id, protocol_id, protocol_version, left_hash, right_hash, status, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (check_id, stored.protocolId, stored.protocolVersion, stored.leftHash, stored.rightHash, stored.status, self._dump(stored.model_dump(mode="json", exclude_none=True)), self._now()),
+            )
+        return stored
+
+    def get_equivalence(self, check_id: str) -> Any:
+        from .equivalence import EquivalenceResultV1
+
+        with self._connect() as connection:
+            row = connection.execute("SELECT result_json FROM equivalence_checks WHERE check_id = ?", (check_id,)).fetchone()
+        if row is None:
+            raise WorkflowNotFound(f"equivalence check {check_id!r} does not exist")
+        return EquivalenceResultV1.model_validate(json.loads(row["result_json"]))
+
+    def register_artifact_ref(self, artifact_id: str, owner_type: str, owner_id: str, required_for: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO artifact_refs (artifact_id, owner_type, owner_id, required_for, created_at) VALUES (?, ?, ?, ?, ?)",
+                (artifact_id, owner_type, owner_id, required_for, self._now()),
+            )
+
+    def list_artifact_refs(self, artifact_id: str | None = None) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            if artifact_id is None:
+                rows = connection.execute("SELECT * FROM artifact_refs ORDER BY artifact_id, owner_type, owner_id").fetchall()
+            else:
+                rows = connection.execute("SELECT * FROM artifact_refs WHERE artifact_id = ? ORDER BY owner_type, owner_id", (artifact_id,)).fetchall()
+        return [
+            {"artifactId": row["artifact_id"], "ownerType": row["owner_type"], "ownerId": row["owner_id"], "requiredFor": row["required_for"]}
+            for row in rows
+        ]
+
+    def abandon_capability(self, artifact_id: str, capability: str, reason: str) -> dict[str, Any]:
+        record_id = f"del_{uuid.uuid4().hex}"
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM artifact_refs WHERE artifact_id = ? AND required_for = ?",
+                (artifact_id, capability),
+            )
+            connection.execute(
+                "INSERT INTO deletion_records (record_id, artifact_id, capability, reason, created_at) VALUES (?, ?, ?, ?, ?)",
+                (record_id, artifact_id, capability, reason, self._now()),
+            )
+        return {"recordId": record_id, "artifactId": artifact_id, "capability": capability}
+
     def gc_dry_run(self) -> dict[str, Any]:
         from .. import storage
 
@@ -1254,6 +1386,7 @@ class WorkflowStore:
             segment_runs = {row["run_id"] for row in connection.execute("SELECT run_id FROM segments WHERE run_id IS NOT NULL")}
             measurement_runs = {row["source_run_id"] for row in connection.execute("SELECT source_run_id FROM measurements WHERE source_run_id IS NOT NULL")}
             pins = {row["artifact_id"] for row in connection.execute("SELECT artifact_id FROM artifact_pins")}
+            refs = {row["artifact_id"] for row in connection.execute("SELECT artifact_id FROM artifact_refs")}
             checkpoint_runs: set[str] = set()
             for row in connection.execute("SELECT start_checkpoint_json, end_checkpoint_json FROM segments"):
                 for raw in row:
@@ -1271,7 +1404,7 @@ class WorkflowStore:
                         checkpoint_runs.add(run_id)
                 except (ValueError, TypeError):
                     pass
-        referenced = segment_runs | measurement_runs | checkpoint_runs | pins
+        referenced = segment_runs | measurement_runs | checkpoint_runs | pins | refs
         candidates = []
         for path in sorted(storage.RUNS.iterdir()) if storage.RUNS.is_dir() else []:
             if not path.is_dir() or path.name in referenced:

@@ -92,6 +92,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [route, setRoute] = useState<RoutePlan | null>(null);
   const [segment, setSegment] = useState<RoutePlan['segments'][number] | null>(null);
   const [measurement, setMeasurement] = useState<Measurement | null>(null);
+  const [experiments, setExperiments] = useState<Array<{ index: number; routeId: string; segmentId: string; status: string; runId: string | null }>>([]);
   const [provenance, setProvenance] = useState<Provenance | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [zone, setZone] = useState<'setup' | 'flow' | 'run' | 'experiment' | 'analyze' | 'report'>('setup');
@@ -218,6 +219,57 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setProvenance(await api<Provenance>(`/api/v1/workflow/measurements/${result.measurementId}/provenance`));
   });
 
+  const sleep = (ms: number) => new Promise(resolve => window.setTimeout(resolve, ms));
+
+  const waitSegment = async (segmentId: string) => {
+    for (let i = 0; i < 300; i += 1) {
+      const current = await api<RoutePlan['segments'][number]>(`/api/v1/workflow/segments/${segmentId}`);
+      setExperiments(previous => previous.map(item => item.segmentId === segmentId ? { ...item, status: current.status, runId: current.runId } : item));
+      if (['succeeded', 'failed', 'cancelled', 'interrupted'].includes(current.status)) return current;
+      await sleep(500);
+    }
+    throw new Error('experiment segment did not finish');
+  };
+
+  const runExperiment = () => run('experiment', async () => {
+    if (!compile) throw new Error('先采纳工程');
+    const rows: Array<{ index: number; routeId: string; segmentId: string; status: string; runId: string | null }> = [];
+    for (let index = 1; index <= 3; index += 1) {
+      const created = await postJson<{ plan: RoutePlan }>('/api/v1/workflow/routes/from-compile', {
+        compileId: compile.compileId, name: `${compile.projectName} · variant ${index}`,
+      });
+      const item = created.plan.segments[0];
+      rows.push({ index, routeId: created.plan.route.routeId, segmentId: item.segmentId, status: 'planned', runId: null });
+      setExperiments([...rows]);
+      const started = await postJson<{ segment: RoutePlan['segments'][number]; runId: string }>(
+        `/api/v1/workflow/segments/${item.segmentId}/execute`, {},
+      );
+      rows[rows.length - 1] = { ...rows[rows.length - 1], status: started.segment.status, runId: started.runId };
+      setExperiments([...rows]);
+      await waitSegment(item.segmentId);
+    }
+  });
+
+  const downloadReport = () => {
+    const lines = [
+      '<!doctype html><meta charset="utf-8"><title>P0 Workflow Report</title>',
+      '<style>body{font-family:system-ui;padding:32px;line-height:1.5}table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:6px 10px}</style>',
+      `<h1>${compile?.projectName ?? 'Workflow'} — P0 report</h1>`,
+      `<p>Compile: ${compile?.compileId ?? '—'}<br>Route: ${route?.route.routeId ?? '—'}<br>Run: ${segment?.runId ?? '—'}</p>`,
+      '<h2>Experiment variants</h2><table><tr><th>#</th><th>Status</th><th>Run</th></tr>',
+      ...experiments.map(item => `<tr><td>${item.index}</td><td>${item.status}</td><td>${item.runId ?? '—'}</td></tr>`),
+      '</table>',
+      '<h2>Measurement</h2>',
+      `<p>${measurement ? `${measurement.status}: ${measurement.value ?? '—'} ${measurement.unit} · binding ${measurement.bindingStatus} · equivalence ${measurement.equivalenceStatus}` : '—'}</p>`,
+    ];
+    const url = URL.createObjectURL(new Blob([lines.join('')], { type: 'text/html' }));
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = 'p0-workflow-report.html';
+    anchor.click();
+    URL.revokeObjectURL(url);
+  };
+
   return (
     <div className="wf-shell">
       <header className="wf-topbar">
@@ -310,17 +362,20 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         </section>
         {zone === 'experiment' && <section className="wf-card wf-wide">
           <div className="wf-card-head"><span>04</span><h2>Experiment</h2></div>
-          <p className="wf-muted">P0 的实验对象与队列尚未接入。当前可用 Route 的单次执行与 Measurement；DOE 将复用同一 Compile / Segment / Measurement 契约。</p>
-          <div className="wf-summary"><strong>当前可执行条件</strong><span>{compile ? `${compile.stepCount} 步已编译` : '尚未采纳工程'} · {segment ? segment.status : '无 Segment'}</span></div>
+          <p className="wf-muted">P0 手工实验：对同一 Compile 顺序运行 3 个变体，验证重复执行与状态汇总。DOE 设计器仍属于后续阶段。</p>
+          <button className="wf-button primary" disabled={!compile || !!busy} onClick={() => void runExperiment()}>{busy === 'experiment' ? '实验运行中…' : '运行 3 个变体'}</button>
+          <table className="wf-table"><thead><tr><th>#</th><th>Status</th><th>Run</th></tr></thead><tbody>{experiments.map(item => <tr key={item.segmentId}><td>{item.index}</td><td>{item.status}</td><td><code>{item.runId ?? '—'}</code></td></tr>)}</tbody></table>
         </section>}
         {zone === 'analyze' && <section className="wf-card wf-wide">
           <div className="wf-card-head"><span>05</span><h2>Analyze</h2></div>
           <p className="wf-muted">分析区当前展示 Measurement 与 Provenance；数值等价独立于绑定状态。</p>
           {measurement ? <div className="wf-summary"><strong>{measurement.status}</strong><span>{measurement.value === null ? measurement.reason : `${measurement.value.toFixed(4)} ${measurement.unit}`}</span><span>binding {measurement.bindingStatus} · equivalence {measurement.equivalenceStatus}</span></div> : <div className="wf-empty">完成一次运行与测量后显示指标。</div>}
+          {experiments.length > 0 && <table className="wf-table"><thead><tr><th>Variant</th><th>Status</th><th>Run</th></tr></thead><tbody>{experiments.map(item => <tr key={item.segmentId}><td>{item.index}</td><td>{item.status}</td><td><code>{item.runId ?? '—'}</code></td></tr>)}</tbody></table>}
         </section>}
         {zone === 'report' && <section className="wf-card wf-wide">
           <div className="wf-card-head"><span>06</span><h2>Report</h2></div>
-          <p className="wf-muted">报告导出仍待实现；这里汇总本次工作流的可追溯对象。</p>
+          <p className="wf-muted">生成包含 Flow、Compile、Run、变体与 Measurement 的 HTML 报告；等价状态与绑定状态分开记录。</p>
+          <button className="wf-button primary" onClick={downloadReport}>下载 HTML 报告</button>
           <div className="wf-summary"><strong>Workflow summary</strong><span>Flow {compile?.flowId ?? '—'}</span><span>Compile {compile?.compileId ?? '—'}</span><span>Run {segment?.runId ?? '—'}</span><span>Measurement {measurement?.measurementId ?? '—'}</span><span>Binding {measurement?.bindingStatus ?? '—'}</span></div>
         </section>}
       </main>

@@ -328,3 +328,7 @@ button, input { font: inherit; }
 .wf-zone-nav button.active { background: var(--wf-teal); color: #04211e; font-weight: 650; }
 .wf-hidden { display: none; }
 .wf-wide { grid-column: 1 / -1; min-height: 220px; }
+
+.wf-table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 11px; }
+.wf-table th, .wf-table td { border-bottom: 1px solid var(--wf-line); padding: 7px 6px; text-align: left; }
+.wf-table th { color: var(--wf-muted); font-weight: 500; }

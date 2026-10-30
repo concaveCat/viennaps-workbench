@@ -10,7 +10,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import Field, ValidationError
 
 from .. import storage
-from ..models import StrictModel
+from ..models import ProjectV7, StrictModel
 from .metrology import MeasurementResultV1, MetrologyRecipeV1, MetricDefinitionV1
 from .adoption import adopt_project, first_route
 from .equivalence import ComparisonProtocolV1, EquivalenceResultV1, compare_snapshots
@@ -122,7 +122,7 @@ class SegmentExecutionResponse(StrictModel):
 
 
 class AdoptProjectRequest(StrictModel):
-    project: dict
+    project: ProjectV7
     flowId: str | None = None
 
 
@@ -147,10 +147,45 @@ class EquivalenceCheckRequest(StrictModel):
     right: dict
 
 
+class ProtocolSummaryV1(StrictModel):
+    protocolId: str
+    version: int
+    methodVersion: str | None = None
+    createdAt: str
+
+
+class ProtocolListResponse(StrictModel):
+    protocols: list[ProtocolSummaryV1]
+
+
 class GcDryRunResponse(StrictModel):
     referenced: list[str]
     candidates: list[dict]
     bytesReclaimable: int
+
+
+class ArtifactRefRequest(StrictModel):
+    artifactId: str
+    ownerType: str
+    ownerId: str
+    requiredFor: str
+
+
+class ArtifactRefItemV1(StrictModel):
+    artifactId: str
+    ownerType: str
+    ownerId: str
+    requiredFor: str
+
+
+class ArtifactRefResponse(StrictModel):
+    refs: list[ArtifactRefItemV1]
+
+
+class AbandonRequest(StrictModel):
+    artifactId: str
+    capability: str
+    reason: str
 
 
 @lru_cache(maxsize=8)
@@ -184,6 +219,44 @@ def _call(operation):
         raise _http_error(exc) from exc
 
 
+@router.post("/comparison-protocols", response_model=ComparisonProtocolV1, status_code=201)
+async def register_protocol(protocol: ComparisonProtocolV1) -> ComparisonProtocolV1:
+    return _call(lambda: get_store().register_comparison_protocol(protocol))
+
+
+@router.get("/comparison-protocols", response_model=ProtocolListResponse)
+async def list_protocols() -> ProtocolListResponse:
+    rows = _call(get_store().list_comparison_protocols)
+    return ProtocolListResponse(protocols=[ProtocolSummaryV1.model_validate(row) for row in rows])
+
+
+@router.get("/comparison-protocols/{protocol_id}", response_model=ComparisonProtocolV1)
+async def get_protocol(protocol_id: str, version: int | None = None) -> ComparisonProtocolV1:
+    return _call(lambda: get_store().get_comparison_protocol(protocol_id, version))
+
+
+@router.get("/equivalence/{check_id}", response_model=EquivalenceResultV1)
+async def get_equivalence(check_id: str) -> EquivalenceResultV1:
+    return _call(lambda: get_store().get_equivalence(check_id))
+
+
+@router.post("/artifact-refs", response_model=dict, status_code=201)
+async def register_artifact_ref(request: ArtifactRefRequest) -> dict:
+    _call(lambda: get_store().register_artifact_ref(request.artifactId, request.ownerType, request.ownerId, request.requiredFor))
+    return {"registered": True}
+
+
+@router.get("/artifact-refs", response_model=ArtifactRefResponse)
+async def list_artifact_refs(artifact_id: str | None = None) -> ArtifactRefResponse:
+    rows = _call(lambda: get_store().list_artifact_refs(artifact_id))
+    return ArtifactRefResponse(refs=[ArtifactRefItemV1.model_validate(row) for row in rows])
+
+
+@router.post("/gc/abandon", response_model=dict)
+async def abandon_capability(request: AbandonRequest) -> dict:
+    return _call(lambda: get_store().abandon_capability(request.artifactId, request.capability, request.reason))
+
+
 @router.post("/gc/dry-run", response_model=GcDryRunResponse)
 async def gc_dry_run() -> GcDryRunResponse:
     return GcDryRunResponse.model_validate(_call(get_store().gc_dry_run))
@@ -203,7 +276,11 @@ async def unpin_artifact(artifact_id: str) -> dict:
 
 @router.post("/equivalence/check", response_model=EquivalenceResultV1)
 async def equivalence_check(request: EquivalenceCheckRequest) -> EquivalenceResultV1:
-    return _call(lambda: compare_snapshots(request.protocol, request.left, request.right))
+    def operation():
+        store = get_store()
+        store.register_comparison_protocol(request.protocol)
+        return store.record_equivalence(compare_snapshots(request.protocol, request.left, request.right))
+    return _call(operation)
 
 
 @router.post("/metrics", response_model=MetricDefinitionV1, status_code=201)
@@ -317,7 +394,7 @@ async def get_compile(compile_id: str) -> CompiledWorkflowV1:
 @router.post("/flows/from-project", response_model=AdoptProjectResponse, status_code=201)
 async def adopt_project_endpoint(request: AdoptProjectRequest) -> AdoptProjectResponse:
     def operation():
-        flow, binding, compiled = adopt_project(request.project, flow_id=request.flowId)
+        flow, binding, compiled = adopt_project(request.project.model_dump(mode="json", exclude_none=True), flow_id=request.flowId)
         get_store().register_compile(compiled)
         return AdoptProjectResponse(
             flowId=flow.flowId,

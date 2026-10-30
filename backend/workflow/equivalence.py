@@ -22,10 +22,13 @@ class ComparisonProtocolV1(StrictModel):
     pointTolerance: Annotated[float, Field(gt=0)]
     metricTolerances: dict[str, Annotated[float, Field(ge=0)]] = Field(default_factory=dict)
     methodVersion: Annotated[str, Field(min_length=1, max_length=32)] = "snapshot-point-v1"
+    checkType: Literal["snapshot", "same_segment_replay", "continuous_vs_segmented", "prefix_reuse"] = "snapshot"
 
 
 class EquivalenceResultV1(StrictModel):
     schemaVersion: Literal[1]
+    checkId: Id | None = None
+    checkType: Literal["snapshot", "same_segment_replay", "continuous_vs_segmented", "prefix_reuse"] = "snapshot"
     protocolId: Id
     protocolVersion: Annotated[int, Field(ge=1)]
     leftHash: Hash64
@@ -60,6 +63,7 @@ def compare_snapshots(protocol: ComparisonProtocolV1, left: dict[str, Any], righ
         reasons.append("point counts differ")
         return EquivalenceResultV1(
             schemaVersion=1,
+            checkType=protocol.checkType,
             protocolId=protocol.protocolId,
             protocolVersion=protocol.version,
             leftHash=left_hash,
@@ -85,6 +89,7 @@ def compare_snapshots(protocol: ComparisonProtocolV1, left: dict[str, Any], righ
         reasons.append(f"snapshot coordinates are invalid: {exc}")
         return EquivalenceResultV1(
             schemaVersion=1,
+            checkType=protocol.checkType,
             protocolId=protocol.protocolId,
             protocolVersion=protocol.version,
             leftHash=left_hash,
@@ -99,6 +104,7 @@ def compare_snapshots(protocol: ComparisonProtocolV1, left: dict[str, Any], righ
     status = "established" if not reasons else "failed"
     return EquivalenceResultV1(
         schemaVersion=1,
+        checkType=protocol.checkType,
         protocolId=protocol.protocolId,
         protocolVersion=protocol.version,
         leftHash=left_hash,

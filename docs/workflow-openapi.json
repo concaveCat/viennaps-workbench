@@ -1,6 +1,30 @@
 {
   "components": {
     "schemas": {
+      "AbandonRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "artifactId": {
+            "title": "Artifactid",
+            "type": "string"
+          },
+          "capability": {
+            "title": "Capability",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "artifactId",
+          "capability",
+          "reason"
+        ],
+        "title": "AbandonRequest",
+        "type": "object"
+      },
       "AdoptProjectRequest": {
         "additionalProperties": false,
         "properties": {
@@ -16,9 +40,7 @@
             "title": "Flowid"
           },
           "project": {
-            "additionalProperties": true,
-            "title": "Project",
-            "type": "object"
+            "$ref": "#/components/schemas/ProjectV7"
           }
         },
         "required": [
@@ -171,6 +193,81 @@
           "segments"
         ],
         "title": "AppendAttemptRequest",
+        "type": "object"
+      },
+      "ArtifactRefItemV1": {
+        "additionalProperties": false,
+        "properties": {
+          "artifactId": {
+            "title": "Artifactid",
+            "type": "string"
+          },
+          "ownerId": {
+            "title": "Ownerid",
+            "type": "string"
+          },
+          "ownerType": {
+            "title": "Ownertype",
+            "type": "string"
+          },
+          "requiredFor": {
+            "title": "Requiredfor",
+            "type": "string"
+          }
+        },
+        "required": [
+          "artifactId",
+          "ownerType",
+          "ownerId",
+          "requiredFor"
+        ],
+        "title": "ArtifactRefItemV1",
+        "type": "object"
+      },
+      "ArtifactRefRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "artifactId": {
+            "title": "Artifactid",
+            "type": "string"
+          },
+          "ownerId": {
+            "title": "Ownerid",
+            "type": "string"
+          },
+          "ownerType": {
+            "title": "Ownertype",
+            "type": "string"
+          },
+          "requiredFor": {
+            "title": "Requiredfor",
+            "type": "string"
+          }
+        },
+        "required": [
+          "artifactId",
+          "ownerType",
+          "ownerId",
+          "requiredFor"
+        ],
+        "title": "ArtifactRefRequest",
+        "type": "object"
+      },
+      "ArtifactRefResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "refs": {
+            "items": {
+              "$ref": "#/components/schemas/ArtifactRefItemV1"
+            },
+            "title": "Refs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "refs"
+        ],
+        "title": "ArtifactRefResponse",
         "type": "object"
       },
       "AttemptDetailResponse": {
@@ -624,6 +721,17 @@
       "ComparisonProtocolV1": {
         "additionalProperties": false,
         "properties": {
+          "checkType": {
+            "default": "snapshot",
+            "enum": [
+              "snapshot",
+              "same_segment_replay",
+              "continuous_vs_segmented",
+              "prefix_reuse"
+            ],
+            "title": "Checktype",
+            "type": "string"
+          },
           "methodVersion": {
             "default": "snapshot-point-v1",
             "maxLength": 32,
@@ -1282,6 +1390,31 @@
       "EquivalenceResultV1": {
         "additionalProperties": false,
         "properties": {
+          "checkId": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 3,
+                "pattern": "^[A-Za-z0-9_-]+$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Checkid"
+          },
+          "checkType": {
+            "default": "snapshot",
+            "enum": [
+              "snapshot",
+              "same_segment_replay",
+              "continuous_vs_segmented",
+              "prefix_reuse"
+            ],
+            "title": "Checktype",
+            "type": "string"
+          },
           "leftHash": {
             "pattern": "^[a-f0-9]{64}$",
             "title": "Lefthash",
@@ -2754,6 +2887,58 @@
           "solver"
         ],
         "title": "ProjectV7",
+        "type": "object"
+      },
+      "ProtocolListResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "protocols": {
+            "items": {
+              "$ref": "#/components/schemas/ProtocolSummaryV1"
+            },
+            "title": "Protocols",
+            "type": "array"
+          }
+        },
+        "required": [
+          "protocols"
+        ],
+        "title": "ProtocolListResponse",
+        "type": "object"
+      },
+      "ProtocolSummaryV1": {
+        "additionalProperties": false,
+        "properties": {
+          "createdAt": {
+            "title": "Createdat",
+            "type": "string"
+          },
+          "methodVersion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Methodversion"
+          },
+          "protocolId": {
+            "title": "Protocolid",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "protocolId",
+          "version",
+          "createdAt"
+        ],
+        "title": "ProtocolSummaryV1",
         "type": "object"
       },
       "ProvenanceVerificationV1": {
@@ -5460,6 +5645,96 @@
         "summary": "Specialized Models"
       }
     },
+    "/api/v1/workflow/artifact-refs": {
+      "get": {
+        "operationId": "list_artifact_refs_api_v1_workflow_artifact_refs_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "artifact_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Artifact Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtifactRefResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Artifact Refs",
+        "tags": [
+          "workflow"
+        ]
+      },
+      "post": {
+        "operationId": "register_artifact_ref_api_v1_workflow_artifact_refs_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ArtifactRefRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Register Artifact Ref Api V1 Workflow Artifact Refs Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Register Artifact Ref",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
     "/api/v1/workflow/artifacts/{artifact_id}/pin": {
       "post": {
         "operationId": "pin_artifact_api_v1_workflow_artifacts__artifact_id__pin_post",
@@ -5632,6 +5907,124 @@
         ]
       }
     },
+    "/api/v1/workflow/comparison-protocols": {
+      "get": {
+        "operationId": "list_protocols_api_v1_workflow_comparison_protocols_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProtocolListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Protocols",
+        "tags": [
+          "workflow"
+        ]
+      },
+      "post": {
+        "operationId": "register_protocol_api_v1_workflow_comparison_protocols_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ComparisonProtocolV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComparisonProtocolV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Register Protocol",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/comparison-protocols/{protocol_id}": {
+      "get": {
+        "operationId": "get_protocol_api_v1_workflow_comparison_protocols__protocol_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "protocol_id",
+            "required": true,
+            "schema": {
+              "title": "Protocol Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Version"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComparisonProtocolV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Protocol",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
     "/api/v1/workflow/compiles": {
       "get": {
         "operationId": "list_compiles_api_v1_workflow_compiles_get",
@@ -5775,6 +6168,48 @@
         ]
       }
     },
+    "/api/v1/workflow/equivalence/{check_id}": {
+      "get": {
+        "operationId": "get_equivalence_api_v1_workflow_equivalence__check_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "check_id",
+            "required": true,
+            "schema": {
+              "title": "Check Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EquivalenceResultV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Equivalence",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
     "/api/v1/workflow/flows/from-project": {
       "post": {
         "operationId": "adopt_project_endpoint_api_v1_workflow_flows_from_project_post",
@@ -5811,6 +6246,49 @@
           }
         },
         "summary": "Adopt Project Endpoint",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/gc/abandon": {
+      "post": {
+        "operationId": "abandon_capability_api_v1_workflow_gc_abandon_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AbandonRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Abandon Capability Api V1 Workflow Gc Abandon Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Abandon Capability",
         "tags": [
           "workflow"
         ]
