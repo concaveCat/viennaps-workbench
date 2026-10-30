@@ -690,6 +690,20 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
         prefix = f"steps[{index}].nativeParameters"
         params = step.nativeParameters
         if step.nativeModel == "geometricTrenchDeposition":
+            # The native radius formula needs a trustworthy vertical bound.
+            # GDS geometry has no project-level z description we can bound
+            # without parsing the asset, and a continuation state loads a
+            # saved Domain whose actual coordinates are not in the project.
+            if project.geometry.get("kind") == "gds":
+                issues.append(FieldIssue(
+                    f"steps[{index}].nativeModel",
+                    "GeometricTrenchDeposition is not supported with GDS geometry; its native radius formula "
+                    "needs a bounded vertical span from a parametric 2D structure"))
+            if getattr(project, "continuationState", None) is not None:
+                issues.append(FieldIssue(
+                    f"steps[{index}].nativeModel",
+                    "GeometricTrenchDeposition is not supported with a continuation state; the saved Domain's "
+                    "vertical span cannot be validated from the project description"))
             # The native closed form uses absolute z and the initial-structure
             # bound below is only valid when this is the first enabled step.
             # A later step can raise/lower the surface and move it outside the
