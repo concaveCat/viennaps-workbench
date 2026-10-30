@@ -107,7 +107,7 @@ try {
   await page.locator('[aria-label="DOE 设计摘要"]').filter({ hasText: '8 条件 × 1 重复 = 8 逻辑执行' }).waitFor();
   await page.getByRole('button', { name: '运行实验', exact: true }).click();
   await page.getByText('实验状态：已完成').waitFor({ timeout: 180000 });
-  assert.match(await page.locator('.wf-summary').filter({ hasText: '队列' }).innerText(), /8\/8 已成功/);
+  assert.match(await page.locator('.wf-summary').filter({ hasText: '队列' }).innerText(), /8\/8 运行成功/);
   // Results come first; the inputs fold away after a run and reopen on demand.
   await page.locator('.wf-experiment-inputs > summary').click();
   await page.getByRole('button', { name: '筛选 / 排序' }).click();

@@ -13,6 +13,9 @@ os.environ.setdefault("WORKBENCH_PORT", "8767")
 
 from backend.main import app  # noqa: E402
 from backend.workflow.analysis import (  # noqa: E402
+    _measurement_has_value,
+    _reason_detail,
+    _reason_text,
     _status_label,
     _svg_for_snapshot,
     compare_snapshots,
@@ -131,7 +134,7 @@ class AnalysisTests(unittest.IsolatedAsyncioTestCase):
         self.assertRegex(body["sha256"], r"^[a-f0-9]{64}$")
         html = body["html"]
         for text in (
-            "P3 acceptance report", self.adopted["flowId"], "ViennaPS", "实际种子",
+            "P3 acceptance report", self.adopted["flowId"], "ViennaPS",
             "depth", "工艺窗口", "window candidate selected",
             "report-svg", "证据", self.measurement_id, "几何类型", "生成时间", "报告摘要",
             "技术详情", "报告哈希", "流程与编译", "几何 / Clip", "引擎与种子", "运行与测量",
@@ -139,6 +142,10 @@ class AnalysisTests(unittest.IsolatedAsyncioTestCase):
             "均值", "标准差", "统计状态", "候选", "成功",
         ):
             self.assertIn(text, html)
+        self.assertRegex(html, r"实际种子|种子（请求值）")
+        self.assertIn("种子策略", html)
+        self.assertIn("各向同性模型不使用射线通量引擎", html)
+        self.assertNotIn("isotropic model does not use a ray flux engine", html)
         for stale in ("not recorded", "candidate 1", "No compile envelope selected.",
                       "No run manifest selected.", "No measurement selected.",
                       "Process window", "CI method", "actual seed", "report hash"):
@@ -153,8 +160,9 @@ class AnalysisTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(single[0], 200, single[2])
         single_html = json_body(single)["html"]
-        for text in (self.adopted["flowId"], "流程与编译", "几何类型", "变量", "编译 ID", "实际种子"):
+        for text in (self.adopted["flowId"], "流程与编译", "几何类型", "变量", "编译 ID"):
             self.assertIn(text, single_html)
+        self.assertRegex(single_html, r"实际种子|种子（请求值）")
         self.assertNotIn("未选择编译记录", single_html)
         self.assertNotIn("not recorded", single_html)
 
@@ -316,6 +324,75 @@ class ReportRenderingTests(unittest.TestCase):
         z_polygon = z_svg.split("<polygon", 1)[1].split("/>", 1)[0]
         z_coords = z_polygon.split('points="', 1)[1].split('"', 1)[0].split()
         self.assertGreater(len({point.split(",")[1] for point in z_coords}), 1)
+
+    def test_measurement_reasons_are_localized(self):
+        self.assertEqual(
+            _reason_text("multiple selected-material surfaces cross the measurement x"),
+            "测量位置 X 处有多条材料界面相交，无法确定唯一深度；请移动 X 位置或更换测量材料。",
+        )
+        self.assertEqual(
+            _reason_text("no material surface found at the measurement x"),
+            "测量位置 X 处没有找到材料界面。",
+        )
+        self.assertEqual(
+            _reason_text("isotropic model does not use a ray flux engine"),
+            "各向同性模型不使用射线通量引擎。",
+        )
+        self.assertIsNone(_reason_detail("multiple selected-material surfaces cross the measurement x"))
+        self.assertEqual(_reason_text("some brand new english reason"), "测量无有效值")
+        self.assertEqual(_reason_detail("some brand new english reason"), "some brand new english reason")
+
+        class Measurement:
+            def __init__(self, status, value):
+                self.status, self.value = status, value
+
+        self.assertTrue(_measurement_has_value(Measurement("measured", 0.9)))
+        self.assertFalse(_measurement_has_value(Measurement("ambiguous", None)))
+        self.assertFalse(_measurement_has_value(Measurement("measured", None)))
+
+    def test_2d_svg_fills_material_to_bottom_and_legend_lists_only_drawn(self):
+        snapshot = {
+            "dimension": 2, "axisMap": {"x": 0, "h": 1, "z": 2}, "coordinateUnit": "um",
+            "topology": "lines",
+            "points": [[0, 0, 0], [1, 0, 0], [1, 0.5, 0], [0, 0.5, 0]],
+            "lines": [[0, 1], [1, 2], [2, 3], [3, 0]],
+            "cellData": {"materialIds": [10, 10, 20, 20]},
+            # 30 is registered but never drawn: the legend must not list it.
+            "materials": {
+                "10": {"name": "Si", "color": "#c79a08"},
+                "20": {"name": "Mask", "color": "#4e79a7"},
+                "30": {"name": "SiO2", "color": "#59a14f"},
+            },
+        }
+        svg = _svg_for_snapshot(snapshot)
+        self.assertIn("<polygon", svg)
+        self.assertIn("Si", svg)
+        self.assertIn("Mask", svg)
+        self.assertNotIn("SiO2", svg)
+        # The contour is closed down to the bottom of the plot (18 + 290 = 308).
+        first_polygon = svg.split("<polygon", 1)[1].split("/>", 1)[0]
+        coords = first_polygon.split('points="', 1)[1].split('"', 1)[0].split()
+        self.assertTrue(any(point.endswith(",308.000") for point in coords), coords)
+
+    def test_3d_svg_is_an_isometric_projection(self):
+        snapshot = {
+            "dimension": 3, "axisMap": {"x": 0, "y": 1, "z": 2}, "coordinateUnit": "um",
+            "topology": "triangles",
+            "points": [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0.6], [1, 1, 0.6]],
+            "triangles": [[0, 1, 2], [2, 3, 4]],
+            "cellData": {"materialIds": [10, 20]},
+            "materials": {
+                "10": {"name": "Si", "color": "#c79a08"},
+                "20": {"name": "Mask", "color": "#4e79a7"},
+            },
+        }
+        svg = _svg_for_snapshot(snapshot)
+        self.assertIn("等轴投影", svg)
+        self.assertGreaterEqual(svg.count("<polygon"), 2)
+        self.assertIn("材料图例", svg)
+        self.assertIn("Si", svg)
+        self.assertIn("Mask", svg)
+        self.assertIn(" µm</text>", svg)  # scale bar keeps its unit
 
 
 if __name__ == "__main__":

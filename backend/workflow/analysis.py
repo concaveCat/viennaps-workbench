@@ -6,6 +6,7 @@ import hashlib
 import html
 import json
 import math
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -323,6 +324,13 @@ STATUS_LABELS = {
     "identical": "一致",
     "different": "不同",
     "measured": "已测量",
+    "ambiguous": "测量有歧义",
+    "no_intersection": "无交点",
+    "region_empty": "区域为空",
+    "material_not_found": "材料缺失",
+    "unsupported_dimension": "维度不支持",
+    "unsupported_units": "单位不支持",
+    "invalid_geometry": "几何无效",
     "evaluated": "已评估",
     "pass": "通过",
     "fail": "超出",
@@ -382,6 +390,86 @@ def _code(value: Any, empty: str = "未记录") -> str:
     if value is None or (isinstance(value, str) and not value.strip()):
         return empty
     return f"<code>{_escape(value)}</code>"
+
+
+# Metrology reasons are stored as English API codes. Reports must show Chinese
+# prose; the raw code only survives in the technical-details block.
+_MEASUREMENT_REASON_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"^multiple selected-material surfaces cross the measurement x$"),
+     "测量位置 X 处有多条材料界面相交，无法确定唯一深度；请移动 X 位置或更换测量材料。"),
+    (re.compile(r"^no material surface found at the measurement x$"),
+     "测量位置 X 处没有找到材料界面。"),
+    (re.compile(r"^no selected-material segment crosses the measurement x$"),
+     "测量位置 X 处没有所选材料的界面。"),
+    (re.compile(r"^isotropic model does not use a ray flux engine$"),
+     "各向同性模型不使用射线通量引擎。"),
+    (re.compile(r"^a selected-material segment lies on the measurement height$"),
+     "所选材料的界面正好落在测量高度上。"),
+    (re.compile(r"^fewer than two selected-material crossings at the measurement height$"),
+     "测量高度上少于两个所选材料交点。"),
+    (re.compile(r"^etch-depth x coordinate is outside the measurement region$"),
+     "深度测量的 X 坐标超出测量区域。"),
+    (re.compile(r"^material '?([^']+)'? is not present in the snapshot$"),
+     "快照中没有材料 {0}。"),
+    (re.compile(r"^line and material-id counts differ$"),
+     "快照的线与材料编号数量不一致。"),
+    (re.compile(r"^snapshot requires points, lines and cellData\.materialIds$"),
+     "快照缺少点、线或材料编号。"),
+    (re.compile(r"^3D material top-height summary has no finite height$"),
+     "3D 材料顶面高度不是有限值。"),
+    (re.compile(r"^3D metrology v1 supports material top-height depth only$"),
+     "3D 测量仅支持材料顶面高度深度。"),
+    (re.compile(r"^P0-3 metrology supports 2D and 3D-depth snapshots only$"),
+     "测量仅支持 2D 与 3D 深度快照。"),
+    (re.compile(r"^P0-3 V1 requires snapshot coordinates in um; normalize before measuring$"),
+     "快照坐标必须是 µm，请先归一化。"),
+)
+_MEASUREMENT_REASON_FALLBACK = "测量无有效值"
+
+_ENGINE_REASON_LABELS = {
+    "isotropic model does not use a ray flux engine": "各向同性模型不使用射线通量引擎。",
+    "directional model does not use a stochastic ray flux engine": "定向模型不使用随机射线通量引擎。",
+    "native model does not use a stochastic ray flux engine": "原生模型不使用随机射线通量引擎。",
+    "pinned per-step verified engine; no fallback": "按步骤固定使用已验证引擎，不做回退。",
+    "pinned concrete engine for ViennaPS Process.calculateFlux; no fallback": "固定使用已验证的具体引擎执行 calculateFlux，不做回退。",
+    "native geometry operation; no process engine or physical duration": "原生几何操作：不使用工艺引擎，也没有物理时长。",
+    "zero rate; ViennaPS Process was not called": "速率为 0：未调用 ViennaPS Process。",
+}
+
+
+def _engine_reason_text(value: Any) -> str:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return "未记录"
+    text = str(value)
+    return _ENGINE_REASON_LABELS.get(text, text)
+
+
+def _reason_text(reason: Any) -> str:
+    """Chinese explanation for a metrology reason code."""
+
+    if reason is None or (isinstance(reason, str) and not reason.strip()):
+        return _MEASUREMENT_REASON_FALLBACK
+    text = str(reason)
+    for pattern, template in _MEASUREMENT_REASON_PATTERNS:
+        match = pattern.match(text)
+        if match:
+            return template.format(*match.groups()) if match.groups() else template
+    return _MEASUREMENT_REASON_FALLBACK
+
+
+def _reason_detail(reason: Any) -> str | None:
+    """Raw English reason, only when it has no Chinese mapping."""
+
+    if reason is None or (isinstance(reason, str) and not reason.strip()):
+        return None
+    text = str(reason)
+    return None if any(pattern.match(text) for pattern, _ in _MEASUREMENT_REASON_PATTERNS) else text
+
+
+def _measurement_has_value(measurement: Any) -> bool:
+    """Only a `measured` result carries a number; everything else is ambiguous/failed."""
+
+    return getattr(measurement, "status", None) == "measured" and _number(getattr(measurement, "value", None)) is not None
 
 
 def _details(rows: list[tuple[str, str]], summary: str = "技术详情") -> str:
@@ -446,10 +534,14 @@ def _variant_seed(variant: dict[str, Any]) -> Any:
 
 
 def _variant_title(variant: dict[str, Any], index: int) -> str:
-    parts = [f"候选 {index + 1}", f"V{_fmt_number(variant.get('ordinal') or index + 1)}"]
+    """Readable label: the conditions, never an opaque "candidate 1"."""
+
+    parts: list[str] = []
     conditions = _variant_conditions(variant)
     if conditions:
         parts.append(conditions)
+    else:
+        parts.append(f"V{_fmt_number(variant.get('ordinal') or index + 1)}")
     seed = _variant_seed(variant)
     if seed is not None:
         parts.append(f"seed {_fmt_number(seed)}")
@@ -546,55 +638,69 @@ def _tick_text(value: float, step: float) -> str:
     return f"{value:.{decimals}f}"
 
 
-def _trace_polygons(lines: list[Any], limit: int = 4000) -> list[list[int]]:
-    """Trace closed loops out of a line soup so material regions can be filled."""
+def _material_chains(edges: list[tuple[int, int]], limit: int = 4000) -> list[list[int]]:
+    """Join one material's boundary edges into open or closed polylines.
 
-    adjacency: dict[int, list[tuple[int, int]]] = {}
-    for index, line in enumerate(lines):
-        try:
-            a, b = int(line[0]), int(line[1])
-        except (IndexError, TypeError, ValueError):
+    A GDS cross section shares boundaries between materials, so the contour of a
+    single material is usually a chain, not a closed loop. The caller closes each
+    chain down to the bottom of the plot to paint the region.
+    """
+
+    used = [False] * len(edges)
+    adjacency: dict[int, list[int]] = {}
+    for index, (a, b) in enumerate(edges):
+        adjacency.setdefault(a, []).append(index)
+        adjacency.setdefault(b, []).append(index)
+
+    def other(edge_index: int, node: int) -> int:
+        a, b = edges[edge_index]
+        return b if a == node else a
+
+    chains: list[list[int]] = []
+    for start in range(len(edges)):
+        if used[start]:
             continue
-        adjacency.setdefault(a, []).append((b, index))
-        adjacency.setdefault(b, []).append((a, index))
-    used: set[int] = set()
-    polygons: list[list[int]] = []
-    for start in adjacency:
-        for neighbor, edge in adjacency[start]:
-            if edge in used:
-                continue
-            used.add(edge)
-            loop = [start, neighbor]
-            current = neighbor
-            while current != start and len(loop) <= limit:
-                step = None
-                for candidate, candidate_edge in adjacency.get(current, []):
-                    if candidate_edge not in used:
-                        step = (candidate, candidate_edge)
-                        break
-                if step is None:
-                    break
-                used.add(step[1])
-                current = step[0]
-                loop.append(current)
-            if current == start and len(loop) >= 4:
-                polygons.append(loop[:-1])
-            if len(polygons) >= 200:
-                return polygons
-    return polygons
+        used[start] = True
+        chain = [edges[start][0], edges[start][1]]
+        grew = True
+        while grew and len(chain) <= limit:
+            grew = False
+            tail = chain[-1]
+            for edge_index in adjacency.get(tail, []):
+                if used[edge_index]:
+                    continue
+                used[edge_index] = True
+                chain.append(other(edge_index, tail))
+                grew = True
+                break
+        grew = True
+        while grew and len(chain) <= limit:
+            grew = False
+            head = chain[0]
+            for edge_index in adjacency.get(head, []):
+                if used[edge_index]:
+                    continue
+                used[edge_index] = True
+                chain.insert(0, other(edge_index, head))
+                grew = True
+                break
+        chains.append(chain)
+    return chains
 
 
-def _polygon_area(points: list[Any], loop: list[int], x_index: int = 0, y_index: int = 1) -> float:
-    area = 0.0
-    for index, current in enumerate(loop):
-        nxt = loop[(index + 1) % len(loop)]
-        try:
-            x1, y1 = float(points[current][x_index]), float(points[current][y_index])
-            x2, y2 = float(points[nxt][x_index]), float(points[nxt][y_index])
-        except (IndexError, TypeError, ValueError):
-            return 0.0
-        area += x1 * y2 - x2 * y1
-    return abs(area) / 2.0
+def _svg_legend(parts: list[str], view: dict[str, Any], materials: list[int], x: float, y: float) -> None:
+    materials = materials[:8]
+    if not materials:
+        return
+    legend_width = 146
+    legend_height = 18 + 16 * len(materials)
+    parts.append(f'<rect x="{x:.3f}" y="{y:.3f}" width="{legend_width}" height="{legend_height}" fill="#ffffff" fill-opacity="0.92" stroke="#d8dee6"/>')
+    parts.append(f'<text x="{x + 8:.3f}" y="{y + 13:.3f}" font-size="9" fill="#334155" font-weight="600">材料图例</text>')
+    for row, material in enumerate(materials):
+        item_y = y + 22 + row * 16
+        color = _material_color(view, material)
+        parts.append(f'<rect x="{x + 8:.3f}" y="{item_y - 8:.3f}" width="10" height="10" fill="{_escape(color)}" stroke="#94a3b8" stroke-width="0.5"/>')
+        parts.append(f'<text x="{x + 24:.3f}" y="{item_y + 1:.3f}" font-size="9" fill="#17212b">{_escape(_material_name(view, material))}</text>')
 
 
 def _svg_for_snapshot(snapshot: dict[str, Any], width: int = 560, height: int = 360) -> str:
@@ -602,6 +708,16 @@ def _svg_for_snapshot(snapshot: dict[str, Any], width: int = 560, height: int = 
     points = view["points"]
     if not points:
         return '<p class="muted">快照没有可绘制的点。</p>'
+    dimension = int(view.get("dimension") or 0)
+    if dimension == 3 and view.get("triangles"):
+        return _svg_isometric(view, width=width, height=height)
+    return _svg_section(view, width=width, height=height)
+
+
+def _svg_section(view: dict[str, Any], width: int = 560, height: int = 360) -> str:
+    """2D cross section: material fills traced from lines + materialIds."""
+
+    points = view["points"]
     dimension = int(view.get("dimension") or 0)
     x_index, y_index = _axis_indices(view, points)
     xs = [float(point[x_index]) for point in points if len(point) > x_index]
@@ -624,6 +740,7 @@ def _svg_for_snapshot(snapshot: dict[str, Any], width: int = 560, height: int = 
     def py(value: float) -> float:
         return offset_y + (y1 - value) * scale
 
+    fill_bottom = top + plot_height
     unit = str(view.get("coordinateUnit") or "um")
     unit_label = "µm" if unit in {"um", "µm"} else unit
     vertical_label = "z" if y_index == 2 and dimension == 3 else ("z" if y_index == 2 else "高度")
@@ -635,12 +752,11 @@ def _svg_for_snapshot(snapshot: dict[str, Any], width: int = 560, height: int = 
     ]
 
     step = _nice_step(max(x_span, y_span) / 4)
-    # Light grid plus numeric ticks on both axes.
     tick = math.ceil(x0 / step) * step
     while tick <= x1 + step * 1e-9:
         gx = px(tick)
-        parts.append(f'<line x1="{gx:.3f}" y1="{top}" x2="{gx:.3f}" y2="{top + plot_height:.3f}" stroke="#eef2f7" stroke-width="1"/>')
-        parts.append(f'<text x="{gx:.3f}" y="{top + plot_height + 14:.3f}" font-size="9" fill="#6b7785" text-anchor="middle">{_tick_text(tick, step)}</text>')
+        parts.append(f'<line x1="{gx:.3f}" y1="{top}" x2="{gx:.3f}" y2="{fill_bottom:.3f}" stroke="#eef2f7" stroke-width="1"/>')
+        parts.append(f'<text x="{gx:.3f}" y="{fill_bottom + 14:.3f}" font-size="9" fill="#6b7785" text-anchor="middle">{_tick_text(tick, step)}</text>')
         tick += step
     tick = math.ceil(y0 / step) * step
     while tick <= y1 + step * 1e-9:
@@ -649,56 +765,60 @@ def _svg_for_snapshot(snapshot: dict[str, Any], width: int = 560, height: int = 
         parts.append(f'<text x="{left - 6:.3f}" y="{gy + 3:.3f}" font-size="9" fill="#6b7785" text-anchor="end">{_tick_text(tick, step)}</text>')
         tick += step
 
-    # Axis lines and titles.
-    parts.append(f'<line x1="{left}" y1="{top + plot_height:.3f}" x2="{left + plot_width:.3f}" y2="{top + plot_height:.3f}" stroke="#94a3b8" stroke-width="1.2"/>')
-    parts.append(f'<line x1="{left}" y1="{top}" x2="{left}" y2="{top + plot_height:.3f}" stroke="#94a3b8" stroke-width="1.2"/>')
+    parts.append(f'<line x1="{left}" y1="{fill_bottom:.3f}" x2="{left + plot_width:.3f}" y2="{fill_bottom:.3f}" stroke="#94a3b8" stroke-width="1.2"/>')
+    parts.append(f'<line x1="{left}" y1="{top}" x2="{left}" y2="{fill_bottom:.3f}" stroke="#94a3b8" stroke-width="1.2"/>')
     parts.append(f'<text x="{left + plot_width / 2:.3f}" y="{height - 10:.3f}" font-size="10" fill="#334155" text-anchor="middle">x ({_escape(unit_label)})</text>')
     parts.append(f'<text x="14" y="{top + plot_height / 2:.3f}" font-size="10" fill="#334155" text-anchor="middle" transform="rotate(-90 14 {top + plot_height / 2:.3f})">{_escape(vertical_label)} ({_escape(unit_label)})</text>')
 
+    drawn: list[int] = []
     if dimension == 2:
         material_ids = view.get("lineMaterialIds") or []
-        by_material: dict[int, list[list[int]]] = {}
+        by_material: dict[int, list[tuple[int, int]]] = {}
         for index, line in enumerate(view.get("lines") or []):
+            try:
+                a, b = int(line[0]), int(line[1])
+            except (IndexError, TypeError, ValueError):
+                continue
+            if a == b or a >= len(points) or b >= len(points):
+                continue
             material = int(material_ids[index]) if index < len(material_ids) else -1
-            by_material.setdefault(material, []).append(line)
-        for material, material_lines in by_material.items():
+            by_material.setdefault(material, []).append((a, b))
+        for material, edges in by_material.items():
             color = _material_color(view, material)
-            loops = [loop for loop in _trace_polygons(material_lines) if _polygon_area(points, loop, x_index, y_index) > 1e-18]
-            for loop in loops[:120]:
-                coords = " ".join(f"{px(float(points[index][x_index])):.3f},{py(float(points[index][y_index])):.3f}" for index in loop)
-                parts.append(f'<polygon points="{coords}" fill="{_escape(color)}" fill-opacity="0.32" stroke="{_escape(color)}" stroke-width="1"/>')
-            if not loops:
-                # A branched contour (shared boundary with another material) has no
-                # single closed loop; paint a translucent band so the material
-                # region is still visible instead of a bare outline.
-                for line in material_lines:
-                    try:
-                        a, b = points[int(line[0])], points[int(line[1])]
-                    except (IndexError, TypeError, ValueError):
-                        continue
-                    parts.append(
-                        f'<line x1="{px(float(a[x_index])):.3f}" y1="{py(float(a[y_index])):.3f}" '
-                        f'x2="{px(float(b[x_index])):.3f}" y2="{py(float(b[y_index])):.3f}" '
-                        f'stroke="{_escape(color)}" stroke-width="6" stroke-opacity="0.22" stroke-linecap="round"/>'
-                    )
-            # Keep the raw contour visible even when no closed loop could be traced.
-            for line in material_lines:
-                try:
-                    a, b = points[int(line[0])], points[int(line[1])]
-                except (IndexError, TypeError, ValueError):
+            for chain in _material_chains(edges)[:200]:
+                chain_xs = [float(points[index][x_index]) for index in chain if index < len(points)]
+                if not chain_xs:
                     continue
+                closed = len(chain) > 2 and chain[0] == chain[-1]
+                if not closed and (max(chain_xs) - min(chain_xs) < 1e-12):
+                    continue
+                coords = [(px(float(points[index][x_index])), py(float(points[index][y_index])))
+                          for index in chain if index < len(points)]
+                if not coords:
+                    continue
+                if not closed:
+                    coords = coords + [(coords[-1][0], fill_bottom), (coords[0][0], fill_bottom)]
+                points_text = " ".join(f"{cx:.3f},{cy:.3f}" for cx, cy in coords)
+                parts.append(f'<polygon points="{points_text}" fill="{_escape(color)}" fill-opacity="0.32" stroke="{_escape(color)}" stroke-width="0.8"/>')
+                if material not in drawn:
+                    drawn.append(material)
+            for a, b in edges:
                 parts.append(
-                    f'<line x1="{px(float(a[x_index])):.3f}" y1="{py(float(a[y_index])):.3f}" '
-                    f'x2="{px(float(b[x_index])):.3f}" y2="{py(float(b[y_index])):.3f}" '
+                    f'<line x1="{px(float(points[a][x_index])):.3f}" y1="{py(float(points[a][y_index])):.3f}" '
+                    f'x2="{px(float(points[b][x_index])):.3f}" y2="{py(float(points[b][y_index])):.3f}" '
                     f'stroke="{_escape(color)}" stroke-width="1.1" stroke-opacity="0.9"/>'
                 )
+            if material not in drawn:
+                drawn.append(material)
     else:
+        # A 3D snapshot without triangles: fall back to a projected point cloud.
         for index, point in enumerate(points):
             material = view["materialIds"][index] if index < len(view["materialIds"]) else -1
             color = _material_color(view, material)
             parts.append(f'<circle cx="{px(float(point[x_index])):.3f}" cy="{py(float(point[y_index])):.3f}" r="1.1" fill="{_escape(color)}" fill-opacity="0.85"/>')
+            if material not in drawn:
+                drawn.append(material)
 
-    # Scale bar: a round length close to a quarter of the horizontal span.
     bar_value = _nice_step(x_span / 4, 1)
     if bar_value * scale > plot_width * 0.6:
         bar_value = _nice_step(bar_value / 2, 1)
@@ -710,36 +830,124 @@ def _svg_for_snapshot(snapshot: dict[str, Any], width: int = 560, height: int = 
     parts.append(f'<line x1="{bar_x + bar_px:.3f}" y1="{bar_y - 4:.3f}" x2="{bar_x + bar_px:.3f}" y2="{bar_y + 4:.3f}" stroke="#17212b" stroke-width="1.2"/>')
     parts.append(f'<text x="{bar_x + bar_px / 2:.3f}" y="{bar_y - 7:.3f}" font-size="9" fill="#17212b" text-anchor="middle">{_fmt_number(bar_value)} {_escape(unit_label)}</text>')
 
-    # Material legend with colour swatches and readable names.
-    legend_materials: list[Any] = []
-    seen: set[Any] = set()
-    for material in (view.get("lineMaterialIds") if dimension == 2 else view.get("materialIds")) or []:
-        if material in seen:
-            continue
-        seen.add(material)
-        legend_materials.append(material)
-    for key in (view.get("materials") or {}):
-        try:
-            material = int(key)
-        except (TypeError, ValueError):
-            continue
-        if material not in seen:
-            seen.add(material)
-            legend_materials.append(material)
-    legend_materials = legend_materials[:8]
-    if legend_materials:
-        legend_width = 146
-        legend_height = 18 + 16 * len(legend_materials)
-        legend_x = left + plot_width - legend_width - 8
-        legend_y = top + 8
-        parts.append(f'<rect x="{legend_x:.3f}" y="{legend_y:.3f}" width="{legend_width}" height="{legend_height}" fill="#ffffff" fill-opacity="0.92" stroke="#d8dee6"/>')
-        parts.append(f'<text x="{legend_x + 8:.3f}" y="{legend_y + 13:.3f}" font-size="9" fill="#334155" font-weight="600">材料图例</text>')
-        for row, material in enumerate(legend_materials):
-            item_y = legend_y + 22 + row * 16
-            color = _material_color(view, material)
-            parts.append(f'<rect x="{legend_x + 8:.3f}" y="{item_y - 8:.3f}" width="10" height="10" fill="{_escape(color)}" stroke="#94a3b8" stroke-width="0.5"/>')
-            parts.append(f'<text x="{legend_x + 24:.3f}" y="{item_y + 1:.3f}" font-size="9" fill="#17212b">{_escape(_material_name(view, material))}</text>')
+    # Legend lists only materials that were actually drawn.
+    _svg_legend(parts, view, drawn, left + plot_width - 146 - 8, top + 8)
 
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def _svg_isometric(view: dict[str, Any], width: int = 560, height: int = 360) -> str:
+    """Isometric projection of a 3D snapshot (u = x - 0.5y, v = z + 0.35y)."""
+
+    points = view["points"]
+    axis_map = view.get("axisMap") or {}
+
+    def axis_index(key: str, fallback: int) -> int:
+        try:
+            return int(axis_map.get(key, fallback))
+        except (TypeError, ValueError):
+            return fallback
+
+    xi, yi, zi = axis_index("x", 0), axis_index("y", 1), axis_index("z", 2)
+    projected: list[tuple[float, float, float]] = []
+    raw: list[tuple[float, float, float]] = []
+    for point in points:
+        try:
+            x, y, z = float(point[xi]), float(point[yi]), float(point[zi])
+        except (IndexError, TypeError, ValueError):
+            projected.append((0.0, 0.0, 0.0))
+            raw.append((0.0, 0.0, 0.0))
+            continue
+        projected.append((x - 0.5 * y, z + 0.35 * y, y))
+        raw.append((x, y, z))
+    us = [row[0] for row in projected]
+    vs = [row[1] for row in projected]
+    u0, u1, v0, v1 = min(us), max(us), min(vs), max(vs)
+    u_span = (u1 - u0) or 1.0
+    v_span = (v1 - v0) or 1.0
+    left, right, top, bottom = 62, 18, 18, 52
+    plot_width = max(1.0, width - left - right)
+    plot_height = max(1.0, height - top - bottom)
+    scale = min(plot_width / u_span, plot_height / v_span)
+    offset_x = left + (plot_width - u_span * scale) / 2.0
+    offset_y = top + (plot_height - v_span * scale) / 2.0
+
+    def px(value: float) -> float:
+        return offset_x + (value - u0) * scale
+
+    def py(value: float) -> float:
+        return offset_y + (v1 - value) * scale
+
+    unit = str(view.get("coordinateUnit") or "um")
+    unit_label = "µm" if unit in {"um", "µm"} else unit
+    aria = f"3D 结构等轴投影：u = x - 0.5y，v = z + 0.35y，单位 {unit_label}"
+    parts = [
+        f'<svg viewBox="0 0 {width} {height}" class="report-svg" role="img" aria-label="{_escape(aria)}">',
+        f'<rect x="0" y="0" width="{width}" height="{height}" fill="#fbfdff"/>',
+        f'<rect x="{left}" y="{top}" width="{plot_width:.3f}" height="{plot_height:.3f}" fill="#ffffff" stroke="#d8dee6"/>',
+    ]
+
+    triangles = view.get("triangles") or []
+    material_ids = view.get("triangleMaterialIds") or []
+    faces: list[tuple[float, int, int, int, int]] = []
+    for index, triangle in enumerate(triangles):
+        try:
+            a, b, c = int(triangle[0]), int(triangle[1]), int(triangle[2])
+        except (IndexError, TypeError, ValueError):
+            continue
+        if max(a, b, c) >= len(projected):
+            continue
+        depth = (projected[a][2] + projected[b][2] + projected[c][2]) / 3.0
+        faces.append((depth, index, a, b, c))
+    # Far faces (larger y) first so nearer material covers them.
+    faces.sort(key=lambda row: row[0], reverse=True)
+
+    drawn: list[int] = []
+    for _depth, index, a, b, c in faces:
+        material = int(material_ids[index]) if index < len(material_ids) else -1
+        color = _material_color(view, material)
+        points_text = " ".join(
+            f"{px(projected[vertex][0]):.3f},{py(projected[vertex][1]):.3f}" for vertex in (a, b, c)
+        )
+        parts.append(f'<polygon points="{points_text}" fill="{_escape(color)}" fill-opacity="0.88" stroke="{_escape(color)}" stroke-width="0.3"/>')
+        if material not in drawn:
+            drawn.append(material)
+
+    if not faces:
+        for index, row in enumerate(projected):
+            material = view["materialIds"][index] if index < len(view["materialIds"]) else -1
+            color = _material_color(view, material)
+            parts.append(f'<circle cx="{px(row[0]):.3f}" cy="{py(row[1]):.3f}" r="1.2" fill="{_escape(color)}" fill-opacity="0.85"/>')
+            if material not in drawn:
+                drawn.append(material)
+
+    # Axes: project the three unit directions from the minimum corner.
+    x_min, y_min, z_min = min(r[0] for r in raw), min(r[1] for r in raw), min(r[2] for r in raw)
+    x_max, y_max, z_max = max(r[0] for r in raw), max(r[1] for r in raw), max(r[2] for r in raw)
+    origin = (x_min, y_min, z_min)
+
+    def project_corner(x: float, y: float, z: float) -> tuple[float, float]:
+        return px(x - 0.5 * y), py(z + 0.35 * y)
+
+    ox, oy = project_corner(*origin)
+    for end, label in (
+        ((x_max, y_min, z_min), "x"),
+        ((x_min, y_max, z_min), "y"),
+        ((x_min, y_min, z_max), "z"),
+    ):
+        ex, ey = project_corner(*end)
+        parts.append(f'<line x1="{ox:.3f}" y1="{oy:.3f}" x2="{ex:.3f}" y2="{ey:.3f}" stroke="#64748b" stroke-width="1.2"/>')
+        parts.append(f'<text x="{ex + 4:.3f}" y="{ey - 2:.3f}" font-size="9" fill="#334155">{label}</text>')
+
+    bar_value = _nice_step(max(u_span, v_span) / 4, 1)
+    bar_px = max(1.0, bar_value * scale)
+    bar_x = left + plot_width - bar_px - 14
+    bar_y = top + plot_height - 12
+    parts.append(f'<line x1="{bar_x:.3f}" y1="{bar_y:.3f}" x2="{bar_x + bar_px:.3f}" y2="{bar_y:.3f}" stroke="#17212b" stroke-width="3"/>')
+    parts.append(f'<text x="{bar_x + bar_px / 2:.3f}" y="{bar_y - 7:.3f}" font-size="9" fill="#17212b" text-anchor="middle">{_fmt_number(bar_value)} {_escape(unit_label)}</text>')
+
+    _svg_legend(parts, view, drawn, left + plot_width - 146 - 8, top + 8)
     parts.append("</svg>")
     return "".join(parts)
 
@@ -754,6 +962,23 @@ def _parameters_text(parameters: dict[str, Any], names: dict[str, str]) -> str:
             unit = _PARAMETER_UNITS.get(str(key), "")
             parts.append(f"{label} {key}={_fmt_number(value)}{unit}")
     return " · ".join(parts) if parts else "未提供"
+
+
+def _run_step_id(store: Any, run_id: str) -> str | None:
+    """Last snapshot step of a run: what 03 shows by default for that Segment."""
+
+    try:
+        segment = store.get_segment_by_run_id(run_id)
+    except Exception:
+        segment = None
+    if segment is not None and getattr(segment, "throughStepId", None):
+        return str(segment.throughStepId)
+    try:
+        manifest = storage.read_json(storage.run_path(run_id) / "manifest.json")
+    except Exception:
+        return None
+    listed = manifest.get("snapshots") or []
+    return str(listed[-1].get("stepId")) if listed and listed[-1].get("stepId") else None
 
 
 def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
@@ -911,12 +1136,23 @@ def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
     if manifest:
         versions = manifest.get("versions") or {}
         solver = manifest.get("requestedSolver") or {}
+        requested_random = solver.get("random") if isinstance(solver.get("random"), dict) else {}
+        actual_seed = _number(manifest.get("actualSeed"))
+        requested_seed = _number((requested_random or {}).get("seed"))
+        seed_mode = (requested_random or {}).get("mode")
+        if actual_seed is not None:
+            seed_label, seed_value = "实际种子", _fmt_number(actual_seed)
+        elif requested_seed is not None:
+            seed_label, seed_value = "种子（请求值）", _fmt_number(requested_seed)
+        else:
+            seed_label, seed_value = "种子", "未记录（确定性 CPU 运行）"
         engine_text = "ViennaPS %s · ViennaLS %s" % (
             _display(versions.get("viennaps"), "未记录"), _display(versions.get("viennals"), "未记录"))
         sections.append(_kv_table([
             ("引擎", engine_text),
             ("请求引擎", _display(solver.get("enginePreference"))),
-            ("实际种子", _display(manifest.get("actualSeed"))),
+            (seed_label, seed_value),
+            ("种子策略", _display(manifest.get("seedPolicy") or seed_mode)),
             ("请求输入哈希", _code(manifest.get("requestedInputHash"))),
             ("执行哈希", _code(manifest.get("executionHash"))),
         ]))
@@ -926,7 +1162,7 @@ def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
             sections.append(_table(
                 ["步骤", "步骤引擎", "原因"],
                 [[_escape(_step_label(row.get("stepId"), step_names)), _display(row.get("actualEngine")),
-                  _display(row.get("engineSelectionReason"))] for row in actual[:40]],
+                  _escape(_engine_reason_text(row.get("engineSelectionReason")))] for row in actual[:40]],
             ))
         sections.append(_details([
             ("运行模式", _display(manifest.get("runMode"))),
@@ -968,20 +1204,35 @@ def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
         except Exception:
             metric_name = None
         metric_label = metric_name or measurement.metricId
-        sections.append("<p>测量 %s · 数值 %s %s · %s</p>" % (
-            _escape(metric_label), _fmt_number(measurement.value), _display(measurement.unit, ""),
-            _status_label(measurement.status)))
-        sections.append(_kv_table([
+        has_value = _measurement_has_value(measurement)
+        value_text = _fmt_number(measurement.value) if has_value else "未记录"
+        unit_text = _display(measurement.unit, "") if has_value else ""
+        status_text = _status_label(measurement.status)
+        reason_text = _reason_text(measurement.reason)
+        headline = "测量 %s · 数值 %s%s · %s" % (
+            _escape(metric_label), value_text, (" " + unit_text) if unit_text else "", status_text)
+        if not has_value:
+            headline += " · 说明 %s" % _escape(reason_text)
+        sections.append("<p>%s</p>" % headline)
+        rows: list[tuple[str, str]] = [
             ("测量", _code(measurement.measurementId)),
             ("指标", _escape(metric_label)),
             ("配方", "%s v%s" % (_escape(measurement.recipeId), _display(measurement.recipeVersion, ""))),
             ("方法", "%s · %s" % (_display(measurement.method), _display(measurement.material))),
-            ("数值", "%s %s" % (_fmt_number(measurement.value), _display(measurement.unit, ""))),
+            ("数值", value_text),
+            ("状态", status_text),
+        ]
+        if unit_text:
+            rows.append(("单位", unit_text))
+        if not has_value:
+            rows.append(("说明", _escape(reason_text)))
+        rows.extend([
             ("来源快照", _code(measurement.sourceSnapshotHash)),
             ("绑定状态", _status_label(measurement.bindingStatus)),
             ("等价状态", _status_label(measurement.equivalenceStatus)),
-            ("状态", _status_label(measurement.status)),
-        ]))
+        ])
+        sections.append(_kv_table(rows))
+        raw_reason = _reason_detail(measurement.reason)
         sections.append(_details([
             ("算法版本", _display(measurement.algorithmVersion)),
             ("来源运行 ID", _code(measurement.sourceRunId)),
@@ -990,7 +1241,7 @@ def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
             ("不确定度", _fmt_number(measurement.uncertainty)),
             ("不确定度状态", _status_label(measurement.uncertaintyStatus)),
             ("坐标系统", _display(measurement.coordinateSystem)),
-            ("原因", _display(measurement.reason, "未提供")),
+            ("原因（原始）", _code(raw_reason) if raw_reason else "未提供"),
         ]))
         if provenance:
             sections.append("<h3>证据</h3>")
@@ -1014,9 +1265,10 @@ def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
         if variants:
             sections.append("<h3>候选</h3>")
             sections.append(_table(
-                ["候选", "条件", "状态", "运行数"],
-                [[_escape(_variant_title(variant, index)), _display(_variant_conditions(variant), "未提供"),
-                  _escape(_variant_status(variant)), _fmt_number(len(variant.get("replicates") or []))]
+                ["编号", "条件", "状态", "运行数"],
+                [[_escape("V%s" % _fmt_number(variant.get("ordinal") or index + 1)),
+                  _escape(_variant_title(variant, index)),
+                  _escape(_variant_status(variant)), _fmt_number(len(variant.get("replicates") or []))]  # title = conditions + seed
                  for index, variant in enumerate(variants)],
             ))
         aggregation = experiment.get("aggregation") or {}
@@ -1062,15 +1314,21 @@ def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
     sections.append("<h2>结构视图</h2>")
     view_snapshots: list[tuple[dict[str, Any], str]] = []
     if experiment:
+        # Same snapshot as 03: the first replicate that actually ran, at the
+        # last step of that run (not the step of some other run).
         for index, variant in enumerate((experiment.get("variants") or [])[:3]):
-            replicate = (variant.get("replicates") or [{}])[0]
-            if not replicate.get("runId") or not step_id:
+            replicate = next((row for row in variant.get("replicates") or [] if row.get("runId")), None)
+            if not replicate:
+                continue
+            run_for_view = str(replicate["runId"])
+            step_for_view = _run_step_id(store, run_for_view)
+            if not step_for_view:
                 continue
             try:
-                snapshot = load_snapshot(replicate["runId"], step_id)
+                snapshot = load_snapshot(run_for_view, step_for_view)
             except Exception:
                 continue
-            caption_parts = [_step_label(step_id, step_names)]
+            caption_parts = [_step_label(step_for_view, step_names)]
             conditions = _variant_conditions(variant)
             if conditions:
                 caption_parts.append(conditions)

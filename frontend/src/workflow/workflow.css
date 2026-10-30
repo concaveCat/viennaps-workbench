@@ -525,6 +525,9 @@ body {
 .wf-button:disabled { opacity: .5; }
 .wf-summary { background: #f5f7f9; border: 1px solid var(--spx-line-soft); border-left: 3px solid var(--spx-blue); border-radius: 0; padding: 6px 8px; margin-top: 7px; font-size: 11px; }
 .wf-summary.success { border-left-color: var(--spx-green); }
+/* Metric validity is a separate fact from run success: keep the warning visible. */
+.wf-summary.warning { background: #fdf6ec; border-left-color: #d68b00; }
+.wf-summary.warning strong { color: #8a5a00; }
 .wf-summary strong { font-size: 11px; }
 .wf-muted { color: var(--spx-muted); font-size: 11px; }
 .wf-empty { border-radius: 0; border-color: var(--spx-line); color: var(--spx-muted); min-height: 90px; }

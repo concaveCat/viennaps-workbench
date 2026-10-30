@@ -272,6 +272,7 @@ type ExperimentDoc = {
     replicates: Array<{
       status: string; value?: number | null; unit?: string; runId?: string; seed?: number;
       attemptCount?: number; statisticalSample?: boolean; measurementId?: string; reason?: string;
+      measurementStatus?: string;
     }>;
   }>;
   project?: { steps: Array<{ id: string }> };
@@ -485,9 +486,13 @@ const STATUS_LABELS: Record<string, string> = {
   interrupted: '已中断',
   verified: '已核验',
   measured: '已测量',
-  ambiguous: '有歧义',
+  ambiguous: '测量有歧义',
   region_empty: '区域为空',
   no_intersection: '无交点',
+  material_not_found: '材料缺失',
+  unsupported_dimension: '维度不支持',
+  unsupported_units: '单位不支持',
+  invalid_geometry: '几何无效',
   stale: '待重跑',
   completed: '已完成',
   pending: '待处理',
@@ -727,6 +732,54 @@ function formatNumber(value: number | null | undefined, digits = 4): string {
   return String(Number(value.toPrecision(digits)));
 }
 
+/** Only a `measured` result carries a number; every other status is an ambiguity or a failure. */
+function measurementHasValue(item: { status?: string | null; value?: number | null }): boolean {
+  return item.status === 'measured' && typeof item.value === 'number' && Number.isFinite(item.value);
+}
+
+const MEASUREMENT_REASON_PATTERNS: Array<[RegExp, (match: RegExpMatchArray) => string]> = [
+  [/^multiple selected-material surfaces cross the measurement x$/, () => '测量位置 X 处有多条材料界面相交，无法确定唯一深度；请移动 X 位置或更换测量材料。'],
+  [/^no material surface found at the measurement x$/, () => '测量位置 X 处没有找到材料界面。'],
+  [/^no selected-material segment crosses the measurement x$/, () => '测量位置 X 处没有所选材料的界面。'],
+  [/^isotropic model does not use a ray flux engine$/, () => '各向同性模型不使用射线通量引擎。'],
+  [/^a selected-material segment lies on the measurement height$/, () => '所选材料的界面正好落在测量高度上。'],
+  [/^fewer than two selected-material crossings at the measurement height$/, () => '测量高度上少于两个所选材料交点。'],
+  [/^etch-depth x coordinate is outside the measurement region$/, () => '深度测量的 X 坐标超出测量区域。'],
+  [/^material '?([^']+)'? is not present in the snapshot$/, match => `快照中没有材料 ${match[1]}。`],
+  [/^line and material-id counts differ$/, () => '快照的线与材料编号数量不一致。'],
+  [/^snapshot requires points, lines and cellData\.materialIds$/, () => '快照缺少点、线或材料编号。'],
+  [/^3D material top-height summary has no finite height$/, () => '3D 材料顶面高度不是有限值。'],
+  [/^3D metrology v1 supports material top-height depth only$/, () => '3D 测量仅支持材料顶面高度深度。'],
+  [/^P0-3 metrology supports 2D and 3D-depth snapshots only$/, () => '测量仅支持 2D 与 3D 深度快照。'],
+  [/^P0-3 V1 requires snapshot coordinates in um; normalize before measuring$/, () => '快照坐标必须是 µm，请先归一化。'],
+];
+
+const MEASUREMENT_FALLBACK_REASON = '测量无有效值';
+
+/** Chinese explanation for a metrology reason; unmapped English stays in the tooltip only. */
+function measurementReasonText(reason: string | null | undefined): string {
+  if (!reason || !reason.trim()) return MEASUREMENT_FALLBACK_REASON;
+  for (const [pattern, render] of MEASUREMENT_REASON_PATTERNS) {
+    const match = reason.match(pattern);
+    if (match) return render(match);
+  }
+  return MEASUREMENT_FALLBACK_REASON;
+}
+
+/** Raw backend text, kept for title/technical details only when it has no Chinese mapping. */
+function measurementReasonDetail(reason: string | null | undefined): string | undefined {
+  if (!reason || !reason.trim()) return undefined;
+  return MEASUREMENT_REASON_PATTERNS.some(([pattern]) => pattern.test(reason)) ? undefined : reason;
+}
+
+function measurementValueText(item: { status?: string | null; value?: number | null; unit?: string | null }): string {
+  return measurementHasValue(item) ? `${formatNumber(item.value)} ${displayUnit(item.unit)}` : '—';
+}
+
+function measurementUnitText(item: { status?: string | null; value?: number | null; unit?: string | null }): string {
+  return measurementHasValue(item) ? displayUnit(item.unit) : '';
+}
+
 /** `V1 · 0.02 s · seed 20261029` — condition label used by 04 results and 05 candidates. */
 function variantConditionLabel(variant: ExperimentDoc['variants'][number], replicateSeed?: number): string {
   const parameters = variant.parameters ?? {};
@@ -816,6 +869,33 @@ function errorText(payload: unknown): string {
     return JSON.stringify(payload);
   }
   return '请求失败';
+}
+
+/**
+ * Backend conflicts are English by design (they are API codes). The UI never
+ * shows them verbatim: known ones are translated, the rest get a Chinese prefix
+ * and keep the original in the activity log for debugging.
+ */
+const BACKEND_ERROR_PATTERNS: Array<[RegExp, (match: RegExpMatchArray) => string]> = [
+  [/^continued Segment has no successful predecessor checkpoint$/, () => '当前 Segment 需要前一个 Segment 成功后才能继续；请先执行前序 Segment，或点“执行全部 Segment”。'],
+  [/^continued Segment requires a start checkpoint$/, () => '当前 Segment 缺少起始检查点；请先执行前序 Segment。'],
+  [/^start checkpoint has no native Domain state$/, () => '前序 Segment 的检查点没有可续算的 Domain 状态；请重新执行前序 Segment。'],
+  [/^start checkpoint state hash does not match the manifest$/, () => '前序检查点与运行清单不一致；请重新执行前序 Segment。'],
+  [/^segment (.+) is not planned$/, () => '该 Segment 不在待执行状态，可能已运行或正在运行。'],
+  [/^Segment range does not select a valid compile slice$/, () => 'Segment 的步骤范围无效；请重新创建 Route。'],
+  [/^legacy unverified route cannot be executed$/, () => '旧版未验证 Route 不能执行；请重新创建 Route。'],
+  [/^route compatibility verification failed: (.+)$/, match => `Route 与当前编译不兼容：${translateBackendError(match[1])}`],
+  [/^Segment project is invalid: (.+)$/, match => `Segment 工程无效：${match[1]}`],
+  [/^segment run could not start: (.+)$/, match => `Segment 无法启动：${match[1]}`],
+];
+
+function translateBackendError(message: string): string {
+  const text = (message ?? '').trim();
+  for (const [pattern, render] of BACKEND_ERROR_PATTERNS) {
+    const match = text.match(pattern);
+    if (match) return render(match);
+  }
+  return text;
 }
 
 function stepOptionLabel(step: ProjectStep, index: number): string {
@@ -1264,6 +1344,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [metricDetail, setMetricDetail] = useState<{ measurement: Measurement; recipe: Recipe; provenance: Provenance } | null>(null);
   const [experimentDoc, setExperimentDoc] = useState<ExperimentDoc | null>(null);
   const [experimentTable, setExperimentTable] = useState<ExperimentTable | null>(null);
+  /** Measurements referenced by experiment replicates: the reason for an
+   * ambiguous metric is stored on the measurement, not on the replicate. */
+  const [replicateMeasurements, setReplicateMeasurements] = useState<Record<string, Measurement>>({});
   const [layouts, setLayouts] = useState<Array<{ layoutId: string; fileName: string; structureCount: number }>>([]);
   const [activeLayout, setActiveLayout] = useState<LayoutDetail | null>(null);
   const [layoutStructure, setLayoutStructure] = useState('');
@@ -1409,6 +1492,22 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
 
   const projectDirty = !!project && JSON.stringify(project) !== savedProjectJson;
 
+  // A reopened GDS project has no freshly uploaded asset, but its geometry still
+  // names the GDS file. The 01 file row must show that instead of "未选择 GDS".
+  const boundGdsFileName = (() => {
+    if (projectGeometrySource.kind !== 'layout') return '';
+    const geometry = (project?.geometry ?? {}) as Record<string, unknown>;
+    return typeof geometry.fileName === 'string' ? geometry.fileName : '';
+  })();
+  // Clip assets are stored as `<clipId>.gds`; the readable name lives on the
+  // registered Layout, so prefer it when the project is bound to one.
+  const boundLayoutId = projectGeometrySource.kind === 'layout' ? projectGeometrySource.layoutId : undefined;
+  const boundLayoutFileName = activeLayout?.fileName
+    ?? layouts.find(item => item.layoutId === boundLayoutId)?.fileName
+    ?? '';
+  const gdsDisplayName = gds?.fileName ?? (boundLayoutFileName || boundGdsFileName);
+  const gdsFromRegisteredLayout = !gds && !!(boundGdsFileName || boundLayoutFileName);
+
   const geometrySaveBlock = (() => {
     if (!project || projectGeometrySource.kind !== 'layout' || projectGeometrySource.clipId) return '';
     const geometry = (project.geometry ?? {}) as Record<string, unknown>;
@@ -1480,6 +1579,68 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     }
   };
 
+  /**
+   * Everything below is bound to one project. Creating/opening/closing a project
+   * must drop all of it, otherwise 04/05/06 keep showing the previous project's
+   * experiment, comparison and report.
+   */
+  const resetProjectScopedState = () => {
+    setCompile(null);
+    setRoute(null);
+    setSegment(null);
+    setMeasurement(null);
+    setProvenance(null);
+    setMetrics([]);
+    setMeasurementMark(null);
+    setMetricDetail(null);
+    setDecisions([]);
+    setActiveRecipeId('');
+    setActiveRecipeVersion(1);
+    setCompileStale(true);
+    setPreviousCompile(null);
+    setCompileDiff(null);
+    setRunSnapshots({});
+    setStructurePick('');
+    setStructureView(null);
+    setStructureError('');
+    setStructureLoading(false);
+    setStructureStats(null);
+    setSelectedFlowStepId(null);
+    setExperimentDoc(null);
+    setExperimentTable(null);
+    setExperimentList([]);
+    setReplicateMeasurements({});
+    setAutoAnalysisId('');
+    autoAnalysisRef.current = '';
+    setComparison(null);
+    setCompareCandidates([]);
+    setCandidateViews({});
+    setSyncZoom(1);
+    setSyncAxis('xy');
+    setWindowLower('');
+    setWindowUpper('');
+    setWindowError('');
+    setWindowResult(null);
+    setTableMin('');
+    setTableMax('');
+    setTableSort('ordinal');
+    setRetentionInfo(null);
+    setReportDocument(null);
+    setReportConclusions('');
+    setCalibrationCsv('');
+    setCalibrationDataset(null);
+    setCalibrationFit(null);
+    setClipNotice('');
+    setClipName('clip');
+    setSelectedPairs([]);
+    setLayoutStructure('');
+    setLayerMaterials({});
+    setActiveClip(null);
+    setActiveLayout(null);
+    setCanvas(null);
+    setClips([]);
+  };
+
   const applyLoadedProject = (document: ProjectDoc, record?: ProjectRecord) => {
     setProject(document);
     setProjectId(record?.projectId ?? '');
@@ -1489,26 +1650,18 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setProjectNotice(record
       ? `已打开 · ${record.name} · ${formatDateTime(record.updatedAt)}`
       : '草稿（未保存）');
+    // A freshly uploaded GDS belongs to the previous session, not this project.
+    setGds(null);
     const geometry = (document.geometry ?? {}) as Record<string, unknown>;
     if (geometry.kind !== 'gds') parametricGeometryRef.current = geometry;
     setProjectGeometrySource(geometry.kind === 'gds'
       ? { kind: 'layout', clipName: typeof geometry.fileName === 'string' ? geometry.fileName : 'GDS Clip' }
       : { kind: 'parametric' });
-    setCompile(null);
-    setRoute(null);
-    setSegment(null);
-    setMeasurement(null);
-    setProvenance(null);
-    setCompileStale(true);
+    resetProjectScopedState();
     setProjectState(emptyWorkflowState());
     lastStateJson.current = '';
     setStateNotice('');
     setRestoreNotice('');
-    setActiveClip(null);
-    setCanvas(null);
-    setActiveLayout(null);
-    setClips([]);
-    setClipNotice('');
     setSetupMode('project');
   };
 
@@ -1532,6 +1685,13 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         return { kind: 'layout', clipId: clip.clipId, clipName: clip.name, layoutId: clip.layoutId, clipHash: clip.clipHash };
       }
     } catch { /* the clip list is best effort */ }
+    // The clip may have been deleted but the registered Layout is still there:
+    // keep the filename and let the GDS tab open on that Layout.
+    try {
+      const data = await api<{ layouts: Array<{ layoutId: string; fileName: string }> }>('/api/v1/workflow/layouts');
+      const layout = data.layouts.find(item => item.fileName === fileName);
+      if (layout) return { kind: 'layout', clipName: fileName, layoutId: layout.layoutId };
+    } catch { /* the layout list is best effort */ }
     return { kind: 'layout', clipName: fileName || 'GDS Clip' };
   };
 
@@ -1781,6 +1941,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       setSavedProjectJson('');
       setProjectSavedAt('');
       setProjectNotice('');
+      resetProjectScopedState();
       setProjectState(emptyWorkflowState());
       lastStateJson.current = '';
       setRestoreNotice('');
@@ -1814,8 +1975,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setCloseArmed(false);
     setNewProjectArmed(false);
     window.localStorage.removeItem(PROJECT_STORAGE_KEY);
-    setCompile(null); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);
-    setCompileStale(true);
+    resetProjectScopedState();
     setProjectGeometrySource({ kind: 'parametric' });
     setProjectState(emptyWorkflowState());
     lastStateJson.current = '';
@@ -1855,6 +2015,20 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [project, projectId, busy, projectFormErrors, projectGeometrySource, activeClip, clips]);
+
+  // Unsaved edits: let the browser ask before a refresh/close. No custom modal;
+  // the native prompt is the only reliable guard against losing a draft.
+  useEffect(() => {
+    if (!projectDirty) return;
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      // Legacy Chrome/Safari still need a truthy returnValue.
+      event.returnValue = '有未保存的更改';
+      return event.returnValue;
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, [projectDirty]);
 
   useEffect(() => {
     const stored = window.localStorage.getItem(PROJECT_STORAGE_KEY);
@@ -2052,6 +2226,17 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const canCompile = !!project && authoredSteps.length > 0 && !busy;
   const canRoute = !!compile && !compileStale && !busy;
   const canRun = !!segment && segment.status === 'planned' && !busy;
+  /** A continued Segment can only start from a successful predecessor checkpoint. */
+  const attemptSegments = segment && route
+    ? route.segments.filter(item => item.attemptId === segment.attemptId)
+    : [];
+  const segmentIndexInAttempt = segment
+    ? attemptSegments.findIndex(item => item.segmentId === segment.segmentId)
+    : -1;
+  const blockingPredecessors = segmentIndexInAttempt > 0
+    ? attemptSegments.slice(0, segmentIndexInAttempt).filter(item => item.status !== 'succeeded')
+    : [];
+  const needsPredecessors = blockingPredecessors.length > 0;
   const canMeasure = !!segment && segment.status === 'succeeded' && !!segment.runId && !busy;
   const experimentRunCount = (experimentDoc?.variants ?? []).reduce(
     (total, variant) => total + variant.replicates.filter(replicate => !!replicate.runId).length, 0,
@@ -2173,14 +2358,24 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   // reports the etched depth instead of the surface height.
   const structureNote = useMemo(() => {
     if (!structureView || !structureViewExtent) return null;
-    const measuredDepth = measurement && measurement.value !== null && measurement.method === 'etch_depth'
-      ? Math.abs(measurement.value)
+    // An ambiguous/failed measurement must never look like a measured depth.
+    if (measurement && !measurementHasValue(measurement)) return '测量无有效值';
+    const measuredDepth = measurement && measurementHasValue(measurement) && measurement.method === 'etch_depth'
+      ? Math.abs(measurement.value as number)
       : null;
     if (measuredDepth !== null && measuredDepth >= 5e-4 && measurement) {
       return `深度 ${formatMicrons(measuredDepth)} ${displayUnit(measurement.unit)}`;
     }
     return structureSurfaceNote(structureView, 'xy');
   }, [structureView, structureViewExtent, measurement]);
+
+  // The marker stays where the recipe measured, but without a value it must not
+  // claim a depth/height label.
+  const displayMeasurementMark = useMemo<StructureMarker>(() => {
+    if (!measurementMark) return null;
+    if (!measurement || measurementHasValue(measurement)) return measurementMark;
+    return { ...measurementMark, label: '测量位置（无有效值）' };
+  }, [measurementMark, measurement]);
 
   useEffect(() => {
     // 3D reads the raw snapshot inside its worker; fetching a candidate view too
@@ -2219,9 +2414,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       await task();
       setActivityLog(previous => [...previous.slice(-79), `${clockTime()}  ${label} 完成`]);
     } catch (exc) {
-      const message = exc instanceof Error ? exc.message : String(exc);
-      setError(message);
-      setActivityLog(previous => [...previous.slice(-79), `${clockTime()}  ${label} 失败: ${message}`]);
+      const raw = exc instanceof Error ? exc.message : String(exc);
+      setError(translateBackendError(raw));
+      setActivityLog(previous => [...previous.slice(-79), `${clockTime()}  ${label} 失败: ${translateBackendError(raw)}${raw !== translateBackendError(raw) ? `（${raw}）` : ''}`]);
     } finally { setBusy(null); }
   };
 
@@ -2248,11 +2443,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
 
   const importProject = async (file: File) => {
     setError('');
-    setCompile(null);
-    setRoute(null);
-    setSegment(null);
-    setMeasurement(null);
-    setProvenance(null);
+    resetProjectScopedState();
     try {
       const parsed = JSON.parse(await file.text()) as ProjectDoc;
       setProject(parsed);
@@ -2284,8 +2475,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setSavedProjectJson('');
     setProjectSavedAt('');
     setProjectNotice('');
-    setCompile(null); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);
-    setCompileStale(true);
+    resetProjectScopedState();
     setProjectGeometrySource({ kind: 'parametric' });
     setNewProjectArmed(false);
     setProjectState(emptyWorkflowState());
@@ -2313,9 +2503,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setSavedProjectJson('');
     setProjectSavedAt('');
     setProjectNotice('草稿（未保存）');
+    resetProjectScopedState();
     setProjectGeometrySource({ kind: 'parametric' });
-    setCompileStale(true);
-    setCompile(null); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);
     setProjectState(emptyWorkflowState());
     lastStateJson.current = '';
     setRestoreNotice('');
@@ -2400,8 +2589,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setProjectGeometrySource(layout && activeClip
       ? { kind: 'layout', clipId: activeClip.clipId, clipName: activeClip.name, layoutId: activeClip.layoutId, clipHash: activeClip.clipHash }
       : { kind: 'parametric' });
-    setCompileStale(true);
-    setCompile(null); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);
+    resetProjectScopedState();
     setProjectId('');
     setSavedProjectJson('');
     setProjectSavedAt('');
@@ -2511,6 +2699,37 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       ? { ...route, segments: route.segments.map(item => item.segmentId === result.segment.segmentId ? result.segment : item) }
       : null;
     if (nextPlan) { setRoute(nextPlan); recordRoute(nextPlan); }
+  });
+
+  /**
+   * "执行前序并运行": a continued Segment needs a successful predecessor
+   * checkpoint, so run every unfinished Segment up to the current one in order
+   * and stop at the first failure instead of surfacing an English backend error.
+   */
+  const executeThroughCurrent = () => run('execute', async () => {
+    if (!segment || !route) throw new Error('先创建 Route');
+    const attemptSegments = route.segments.filter(item => item.attemptId === segment.attemptId);
+    const index = attemptSegments.findIndex(item => item.segmentId === segment.segmentId);
+    if (index < 0) throw new Error('当前 Segment 不在 Route 中');
+    const chain = attemptSegments.slice(0, index + 1).filter(item => item.status !== 'succeeded');
+    let working = route;
+    for (const item of chain) {
+      const started = await postJson<{ segment: RoutePlan['segments'][number]; runId: string }>(
+        `/api/v1/workflow/segments/${item.segmentId}/execute`, {},
+      );
+      setSegment(started.segment);
+      working = { ...working, segments: working.segments.map(row => row.segmentId === started.segment.segmentId ? started.segment : row) };
+      setRoute(working);
+      recordRoute(working);
+      const done = await waitSegment(item.segmentId);
+      setSegment(done);
+      working = { ...working, segments: working.segments.map(row => row.segmentId === done.segmentId ? done : row) };
+      setRoute(working);
+      recordRoute(working);
+      if (done.status !== 'succeeded') {
+        throw new Error(`执行到「${stepDisplayName(item.throughStepId)}」时${statusLabel(done.status)}，已停止；请先排查该 Segment 再继续。`);
+      }
+    }
   });
 
   const ensureRecipe = async (): Promise<{ recipeId: string; recipeVersion: number; metricId: string }> => {
@@ -3746,6 +3965,34 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [zone, experimentDoc, analysisStepId]);
 
+  // 04 needs the Chinese reason behind an ambiguous replicate metric, and the
+  // experiment document only carries the id. Fetch the missing measurements once.
+  const replicateMeasurementIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const variant of experimentDoc?.variants ?? []) {
+      for (const replicate of variant.replicates) {
+        if (replicate.measurementId && typeof replicate.value !== 'number') ids.add(replicate.measurementId);
+      }
+    }
+    return [...ids].sort();
+  }, [experimentDoc]);
+
+  useEffect(() => {
+    const missing = replicateMeasurementIds.filter(id => !(id in replicateMeasurements));
+    if (!missing.length) return;
+    let cancelled = false;
+    void Promise.all(missing.map(async id => {
+      try { return [id, await api<Measurement>(`/api/v1/workflow/measurements/${id}`)] as const; }
+      catch { return null; }
+    })).then(rows => {
+      if (cancelled) return;
+      const found = rows.filter((row): row is readonly [string, Measurement] => !!row);
+      if (!found.length) return;
+      setReplicateMeasurements(previous => ({ ...previous, ...Object.fromEntries(found) }));
+    });
+    return () => { cancelled = true; };
+  }, [replicateMeasurementIds, replicateMeasurements]);
+
   const experimentConditionRows = useMemo(() => {
     if (!experimentDoc) return [];
     return experimentDoc.variants.map(variant => ({
@@ -3758,8 +4005,20 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const experimentResultRows = useMemo(() => {
     if (!experimentDoc) return [];
     return experimentDoc.variants.map(variant => {
-      const values = variant.replicates
-        .map(replicate => replicate.value)
+      const replicates = variant.replicates.map(replicate => {
+        const metric = replicate.measurementId ? replicateMeasurements[replicate.measurementId] : undefined;
+        const status = metric?.status ?? replicate.measurementStatus ?? (replicate.value != null ? 'measured' : '');
+        const value = typeof replicate.value === 'number' ? replicate.value : (typeof metric?.value === 'number' ? metric.value : null);
+        const valid = status === 'measured' && value !== null && Number.isFinite(value);
+        return {
+          ...replicate,
+          metricStatus: status,
+          metricValue: valid ? value : null,
+          metricReason: valid ? null : (metric?.reason ?? replicate.reason ?? null),
+        };
+      });
+      const values = replicates
+        .map(replicate => replicate.metricValue)
         .filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
       const mean = values.length ? values.reduce((total, value) => total + value, 0) / values.length : null;
       const std = values.length > 1 && mean !== null
@@ -3769,13 +4028,28 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         ordinal: variant.ordinal,
         condition: variantConditionLabel(variant),
         status: experimentVariantStatus(variant),
-        replicates: variant.replicates,
+        replicates,
+        runSucceeded: replicates.filter(replicate => replicate.status === 'succeeded').length,
+        validMetrics: values.length,
+        total: replicates.length,
         mean,
         std,
         unit: displayUnit(variant.replicates.find(replicate => replicate.unit)?.unit ?? experimentDoc.unit),
       };
     });
-  }, [experimentDoc]);
+  }, [experimentDoc, replicateMeasurements]);
+
+  /** Run success and metric validity are separate facts; never collapse them into "成功". */
+  const experimentMetricSummary = useMemo(() => {
+    const rows = experimentDoc?.variants.flatMap(variant => variant.replicates) ?? [];
+    const total = rows.length;
+    const runSucceeded = rows.filter(replicate => replicate.status === 'succeeded').length;
+    const validMetrics = rows.filter(replicate => {
+      const metric = replicate.measurementId ? replicateMeasurements[replicate.measurementId] : undefined;
+      return (metric?.status ?? replicate.measurementStatus) === 'measured' && typeof replicate.value === 'number';
+    }).length;
+    return { total, runSucceeded, validMetrics };
+  }, [experimentDoc, replicateMeasurements]);
 
   const windowBlockedReason = !experimentDoc
     ? '先完成实验或测量：还没有可分析的实验。'
@@ -3962,10 +4236,18 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     return `配方 · ${String(item.payload.recipeId ?? '—')} v${String(item.payload.recipeVersion ?? 1)}`;
   };
 
-  const renderExperimentList = () => experimentList.length === 0 ? null : (
+  // Only experiments recorded in the open project's workflow state are shown;
+  // the global list would otherwise leak the previous project's experiment.
+  const visibleExperimentList = useMemo(() => {
+    if (!projectId) return experimentList;
+    const known = new Set(projectState.experimentIds);
+    return experimentList.filter(row => known.has(row.experimentId));
+  }, [experimentList, projectId, projectState.experimentIds]);
+
+  const renderExperimentList = () => visibleExperimentList.length === 0 ? null : (
     <div className="wf-experiment-list" aria-label="实验列表">
       <div className="wf-card-subhead">实验列表（点击切换查看）</div>
-      {experimentList.map(row => <button
+      {visibleExperimentList.map(row => <button
         type="button"
         key={row.experimentId}
         className={row.experimentId === experimentDoc?.experimentId ? 'wf-experiment-row active' : 'wf-experiment-row'}
@@ -4253,12 +4535,23 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const renderClipEditor = (mode: 'draft' | 'project', showList = true) => (
     <div className="wf-clip-editor">
       <div className="spx-file-row">
-        <div className={gds ? 'spx-file-name filled' : 'spx-file-name'}>{gds ? gds.fileName : '未选择 GDS 文件'}</div>
-        <button type="button" className="wf-button ghost spx-browse" disabled={!!busy} onClick={() => gdsInput.current?.click()}>{gds ? '更换 GDS' : '上传 GDS'}</button>
+        <div className={gdsDisplayName ? 'spx-file-name filled' : 'spx-file-name'} title={gdsDisplayName || undefined}>
+          {gdsDisplayName || '未选择 GDS 文件'}
+        </div>
+        <button type="button" className="wf-button ghost spx-browse" disabled={!!busy} onClick={() => gdsInput.current?.click()}>{gdsDisplayName ? '更换 GDS' : '上传 GDS'}</button>
       </div>
-      {gds && <div className="spx-form-note">asset {gds.assetId.slice(0, 20)}…</div>}
+      {gds
+        ? <div className="spx-form-note">asset {gds.assetId.slice(0, 20)}…</div>
+        : gdsFromRegisteredLayout
+          ? <div className="spx-form-note">来自已注册 Layout{activeLayout ? ` · ${activeLayout.fileName}` : ''}（无需重新上传）</div>
+          : null}
       <div className="wf-template-row">
-        <button className="wf-button ghost" disabled={!!busy || !gds} title={!gds ? '先上传 GDS' : '注册为版图'} onClick={() => void registerLayout()}>注册为 Layout</button>
+        <button className="wf-button ghost"
+          disabled={!!busy || !gds}
+          title={activeLayout && !gds ? '该 GDS 已注册为 Layout' : !gds ? '先上传 GDS' : '注册为版图'}
+          onClick={() => void registerLayout()}>
+          {activeLayout && !gds ? '已注册 Layout' : '注册为 Layout'}
+        </button>
         <select aria-label="版图选择" value={activeLayout?.layoutId ?? ''} onChange={event => void chooseLayout(event.target.value)}>
           <option value="">{layouts.length ? '选择 Layout' : '尚无 Layout'}</option>
           {layouts.map(item => <option key={item.layoutId} value={item.layoutId}>{item.fileName} · {item.structureCount} 结构</option>)}
@@ -4347,7 +4640,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     { label: 'Route', value: route?.route.name ?? '—', title: route?.route.routeId },
     { label: 'Segment', value: segment ? statusLabel(segment.status) : '—', title: segment?.segmentId },
     { label: 'Run', value: segment?.runId ? '已记录' : '—', title: segment?.runId ?? undefined },
-    { label: '测量', value: measurement ? `${measurement.value === null ? '—' : formatNumber(measurement.value)} ${displayUnit(measurement.unit)}` : '—', title: measurement?.measurementId },
+    { label: '测量', value: measurement ? measurementValueText(measurement) : '—', title: measurement?.measurementId },
     { label: '引擎', value: health ? `ViennaPS ${health.viennaps ?? '—'}` : '—' },
   ];
 
@@ -4439,7 +4732,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 <button role="menuitem" onClick={() => { setOpenMenu(null); navigateZone('flow'); }}>打开流程编辑器</button>
               </>}
               {id === 'run' && <>
-                <button role="menuitem" disabled={!canRun} onClick={() => { setOpenMenu(null); void execute(); }}>执行当前 Segment</button>
+                <button role="menuitem" disabled={!canRun} onClick={() => { setOpenMenu(null); void (needsPredecessors ? executeThroughCurrent() : execute()); }}>
+                  {needsPredecessors ? '执行前序并运行' : '执行当前 Segment'}
+                </button>
                 <button role="menuitem" disabled={!route} onClick={() => { setOpenMenu(null); void executeAll(); }}>执行全部 Segment</button>
                 <button role="menuitem" disabled={!canMeasure} onClick={() => { setOpenMenu(null); void measure(); }}>测量并绑定 Provenance</button>
                 <button role="menuitem" disabled={!route || !decisionPrefixId} onClick={() => { setOpenMenu(null); void decideMeasurementBranch(); }}>测量驱动分支</button>
@@ -4507,9 +4802,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 {
                   label: '测量',
                   target: 'run' as const,
-                  value: measurement ? `${measurement.value === null ? '—' : formatNumber(measurement.value)} ${displayUnit(measurement.unit)}` : '—',
-                  badge: measurement ? '已测量' : '未测量',
-                  badgeClass: measurement ? 'measured' : 'planned',
+                  value: measurement ? measurementValueText(measurement) : '—',
+                  badge: measurement ? (measurementHasValue(measurement) ? '已测量' : statusLabel(measurement.status)) : '未测量',
+                  badgeClass: measurement ? (measurementHasValue(measurement) ? 'measured' : measurement.status) : 'planned',
                   title: measurement ? `Measurement ${measurement.measurementId}` : '尚未测量',
                 },
                 {
@@ -5401,8 +5696,10 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                   </div>
                   {measurement && <div className="wf-structure-info">
                     <span className="wf-muted">测量值</span>
-                    <strong>{measurement.value === null ? measurement.reason ?? '无值' : `${formatMicrons(measurement.value)} ${displayUnit(measurement.unit)}`}</strong>
-                    <span className="wf-muted">测量位置在 2D 视图显示</span>
+                    <strong title={measurementReasonDetail(measurement.reason)}>
+                      {measurementHasValue(measurement) ? `${formatMicrons(measurement.value as number)} ${displayUnit(measurement.unit)}` : '—'}
+                    </strong>
+                    <span className="wf-muted">{measurementHasValue(measurement) ? '测量位置在 2D 视图显示' : `测量${statusLabel(measurement.status)}：${measurementReasonText(measurement.reason)}`}</span>
                   </div>}
                   {!measurement && <div className="wf-muted">测量后在 2D 视图显示位置</div>}
                 </div>
@@ -5413,7 +5710,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                     view={structureView}
                     frame={structureFrame(structureView, 'xy')}
                     axis="xy"
-                    marker={measurement ? measurementMark : null}
+                    marker={displayMeasurementMark}
                     note={structureNote}
                     label="当前 Run 结构视图"
                   />
@@ -5442,7 +5739,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                         <span>{row.count}</span>
                       </div>)}
                     </div>
-                    {measurement && measurementMark && <div className="wf-muted">测量标记：{measurementMark.label}</div>}
+                    {measurement && displayMeasurementMark && <div className="wf-muted">测量标记：{displayMeasurementMark.label}</div>}
                   </div>
                 </div>
                 : <div className="wf-structure-empty">
@@ -5497,10 +5794,17 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               </div>;})}
             </div>}
             <div className="spx-run-actions">
-              <button className="wf-button primary" disabled={!canRun} onClick={() => void execute()}>
-                {busy === 'execute' ? '启动中…' : '执行当前 Segment'}
+              <button className="wf-button primary" disabled={!canRun}
+                title={needsPredecessors
+                  ? `前序 ${blockingPredecessors.length} 个 Segment 尚未成功；点击后按顺序执行到当前 Segment`
+                  : '从当前 Segment 的起点执行'}
+                onClick={() => void (needsPredecessors ? executeThroughCurrent() : execute())}>
+                {busy === 'execute' ? '启动中…' : needsPredecessors ? '执行前序并运行' : '执行当前 Segment'}
               </button>
               <button className="wf-button" disabled={!route || !!busy} onClick={() => void executeAll()}>执行全部 Segment</button>
+              {segment?.status === 'planned' && needsPredecessors && <span className="wf-muted" aria-label="前序 Segment 提示">
+                前序 {blockingPredecessors.length} 个 Segment 尚未成功：会按顺序执行到当前 Segment，失败即停止。
+              </span>}
               <button className="wf-button" disabled={!canMeasure} onClick={() => void measure()}>
                 {busy === 'measure' ? '测量中…' : '测量'}
               </button>
@@ -5529,12 +5833,21 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               <p className="wf-muted wf-recipe-note">深度：在 X 位置量到参考高度的高度差；指定高度 CD：在给定高度量开口宽度。材料决定交点所属材料。</p>
             </div>
             {segment.status === 'running' && <div className="wf-progress"><i /></div>}
-            {measurement && <div className="wf-summary">
+            {measurement && <div className={`wf-summary${measurementHasValue(measurement) ? '' : ' warning'}`} aria-label="当前测量">
               <strong>测量 · {statusLabel(measurement.status)}</strong>
-              <span>{measurement.value === null ? measurement.reason ?? '无值' : `${formatMicrons(measurement.value)} ${displayUnit(measurement.unit)}`}</span>
+              <span title={measurementReasonDetail(measurement.reason)}>{measurementValueText(measurement)}</span>
+              {!measurementHasValue(measurement) && <span>说明：{measurementReasonText(measurement.reason)}</span>}
               <span>绑定 (binding)：{bindingLabel(measurement.bindingStatus)} · 等价 (equivalence)：{bindingLabel(measurement.equivalenceStatus)}</span>
             </div>}
-            {metrics.length > 0 && <table className="wf-table"><thead><tr><th>状态</th><th>数值</th><th>配方 / 步骤</th><th>绑定 / 等价</th><th /></tr></thead><tbody>{metrics.map(item => <tr key={item.measurementId}><td>{statusLabel(item.status)}</td><td>{item.value === null ? item.reason : `${formatMicrons(item.value)} ${displayUnit(item.unit)}`}</td><td>{item.recipeId} v{item.recipeVersion} · {item.method} · {item.material} · {stepDisplayName(item.sourceStepId ?? '')}</td><td>{bindingLabel(item.bindingStatus)} / {bindingLabel(item.equivalenceStatus)}</td><td><button className="wf-link" aria-label={`查看 ${item.measurementId} 证据`} onClick={() => void showMetricDetail(item)}>详情</button></td></tr>)}</tbody></table>}
+            {metrics.length > 0 && <table className="wf-table" aria-label="测量记录表"><thead><tr><th>状态</th><th>数值</th><th>单位</th><th>说明</th><th>配方 / 步骤</th><th>绑定 / 等价</th><th /></tr></thead><tbody>{metrics.map(item => <tr key={item.measurementId} title={measurementReasonDetail(item.reason)}>
+              <td><span className={`wf-status ${item.status}`}>{statusLabel(item.status)}</span></td>
+              <td>{measurementHasValue(item) ? formatNumber(item.value) : '—'}</td>
+              <td>{measurementUnitText(item)}</td>
+              <td>{measurementHasValue(item) ? '—' : measurementReasonText(item.reason)}</td>
+              <td>{item.recipeId} v{item.recipeVersion} · {item.method} · {item.material} · {stepDisplayName(item.sourceStepId ?? '')}</td>
+              <td>{bindingLabel(item.bindingStatus)} / {bindingLabel(item.equivalenceStatus)}</td>
+              <td><button className="wf-link" aria-label={`查看 ${item.measurementId} 证据`} onClick={() => void showMetricDetail(item)}>详情</button></td>
+            </tr>)}</tbody></table>}
             {metricDetail && <div className="wf-evidence">
               <div className="wf-evidence-head"><strong>{metricDetail.measurement.measurementId}</strong><span className={`wf-status ${metricDetail.measurement.status}`}>{statusLabel(metricDetail.measurement.status)}</span></div>
               <div className="wf-evidence-grid">
@@ -5651,27 +5964,41 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             </div>
             {experimentDoc.queue && <div className="wf-summary">
               <strong>队列</strong>
-              <span>{experimentDoc.queue.succeeded}/{experimentDoc.queue.total} 已成功 · 待处理 {experimentDoc.queue.pending} · 运行中 {experimentDoc.queue.running}</span>
+              <span>{experimentDoc.queue.succeeded}/{experimentDoc.queue.total} 运行成功 · 待处理 {experimentDoc.queue.pending} · 运行中 {experimentDoc.queue.running}</span>
               <span>预计剩余 {experimentDoc.queue.estimatedSecondsRemaining} s</span>
               <span>{experimentDoc.queue.estimatedCostUsd > 0
                 ? `成本 $${experimentDoc.queue.estimatedCostUsd.toFixed(4)}`
                 : '本地 CPU · 无云成本'}</span>
               <span>重试 {experimentDoc.queue.retries}</span>
             </div>}
+            {experimentMetricSummary.total > 0 && <div
+              className={`wf-summary${experimentMetricSummary.validMetrics === 0 ? ' warning' : ''}`}
+              aria-label="实验指标汇总" role={experimentMetricSummary.validMetrics === 0 ? 'alert' : 'status'}>
+              <strong>指标汇总</strong>
+              <span>{experimentMetricSummary.runSucceeded}/{experimentMetricSummary.total} 运行成功 · {experimentMetricSummary.validMetrics}/{experimentMetricSummary.total} 有有效指标</span>
+              {experimentMetricSummary.validMetrics === 0 && <span>没有有效指标：运行本身成功，但测量结果全部为歧义或无值。请在 03 调整测量位置/材料后重新测量，均值与统计暂不可用。</span>}
+            </div>}
             {experimentResultRows.length > 0 ? <table className="wf-table wf-result-table" aria-label="实验结果表">
-              <thead><tr><th>变体</th><th>条件</th><th>重复结果（每次）</th><th>均值（{displayUnit(experimentResultRows[0].unit)}）</th><th>标准差（{displayUnit(experimentResultRows[0].unit)}）</th><th>状态</th></tr></thead>
+              <thead><tr><th>变体</th><th>条件</th><th>重复（运行状态 / 指标）</th><th>均值（{experimentMetricSummary.validMetrics > 0 ? displayUnit(experimentResultRows[0].unit) : '—'}）</th><th>标准差（{experimentMetricSummary.validMetrics > 0 ? displayUnit(experimentResultRows[0].unit) : '—'}）</th><th>运行 / 指标</th></tr></thead>
               <tbody>{experimentResultRows.map(row => <tr key={row.ordinal}>
                 <td>V{row.ordinal}</td>
                 <td className="wf-condition">{row.condition}</td>
-                <td><div className="wf-repeats">{row.replicates.map((replicate, index) => <span className="wf-repeat" key={`${row.ordinal}-${index}`}>
+                <td><div className="wf-repeats">{row.replicates.map((replicate, index) => <span className="wf-repeat" key={`${row.ordinal}-${index}`} title={measurementReasonDetail(replicate.metricReason) ?? undefined}>
                   <span>#{index + 1}</span>
-                  <code>{formatNumber(replicate.value)}</code>
-                  <span>{displayUnit(replicate.unit ?? row.unit)}</span>
                   <span className={`wf-status ${replicate.status}`}>{statusLabel(replicate.status)}</span>
+                  <code>{replicate.metricValue === null ? '—' : formatNumber(replicate.metricValue)}</code>
+                  <span>{replicate.metricValue === null ? '' : displayUnit(replicate.unit ?? row.unit)}</span>
+                  <span className={`wf-status ${replicate.metricStatus || 'planned'}`}>
+                    {replicate.metricStatus ? statusLabel(replicate.metricStatus) : '无指标'}
+                  </span>
+                  {replicate.metricValue === null && <span className="wf-muted">说明：{measurementReasonText(replicate.metricReason)}</span>}
                 </span>)}</div></td>
-                <td>{formatNumber(row.mean)}</td>
-                <td>{formatNumber(row.std)}</td>
-                <td><span className={`wf-status ${row.status}`}>{statusLabel(row.status)}</span></td>
+                <td>{row.mean === null ? '—' : formatNumber(row.mean)}</td>
+                <td>{row.std === null ? '—' : formatNumber(row.std)}</td>
+                <td>
+                  <span className={`wf-status ${row.status}`}>{statusLabel(row.status)}</span>
+                  <span className="wf-muted"> · {row.validMetrics}/{row.total} 有效</span>
+                </td>
               </tr>)}</tbody>
             </table> : <div className="wf-empty">实验已创建，点击“运行实验”后在这里显示每个变体的重复测量与统计。</div>}
           </div>}
@@ -5834,7 +6161,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
           {analysisReady && <>
             {measurement && <div className="wf-summary" aria-label="测量结果">
               <strong>{statusLabel(measurement.status)}</strong>
-              <span>{measurement.value === null ? (measurement.reason || '无数值') : `${formatNumber(measurement.value)} ${displayUnit(measurement.unit)}`}</span>
+              <span title={measurementReasonDetail(measurement.reason)}>{measurementValueText(measurement)}</span>
+              {!measurementHasValue(measurement) && <span>说明：{measurementReasonText(measurement.reason)}</span>}
               <span>绑定：{bindingLabel(measurement.bindingStatus)} · 等价：{bindingLabel(measurement.equivalenceStatus)}</span>
               <span>配方 v{measurement.recipeVersion}{measurement.createdAt ? ` · ${formatDateTime(measurement.createdAt)}` : ''}</span>
             </div>}
@@ -5942,13 +6270,15 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             <div className="wf-card-subhead">测量指标</div>
             {analysisMetrics.length > 0
               ? <table className="wf-table" aria-label="测量指标表">
-                <thead><tr><th>Run</th><th>步骤</th><th>方法</th><th>数值</th><th>单位</th><th>绑定状态</th></tr></thead>
+                <thead><tr><th>Run</th><th>步骤</th><th>方法</th><th>状态</th><th>数值</th><th>单位</th><th>说明</th><th>绑定状态</th></tr></thead>
                 <tbody>{analysisMetrics.map(item => <tr key={item.measurementId} title={item.measurementId}>
                   <td title={item.sourceRunId ?? undefined}>{runDisplayLabel(item.sourceRunId)}</td>
                   <td>{item.sourceStepId ? stepDisplayName(item.sourceStepId) : '—'}</td>
                   <td>{metricMethodLabel(item.method)}</td>
-                  <td>{item.value === null ? (item.reason ?? '—') : formatNumber(item.value)}</td>
-                  <td>{displayUnit(item.unit)}</td>
+                  <td><span className={`wf-status ${item.status}`}>{statusLabel(item.status)}</span></td>
+                  <td>{measurementHasValue(item) ? formatNumber(item.value) : '—'}</td>
+                  <td>{measurementUnitText(item)}</td>
+                  <td title={measurementReasonDetail(item.reason)}>{measurementHasValue(item) ? '—' : measurementReasonText(item.reason)}</td>
                   <td><span className={`wf-status ${item.bindingStatus === 'verified' ? 'succeeded' : 'planned'}`}>{bindingLabel(item.bindingStatus)}</span></td>
                 </tr>)}</tbody>
               </table>
@@ -6049,7 +6379,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             <div><span>编译</span><strong>{compile ? `${compile.dimension}D · ${compile.stepCount} 步` : '未提供'}</strong></div>
             <div><span>Route</span><strong>{route ? `${route.route.name} · ${route.segments.length} Segment` : '未提供'}</strong></div>
             <div><span>Run</span><strong>{hasExecutedRun && segment ? statusLabel(segment.status) : '未提供'}</strong></div>
-            <div><span>测量</span><strong>{measurement ? `${formatNumber(measurement.value)} ${displayUnit(measurement.unit)}` : '未提供'}</strong></div>
+            <div><span>测量</span><strong>{measurement ? measurementValueText(measurement) : '未提供'}</strong></div>
             <div><span>实验</span><strong>{experimentDoc ? `${experimentDoc.name} · ${experimentDoc.variants.length} 变体` : '未提供'}</strong></div>
             <div><span>报告</span><strong>{reportDocument ? `已生成 · ${formatDateTime(reportDocument.createdAt)}` : '未生成'}</strong></div>
           </div>

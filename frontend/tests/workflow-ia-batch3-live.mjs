@@ -94,7 +94,7 @@ try {
   assert.equal(await page.locator('.wf-result-table tbody tr').count(), 3);
   assert.equal(await page.locator('.wf-result-table .wf-repeat').count(), 6, 'every replicate must be shown');
   const resultHeaders = await page.locator('.wf-result-table thead').innerText();
-  for (const header of ['条件', '重复结果', '均值', '标准差', '状态']) {
+  for (const header of ['条件', '重复（运行状态 / 指标）', '均值', '标准差', '运行 / 指标']) {
     assert.ok(resultHeaders.includes(header), `result header must be Chinese: ${header}`);
   }
   const resultText = await page.locator('.wf-result-table').innerText();
@@ -190,7 +190,7 @@ try {
   await metricTable.waitFor();
   assert.ok(await metricTable.locator('tbody tr').count() >= 1, 'metric table must list the measurement');
   const metricHeaders = await metricTable.locator('thead').innerText();
-  for (const header of ['Run', '步骤', '方法', '数值', '单位', '绑定状态']) {
+  for (const header of ['Run', '步骤', '方法', '状态', '数值', '单位', '说明', '绑定状态']) {
     assert.ok(metricHeaders.includes(header), `metric header must exist: ${header}`);
   }
   assert.doesNotMatch(await metricTable.innerText(), /(?:^|\s)(?:run_|s_|c_)[a-z0-9]{6,}/, 'metric table must not show raw ids');
