@@ -28,6 +28,22 @@ FLUOROCARBON_MATERIAL_DEFAULTS = {
 }
 
 
+def ibe_fields() -> list[dict[str, Any]]:
+    """Native IBEParameters fields shared by ionBeam and faradayCage.
+
+    FaradayCageParameters wraps this exact native struct in ``ibeParams`` and
+    adds ``cageAngle``; keeping one definition prevents the two allowlist rows
+    from drifting apart.
+    """
+    return [number("meanEnergy", 100), number("sigmaEnergy", 10), number("thresholdEnergy", 20),
+            number("thetaRMin", 70, maximum=180), number("thetaRMax", 90, maximum=180),
+            number("minAngle", 85, maximum=180), number("inflectAngle", 89, maximum=180),
+            number("exponent", 100), number("n_l", 10), number("tiltAngle", 0, minimum=-180, maximum=180),
+            number("planeWaferRate", 0.1), number("redepositionRate", 0), number("redepositionThreshold", 0.1),
+            number("cos4YieldA1", 0), number("cos4YieldA2", 0), number("cos4YieldA3", 0), number("cos4YieldA4", 0),
+            rates("materialPlaneWaferRateByMaterial", 0.0, label="材料平面晶圆速率表")]
+
+
 CATALOG: list[dict[str, Any]] = [
     {"id": "sf6o2", "label": "SF₆/O₂ 等离子体刻蚀", "nativeClass": "SF6O2Etching", "operation": "etch", "usesFlux": True,
      "fields": [number("ionFlux", 1), number("etchantFlux", 1), number("oxygenFlux", 0.2),
@@ -54,13 +70,17 @@ CATALOG: list[dict[str, Any]] = [
                  "defaults": FLUOROCARBON_MATERIAL_DEFAULTS, "minimum": -1_000_000.0, "maximum": 1_000_000.0,
                  "step": 0.01, "nativeUnit": None}]},
     {"id": "ionBeam", "label": "离子束刻蚀（IBE）", "nativeClass": "IonBeamEtching", "operation": "etch", "usesFlux": True,
-     "fields": [number("meanEnergy", 100), number("sigmaEnergy", 10), number("thresholdEnergy", 20),
-                number("thetaRMin", 70, maximum=180), number("thetaRMax", 90, maximum=180),
-                number("minAngle", 85, maximum=180), number("inflectAngle", 89, maximum=180),
-                number("exponent", 100), number("n_l", 10), number("tiltAngle", 0, minimum=-180, maximum=180),
-                number("planeWaferRate", 0.1), number("redepositionRate", 0), number("redepositionThreshold", 0.1),
-                number("cos4YieldA1", 0), number("cos4YieldA2", 0), number("cos4YieldA3", 0), number("cos4YieldA4", 0),
-                rates("materialPlaneWaferRateByMaterial", 0.0, label="材料平面晶圆速率表")]},
+     "fields": ibe_fields()},
+    # Experimental: native construction and CPU runs are covered by
+    # tests/test_engine_batch1_specialized.py, but no Stage 8/9 direct-reference
+    # acceptance row has been archived for this model yet. Validation warns
+    # instead of claiming verified CPU coverage; GPU coverage stays unclaimed.
+    # ViennaPS 4.6.2 binds FaradayCageEtching in both dimensions, but the 2D
+    # native model does not return for the controlled probe, so only the 3D
+    # constructor path is exposed.
+    {"id": "faradayCage", "label": "法拉第笼离子束刻蚀", "nativeClass": "FaradayCageEtching", "operation": "etch",
+     "usesFlux": True, "experimental": True, "dimensions": [3],
+     "fields": [number("cageAngle", 0, maximum=180)] + ibe_fields()},
     {"id": "wetEtch", "label": "晶向湿法刻蚀", "nativeClass": "WetEtching", "operation": "etch", "usesFlux": False,
      "fields": [rates("materialRates", 0.0),
                 {"key": "useCrystallineRates", "label": "使用晶向速率", "kind": "boolean", "default": False},
@@ -100,6 +120,21 @@ CATALOG: list[dict[str, Any]] = [
     {"id": "selectiveEpitaxy", "label": "选择性外延", "nativeClass": "SelectiveEpitaxy", "operation": "deposit", "usesFlux": False,
      "depositMaterial": "SiGe", "fields": [rates("materialRates", 0.05, label="外延材料速率表"),
                 number("rate111", 0.5), number("rate100", 1.0)]},
+    # GeometricTrenchDeposition is a ViennaLS geometric-advection distribution,
+    # not a velocity-field model: it deposits on the top level set (created by
+    # the step's selectable depositMaterial) without a native material table.
+    # 4.6.2 ignores trenchWidth, and its thickness does not scale with the
+    # process duration. It evaluates the local radius from the absolute z
+    # coordinate, with the trench top assumed at z=0. Validation surfaces these
+    # native semantics as a warning instead of pretending they are ordinary
+    # deposition parameters. The installed 3D binding SIGSEGVs in a controlled
+    # probe, so only the verified 2D constructor is exposed.
+    {"id": "geometricTrenchDeposition", "label": "几何沟槽沉积", "nativeClass": "GeometricTrenchDeposition",
+     "operation": "deposit", "usesFlux": False, "experimental": True, "dimensions": [2],
+     "depositMaterialSelectable": True,
+     "fields": [number("trenchWidth", 1.0), number("trenchDepth", 4.0, minimum=0.000001),
+                number("depositionRate", 0.5), number("bottomMed", 0.2), number("a", 0.3),
+                number("b", 0.1), number("n", 1.0)]},
     {"id": "neutralTransport", "label": "中性粒子输运", "nativeClass": "NeutralTransport", "operation": "native", "usesFlux": True,
      "fields": [number("incomingFlux", 0.2), number("sourceDistributionPower", 1), number("etchFrontSticking", 0.5, maximum=1),
                 number("zeroCoverageSticking", 0.1, maximum=1), number("coverageTimeStep", 0.05),

@@ -182,6 +182,8 @@ def validate_project(payload: Any, *, kind: str = "project") -> tuple[Project, l
         warnings.extend(_planarize_warnings(project))
         warnings.extend(_gds_boolean_warnings(project))
         if project.schemaVersion == 7:
+            warnings.extend(_specialized_model_warnings(project))
+        if project.schemaVersion == 7:
             issues.extend(_validate_specialized_steps(project))
         if project.dimension == 3:
             issues.extend(_validate_v3_3d_geometry(project))
@@ -214,6 +216,12 @@ def validate_project(payload: Any, *, kind: str = "project") -> tuple[Project, l
                         (not native_engine.startswith("GPU_") and not capability_verified(
                             project.dimension, model_key, step_value(step, "operation"), boundary,
                             native_engine, schema_version=project.schemaVersion, **signature))):
+                    if installed_model and installed_model.get("experimental") and not native_engine.startswith("GPU_"):
+                        # Experimental models have native smoke tests but no
+                        # archived direct-reference row yet. Only CPU_DISK (or
+                        # the no-flux "not-applicable" path) is admitted, and
+                        # the limitation is already reported as a warning.
+                        continue
                     issues.append(FieldIssue(f"steps[{i}].nativeModel", f"this native model/dimension/operation/boundary {native_engine} combination has not passed direct-reference acceptance"))
                 continue
             if step_value(step,"enabled") and (uses_flux(step) if project.schemaVersion in (4,5,6,7) else step_value(step,"model")=="singleParticle" and step_value(step,"rateMagnitude")>0):
@@ -296,6 +304,44 @@ def _planarize_warnings(project: Any) -> list[str]:
             f"whose upper plateau covers 10% of its exposed area or less, or that is genuinely multi-level "
             f"without one dominant upper plateau, can be over- or under-cut. The measured stop height, the "
             f"percentile and the effective cutoff are recorded in the step result.")
+    return warnings
+
+
+def _specialized_model_warnings(project: Any) -> list[str]:
+    """State native semantics that the specialized UI fields cannot change.
+
+    Two models are exposed ahead of their Stage 8/9 direct-reference evidence,
+    and their 4.6.2 native behaviour differs from an ordinary deposition model.
+    Keep those differences visible in the same warning list the UI renders.
+    """
+    warnings: list[str] = []
+    for index, step in enumerate(project.steps):
+        if step_value(step, "model") != "specialized":
+            continue
+        model_id = str(step_value(step, "nativeModel", ""))
+        spec = model_spec(model_id)
+        if spec is None:
+            continue
+        if spec.get("experimental"):
+            warnings.append(
+                f"steps[{index}].nativeModel: {model_id} has real native construction and CPU smoke coverage "
+                f"in tests/test_engine_batch1_specialized.py, but no archived Stage 8/9 direct-reference "
+                f"acceptance row. CPU_DISK is allowed with this warning; GPU coverage is not claimed.")
+        if model_id == "faradayCage":
+            domain = project.domain
+            boundary = getattr(domain, "boundaryXY", None) or getattr(domain, "xBoundary", None)
+            if boundary != "periodic":
+                warnings.append(
+                    f"steps[{index}].nativeModel: ViennaPS 4.6.2 FaradayCageEtching builds a periodic cage source "
+                    f"and requires periodic lateral boundaries; this project uses {boundary!r}. The native run "
+                    f"still executes but does not represent a periodic Faraday cage.")
+        if model_id == "geometricTrenchDeposition":
+            warnings.append(
+                f"steps[{index}].nativeModel: GeometricTrenchDeposition is a ViennaLS geometric-advection "
+                f"distribution, not a flux or velocity-field deposition. It grows the step's depositMaterial "
+                f"top level set without a native mask; 4.6.2 ignores trenchWidth, the process duration does not "
+                f"scale the thickness, and the local radius a*(1-|z|/trenchDepth)^n+b is evaluated from absolute "
+                f"z with the trench top assumed at z=0.")
     return warnings
 
 
@@ -600,6 +646,13 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
         spec = model_spec(step.nativeModel)
         if spec is None:
             continue
+        allowed_dimensions = spec.get("dimensions")
+        if allowed_dimensions and project.dimension not in allowed_dimensions:
+            available = ", ".join(f"{value}D" for value in allowed_dimensions)
+            issues.append(FieldIssue(
+                f"steps[{index}].nativeModel",
+                f"{step.nativeModel} is only available in {available}; this project is {project.dimension}D"))
+            continue
         # Material tables describe the stack the process sees: the initial
         # geometry plus everything earlier enabled deposition steps added.
         # A disabled draft step is checked against the same chain with disabled
@@ -670,7 +723,7 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
             required = available_names | {"Polymer", "Mask"}
             if set(params.get("materialParametersByMaterial", {})) != required:
                 issues.append(FieldIssue(f"{prefix}.materialParametersByMaterial", f"native FluorocarbonEtching requires a parameter row for every material present at this step and Polymer: {sorted(required)}"))
-        if step.nativeModel == "ionBeam":
+        if step.nativeModel in {"ionBeam", "faradayCage"}:
             table = params.get("materialPlaneWaferRateByMaterial", {})
             if isinstance(table, dict):
                 unavailable = sorted(set(table) - available_names)
@@ -1075,11 +1128,20 @@ def select_engine(project: dict, step: dict, *, analysis_mode: str = "process") 
         candidates = ["GPU_DISK", "GPU_TRIANGLE"] if preference == "gpu" else ["CPU_DISK", "CPU_TRIANGLE"]
     boundary = project["domain"].get("boundaryXY", project["domain"].get("xBoundary"))
     signature = gpu_project_signature(project, step)
+    experimental_cpu = False
+    if step.get("model") == "specialized":
+        spec = model_spec(str(step.get("nativeModel", "")))
+        experimental_cpu = bool(spec and spec.get("experimental"))
     for engine in candidates:
         # Matrix entries describe measured coverage; an absent row is not an
         # engine capability failure. The supervisor resolves the actual device
         # and the bounded worker reports native errors without CPU fallback.
         if engine == "GPU_DISK":
+            return engine
+        if experimental_cpu and engine == "CPU_DISK":
+            # Real native CPU smoke coverage exists for these models; the only
+            # missing piece is an archived Stage 8/9 acceptance row, which
+            # validation reports as a warning rather than hiding the model.
             return engine
         limitation = known_engine_limitation(project["dimension"], model, engine, step)
         if project.get("schemaVersion") == 7 and limitation:

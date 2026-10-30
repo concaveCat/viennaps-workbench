@@ -79,6 +79,39 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
             parameters.materialPlaneWaferRate.set(material_handle(name), float(value))
         masks = [material_handle(name) for name in sorted(_mask_material_names(project))]
         model = ps.IonBeamEtching(parameters, masks)
+    elif model_id == "faradayCage":
+        # FaradayCageParameters wraps an IBEParameters struct and adds the cage
+        # tilt. This must stay a real FaradayCageEtching construction: silently
+        # substituting IonBeamEtching would drop the two-direction cage source.
+        parameters = ps.FaradayCageParameters()
+        for key in ("meanEnergy", "sigmaEnergy", "thresholdEnergy", "thetaRMin", "thetaRMax",
+                    "minAngle", "inflectAngle", "exponent", "n_l", "tiltAngle", "planeWaferRate",
+                    "redepositionRate", "redepositionThreshold"):
+            setattr(parameters.ibeParams, key, float(p[key]))
+        for index, key in enumerate(("cos4YieldA1", "cos4YieldA2", "cos4YieldA3", "cos4YieldA4"), start=1):
+            setattr(parameters.ibeParams.cos4Yield, f"a{index}", float(p[key]))
+        for name, value in sorted(p["materialPlaneWaferRateByMaterial"].items()):
+            parameters.ibeParams.materialPlaneWaferRate.set(material_handle(name), float(value))
+        parameters.cageAngle = float(p["cageAngle"])
+        mask_names = sorted(_mask_material_names(project))
+        masks = [material_handle(name) for name in mask_names]
+        model = ps.FaradayCageEtching(parameters, masks)
+        resolved["nativeParameterContainer"] = {
+            "nativeClass": "FaradayCageParameters",
+            "ibeParametersClass": "IBEParameters",
+            "cageAngle": float(parameters.cageAngle),
+            "ibeParameters": {key: float(getattr(parameters.ibeParams, key)) for key in (
+                "meanEnergy", "sigmaEnergy", "thresholdEnergy", "thetaRMin", "thetaRMax", "minAngle",
+                "inflectAngle", "exponent", "n_l", "tiltAngle", "planeWaferRate", "redepositionRate",
+                "redepositionThreshold")},
+            "cos4Yield": {f"a{index}": float(getattr(parameters.ibeParams.cos4Yield, f"a{index}"))
+                          for index in range(1, 5)},
+            "maskMaterials": mask_names,
+            "materialPlaneWaferRateByMaterial": {name: float(value)
+                                                 for name, value in sorted(p["materialPlaneWaferRateByMaterial"].items())},
+            "maskMaterialPlaneWaferRateForcedZero": True,
+            "boundaryRequirement": "ViennaPS 4.6.2 FaradayCageEtching uses a periodic source and warns unless both lateral boundaries are periodic",
+        }
     elif model_id == "wetEtch":
         material_rates = [(material_handle(name), float(value)) for name, value in sorted(p["materialRates"].items())]
         if p["useCrystallineRates"]:
@@ -146,6 +179,25 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
         # overload; registry handles do not satisfy its top-material check.
         rates = [(getattr(ps.Material, name), float(value)) for name, value in sorted(p["materialRates"].items())]
         model = ps.SelectiveEpitaxy(rates, float(p["rate111"]), float(p["rate100"]))
+    elif model_id == "geometricTrenchDeposition":
+        # GeometricTrenchDeposition is a ViennaLS geometric-advection
+        # distribution. It has no material table and no native mask; the worker
+        # adds the new level set with Domain.duplicateTopLevelSet(depositMaterial)
+        # before Process.apply(), so that top level set is what grows.
+        argument_keys = ("trenchWidth", "trenchDepth", "depositionRate", "bottomMed", "a", "b", "n")
+        arguments = {key: float(p[key]) for key in argument_keys}
+        model = ps.GeometricTrenchDeposition(*(arguments[key] for key in argument_keys))
+        resolved["nativeGeometricAdvection"] = {
+            "nativeClass": "GeometricTrenchDeposition",
+            "constructorArguments": arguments,
+            "depositMaterial": step.get("depositMaterial"),
+            "addsNewLevelSetThrough": "Domain.duplicateTopLevelSet(depositMaterial) before Process.apply()",
+            "nativeMask": None,
+            "trenchWidthUsedByNativeKernel": False,
+            "durationScalesThickness": False,
+            "depthReference": "absolute z; radius = a*(1-|z|/trenchDepth)^n + b with the trench top assumed at z=0 and bottomMed at z=-trenchDepth",
+            "nativeTiming": "one geometric advection per Process.apply(); the process duration does not change the deposited thickness",
+        }
     elif model_id == "neutralTransport":
         parameters = ps.NeutralTransportParameters()
         for key in ("incomingFlux", "sourceDistributionPower", "etchFrontSticking", "zeroCoverageSticking",

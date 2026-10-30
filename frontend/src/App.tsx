@@ -41,7 +41,7 @@ type NeutralSpecies = { kind: 'neutral'; label: string; defaultStickingProbabili
 type ParticleSpecies = IonSpecies | NeutralSpecies;
 type MultiParticleRateCoefficients = { defaultBySpecies: Record<string, number>; byMaterial: Record<string, Record<string, number>> };
 type SpecializedField = { key: string; label: string; kind: 'number' | 'boolean' | 'enum' | 'vector3' | 'material' | 'materialOptional' | 'text' | 'materialRates' | 'fluorocarbonMaterials'; default: unknown; minimum?: number; maximum?: number; step?: number; nativeUnit?: string | null; options?: { value: string; label: string }[]; defaults?: Record<string, number> };
-type SpecializedModel = { id: string; label: string; nativeClass: string; operation: 'etch' | 'deposit' | 'native'; usesFlux: boolean; depositMaterial?: string; depositMaterialSelectable?: boolean; fields: SpecializedField[] };
+type SpecializedModel = { id: string; label: string; nativeClass: string; operation: 'etch' | 'deposit' | 'native'; usesFlux: boolean; dimensions?: number[]; depositMaterial?: string; depositMaterialSelectable?: boolean; fields: SpecializedField[] };
 type SpecializedCatalog = { schemaVersion: number; engineVersion: string; unitsNote: string; models: SpecializedModel[] };
 type Step = {
   id: string; name: string; enabled: boolean; operation?: 'etch' | 'deposit' | 'native'; model: 'isotropic' | 'singleParticle' | 'multiParticle' | 'directional' | 'specialized' | 'removeMaterial' | 'planarize' | 'boolean' | 'gdsBoolean';
@@ -199,7 +199,7 @@ function initialVisibleMaterialIds(catalog: MaterialCatalogItem[], geometry: Geo
   const usedIds = catalog.filter(material => usedNames.includes(material.name)).map(material => material.id);
   return [...new Set([...usedIds, ...preferred, ...catalogIds])].filter(id => catalogIds.includes(id)).slice(0, 16);
 }
-const SPECIALIZED_FLUX_MODELS = new Set(['sf6o2', 'cf4o2', 'hbro2', 'sf6c4f8', 'fluorocarbon', 'ionBeam', 'teosDeposition', 'teospecvd', 'ald', 'neutralTransport']);
+const SPECIALIZED_FLUX_MODELS = new Set(['sf6o2', 'cf4o2', 'hbro2', 'sf6c4f8', 'fluorocarbon', 'ionBeam', 'faradayCage', 'teosDeposition', 'teospecvd', 'ald', 'neutralTransport']);
 const NATIVE_MAKEFIN_SIGSEGV_MODELS = new Set(['sf6o2', 'hbro2', 'sf6c4f8', 'neutralTransport']);
 // Mirrors backend.models.MIN_DOMAIN_EXTENT_3D: a 22 nm FinFET cell is only
 // 0.48 x 0.50 um, so the old 1 um 3D floor blocked real layouts. The 2D domain
@@ -245,6 +245,13 @@ function geometryMaterialNames(geometry: Geometry): string[] {
     if ((geometry.kind === 'trench' || geometry.kind === 'hole' || geometry.kind === 'fin') && geometry.maskHeight > 0) names.add(geometry.maskMaterial ?? 'Mask');
   }
   return [...names].filter(Boolean).sort();
+}
+function specializedModelAvailable(spec: SpecializedModel, dimension: number): boolean {
+  return !spec.dimensions || spec.dimensions.includes(dimension);
+}
+function specializedDimensionLabel(spec: SpecializedModel): string | null {
+  if (!spec.dimensions || spec.dimensions.length === 0 || spec.dimensions.length >= 2) return null;
+  return `仅支持 ${spec.dimensions[0]}D`;
 }
 function specializedDefaults(spec: SpecializedModel, geometry: Geometry): Record<string, unknown> {
   const names = geometryMaterialNames(geometry);
@@ -1580,7 +1587,8 @@ export default function App() {
   const addStep = (model: Step['model'] = 'isotropic') => {
     const id = newStepId();
     if (model === 'specialized') {
-      const spec = specializedCatalog?.models.find(row => row.id === newSpecializedModel);
+      const spec = specializedCatalog?.models.find(row => row.id === newSpecializedModel
+        && specializedModelAvailable(row, project.dimension)) ?? availableSpecializedModels[0];
       if (!spec) { setNotice('ViennaPS 专用模型目录尚未加载完成。'); return; }
       const step: Step = { id, name: `步骤 ${project.steps.length + 1}`, enabled: true, model: 'specialized',
         nativeModel: spec.id, operation: spec.operation, nativeParameters: specializedDefaults(spec, project.geometry),
@@ -1618,6 +1626,7 @@ export default function App() {
   const changeSpecializedModel = (stepId: string, nativeModel: string) => {
     const spec = specializedCatalog?.models.find(row => row.id === nativeModel);
     if (!spec) return;
+    if (!specializedModelAvailable(spec, project.dimension)) { setNotice(`${spec.label} ${specializedDimensionLabel(spec) ?? '不支持当前维度'}。`); return; }
     setProject(previous => {
       const promoted = promoteProjectToV7(previous);
       return { ...promoted, steps: promoted.steps.map(step => {
@@ -1629,6 +1638,7 @@ export default function App() {
       }) };
     });
   };
+  const availableSpecializedModels = (specializedCatalog?.models ?? []).filter(spec => specializedModelAvailable(spec, project.dimension));
   const editSpecializedParameter = (stepId: string, key: string, value: unknown) => editStep(stepId, step => step.model === 'specialized'
     ? { ...step, nativeParameters: { ...(step.nativeParameters ?? {}), [key]: value } } : step);
   const addGeometryStep = (model: 'removeMaterial' | 'planarize' | 'boolean' | 'gdsBoolean') => {
@@ -2536,7 +2546,7 @@ export default function App() {
                 <button className="button add-step" onClick={() => addStep('multiParticle')}>＋ 添加多粒子步骤</button>
                 <button className="button add-step" onClick={() => addStep('directional')}>＋ 添加定向步骤</button>
               </div></div>
-              <div className="add-step-group"><strong>ViennaPS 专用模型</strong><div className="specialized-add-row"><select aria-label="选择 ViennaPS 专用模型" value={newSpecializedModel} onChange={event => setNewSpecializedModel(event.target.value)}>{(specializedCatalog?.models ?? []).map(spec => <option key={spec.id} value={spec.id}>{spec.label}</option>)}</select><button className="button add-step" disabled={!specializedCatalog} onClick={() => addStep('specialized')}>＋ 添加专用模型步骤</button></div></div>
+              <div className="add-step-group"><strong>ViennaPS 专用模型</strong><div className="specialized-add-row"><select aria-label="选择 ViennaPS 专用模型" value={availableSpecializedModels.some(spec => spec.id === newSpecializedModel) ? newSpecializedModel : availableSpecializedModels[0]?.id ?? ''} onChange={event => setNewSpecializedModel(event.target.value)}>{availableSpecializedModels.map(spec => <option key={spec.id} value={spec.id}>{spec.label}</option>)}</select><button className="button add-step" disabled={!specializedCatalog} onClick={() => addStep('specialized')}>＋ 添加专用模型步骤</button></div></div>
               <div className="add-step-group"><strong>几何操作</strong><div className="add-step-row">
                 <button className="button add-step" onClick={() => addGeometryStep('removeMaterial')}>＋ 移除材料</button>
                 <button className="button add-step" onClick={() => addGeometryStep('planarize')}>＋ 平坦化</button>
@@ -2819,7 +2829,7 @@ export default function App() {
               })} />}
               {selectedStepObject.model !== 'specialized' && <SelectField label="过程模型" value={selectedStepObject.model} options={[{ value: 'isotropic', label: '各向同性过程' }, { value: 'singleParticle', label: '单粒子过程' }, { value: 'multiParticle', label: '多粒子过程' }, { value: 'directional', label: '定向过程' }]} onChange={value => changeStepModel(selectedStepObject.id, value as Step['model'])} />}
               {selectedStepObject.model !== 'specialized' && selectedStepObject.operation === 'deposit' && <SelectField label="沉积材料" value={selectedStepObject.depositMaterial ?? materials[0]?.name ?? 'SiO2'} options={materials.map(m => ({ value: m.name, label: m.name }))} onChange={value => editStep(selectedStepObject.id, step => ({ ...step, depositMaterial: value }))} hint="材料不改变通用全局速率" />}
-              {selectedStepObject.model === 'specialized' && <SelectField label="ViennaPS 4.6.2 专用模型" value={selectedStepObject.nativeModel ?? ''} options={specializedCatalog?.models.map(item => ({ value: item.id, label: item.label })) ?? []} onChange={value => changeSpecializedModel(selectedStepObject.id, value)} />}
+              {selectedStepObject.model === 'specialized' && <SelectField label="ViennaPS 4.6.2 专用模型" value={selectedStepObject.nativeModel ?? ''} options={availableSpecializedModels.map(item => ({ value: item.id, label: item.label }))} onChange={value => changeSpecializedModel(selectedStepObject.id, value)} />}
               </div>
               {selectedStepObject.model === 'specialized' ? <div className="step-tab-panel" data-step-tab-panel="native">
                 {(() => {
@@ -2829,6 +2839,7 @@ export default function App() {
                   const geometryNames = geometryMaterialNames(project.geometry);
                   return <>
                     <div className="inline-note">参数直接传给安装的 {spec.nativeClass}。{specializedCatalog?.unitsNote} 原生模型规定的工艺速率由该模型内部计算，工作台不叠加通用速率。</div>
+                    {specializedDimensionLabel(spec) && <div className="inline-note warning">安装版 {spec.nativeClass} {specializedDimensionLabel(spec)}：{spec.dimensions?.[0] === 2 ? '3D 绑定在受控探测中崩溃' : '2D 绑定在受控探测中不返回'}，因此其他维度的项目会被验证拒绝。</div>}
                     {spec.id === 'oxideRegrowth' && <div className="inline-note warning">本机 ViennaPS 4.6.2 的 OxideRegrowth 已验证条件是含 SiO₂ / Si₃N₄ 的平坦多层结构。请将“顶层图案”设为“无”；此版本在带沟槽或圆孔的 Domain 上可能崩溃。{project.geometry.kind === 'stack' && project.geometry.pattern.kind !== 'none' && <button className="button" onClick={() => updateProject(previous => previous.geometry.kind === 'stack' ? { ...previous, geometry: { ...previous.geometry, pattern: { kind: 'none' } } } : previous)}>将顶层图案改为无</button>}</div>}
                     {spec.depositMaterial && <div className="not-applicable"><strong>原生沉积材料</strong><span>{spec.depositMaterial}（由模型固定）</span></div>}
                     {spec.depositMaterialSelectable && <SelectField label="沉积材料" value={selectedStepObject.depositMaterial ?? 'Al2O3'} options={materials.map(item => ({ value: item.name, label: item.name }))} onChange={value => editStep(selectedStepObject.id, step => ({ ...step, depositMaterial: value }))} />}
