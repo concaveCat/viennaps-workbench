@@ -8,7 +8,7 @@
 
 ## 能力矩阵和选择规则
 
-`docs/stage9-evidence/gpu-capability-matrix.json` 现有 545 个 GPU_DISK 证据行，由 `tests/fixtures/derive_stage9_gpu_matrix.py` 从已验证证据生成，并逐行校验产品、直接 ViennaPS 参考及 bounded-child guard。每个发布签名都比较坐标、拓扑、材料数组和材料映射；材料标识仅在直接材料矩阵覆盖范围内泛化：
+`docs/stage9-evidence/gpu-capability-matrix.json` 现有 560 条证据行（558 条 `GPU_DISK` + 2 条 `GPU_TRIANGLE`），由 `tests/fixtures/derive_stage9_gpu_matrix.py` 从已验证证据生成，并逐行校验产品、直接 ViennaPS 参考及 bounded-child guard。每个发布签名都比较坐标、拓扑、材料数组和材料映射；材料标识仅在直接材料矩阵覆盖范围内泛化：
 
 - 352 个 ViennaPS 专用模型行，涵盖实测平面、沟槽、圆孔、Fin、层叠结构及 GDS 路由；
 - 90 个通用 `singleParticle` 行与 95 个 `multiParticle` 行，涵盖平面、沟槽、圆孔、Fin、GDS 及保留的层叠结构；
@@ -79,7 +79,7 @@
 
 ## 限制和未开放组合
 
-- 安装版 `FluxEngineType` 列有 `GPU_TRIANGLE` 和 `GPU_LINE`。新增 GPU_TRIANGLE 诊断用 Stage 8 产品 worker/独立 ViennaPS 直调分别执行 2D、3D SF₆/O₂；两例均读回 RTX 3060 UUID、`nvidia-smi` 识别 worker PID，初末坐标、拓扑、材料数组和材料映射一致。GPU_LINE 的独立 ViennaPS 直调在 2D 和 3D SF₆/O₂ 上均成功并改变点坐标；这些调用没有记录 CUDA UUID，也没有产品 worker/产品-直调对照或 WebUI 保存/重放验收。两种引擎都尚未进入 schema-7 能力矩阵，因此 UI 仍只选择已覆盖的 GPU_DISK。证据：`docs/stage9-evidence/gpu-variants/gpu-triangle-{2d,3d}/summary-gpu_triangle.json` 和 `gpu-line-{2d,3d}-direct.{json,guard.json,log}`。
+- 安装版 `FluxEngineType` 列有 `GPU_TRIANGLE` 和 `GPU_LINE`。新增 GPU_TRIANGLE 诊断用 Stage 8 产品 worker/独立 ViennaPS 直调分别执行 2D、3D SF₆/O₂；两例均读回 RTX 3060 UUID、`nvidia-smi` 识别 worker PID，初末坐标、拓扑、材料数组和材料映射一致。该证据已进入 schema-7 能力矩阵（2 条 `GPU_TRIANGLE` 行：`specialized:sf6o2` / etch / reflective / stack / pattern=none，2D 与 3D），通过 `solver.gpuEngine=GPU_TRIANGLE` 显式选择；其它模型、维度、边界或几何一律 422，不回退到 GPU_DISK/CPU_DISK。GPU_LINE 的独立 ViennaPS 直调在 2D 和 3D SF₆/O₂ 上均成功并改变点坐标；这些调用没有记录 CUDA UUID，也没有产品 worker/产品-直调对照或 WebUI 保存/重放验收，因此 GPU_LINE 仍不暴露。证据：`docs/stage9-evidence/gpu-variants/gpu-triangle-{2d,3d}/summary-gpu_triangle.json` 和 `gpu-line-{2d,3d}-direct.{json,guard.json,log}`。
 - 通用 SingleParticle 按矩阵实测签名开放；能力矩阵中的材料范围才是开放边界。自定义原生材料 ID 177–240 的 GPU 直调和多种 GDS/材料角色已按矩阵证据覆盖；另有网页端原生 ID 187/188 的 2D/3D 反射边界平面基底案例完成注册、GPU 运行、保存、重开、导出及重放，产品初末和重放网格与直接 ViennaPS 完全一致。网页证据和自动检查见 `docs/stage9-evidence/gpu-custom-material/summary.json` 与其 `browser/` 子目录；这不扩大到矩阵未覆盖的模型或几何组合。
 - 本阶段 specialized 和 MultiParticle 的 GPU 边界能力按精确矩阵开放；此前 8 个 periodic GDS 崩溃组合已通过隐藏周期支撑图形修复，并经 2D/3D GPU_DISK 与 CPU_DISK 产品/直接对照及真实浏览器运行验证。超出周期 Domain 的 GDS 布局仍需扩大 Domain 或调整放置。通用旧项目的 GPU 组合只沿用各自原有兼容能力证据。
 - 安装版 ViennaPS 的 GPU MultiParticle 绑定只转换一种离子类型，多个离子类型会被忽略。单次通量 CPU/GPU 对照已确认 GPU 缺少第二离子通道；运行 API 和 UI 显示该限制、禁用受影响的 GPU 请求，而相同配置的 CPU_DISK 已在 8 个 2D/3D 产品/直接对照中验证。进一步的 bounded Python API 探测发现 `ProcessModel.setVelocityField` 需要未导出的 `viennaps::VelocityField<double, D>`，读取该对象不能转换为 Python，ViennaLS 基类和 Python 子类也都会被拒绝；因此当前安装接口没有可用的安全 Python 合并通量路径。非 `FluxEngineType` 步骤（例如定向/各向同性和几何操作）标记为 `not-applicable`，不会伪报 GPU_DISK。

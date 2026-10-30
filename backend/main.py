@@ -690,12 +690,16 @@ async def slice_run_create(request: Request, payload: Any = Body(...)) -> dict[s
     except ValidationError as exc:
         return _validation_error(exc)
     if parsed_project.schemaVersion != 7 or parsed_project.dimension != 3:
-        raise HTTPException(status_code=422, detail={"path":"project", "message":"ViennaPS Slice requires a schema-7 3D geometry project"})
+        requested_axis = slice_request.sliceAxis or "y"
+        reason = (f"native Slice requires a schema-7 3D geometry project; {requested_axis}-normal slicing "
+                  "is not applicable to a 2D project")
+        raise HTTPException(status_code=422, detail={"path":"project", "message":reason})
     project_payload = parsed_project.model_dump(mode="python", exclude_none=True)
     project_payload["steps"] = []
     try:
         _project, normalized, _warnings = _project_or_422(project_payload)
-        return _supervisor(request).start("slice", normalized, slice_request=slice_request.model_dump(mode="json"))
+        return _supervisor(request).start("slice", normalized,
+                                          slice_request=slice_request.model_dump(mode="json", exclude_none=True))
     except HTTPException:
         raise
     except ActiveRunError as exc:
@@ -757,6 +761,13 @@ async def run_replay(request: Request, payload: Any = Body(...)) -> dict[str, An
             if requests_gpu != requires_gpu:
                 expected = "GPU" if requests_gpu else "CPU"
                 raise HTTPException(status_code=422, detail={"path": "executionRequirements.steps", "message": f"replay engine must match normalizedProject.solver.enginePreference ({expected})"})
+            requested_gpu_engine = project_payload["solver"].get("gpuEngine")
+            if requested_gpu_engine is not None and item.engine != requested_gpu_engine:
+                raise HTTPException(status_code=422, detail={
+                    "path": "executionRequirements.steps",
+                    "message": (f"replay engine {item.engine} differs from normalizedProject.solver.gpuEngine "
+                                f"{requested_gpu_engine}"),
+                })
         if envelope.schemaVersion in (2,3,4,5,6,7):
             step=next((s for s in project_payload["steps"] if s["id"]==item.stepId),None)
             replay_dimension=project_payload["dimension"]
@@ -777,6 +788,17 @@ async def run_replay(request: Request, payload: Any = Body(...)) -> dict[str, An
                     "path": "executionRequirements.steps",
                     "message": "GPU MultiParticle replay must record the strategy for its process or single-pass flux mode",
                 })
+            if valid_strategy and item.engine == "GPU_TRIANGLE" and (
+                    not step or not capability_verified(
+                        replay_dimension, capability_model, step["operation"], boundary, item.engine,
+                        schema_version=envelope.schemaVersion,
+                        execution_strategy=item.executionStrategy,
+                        flux_strategy=item.fluxStrategy, **signature)):
+                raise HTTPException(status_code=422, detail={
+                    "path": "executionRequirements.steps",
+                    "message": (f"GPU_TRIANGLE has no direct-reference acceptance row for {capability_model} "
+                                f"{step['operation'] if step else ''} on {boundary} in {replay_dimension}D; "
+                                "replay is refused instead of falling back to GPU_DISK or CPU_DISK"), })
             if not step or (not item.engine.startswith("GPU_")
                             and not capability_verified(replay_dimension,capability_model,step["operation"],boundary,item.engine,
                                                         schema_version=envelope.schemaVersion,
@@ -800,7 +822,7 @@ async def run_replay(request: Request, payload: Any = Body(...)) -> dict[str, An
         if replay_seed != project_payload["solver"]["random"]["seed"]:
             raise HTTPException(status_code=422, detail={"path": "normalizedProject.solver.random.seed", "message": "seed does not match the step requirements"})
         replay_engine = next(iter(replay_engines))
-        expected_preference = "gpu" if replay_engine == "GPU_DISK" else "cpu"
+        expected_preference = "gpu" if replay_engine.startswith("GPU_") else "cpu"
         if envelope.schemaVersion==1 and project_payload["solver"]["enginePreference"] != expected_preference:
             raise HTTPException(status_code=422, detail={"path": "normalizedProject.solver.enginePreference", "message": f"replay project must explicitly request {expected_preference}"})
     elif requirements.steps:

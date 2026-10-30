@@ -3,6 +3,7 @@
 当前正式发布与启动说明见项目根目录 `README.md`。阶段 1–9 的实现范围、安装版 ViennaPS 原生调用、参考对照、自动化及浏览器验收见对应的 `ACCEPTANCE_STAGE*.md`。
 
 - `ACCEPTANCE_STAGE9.md`：GPU_DISK 精确能力矩阵、分辨率扩展和整体回归。
+- `native-capability-release.md`：GPU_TRIANGLE、任意轴 Slice、HoleShape HALF/QUARTER 与 halfFin/halfTrench 的 schema、证据范围、原生调用与拒绝规则。
 - `stage9-evidence/gpu-capability-matrix.json`：逐模型签名与产品/direct-reference/guard 证据索引。
 - `cpu-thread-evidence/`：本机 CPU 动态上限、schema 7 默认多粒子 GPU_DISK 浏览器运行/重放及发布页 smoke 证据。
 - `schema-project-union.json`、`schema-project-v*.json`、`schema-replay-v*.json`：项目和重放格式；旧格式兼容规则在 API contract 与阶段报告中。

@@ -170,6 +170,17 @@ class SolverV7(Solver):
     # Stable physical NVIDIA device UUID. Missing means host-preferred CUDA
     # device; older schema-1—6 projects remain unchanged and hash-compatible.
     gpuDeviceId: Annotated[str, Field(pattern=r"^GPU-[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$")] | None = None
+    # Concrete native flux engine for an explicit GPU request. Omitted keeps
+    # the historical GPU_DISK route byte-for-byte (hash-compatible). The
+    # installed GPU_TRIANGLE backend is only admitted for evidence-backed
+    # combinations; an unproven request is rejected instead of falling back.
+    gpuEngine: Literal["GPU_DISK", "GPU_TRIANGLE"] | None = None
+
+    @model_validator(mode="after")
+    def gpu_engine_requires_gpu_preference(self) -> "SolverV7":
+        if self.gpuEngine is not None and self.enginePreference != "gpu":
+            raise ValueError("gpuEngine requires solver.enginePreference=gpu; select the GPU engine explicitly or omit gpuEngine")
+        return self
     advection: AdvectionSettingsV7 = Field(default_factory=AdvectionSettingsV7)
     rayTracing: RayTracingSettingsV7 = Field(default_factory=RayTracingSettingsV7)
 
@@ -361,6 +372,8 @@ class ProjectV3(StrictModel):
         # V3 geometry and step unions are validated by the explicit strict
         # validators below; dict fields preserve the v1/v2 model byte shape.
         normalized_geometry, normalized_steps = validate_v3_project_parts(self.geometry, self.steps, self.dimension)
+        validate_geometry_native_flags(normalized_geometry, self.dimension,
+                                       _project_boundary_name(self.domain))
         # Normalize validated numbers/defaults once, without triggering the
         # validate_assignment hook recursively. Legacy contracts are untouched.
         object.__setattr__(self, "geometry", normalized_geometry)
@@ -378,6 +391,43 @@ def validate_v3_project_parts(geometry, steps, dimension):
     return parsed_geometry.model_dump(mode="json", exclude_none=True), [item.model_dump(mode="json", exclude_none=True) for item in parsed]
 
 
+def _project_boundary_name(domain: object) -> str:
+    value = getattr(domain, "boundaryXY", None)
+    if value is None:
+        value = getattr(domain, "xBoundary", "reflective")
+    return str(value)
+
+
+def validate_geometry_native_flags(geometry: dict, dimension: int, boundary: str) -> None:
+    """Reject native half-shape requests that the installed bindings ignore.
+
+    ViennaPS 4.6.2 logs a warning and widens HALF/QUARTER holes (and ignores
+    halfFin/halfTrench) when the domain has periodic boundaries. The Workbench
+    never turns a requested half structure into a full one silently, so the
+    combination fails here before the worker starts.
+    """
+    kind = geometry.get("kind")
+    if kind == "hole":
+        shape = geometry.get("holeShape")
+        if shape in ("HALF", "QUARTER"):
+            if dimension != 3:
+                raise ValueError(f"holeShape {shape} is only applicable to 3D hole geometry")
+            if boundary == "periodic":
+                raise ValueError(
+                    f"holeShape {shape} is not supported with periodic boundaries; "
+                    "the installed ViennaPS binding silently widens it to FULL")
+    elif kind == "trench" and geometry.get("halfTrench"):
+        if boundary == "periodic":
+            raise ValueError(
+                "halfTrench is not supported with periodic boundaries; "
+                "the installed ViennaPS binding silently ignores it")
+    elif kind == "fin" and geometry.get("halfFin"):
+        if boundary == "periodic":
+            raise ValueError(
+                "halfFin is not supported with periodic boundaries; "
+                "the installed ViennaPS binding silently ignores it")
+
+
 class PlaneV3(StrictModel):
     kind: Literal["plane"]
     height: Number
@@ -392,6 +442,9 @@ class TrenchV3(StrictModel):
     maskTaperAngle: Annotated[Number, Field(ge=-45, le=45)]
     substrateMaterial: str
     maskMaterial: str = "Mask"
+    # Installed MakeTrench(..., halfTrench=True) halves the x domain so only
+    # the x>=0 half is built. Omitted preserves the historical full trench.
+    halfTrench: bool | None = None
 
 class HoleV3(StrictModel):
     kind: Literal["hole"]
@@ -402,6 +455,10 @@ class HoleV3(StrictModel):
     maskTaperAngle: Annotated[Number, Field(ge=-45, le=45)]
     substrateMaterial: str
     maskMaterial: str = "Mask"
+    # Installed native ps.HoleShape. Omitted is FULL. HALF keeps x>=0 and
+    # QUARTER keeps x>=0,y>=0; both are 3D-only and reject periodic
+    # boundaries because the native constructor silently widens them to FULL.
+    holeShape: Literal["FULL", "HALF", "QUARTER"] | None = None
 
 class StackLayer(StrictModel):
     id: Annotated[str, Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")]
@@ -479,6 +536,9 @@ class FinGeometryV7(StrictModel):
     maskMaterial: str = "Mask"
     construction: Literal["native", "boolean"] = "native"
     extrusion: FinExtrusionV7 | None = None
+    # Installed MakeFin(..., halfFin=True) halves the x domain (x>=0 only).
+    # Omitted preserves the historical full fin.
+    halfFin: bool | None = None
 
 
 class GDSLayerV7(StrictModel):
@@ -672,7 +732,10 @@ class ProjectV4(StrictModel):
             raise ValueError("3D schemaVersion 4 requires 3D domain and view3D only")
         from pydantic import TypeAdapter
         geometry=TypeAdapter(GeometryV3).validate_python(self.geometry)
-        object.__setattr__(self,"geometry",geometry.model_dump(mode="json",exclude_none=True))
+        normalized_geometry=geometry.model_dump(mode="json",exclude_none=True)
+        validate_geometry_native_flags(normalized_geometry, self.dimension,
+                                       _project_boundary_name(self.domain))
+        object.__setattr__(self,"geometry",normalized_geometry)
         ids=[step.id for step in self.steps]
         if len(ids)!=len(set(ids)): raise ValueError("step IDs must be unique")
         return self
@@ -1213,6 +1276,8 @@ class ProjectV6(StrictModel):
         geometry_adapter = GeometryV7 if self.schemaVersion == 7 else GeometryV3
         geometry = TypeAdapter(geometry_adapter).validate_python(self.geometry)
         normalized_geometry = geometry.model_dump(mode="json", exclude_none=True)
+        validate_geometry_native_flags(normalized_geometry, self.dimension,
+                                       _project_boundary_name(self.domain))
         object.__setattr__(self, "geometry", normalized_geometry)
         ids = [step.id for step in self.steps]
         if len(ids) != len(set(ids)):
@@ -1477,7 +1542,10 @@ class ProjectV5(StrictModel):
             raise ValueError("3D schemaVersion 5 requires 3D domain and view3D only")
         from pydantic import TypeAdapter
         geometry = TypeAdapter(GeometryV3).validate_python(self.geometry)
-        object.__setattr__(self, "geometry", geometry.model_dump(mode="json", exclude_none=True))
+        normalized_geometry = geometry.model_dump(mode="json", exclude_none=True)
+        validate_geometry_native_flags(normalized_geometry, self.dimension,
+                                       _project_boundary_name(self.domain))
+        object.__setattr__(self, "geometry", normalized_geometry)
         ids = [step.id for step in self.steps]
         if len(ids) != len(set(ids)):
             raise ValueError("step IDs must be unique")
@@ -1564,8 +1632,15 @@ class ReplayRequirements(StrictModel):
 
 
 class SliceRequestV7(StrictModel):
+    # ``axis`` is the historical y-normal integer and is kept for byte-level
+    # compatibility with saved requests/replays. New requests select the native
+    # Slice.setSliceDimension index through ``sliceAxis`` (x=0, y=1, z=2).
     axis: Literal[1] = 1
     position: Number
+    sliceAxis: Literal["x", "y", "z"] | None = None
+    # Native Slice.setReflectX negates the first remaining coordinate. Omitted
+    # means False so old request hashes stay unchanged.
+    reflectX: bool | None = None
 
 
 class ReplayProjectV1(StrictModel):

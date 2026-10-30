@@ -43,7 +43,8 @@
     "docs/stage9-evidence/gpu-coverage-audit/material-scope/summary-all-fin-periodic-gpu_disk.json",
     "docs/stage9-evidence/gpu-coverage-audit/material-scope/coverage-report.json",
     "docs/stage9-evidence/gpu-coverage-audit/gpu-device-selection/material-scope/selectable-substrates-summary.json",
-    "docs/stage9-evidence/gpu-coverage-audit/gpu-device-selection/material-scope/specialized-substrate-capability-report.json"
+    "docs/stage9-evidence/gpu-coverage-audit/gpu-device-selection/material-scope/specialized-substrate-capability-report.json",
+    "docs/stage9-evidence/gpu-variants"
   ],
   "materialScopeRows": 185,
   "genericMaterialScopeRows": 151,
@@ -47792,6 +47793,128 @@
         "evidence": [
           "docs/stage9-evidence/gpu-coverage-audit/material-scope/summary-all-fin-periodic-gpu_disk.json"
         ]
+      }
+    },
+    {
+      "schemaVersions": [
+        7
+      ],
+      "dimension": 2,
+      "model": "specialized:sf6o2",
+      "operation": "etch",
+      "boundaryXY": "reflective",
+      "engine": "GPU_TRIANGLE",
+      "status": "verified",
+      "geometryKinds": [
+        "stack"
+      ],
+      "materials": [
+        "Si",
+        "Si3N4",
+        "SiO2"
+      ],
+      "materialRoles": {
+        "Si": [
+          "bulk"
+        ],
+        "Si3N4": [
+          "mask"
+        ],
+        "SiO2": [
+          "film"
+        ]
+      },
+      "materialBindings": {},
+      "patternKinds": [
+        "none"
+      ],
+      "evidence": {
+        "productWorker": "docs/stage9-evidence/gpu-variants/gpu-triangle-2d/sf6o2-2d-gpu_triangle.json",
+        "productGuard": "docs/stage9-evidence/gpu-variants/gpu-triangle-2d/sf6o2-2d-gpu_triangle.final.guard.json",
+        "directReference": "docs/stage9-evidence/gpu-variants/gpu-triangle-2d/sf6o2-2d-gpu_triangle.final.direct-reference.json",
+        "directGuard": "docs/stage9-evidence/gpu-variants/gpu-triangle-2d/sf6o2-2d-gpu_triangle.final.direct.guard.json",
+        "comparisons": {
+          "initial": {
+            "points": true,
+            "cells": true,
+            "materialIds": true,
+            "materialIdsByLevelSetIndex": true
+          },
+          "final": {
+            "points": true,
+            "cells": true,
+            "materialIds": true,
+            "materialIdsByLevelSetIndex": true
+          }
+        },
+        "versions": {
+          "viennaps": "4.6.2",
+          "viennals": "5.8.5"
+        },
+        "seed": 271828,
+        "actualEngine": "GPU_TRIANGLE",
+        "gpuDeviceUuid": "GPU-5532bb0f-735e-bc93-98ca-b7662a8ebf6d"
+      }
+    },
+    {
+      "schemaVersions": [
+        7
+      ],
+      "dimension": 3,
+      "model": "specialized:sf6o2",
+      "operation": "etch",
+      "boundaryXY": "reflective",
+      "engine": "GPU_TRIANGLE",
+      "status": "verified",
+      "geometryKinds": [
+        "stack"
+      ],
+      "materials": [
+        "Si",
+        "Si3N4",
+        "SiO2"
+      ],
+      "materialRoles": {
+        "Si": [
+          "bulk"
+        ],
+        "Si3N4": [
+          "mask"
+        ],
+        "SiO2": [
+          "film"
+        ]
+      },
+      "materialBindings": {},
+      "patternKinds": [
+        "none"
+      ],
+      "evidence": {
+        "productWorker": "docs/stage9-evidence/gpu-variants/gpu-triangle-3d/sf6o2-3d-gpu_triangle.json",
+        "productGuard": "docs/stage9-evidence/gpu-variants/gpu-triangle-3d/sf6o2-3d-gpu_triangle.final.guard.json",
+        "directReference": "docs/stage9-evidence/gpu-variants/gpu-triangle-3d/sf6o2-3d-gpu_triangle.final.direct-reference.json",
+        "directGuard": "docs/stage9-evidence/gpu-variants/gpu-triangle-3d/sf6o2-3d-gpu_triangle.final.direct.guard.json",
+        "comparisons": {
+          "initial": {
+            "points": true,
+            "cells": true,
+            "materialIds": true,
+            "materialIdsByLevelSetIndex": true
+          },
+          "final": {
+            "points": true,
+            "cells": true,
+            "materialIds": true,
+            "materialIdsByLevelSetIndex": true
+          }
+        },
+        "versions": {
+          "viennaps": "4.6.2",
+          "viennals": "5.8.5"
+        },
+        "seed": 271828,
+        "actualEngine": "GPU_TRIANGLE",
+        "gpuDeviceUuid": "GPU-5532bb0f-735e-bc93-98ca-b7662a8ebf6d"
       }
     }
   ]

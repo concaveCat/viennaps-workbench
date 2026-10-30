@@ -309,7 +309,7 @@ references when adapting the suite.
 | `frontend build is missing` on start | Run `npm ci && npm run build` in `frontend/`. |
 | `cannot bind configured loopback port` | Another process holds the port. Set `WORKBENCH_PORT` or remove `var/listen-port.json`; the workbench will not kill the unknown listener. |
 | `ModuleNotFoundError: viennaps` | `.venv` was created without `--system-site-packages`, or ViennaPS is not installed for this Python. |
-| GPU runs rejected or `gpuAvailable()` false | Check `nvidia-smi`, the CUDA build of ViennaPS, and `GET /api/gpu-devices`. GPU support is only exposed for `GPU_DISK` combinations recorded in `docs/stage9-evidence/gpu-capability-matrix.json`. |
+| GPU runs rejected or `gpuAvailable()` false | Check `nvidia-smi`, the CUDA build of ViennaPS, and `GET /api/gpu-devices`. GPU support is only exposed for `GPU_DISK` combinations recorded in `docs/stage9-evidence/gpu-capability-matrix.json`; schema-7 `solver.gpuEngine=GPU_TRIANGLE` is limited to the two archived sf6o2 rows and never falls back. |
 | `request Host must be the active loopback address` | Use `127.0.0.1:<port>` or `localhost:<port>`; reverse proxies and custom hostnames are intentionally rejected. |
 | Run stops with `run artifact size exceeded` | The step produced more than the effective artifact cap (4 GiB by default, `WORKBENCH_MAX_ARTIFACT_MIB`); reduce grid resolution, rays, or output frequency. |
 
@@ -342,7 +342,9 @@ the three capability matrices required at runtime are the exception.
 - Verified only against ViennaPS 4.6.2 / ViennaLS 5.8.5; other versions are
   rejected rather than guessed at.
 - GPU support is limited to `GPU_DISK` for covered model/geometry combinations.
-  `GPU_TRIANGLE` and `GPU_LINE` are not exposed.
+  Schema-7 `solver.gpuEngine=GPU_TRIANGLE` is exposed only for the two archived
+  2D/3D sf6o2 etch/reflective stack rows and is rejected for everything else.
+  `GPU_LINE` is not exposed.
 - The installed 4.6.2 MultiParticle GPU path handles a single ion species;
   multi-ion GPU requests are reported as a native limitation, not silently
   approximated. Multi-ion CPU paths and the single-pass flux strategy remain

@@ -76,7 +76,7 @@ that could use `GPU_DISK`.
 - `RateGrid.setCustomInterpolator`, `MultiParticleProcess.setRateFunction` callbacks,
   `ProcessModel`/`ProcessParams`/`AdvectionCallback` extension hooks — deliberately
   never exposed because they would execute arbitrary Python in the worker.
-- `GPU_TRIANGLE` and `GPU_LINE` — not probed and not exposed.
+- `GPU_LINE` — not probed and not exposed. `GPU_TRIANGLE` is exposed only for the archived 2D/3D specialized sf6o2 etch/reflective stack pair via schema-7 `solver.gpuEngine`; unproven combinations are rejected.
 
 ### Batch A4 (particle shapes)
 

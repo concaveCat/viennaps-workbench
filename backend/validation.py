@@ -227,6 +227,16 @@ def validate_project(payload: Any, *, kind: str = "project") -> tuple[Project, l
                         (not native_engine.startswith("GPU_") and not capability_verified(
                             project.dimension, model_key, step_value(step, "operation"), boundary,
                             native_engine, schema_version=project.schemaVersion, **signature))):
+                    if (project.solver.enginePreference == "gpu"
+                            and normalized["solver"].get("gpuEngine") == "GPU_TRIANGLE"):
+                        issues.append(FieldIssue(
+                            f"steps[{i}].nativeModel",
+                            f"GPU_TRIANGLE has no direct-reference acceptance row for model "
+                            f"{model_key}, operation {step_value(step,'operation')}, boundary {boundary} "
+                            f"in {project.dimension}D; the request is rejected instead of falling back to "
+                            "GPU_DISK or CPU_DISK. Use solver.gpuEngine=GPU_DISK with a covered "
+                            "combination, or select CPU."))
+                        continue
                     if installed_model and installed_model.get("experimental") and not native_engine.startswith("GPU_"):
                         # Experimental models have native smoke tests but no
                         # archived direct-reference row yet. Only CPU_DISK (or
@@ -241,6 +251,16 @@ def validate_project(payload: Any, *, kind: str = "project") -> tuple[Project, l
                 if engine=="unavailable" or (not engine.startswith("GPU_") and not capability_verified(
                         project.dimension,step_value(step,"model"),step_value(step,"operation"),boundary,engine,
                         schema_version=project.schemaVersion, **signature)):
+                    if (project.solver.enginePreference == "gpu"
+                            and normalized["solver"].get("gpuEngine") == "GPU_TRIANGLE"):
+                        issues.append(FieldIssue(
+                            f"steps[{i}].model",
+                            f"GPU_TRIANGLE has no direct-reference acceptance row for model "
+                            f"{step_value(step,'model')}, operation {step_value(step,'operation')}, boundary "
+                            f"{boundary} in {project.dimension}D; the request is rejected instead of falling "
+                            "back to GPU_DISK or CPU_DISK. Use solver.gpuEngine=GPU_DISK with a covered "
+                            "combination, or select CPU."))
+                        continue
                     limitation = known_engine_limitation(project.dimension, step_value(step, "model"),
                                                          "GPU_DISK", step_dict)
                     if limitation and project.solver.enginePreference == "gpu":
@@ -1580,6 +1600,74 @@ def capability_verified(dimension: int, model: str, operation: str, boundary: st
         return False
 
 
+def slice_axis_bounds(project: dict[str, Any], slice_request: dict[str, Any]) -> dict[str, Any]:
+    """Return the native Slice axis, output extent and source-axis bound.
+
+    The slice position moves along the normal axis, so it is bounded by that
+    axis' domain extent. Half-domain geometries (HALF/QUARTER holes and
+    halfFin/halfTrench) only occupy the positive half of the halved axes.
+    z has no finite computational boundary; its bound is the measured source
+    surface range and is checked by the worker after the initial snapshot.
+    """
+    axis_label = str(slice_request.get("sliceAxis") or "y")
+    if axis_label not in {"x", "y", "z"}:
+        raise ValueError(f"native Slice axis must be x, y or z, not {axis_label!r}")
+    axis = {"x": 0, "y": 1, "z": 2}[axis_label]
+    domain = project["domain"]
+    geometry = project.get("geometry") or {}
+    hole_shape = str(geometry.get("holeShape") or "FULL")
+    half_x = (hole_shape in ("HALF", "QUARTER")
+              or bool(geometry.get("halfTrench")) or bool(geometry.get("halfFin")))
+    half_y = hole_shape == "QUARTER"
+    x_extent = float(domain["xExtent"])
+    y_extent = float(domain["yExtent"])
+    if axis == 0:
+        return {"axis": axis, "axisName": "x", "outputExtent": y_extent,
+                "min": 0.0 if half_x else -x_extent / 2,
+                "max": x_extent / 2, "halfDomain": half_x,
+                "restriction": "half-domain" if half_x else None,
+                "lateralAxis": "y", "verticalAxis": "z", "normal": [1.0, 0.0, 0.0]}
+    if axis == 1:
+        if geometry.get("kind") == "fin" and geometry.get("extrusion") is not None:
+            # An extruded 3D fin occupies only the requested y extrusion
+            # range, regardless of whether the worker uses the d2-Extrude
+            # route or the direct 3D box-stencil route.
+            y_min, y_max = (float(value) for value in geometry["extrusion"]["extent"])
+            restriction = "extrusion"
+        elif half_y:
+            y_min, y_max = 0.0, y_extent / 2
+            restriction = "half-domain"
+        else:
+            y_min, y_max = -y_extent / 2, y_extent / 2
+            restriction = None
+        return {"axis": axis, "axisName": "y", "outputExtent": x_extent,
+                "min": y_min, "max": y_max,
+                "halfDomain": half_y,
+                "restriction": restriction,
+                "lateralAxis": "x", "verticalAxis": "z", "normal": [0.0, 1.0, 0.0]}
+    return {"axis": axis, "axisName": "z", "outputExtent": x_extent,
+            "min": None, "max": None, "halfDomain": False, "restriction": None,
+            "lateralAxis": "x", "verticalAxis": "y", "normal": [0.0, 0.0, 1.0]}
+
+
+def slice_position_issue(project: dict[str, Any], slice_request: dict[str, Any]) -> str | None:
+    """Return a 422-ready reason when the Slice position misses its axis."""
+    try:
+        position = float(slice_request["position"])
+    except (KeyError, TypeError, ValueError):
+        return "native Slice requires a finite position"
+    if not math.isfinite(position):
+        return "native Slice requires a finite position"
+    bounds = slice_axis_bounds(project, slice_request)
+    if bounds["min"] is None:
+        return None
+    if bounds["min"] - 1e-12 <= position <= bounds["max"] + 1e-12:
+        return None
+    half_note = f" ({bounds['restriction']} limit)" if bounds.get("restriction") else ""
+    return (f"native Slice {bounds['axisName']} position {position:g} lies outside the source "
+            f"{bounds['axisName']} range [{bounds['min']:g}, {bounds['max']:g}]{half_note}")
+
+
 def select_engine(project: dict, step: dict, *, analysis_mode: str = "process") -> str:
     if not (uses_flux(step) if project.get("schemaVersion") in (4,5,6,7) else step["model"] == "singleParticle" and step["rateMagnitude"] > 0):
         return "not-applicable"
@@ -1588,9 +1676,15 @@ def select_engine(project: dict, step: dict, *, analysis_mode: str = "process") 
     if model == "specialized":
         model = f"specialized:{step.get('nativeModel', '')}"
     if project.get("schemaVersion") in (3,4,5,6,7):
+        requested_gpu_engine = project.get("solver", {}).get("gpuEngine")
         if preference == "gpu":
-            candidates = ["GPU_DISK"]
+            # An explicit GPU engine request never falls back to another GPU
+            # backend. GPU_TRIANGLE is admitted only when its evidence row
+            # matches; otherwise the step resolves to "unavailable".
+            candidates = [requested_gpu_engine or "GPU_DISK"]
         elif preference == "auto" and project.get("schemaVersion") == 7:
+            # AUTO keeps its historical GPU_DISK/CPU_DISK policy; it never
+            # selects GPU_TRIANGLE on its own.
             candidates = ["GPU_DISK", "CPU_DISK"]
         else:
             candidates = ["CPU_DISK"]
