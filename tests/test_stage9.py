@@ -528,9 +528,14 @@ class Stage9GpuMatrixTests(unittest.TestCase):
                                                     row["boundaryXY"], "GPU_DISK", schema_version=7,
                                                     **signature))
         fin_evidence_models = {item["model"].split(":", 1)[1] for item in masks}
-        self.assertNotIn("faradayCage", fin_evidence_models)
+        # Derive the expected set independently of the evidence being checked:
+        # otherwise a missing model row silently removes its assertions. The
+        # explicitly experimental FaradayCage entry has no Stage 9 row.
+        expected_fin_models = {row["id"] for row in specialized_catalog()["models"]
+                               if row["usesFlux"] and not row.get("experimental")}
+        self.assertEqual(fin_evidence_models, expected_fin_models)
         for spec in (row for row in specialized_catalog()["models"]
-                     if row["usesFlux"] and row["id"] in fin_evidence_models):
+                     if row["usesFlux"] and not row.get("experimental")):
             for dimension, mode in ((2, "direct"), (3, "direct"), (3, "extruded")):
                 row = next(item for item in masks if item["model"] == f"specialized:{spec['id']}"
                            and item["dimension"] == dimension and item["finExtrusionMode"] == mode)

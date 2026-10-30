@@ -661,6 +661,23 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
         available_names = executed_names if step.enabled else planned_names
         prefix = f"steps[{index}].nativeParameters"
         params = step.nativeParameters
+        if step.nativeModel == "geometricTrenchDeposition":
+            # The native closed form is a*(1-|z|/depth)^n+b. A fractional n on
+            # a negative base is NaN; the installed binding does not guard it.
+            n_value = params.get("n")
+            try:
+                n_number = float(n_value)
+            except (TypeError, ValueError):
+                n_number = float("nan")
+            if not n_number.is_integer() or n_number < 1:
+                issues.append(FieldIssue(f"{prefix}.n", "must be an integer >= 1; fractional n can produce a non-finite native radius"))
+            for key in ("trenchWidth", "depositionRate"):
+                try:
+                    value = float(params.get(key, 0))
+                except (TypeError, ValueError):
+                    value = 0.0
+                if value <= 0.0:
+                    issues.append(FieldIssue(f"{prefix}.{key}", "must be positive"))
         for field in spec["fields"]:
             key = field["key"]
             path = f"{prefix}.{key}"
@@ -1058,6 +1075,21 @@ def _gpu_combination_verified(dimension: int, model: str, operation: str, bounda
             return False
     return False
 
+
+
+
+def experimental_cpu_replay_allowed(step: Any, engine: str) -> bool:
+    """Allow CPU replay for allowlisted experimental specialized models.
+
+    These models have real native CPU smoke coverage but no archived Stage 8/9
+    direct-reference row, so ``capability_verified`` is intentionally false.
+    A run that the validator already admitted as experimental CPU must remain
+    reproducible through its replay envelope; GPU replay is not granted.
+    """
+    if engine != "CPU_DISK" or not isinstance(step, dict) or step.get("model") != "specialized":
+        return False
+    spec = model_spec(str(step.get("nativeModel", "")))
+    return bool(spec and spec.get("experimental"))
 
 def capability_verified(dimension: int, model: str, operation: str, boundary: str, engine: str,
                         *, schema_version: int | None = None, execution_strategy: str | None = None,

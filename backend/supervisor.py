@@ -23,7 +23,7 @@ from . import storage
 from . import materials as material_registry
 from .validation import (GPU_MULTIPARTICLE_FLUX_STRATEGY, GPU_MULTIPARTICLE_SPLIT_STRATEGY,
                          GPU_MULTIPARTICLE_NATIVE_STRATEGY, GPU_MULTIPARTICLE_NATIVE_FLUX_STRATEGY,
-                         select_engine, capability_verified,
+                         select_engine, capability_verified, experimental_cpu_replay_allowed,
                          gpu_project_signature)
 from .native_build import configured_runtime
 from .rates import uses_flux
@@ -265,10 +265,12 @@ class Supervisor:
                     capability_model=f"specialized:{step['nativeModel']}" if step.get("model")=="specialized" else step["model"]
                     boundary=project["domain"].get("boundaryXY",project["domain"].get("xBoundary"))
                     signature=gpu_project_signature(project,step)
-                    if not engine.startswith("GPU_") and not capability_verified(project["dimension"],capability_model,step["operation"],boundary,engine,
-                                               schema_version=project["schemaVersion"],
-                                               execution_strategy=execution_strategy,
-                                               flux_strategy=flux_strategy, **signature):
+                    if (not engine.startswith("GPU_")
+                            and not capability_verified(project["dimension"],capability_model,step["operation"],boundary,engine,
+                                                        schema_version=project["schemaVersion"],
+                                                        execution_strategy=execution_strategy,
+                                                        flux_strategy=flux_strategy, **signature)
+                            and not experimental_cpu_replay_allowed(step, engine)):
                         raise ReplayMismatch("unverified replay engine, geometry or material combination")
                     if requirement["engine"] != engine or requirement["seed"] != run_seed:
                         raise ReplayMismatch(f"replay engine or seed does not match step {step['id']}")

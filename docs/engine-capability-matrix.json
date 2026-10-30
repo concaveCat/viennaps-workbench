@@ -2611,7 +2611,7 @@
       "acceptanceCriteria": [
         "Validator rejects dimension=2 with a clear 422 before the worker starts.",
         "3D single-step run against a trench + mask produces the same surface as a direct native reference within 1e-6 um (max point distance).",
-        "cageAngle=0 reproduces the existing ionBeam result for the same IBE parameters within 1e-6 um.",
+        "An independent native Faraday reference (cage source directions, not ordinary normal-incidence IBE) matches within 1e-6 um.",
         "Replay of the recorded run reproduces the artifact hashes exactly.",
         "specialized-models catalog documents the model with engineVersion 4.6.2 and dimension 3."
       ]

@@ -1937,7 +1937,15 @@ export default function App() {
       geometry = fin;
     }
     const droppedGdsBoolean = dimension === 2 && source.steps.some(step => step.model === 'gdsBoolean');
-    const convertedSteps = source.steps.filter(step => !(dimension === 2 && step.model === 'gdsBoolean')).map(step => {
+    const droppedSpecialized = source.steps.filter(step => {
+      if (step.model !== 'specialized') return false;
+      const spec = specializedCatalog?.models.find(item => item.id === step.nativeModel);
+      return !!spec?.dimensions?.length && !spec.dimensions.includes(dimension);
+    });
+    const droppedSpecializedIds = new Set(droppedSpecialized.map(step => step.id));
+    const convertedSteps = source.steps
+      .filter(step => !(dimension === 2 && step.model === 'gdsBoolean') && !droppedSpecializedIds.has(step.id))
+      .map(step => {
       if (step.model === 'boolean') {
         const position = step.position ?? [0, 0, 0];
         if (dimension === 3) return { ...step, position: [position[0], 0, position[1]] as [number, number, number], depth: step.depth ?? step.width ?? 1 };
@@ -2000,6 +2008,8 @@ export default function App() {
       ? '已转换到 2D：3D 方向若只有 y 分量则没有对应二维方向，已改为 [0, -1, 0]（向下）。'
       : convertedHole
       ? '已新建对应 2D 工程：圆孔按 x 截面转换为宽度等于孔径的沟槽；原工程和历史结果保持不变。'
+      : droppedSpecialized.length
+      ? `已新建对应 ${dimension}D 工程：以下专用模型不支持该维度，已从副本中移除（${droppedSpecialized.map(step => step.nativeModel).join('、')}）；原工程和历史结果保持不变。`
       : droppedGdsBoolean
       ? '已新建对应 2D 工程：GDS 布尔步骤只支持三维 GDS 项目，已从副本中移除；原工程和历史结果保持不变。'
       : `已新建对应 ${dimension}D 工程；原工程和历史结果保持不变。`);

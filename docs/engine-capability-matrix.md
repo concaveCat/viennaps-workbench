@@ -154,7 +154,7 @@ hashes when unused.
 - Acceptance:
   1. validator rejects `dimension: 2` with a clear 422 before the worker starts;
   2. 3D trench + mask surface equals a direct native reference within `1e-6 µm`;
-  3. `cageAngle = 0` reproduces the same-parameter `ionBeam` result within `1e-6 µm`;
+  3. an independent native Faraday reference (cage source directions, not ordinary normal-incidence IBE) matches within `1e-6 µm`;
   4. replay reproduces artifact hashes exactly;
   5. `specialized-models` catalog row states `engineVersion 4.6.2`, dimension 3.
 
