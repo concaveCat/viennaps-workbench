@@ -11,6 +11,7 @@ type CompileInfo = {
   projectName: string;
   dimension: number;
   stepCount: number;
+  authoredSteps?: ProjectStep[];
   compile: { project: { name: string; dimension: number; steps: ProjectStep[] }; sourceMap?: Array<{ stepId: string; authoredStepId: string }> };
 };
 type RoutePlan = {
@@ -215,16 +216,6 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setSegment(null);
   });
 
-  const resolveTemplateSteps = (steps: Array<Record<string, unknown>>, value: number) => {
-    const replace = (item: unknown): unknown => {
-      if (Array.isArray(item)) return item.map(replace);
-      if (item && typeof item === 'object') return Object.fromEntries(Object.entries(item).map(([key, child]) => [key, replace(child)]));
-      if (typeof item === 'string' && item.trim() === '${duration}') return value;
-      return item;
-    };
-    return steps.map(step => replace(step) as Record<string, unknown>);
-  };
-
   const saveTemplate = () => run('template', async () => {
     if (!compile || !project) throw new Error('先采纳工程');
     const templateId = `tpl_${Date.now().toString(36)}`;
@@ -247,17 +238,15 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setCompileDiff(result);
   });
 
-  const applyTemplate = () => run('template', async () => {
+  const applyTemplate = (mode: 'replace' | 'append') => run('template', async () => {
     if (!project || !templateId) throw new Error('先选择模板');
-    const detail = await api<{ steps: Array<Record<string, unknown>> }>(`/api/v1/workflow/templates/${templateId}`);
     const value = Number(templateVariable) || 0.02;
-    const resolved = resolveTemplateSteps(detail.steps, value);
     const result = await postJson<CompileInfo>('/api/v1/workflow/flows/from-template', {
-      project, templateId, flowId: compile?.flowId, variables: { duration: value },
+      project, templateId, flowId: compile?.flowId, variables: { duration: value }, mode,
     });
     if (compile) setPreviousCompile(compile);
     setCompile(result); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);
-    setProject(previous => previous ? { ...previous, steps: resolved as typeof previous.steps } : previous);
+    setProject(previous => previous ? { ...previous, steps: result.authoredSteps ?? previous.steps } : previous);
   });
 
   const createRoute = () => run('route', async () => {
@@ -498,7 +487,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 <option value="">选择模板</option>
                 {templates.map(item => <option key={item.templateId} value={item.templateId}>{item.name} · {item.stepCount} 步</option>)}
               </select>
-              <button className="wf-button ghost" disabled={!project || !templateId || !!busy} onClick={() => void applyTemplate()}>应用</button>
+              <button className="wf-button ghost" disabled={!project || !templateId || !!busy} onClick={() => void applyTemplate('replace')}>替换流程</button>
+              <button className="wf-button ghost" disabled={!project || !templateId || !!busy} onClick={() => void applyTemplate('append')}>插入模板</button>
             </div>
             <div className="wf-template-row">
               <input aria-label="模板变量值" value={templateVariable} onChange={event => setTemplateVariable(event.target.value)} />

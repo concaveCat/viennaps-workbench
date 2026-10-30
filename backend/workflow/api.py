@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
+import uuid
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import Field, ValidationError
+from pydantic import Field, ValidationError, field_serializer
 
 from .. import snapshots, storage
-from ..models import ProjectV7, StrictModel
+from ..models import ProjectV7, StepV7, StrictModel
 from .metrology import MeasurementResultV1, MetrologyRecipeV1, MetricDefinitionV1, SnapshotPayloadV1, snapshot_content_hash
 from .adoption import adopt_project, first_route
 from .branches import create_branch
@@ -136,7 +137,12 @@ class AdoptProjectResponse(StrictModel):
     projectName: str
     dimension: int
     stepCount: int
+    authoredSteps: list[StepV7] = Field(default_factory=list)
     compile: CompiledWorkflowV1
+
+    @field_serializer("authoredSteps")
+    def _serialize_authored_steps(self, steps: list[StepV7]) -> list[dict]:
+        return [step.model_dump(mode="json", exclude_none=True) for step in steps]
 
 
 class RouteFromCompileRequest(StrictModel):
@@ -194,6 +200,7 @@ class FromTemplateRequest(StrictModel):
     templateId: str
     flowId: str | None = None
     variables: dict[str, float | int | str] = Field(default_factory=dict)
+    mode: Literal["replace", "append"] = "replace"
 
 
 class ProtocolSummaryV1(StrictModel):
@@ -530,6 +537,7 @@ async def adopt_project_endpoint(request: AdoptProjectRequest) -> AdoptProjectRe
             projectName=compiled.project.name,
             dimension=compiled.project.dimension,
             stepCount=len(compiled.project.steps),
+            authoredSteps=flow.steps,
             compile=compiled,
         )
     return _call(operation)
@@ -600,7 +608,16 @@ async def get_template(template_id: str) -> FlowTemplateV1:
 async def adopt_template(request: FromTemplateRequest) -> AdoptProjectResponse:
     def operation():
         template = get_store().get_template(request.templateId)
-        steps = resolve_template(template, request.variables)
+        template_steps = resolve_template(template, request.variables)
+        if request.mode == "append":
+            nonce = uuid.uuid4().hex[:8]
+            inserted = [
+                step.model_copy(update={"id": f"tpl_{nonce}_{index:02d}"})
+                for index, step in enumerate(template_steps, start=1)
+            ]
+            steps = [*request.project.steps, *inserted]
+        else:
+            steps = template_steps
         flow, binding, compiled = adopt_project(
             request.project.model_dump(mode="json", exclude_none=True),
             flow_id=request.flowId,
@@ -611,7 +628,7 @@ async def adopt_template(request: FromTemplateRequest) -> AdoptProjectResponse:
             flowId=flow.flowId, bindingId=binding.bindingId,
             compileId=compiled.compileRecord.compileId, projectName=compiled.project.name,
             dimension=compiled.project.dimension, stepCount=len(compiled.project.steps),
-            compile=compiled,
+            authoredSteps=steps, compile=compiled,
         )
     return _call(operation)
 

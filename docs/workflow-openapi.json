@@ -62,6 +62,14 @@
       "AdoptProjectResponse": {
         "additionalProperties": false,
         "properties": {
+          "authoredSteps": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Authoredsteps",
+            "type": "array"
+          },
           "bindingId": {
             "title": "Bindingid",
             "type": "string"
@@ -2028,6 +2036,15 @@
               }
             ],
             "title": "Flowid"
+          },
+          "mode": {
+            "default": "replace",
+            "enum": [
+              "replace",
+              "append"
+            ],
+            "title": "Mode",
+            "type": "string"
           },
           "project": {
             "$ref": "#/components/schemas/ProjectV7"

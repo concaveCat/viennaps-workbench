@@ -17,15 +17,24 @@ const getJson = async endpoint => {
   return response.json();
 };
 
-const waitForCompileWithPrefix = async (prefix, timeout = 30000) => {
+const waitForCompile = async (predicate, label, timeout = 30000) => {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
-    const summaries = (await getJson('/api/v1/workflow/compiles')).compiles;
-    const latest = await getJson(`/api/v1/workflow/compiles/${summaries[0].compileId}`);
-    if (latest.sourceMap.every(entry => entry.authoredStepId.startsWith(prefix))) return latest;
+    const summaries = (await getJson('/api/v1/workflow/compiles')).compiles.slice(0, 5);
+    for (const summary of summaries) {
+      const candidate = await getJson(`/api/v1/workflow/compiles/${summary.compileId}`);
+      if (predicate(candidate)) return candidate;
+    }
     await new Promise(resolve => setTimeout(resolve, 300));
   }
-  throw new Error(`latest compile was not built from steps prefixed ${prefix}`);
+  throw new Error(`latest compile did not satisfy: ${label}`);
+};
+
+const authoredIds = compile => compile.sourceMap.map(entry => entry.authoredStepId);
+const authoredDuration = (compile, authoredId) => {
+  const entry = compile.sourceMap.find(item => item.authoredStepId === authoredId);
+  const step = compile.project.steps.find(item => item.id === entry.stepId);
+  return Number(step.duration);
 };
 
 const waitForSegment = async (segmentId, timeout = 90000) => {
@@ -45,7 +54,7 @@ const waitForSegment = async (segmentId, timeout = 90000) => {
 // Pre-create a cross-flow template whose authored step ids differ from the project.
 const fixture = JSON.parse(readFileSync(projectPath, 'utf8'));
 const crossFlowTemplateId = 'tpl_crossflow_p1';
-const crossFlowSteps = fixture.steps.map(step => ({
+const crossFlowSteps = fixture.steps.slice(0, 2).map(step => ({
   ...step,
   id: step.id.replace(/^p1_step_/, 'alt_p1_step_'),
   duration: '${duration}',
@@ -99,16 +108,31 @@ try {
   await page.getByRole('button', { name: '02 流程' }).click();
   await page.getByRole('button', { name: '保存当前步骤为模板' }).click();
   await page.getByLabel('模板变量值').fill('0.03');
-  await page.getByRole('button', { name: '应用' }).click();
-  await page.waitForTimeout(1200);
+  await page.getByRole('button', { name: '替换流程' }).click();
+  await waitForCompile(
+    latest => latest.sourceMap.length === 5 && authoredDuration(latest, 'p1_step_04') === 0.03,
+    'replace template with two 0.03 steps',
+  );
   await page.getByRole('button', { name: '比较上一版' }).click();
   await page.getByText('Compile diff').waitFor();
   await page.getByText(/0\.01 → 0\.03/).first().waitFor();
 
-  // Apply a template whose step ids differ from the retained project.
+  // Insert a two-step template: original steps must survive with new authored ids.
   await page.getByLabel('模板选择').selectOption(crossFlowTemplateId);
-  await page.getByRole('button', { name: '应用' }).click();
-  await waitForCompileWithPrefix('alt_p1_step_');
+  await page.waitForTimeout(300);
+  await page.getByRole('button', { name: '插入模板' }).click();
+  const insertedCompile = await waitForCompile(latest => latest.sourceMap.length === 7, 'inserted seven steps');
+  const insertedAuthoredIds = authoredIds(insertedCompile);
+  const insertedIds = insertedAuthoredIds.slice(5);
+  assert.deepEqual(
+    insertedAuthoredIds.slice(0, 5),
+    ['p1_step_01', 'p1_step_02', 'p1_step_03', 'p1_step_04', 'p1_step_05'],
+  );
+  assert.equal(new Set(insertedIds).size, 2);
+  assert.ok(insertedIds.every(stepId => stepId.startsWith('tpl_')), JSON.stringify(insertedIds));
+  assert.deepEqual(insertedIds.map(stepId => authoredDuration(insertedCompile, stepId)), [0.03, 0.03]);
+  await page.getByRole('button', { name: '比较上一版' }).click();
+  await page.getByText(/\+2 \/ -0 \/ moved 0 \/ changed 0/).waitFor();
 
   await page.getByRole('button', { name: '创建首个 Route' }).click();
   await page.getByRole('button', { name: '03 运行' }).click();
@@ -127,11 +151,14 @@ try {
   const authoredByStep = new Map(splitCompile.sourceMap.map(entry => [entry.stepId, entry.authoredStepId]));
   assert.deepEqual(
     [...authoredByStep.values()],
-    ['alt_p1_step_01', 'alt_p1_step_02', 'alt_p1_step_03', 'alt_p1_step_04', 'alt_p1_step_05'],
-    'template must replace authored project steps',
+    [
+      'p1_step_01', 'p1_step_02', 'p1_step_03', 'p1_step_04', 'p1_step_05',
+      ...insertedIds,
+    ],
+    'inserted template must append authored steps after the original ones',
   );
-  assert.equal(authoredByStep.get(tailStepId), 'alt_p1_step_05');
-  assert.equal(authoredByStep.get(prefixStepId), 'alt_p1_step_04');
+  assert.equal(authoredByStep.get(prefixStepId), insertedIds[0]);
+  assert.equal(authoredByStep.get(tailStepId), insertedIds[1]);
 
   // Branch the tail step and execute it from the real prefix checkpoint.
   await page.getByLabel('尾步时长').fill('0.04');
@@ -179,7 +206,11 @@ try {
   assert.equal(experiment.variants.length, 10);
   assert.equal(experiment.variants[0].replicates.length, 2);
   assert.equal(experiment.recipeVersion, 2, 'experiment must pin the latest recipe version');
-  assert.ok(experiment.project.steps.every(step => step.id.startsWith('alt_p1_step_')), 'experiment must use the synchronized project steps');
+  assert.deepEqual(
+    experiment.project.steps.map(step => step.id),
+    ['p1_step_01', 'p1_step_02', 'p1_step_03', 'p1_step_04', 'p1_step_05', ...insertedIds],
+    'experiment must use the synchronized inserted project steps',
+  );
   const recipes = (await getJson('/api/v1/workflow/metrology-recipes')).recipes.filter(item => item.recipeId === experiment.recipeId);
   assert.equal(experiment.recipeVersion, Math.max(...recipes.map(item => item.version)));
   for (const variant of experiment.variants) {

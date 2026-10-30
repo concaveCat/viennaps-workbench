@@ -577,7 +577,7 @@ class WorkflowStore:
     def list_compiles(self) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT compile_id, envelope_json, created_at FROM compiles ORDER BY created_at DESC"
+                "SELECT compile_id, envelope_json, created_at FROM compiles ORDER BY created_at DESC, rowid DESC"
             ).fetchall()
         result = []
         for row in rows:
@@ -794,7 +794,7 @@ class WorkflowStore:
         query = "SELECT * FROM measurements"
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
-        query += " ORDER BY created_at DESC, measurement_id"
+        query += " ORDER BY created_at DESC, rowid DESC"
         with self._connect() as connection:
             rows = connection.execute(query, params).fetchall()
         return [MeasurementResultV1.model_validate(self._measurement_payload(row)) for row in rows]
@@ -1069,7 +1069,7 @@ class WorkflowStore:
                 SELECT r.route_id, r.flow_id, r.name, r.head_attempt_id,
                        r.step_order_json, r.legacy_unverified, r.updated_at,
                        (SELECT COUNT(*) FROM attempts a WHERE a.route_id = r.route_id) AS attempt_count
-                FROM routes r ORDER BY r.updated_at DESC
+                FROM routes r ORDER BY r.updated_at DESC, r.rowid DESC
                 """
             ).fetchall()
         return [
@@ -1323,7 +1323,7 @@ class WorkflowStore:
 
     def list_experiments(self) -> list[dict[str, Any]]:
         with self._connect() as connection:
-            rows = connection.execute("SELECT document_json, updated_at FROM experiments ORDER BY updated_at DESC").fetchall()
+            rows = connection.execute("SELECT document_json, updated_at FROM experiments ORDER BY updated_at DESC, rowid DESC").fetchall()
         return [
             {"experimentId": json.loads(row["document_json"])["experimentId"],
              "name": json.loads(row["document_json"]).get("name"),
@@ -1363,7 +1363,7 @@ class WorkflowStore:
     def list_templates(self) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT template_id, template_json, created_at FROM flow_templates ORDER BY created_at DESC"
+                "SELECT template_id, template_json, created_at FROM flow_templates ORDER BY created_at DESC, rowid DESC"
             ).fetchall()
         return [
             {
