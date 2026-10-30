@@ -67,7 +67,21 @@ def requested_input(project: Project | ProjectV3 | ProjectV4 | ProjectV5 | Proje
         if project.schemaVersion in (4,5,6,7):
             item.pop("selectivityReference",None)
         if project.schemaVersion in (5,6,7) and item.get("model") == "directional":
-            if float(item.get("directionalRateMagnitude", 0.0)) == 0.0:
+            if item.get("rateSets") is not None:
+                # The multi-set surface is additive: each set normalizes its own
+                # direction, and a set without a directional magnitude cannot
+                # consume its direction or visibility natively. Mirroring the
+                # scalar rule keeps hashes equal for physically equal inputs.
+                for rate_set in item["rateSets"]:
+                    if float(rate_set.get("directionalVelocity", 0.0)) == 0.0:
+                        rate_set.pop("direction", None)
+                        rate_set.pop("calculateVisibility", None)
+                    else:
+                        direction = rate_set.get("direction", [0.0, 0.0, 0.0])
+                        norm = math.sqrt(sum(float(value) ** 2 for value in direction))
+                        if norm > 0.0:
+                            rate_set["direction"] = [float(value) / norm for value in direction]
+            elif float(item.get("directionalRateMagnitude", 0.0)) == 0.0:
                 item.pop("direction", None)
                 item.pop("calculateVisibility", None)
             else:

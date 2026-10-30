@@ -60,6 +60,21 @@ def directional_step(*, operation="etch", direction=None, directional=0.3, isotr
     return step
 
 
+def rate_set_step(*, operation="etch", rate_sets=None, deposit_material=None,
+                  step_id="step_rate_sets", duration=0.3, **extra):
+    step = {"id": step_id, "name": "多集合定向", "enabled": True, "operation": operation,
+            "model": "directional", "duration": duration,
+            "rateSets": rate_sets if rate_sets is not None else [
+                {"direction": [0.0, 1.0, 0.0], "directionalVelocity": 0.15,
+                 "isotropicVelocity": 0.05},
+                {"direction": [0.6, -0.8, 0.0], "directionalVelocity": 0.1},
+            ]}
+    if operation == "deposit":
+        step["depositMaterial"] = deposit_material or "W"
+    step.update(extra)
+    return step
+
+
 class DirectionalContract(unittest.TestCase):
     def test_validation_hash_mapping_and_no_ray_fields(self):
         for dimension in (2, 3):
@@ -89,6 +104,119 @@ class DirectionalContract(unittest.TestCase):
             parsed_gpu, _ = validate_project(gpu_preferred, kind="simulate")
             normalized_gpu = parsed_gpu.model_dump(mode="json", exclude_none=True)
             self.assertEqual(select_engine(normalized_gpu, normalized_gpu["steps"][0]), "not-applicable")
+
+    def test_scalar_request_hashes_are_frozen(self):
+        """Omitting ``rateSets`` must not move any existing request hash."""
+        frozen = {
+            (2, "etch"): "649460277660d2d0d2553f3d3c58432b39e14f084e9be0a16403adb891dcfecb",
+            (2, "zero"): "1f24006652c81b4484cc71d3edc6a5b16779cadeb4fe0cacbd81c5e1112f85f6",
+            (3, "etch"): "be995601e436454b8ac06d6fefb3abbf35f6b98f73627d1c9a934181a05393ae",
+            (3, "zero"): "e56b597f81b0214ddb5b44b26f769d81bc8695c531a57c38e93d9c55cad48ad9",
+        }
+        for dimension in (2, 3):
+            direction = [0.0, -1.0, 0.0] if dimension == 2 else [0.0, 0.0, -1.0]
+            for label, step in (
+                ("etch", directional_step(direction=direction, directional=0.3, isotropic=0.1)),
+                ("zero", directional_step(directional=0.0, isotropic=0.0,
+                                          step_id="step_directional_zero")),
+            ):
+                p = project(dimension)
+                p["steps"] = [step]
+                self.assertEqual(requested_input_hash(validate_project(p)[0]),
+                                 frozen[(dimension, label)])
+
+    def test_rate_set_mask_materials_are_tracked_material_references(self):
+        from backend.materials import referenced_material_names
+        names = referenced_material_names({"geometry": {"kind": "plane"}, "steps": [
+            {"model": "directional", "rateSets": [
+                {"direction": [0.0, 1.0, 0.0], "directionalVelocity": 0.1,
+                 "maskMaterials": ["CustomHardmask", "Mask"]}]}]})
+        # A custom material named only in a per-set mask must stay a real
+        # reference, otherwise project materialDefinitions drop it on reopen.
+        self.assertEqual(names, {"CustomHardmask", "Mask"})
+
+    def test_rate_set_validation_hash_normalization_and_mutual_exclusion(self):
+        p = project(2)
+        p["steps"] = [rate_set_step()]
+        parsed, warnings = validate_project(p)
+        self.assertEqual(warnings, [])
+        baseline = requested_input_hash(parsed)
+        single_set = copy.deepcopy(p)
+        single_set["steps"] = [rate_set_step(rate_sets=[
+            {"direction": [0.0, -1.0, 0.0], "directionalVelocity": 0.3, "isotropicVelocity": 0.05}])]
+        scalar_equivalent = copy.deepcopy(p)
+        scalar_equivalent["steps"] = [directional_step(directional=0.3, isotropic=0.05)]
+        # Physically equal inputs in different schema shapes must hash differently.
+        self.assertNotEqual(requested_input_hash(validate_project(single_set)[0]),
+                            requested_input_hash(validate_project(scalar_equivalent)[0]))
+        self.assertNotEqual(baseline, requested_input_hash(validate_project(single_set)[0]))
+
+        # Directions are normalized per set, exactly like the scalar field.
+        scaled = copy.deepcopy(p)
+        scaled["steps"][0]["rateSets"][0]["direction"] = [0.0, 0.5, 0.0]
+        self.assertEqual(baseline, requested_input_hash(validate_project(scaled)[0]))
+
+        # A set without a directional velocity cannot consume direction/visibility.
+        zero = copy.deepcopy(p)
+        zero["steps"][0]["rateSets"][0].update(directionalVelocity=0.0, isotropicVelocity=0.0)
+        zero_other = copy.deepcopy(zero)
+        zero_other["steps"][0]["rateSets"][0].update(direction=[1.0, 0.0, 0.0],
+                                                     calculateVisibility=False)
+        self.assertEqual(requested_input_hash(validate_project(zero)[0]),
+                         requested_input_hash(validate_project(zero_other)[0]))
+
+        changed = copy.deepcopy(p)
+        changed["steps"][0]["rateSets"][1]["isotropicVelocity"] = 0.02
+        self.assertNotEqual(baseline, requested_input_hash(validate_project(changed)[0]))
+
+        def bad(mutate, label):
+            value = copy.deepcopy(p)
+            mutate(value)
+            with self.assertRaises(ProjectInputError, msg=label):
+                validate_project(value)
+
+        bad(lambda value: value["steps"][0].update(rateSets=[]), "empty list")
+        bad(lambda value: value["steps"][0].update(
+            rateSets=[copy.deepcopy(value["steps"][0]["rateSets"][0]) for _ in range(9)]), "too many sets")
+        bad(lambda value: value["steps"][0]["rateSets"][0].update(direction=[0.0, 0.0, 0.0]),
+            "zero direction")
+        bad(lambda value: value["steps"][0]["rateSets"][0].update(direction=[0.0, 1.0, 0.5]),
+            "2D third component")
+        bad(lambda value: value["steps"][0]["rateSets"][0].update(directionalVelocity=-0.1),
+            "negative rate")
+        bad(lambda value: value["steps"][0]["rateSets"][0].update(isotropicVelocity=2.5),
+            "rate above bound")
+        bad(lambda value: value["steps"][0].update(direction=[0.0, -1.0, 0.0]), "scalar direction")
+        bad(lambda value: value["steps"][0].update(directionalRateMagnitude=0.1),
+            "scalar directional rate")
+        bad(lambda value: value["steps"][0].update(isotropicRateMagnitude=0.1),
+            "scalar isotropic rate")
+        bad(lambda value: value["steps"][0].update(calculateVisibility=False),
+            "step-level visibility")
+        bad(lambda value: value["steps"][0]["rateSets"][0].update(maskMaterials=["Mask", "Mask"]),
+            "duplicate masks")
+        bad(lambda value: value["steps"][0]["rateSets"][0].update(maskMaterials=["NotAMaterial"]),
+            "unknown mask")
+        bad(lambda value: value["steps"][0].update(rateFunction="lambda x: x"), "custom callable")
+
+        # A mask list that drops geometry protection is explicit and warned about.
+        masked = project(2, "trench")
+        masked["steps"] = [rate_set_step(rate_sets=[
+            {"direction": [0.0, 1.0, 0.0], "directionalVelocity": 0.2, "maskMaterials": []}])]
+        _parsed, masked_warnings = validate_project(masked)
+        self.assertTrue(any("omits geometry mask material(s) Mask" in warning
+                            for warning in masked_warnings), masked_warnings)
+
+        # 3D uses all three components; the same request is rejected in 2D.
+        three_d = project(3)
+        three_d["steps"] = [rate_set_step(rate_sets=[
+            {"direction": [0.0, 0.0, 1.0], "directionalVelocity": 0.2}])]
+        validate_project(three_d)
+        planar = project(2)
+        planar["steps"] = [rate_set_step(rate_sets=[
+            {"direction": [0.0, 0.0, 1.0], "directionalVelocity": 0.2}])]
+        with self.assertRaises(ProjectInputError):
+            validate_project(planar)
 
     def test_zero_directional_and_isotropic_components_are_noop_independently(self):
         p = project(2)
@@ -255,3 +383,182 @@ class DirectionalWorkflow(unittest.IsolatedAsyncioTestCase):
         history = json_body(await asgi_request(f"/api/runs/{run_id}"))
         self.assertEqual(history["actualExecution"][0]["actualParameters"]["nativeDirectionalVelocity"], -0.2)
         self.assertEqual(history["actualExecution"][0]["actualParameters"]["randomSeed"], "not-applicable")
+
+    async def test_rate_sets_native_reference_in_2d_and_3d(self):
+        two_d = project(2)
+        two_d["steps"] = [rate_set_step(rate_sets=[
+            {"direction": [0.0, -1.0, 0.0], "directionalVelocity": 0.15, "isotropicVelocity": 0.05},
+            {"direction": [0.6, -0.8, 0.0], "directionalVelocity": 0.1},
+        ])]
+        run_id, info = await self.assert_reference(two_d, "directional-ratesets-2d")
+        record = info["actualExecution"][0]
+        parameters = record["actualParameters"]
+        self.assertEqual(record["actualEngine"], "not-applicable")
+        self.assertIsNone(record["actualSeed"])
+        self.assertIsNone(record["actualRate"])
+        self.assertEqual(parameters["mode"], "rateSets")
+        self.assertEqual(parameters["nativeOverload"], "DirectionalProcess(rateSets: Sequence[RateSet])")
+        self.assertEqual(parameters["rateSetCount"], 2)
+        self.assertEqual([item["nativeDirectionalVelocity"] for item in parameters["rateSets"]],
+                         [-0.15, -0.1])
+        self.assertEqual([item["nativeIsotropicVelocity"] for item in parameters["rateSets"]],
+                         [-0.05, -0.0])
+        self.assertEqual([item["nativeUnitDirection"] for item in parameters["rateSets"]],
+                         [[0.0, -1.0, 0.0], [0.6, -0.8, 0.0]])
+        self.assertEqual([item["maskSource"] for item in parameters["rateSets"]],
+                         ["geometry", "geometry"])
+        self.assertEqual(parameters["rateSets"][0]["requestedMaskMaterials"], None)
+        self.assertEqual(parameters["maskMaterials"], [])
+        self.assertEqual(parameters["raysPerPoint"], "not-applicable")
+        self.assertEqual(parameters["randomSeed"], "not-applicable")
+        self.assertEqual(storage.read_json(storage.run_path(run_id) / "manifest.json")["schemaVersion"], 5)
+
+        three_d = project(3)
+        three_d["steps"] = [rate_set_step(operation="deposit", deposit_material="W", rate_sets=[
+            {"direction": [0.0, 0.0, -1.0], "directionalVelocity": 0.2, "isotropicVelocity": 0.02},
+            {"direction": [0.6, 0.0, -0.8], "directionalVelocity": 0.05},
+        ])]
+        run_3d, info_3d = await self.assert_reference(three_d, "directional-ratesets-3d")
+        parameters_3d = info_3d["actualExecution"][0]["actualParameters"]
+        self.assertEqual([item["nativeDirectionalVelocity"] for item in parameters_3d["rateSets"]],
+                         [0.2, 0.05])
+        self.assertEqual(parameters_3d["rateSets"][1]["nativeIsotropicVelocity"], 0.0)
+        self.assertIn(70, storage.read_json(storage.run_path(run_3d) / "manifest.json")["snapshots"][-1]["materialIds"])
+
+    async def test_rate_sets_additivity_per_set_mask_and_visibility(self):
+        # Two 0.15 sets in the same direction are the scalar 0.3 field: the
+        # native sequence overload sums each RateSet contribution.
+        scalar = project(2, "trench")
+        scalar["steps"] = [directional_step(direction=[0.0, -1.0, 0.0], directional=0.3,
+                                             isotropic=0.0, visibility=True)]
+        scalar_id, _ = await self.execute(scalar)
+        split = project(2, "trench")
+        split["steps"] = [rate_set_step(duration=0.4, rate_sets=[
+            {"direction": [0.0, -1.0, 0.0], "directionalVelocity": 0.15},
+            {"direction": [0.0, -1.0, 0.0], "directionalVelocity": 0.15},
+        ])]
+        split_id, split_info = await self.execute(split)
+        self.assertEqual([item["maskMaterials"] for item in split_info["actualExecution"][0]["actualParameters"]["rateSets"]],
+                         [["Mask"], ["Mask"]])
+        snapshot_store.ensure_materialized(storage.run_path(scalar_id), "step_directional")
+        snapshot_store.ensure_materialized(storage.run_path(split_id), "step_rate_sets")
+        scalar_snapshot = storage.read_json(storage.run_path(scalar_id) / "step_directional.json")
+        split_snapshot = storage.read_json(storage.run_path(split_id) / "step_rate_sets.json")
+        self.assertEqual(len(scalar_snapshot["points"]), len(split_snapshot["points"]))
+        self.assertEqual(scalar_snapshot["lines"], split_snapshot["lines"])
+        self.assertEqual(scalar_snapshot["cellData"]["materialIds"],
+                         split_snapshot["cellData"]["materialIds"])
+        self.assertLessEqual(max((math.dist(left, right) for left, right in
+                                  zip(scalar_snapshot["points"], split_snapshot["points"])), default=0.0),
+                             1e-12)
+
+        # Per-set masks: dropping the geometry mask for one set changes the field.
+        masked = project(2, "trench")
+        masked["steps"] = [rate_set_step(rate_sets=[
+            {"direction": [0.0, -1.0, 0.0], "directionalVelocity": 0.2,
+             "maskMaterials": ["Mask"]},
+            {"direction": [0.0, -1.0, 0.0], "directionalVelocity": 0.2,
+             "maskMaterials": ["Mask"]},
+        ])]
+        unmasked = copy.deepcopy(masked)
+        unmasked["steps"][0]["rateSets"][1]["maskMaterials"] = []
+        masked_id, masked_info = await self.execute(masked)
+        unmasked_id, unmasked_info = await self.execute(unmasked)
+        self.assertEqual([item["maskSource"] for item in
+                          unmasked_info["actualExecution"][0]["actualParameters"]["rateSets"]],
+                         ["request", "request"])
+        self.assertEqual([item["maskMaterials"] for item in
+                          unmasked_info["actualExecution"][0]["actualParameters"]["rateSets"]],
+                         [["Mask"], []])
+        self.assertEqual([item["maskMaterialIds"] for item in
+                          unmasked_info["actualExecution"][0]["actualParameters"]["rateSets"]],
+                         [[0], []])
+        compare_mask = []
+        for run_id in (masked_id, unmasked_id):
+            snapshot_store.ensure_materialized(storage.run_path(run_id), "step_rate_sets")
+            compare_mask.append(storage.read_json(storage.run_path(run_id) / "step_rate_sets.json"))
+        self.assertNotEqual(compare_mask[0]["points"], compare_mask[1]["points"])
+
+        # Per-set visibility: the diagonal set shadows differently when it is off.
+        outputs = {}
+        for visibility in (True, False):
+            value = project(2, "trench")
+            value["steps"] = [rate_set_step(rate_sets=[
+                {"direction": [0.6, -0.8, 0.0], "directionalVelocity": 0.3,
+                 "calculateVisibility": visibility},
+                {"direction": [-0.6, -0.8, 0.0], "directionalVelocity": 0.3,
+                 "calculateVisibility": visibility},
+            ])]
+            run_id, info = await self.execute(value)
+            self.assertEqual([item["calculateVisibility"] for item in
+                              info["actualExecution"][0]["actualParameters"]["rateSets"]],
+                             [visibility, visibility])
+            snapshot_store.ensure_materialized(storage.run_path(run_id), "step_rate_sets")
+            outputs[visibility] = storage.read_json(storage.run_path(run_id) / "step_rate_sets.json")
+        self.assertNotEqual(outputs[True]["points"], outputs[False]["points"],
+                            "per-set visibility did not reach the native RateSet")
+
+    async def test_rate_sets_save_reopen_replay_and_zero_noop(self):
+        value = project(2)
+        value["steps"] = [rate_set_step(rate_sets=[
+            {"direction": [0.0, -1.0, 0.0], "directionalVelocity": 0.12, "isotropicVelocity": 0.02},
+            {"direction": [0.6, -0.8, 0.0], "directionalVelocity": 0.08},
+        ]), rate_set_step(rate_sets=[
+            {"direction": [0.0, -1.0, 0.0], "directionalVelocity": 0.0,
+             "isotropicVelocity": 0.0},
+        ], step_id="step_rate_sets_zero")]
+        run_id, info = await self.assert_reference(value, "directional-ratesets-save-replay-2d")
+        zero_parameters = info["actualExecution"][-1]["actualParameters"]
+        self.assertTrue(info["actualExecution"][-1]["noOp"])
+        self.assertEqual(zero_parameters["mode"], "rateSets")
+        self.assertEqual(zero_parameters["rateSetCount"], 1)
+        self.assertIn("not-applicable", zero_parameters["rateSets"][0]["calculateVisibility"])
+        snapshot_store.ensure_materialized(storage.run_path(run_id), "step_rate_sets_zero")
+        self.assertTrue(storage.read_json(storage.run_path(run_id) / "step_rate_sets_zero.json")["noOp"])
+
+        created = await asgi_request("/api/projects", method="POST", payload=value)
+        self.assertEqual(created[0], 201, created[2])
+        project_id = json_body(created)["id"]
+        reopened = json_body(await asgi_request(f"/api/projects/{project_id}"))["project"]
+        normalized = validate_project(value)[0].model_dump(mode="json", exclude_none=True)
+        self.assertEqual(reopened, normalized)
+        self.assertEqual([item["direction"] for item in reopened["steps"][0]["rateSets"]],
+                         [item["direction"] for item in value["steps"][0]["rateSets"]])
+        self.assertEqual([item["directionalVelocity"] for item in reopened["steps"][0]["rateSets"]],
+                         [item["directionalVelocity"] for item in value["steps"][0]["rateSets"]])
+        self.assertTrue(all(item["calculateVisibility"] is True
+                            for item in reopened["steps"][0]["rateSets"]))
+        validated = await asgi_request("/api/projects/validate", method="POST", payload=reopened)
+        self.assertEqual(validated[0], 200, validated[2])
+        self.assertEqual(json_body(validated)["normalizedProject"], normalized)
+        self.assertEqual(json_body(validated)["requestedInputHash"],
+                         requested_input_hash(validate_project(value)[0]))
+
+        replay = json_body(await asgi_request(f"/api/runs/{run_id}/replay-project"))
+        self.assertEqual(replay["schemaVersion"], 5)
+        self.assertEqual(replay["executionRequirements"]["steps"], [])
+        self.assertEqual([item["direction"] for item in replay["normalizedProject"]["steps"][0]["rateSets"]],
+                         [item["direction"] for item in value["steps"][0]["rateSets"]])
+        self.assertEqual([item["directionalVelocity"] for item in replay["normalizedProject"]["steps"][0]["rateSets"]],
+                         [item["directionalVelocity"] for item in value["steps"][0]["rateSets"]])
+        submitted = await asgi_request("/api/runs/replay", method="POST", payload=replay)
+        self.assertEqual(submitted[0], 202, submitted[2])
+        replay_id = json_body(submitted)["runId"]
+        replay_info = await self.wait(replay_id)
+        for step in ("initial", "step_rate_sets", "step_rate_sets_zero"):
+            snapshot_store.ensure_materialized(storage.run_path(run_id), step)
+            snapshot_store.ensure_materialized(storage.run_path(replay_id), step)
+            left = storage.read_json(storage.run_path(run_id) / f"{step}.json")
+            right = storage.read_json(storage.run_path(replay_id) / f"{step}.json")
+            self.assertEqual(left["points"], right["points"])
+            self.assertEqual(left.get("lines"), right.get("lines"))
+            self.assertEqual(left.get("triangles"), right.get("triangles"))
+            self.assertEqual(left["cellData"]["materialIds"], right["cellData"]["materialIds"])
+        self.assertEqual(replay_info["actualExecution"][0]["actualParameters"]["rateSets"],
+                         info["actualExecution"][0]["actualParameters"]["rateSets"])
+
+        archive = await asgi_request(f"/api/runs/{run_id}/download")
+        self.assertEqual(archive[0], 200)
+        with zipfile.ZipFile(io.BytesIO(archive[2])) as zipped:
+            self.assertIn("replay-project.json", zipped.namelist())
+            self.assertIn("step_rate_sets.json", zipped.namelist())

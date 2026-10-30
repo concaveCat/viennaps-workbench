@@ -637,23 +637,81 @@ class ProjectV4(StrictModel):
         return self
 
 Project = ProjectV1  # frozen v1 public Python API
+
+
+def _directional_rate_set_directions(step: "DirectionalStepV5") -> list[tuple[int | None, list[float]]]:
+    """Return the per-set (index, direction) pairs a 2D project must check."""
+    if step.rateSets is not None:
+        return [(index, rate_set.direction) for index, rate_set in enumerate(step.rateSets)]
+    return [(None, step.direction)]
+
+
+class DirectionalRateSetV5(StrictModel):
+    """One real ``viennaps.RateSet`` of the native multi-set overload.
+
+    ``directionalVelocity`` and ``isotropicVelocity`` are non-negative rate
+    magnitudes in um/s, exactly like the step-level scalar fields: the step
+    ``operation`` selects the native sign (etch negative, deposit positive).
+    The name follows the native RateSet property and is not a signed raw value.
+    """
+
+    direction: DirectionVector3
+    directionalVelocity: Annotated[Number, Field(ge=0, le=2)]
+    isotropicVelocity: Annotated[Number, Field(ge=0, le=2)] = 0.0
+    # ``None`` means "derive from the project geometry", the same protected
+    # materials the scalar directional path uses. An explicit list (including
+    # the empty list) is honoured verbatim, so a set can only skip protection
+    # by naming that intent explicitly.
+    maskMaterials: Annotated[list[Annotated[str, Field(min_length=1, max_length=80)]], Field(max_length=16)] | None = None
+    calculateVisibility: bool = True
+
+    @model_validator(mode="after")
+    def validate_rate_set(self):
+        if math.sqrt(sum(float(value) ** 2 for value in self.direction)) <= 1e-12:
+            raise ValueError("rateSets direction must be a nonzero 3-component vector")
+        if self.maskMaterials is not None and len(set(self.maskMaterials)) != len(self.maskMaterials):
+            raise ValueError("rateSets maskMaterials must not contain duplicate material names")
+        return self
+
+
 class DirectionalStepV5(StrictModel):
     id: Annotated[str, Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")]
     name: Annotated[str, Field(min_length=1, max_length=80)]
     enabled: bool
     operation: Literal["etch", "deposit"]
     model: Literal["directional"]
-    direction: DirectionVector3
-    directionalRateMagnitude: Annotated[Number, Field(ge=0, le=2)]
-    isotropicRateMagnitude: Annotated[Number, Field(ge=0, le=2)]
+    # Scalar mode keeps the historical required fields. ``None`` rather than a
+    # default keeps them out of ``model_dump(exclude_none=True)`` for the
+    # additive ``rateSets`` mode, so every existing request hash is unchanged.
+    direction: DirectionVector3 | None = None
+    directionalRateMagnitude: Annotated[Number, Field(ge=0, le=2)] | None = None
+    isotropicRateMagnitude: Annotated[Number, Field(ge=0, le=2)] | None = None
     calculateVisibility: bool = True
+    # Native DirectionalProcess(rateSets: Sequence[RateSet]). Bounded because
+    # every set with a directed component costs one native visibility pass.
+    rateSets: Annotated[list[DirectionalRateSetV5], Field(min_length=1, max_length=8)] | None = None
     duration: Annotated[Number, Field(ge=0.01, le=600)]
     depositMaterial: str | None = None
 
     @model_validator(mode="after")
     def validate_directional_fields(self):
-        if math.sqrt(sum(float(value) ** 2 for value in self.direction)) <= 1e-12:
-            raise ValueError("direction must be a nonzero 3-component vector")
+        scalar_fields = ("direction", "directionalRateMagnitude", "isotropicRateMagnitude")
+        if self.rateSets is None:
+            if any(getattr(self, name) is None for name in scalar_fields):
+                raise ValueError(
+                    "directional steps require direction, directionalRateMagnitude and "
+                    "isotropicRateMagnitude unless rateSets is used")
+            if math.sqrt(sum(float(value) ** 2 for value in self.direction)) <= 1e-12:
+                raise ValueError("direction must be a nonzero 3-component vector")
+        else:
+            if any(name in self.model_fields_set for name in scalar_fields):
+                raise ValueError(
+                    "rateSets is mutually exclusive with direction, directionalRateMagnitude "
+                    "and isotropicRateMagnitude")
+            if self.calculateVisibility is not True:
+                raise ValueError(
+                    "rateSets uses per-set calculateVisibility; omit the step-level flag "
+                    "or leave it true")
         if self.operation == "deposit" and self.depositMaterial is None:
             raise ValueError("deposit steps require depositMaterial")
         if self.operation == "etch" and "depositMaterial" in self.model_fields_set:
@@ -966,8 +1024,11 @@ class ProjectV6(StrictModel):
         if len(ids) != len(set(ids)):
             raise ValueError("step IDs must be unique")
         for index, step in enumerate(self.steps):
-            if isinstance(step, DirectionalStepV5) and self.dimension == 2 and abs(step.direction[2]) > 1e-12:
-                raise ValueError(f"2D directional step {index} must use [x, h, 0]; its third direction component must be zero")
+            if isinstance(step, DirectionalStepV5):
+                for set_index, direction in _directional_rate_set_directions(step):
+                    if self.dimension == 2 and abs(direction[2]) > 1e-12:
+                        path = f"{index}" if set_index is None else f"{index}.rateSets[{set_index}]"
+                        raise ValueError(f"2D directional step {path} must use [x, h, 0]; its third direction component must be zero")
             if isinstance(step, BooleanStepV5):
                 if self.dimension == 2 and (abs(step.position[2]) > 1e-12 or step.depth is not None):
                     raise ValueError(f"2D boolean step {index} requires position [x, h, 0] and no depth")
@@ -1121,8 +1182,10 @@ class ProjectV5(StrictModel):
             raise ValueError("step IDs must be unique")
         for index, step in enumerate(self.steps):
             if isinstance(step, DirectionalStepV5):
-                if self.dimension == 2 and abs(step.direction[2]) > 1e-12:
-                    raise ValueError(f"2D directional step {index} must use [x, h, 0]; its third direction component must be zero")
+                for set_index, direction in _directional_rate_set_directions(step):
+                    if self.dimension == 2 and abs(direction[2]) > 1e-12:
+                        path = f"{index}" if set_index is None else f"{index}.rateSets[{set_index}]"
+                        raise ValueError(f"2D directional step {path} must use [x, h, 0]; its third direction component must be zero")
             elif isinstance(step, BooleanStepV5):
                 if self.dimension == 2 and (abs(step.position[2]) > 1e-12 or step.depth is not None):
                     raise ValueError(f"2D boolean step {index} requires position [x, h, 0] and no depth")

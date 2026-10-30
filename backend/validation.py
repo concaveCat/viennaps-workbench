@@ -12,7 +12,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from .models import Domain3D, Project, ProjectV3, ProjectV4, ProjectV5, ProjectV6, ProjectV7, parse_project
-from .materials import attach_and_reconcile_project_materials
+from .materials import attach_and_reconcile_project_materials, geometry_mask_material_names
 from .rates import has_motion, is_geometry_step, uses_flux, value as step_value
 from .specialized_models import FLUOROCARBON_MATERIAL_DEFAULTS, model_spec
 from .runtime_limits import available_cpu_threads
@@ -181,6 +181,7 @@ def validate_project(payload: Any, *, kind: str = "project") -> tuple[Project, l
         issues.extend(_validate_materials(project))
         warnings.extend(_planarize_warnings(project))
         warnings.extend(_gds_boolean_warnings(project))
+        warnings.extend(_directional_rate_set_warnings(project))
         if project.schemaVersion == 7:
             warnings.extend(_specialized_model_warnings(project))
         if project.schemaVersion == 7:
@@ -348,6 +349,34 @@ def _specialized_model_warnings(project: Any) -> list[str]:
     return warnings
 
 
+def _directional_rate_set_warnings(project: Any) -> list[str]:
+    """Warn when an explicit per-set mask list drops geometry protection.
+
+    A ``rateSets`` entry without ``maskMaterials`` inherits the project's
+    geometry-derived masks. An explicit list is honoured verbatim, including an
+    empty list, so a set can act on a mask material. That is a deliberate
+    choice, but it must never happen silently: surface it at validation time.
+    """
+    warnings: list[str] = []
+    geometry_masks = geometry_mask_material_names(project.geometry)
+    if not geometry_masks:
+        return warnings
+    for index, step in enumerate(project.steps):
+        if step_value(step, "model") != "directional" or step_value(step, "rateSets") is None:
+            continue
+        for set_index, rate_set in enumerate(step_value(step, "rateSets")):
+            masks = step_value(rate_set, "maskMaterials")
+            if masks is None:
+                continue
+            missing = [name for name in geometry_masks if name not in masks]
+            if missing:
+                warnings.append(
+                    f"steps[{index}].rateSets[{set_index}].maskMaterials explicitly omits geometry mask "
+                    f"material(s) {', '.join(missing)}; this rate set moves those materials. Add them to the "
+                    "list to keep the geometry protection.")
+    return warnings
+
+
 def _gds_boolean_warnings(project: Any) -> list[str]:
     """State what a GDS boolean does not model.
 
@@ -450,6 +479,12 @@ def _validate_materials(project: ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 |
                 continue
             add(layer["material"],layer["role"] if uniform_protection else "film",f"geometry.layers[{i}].material")
     for i,step in enumerate(project.steps):
+        if step_value(step,"model") == "directional" and step_value(step,"rateSets") is not None:
+            for set_index, rate_set in enumerate(step_value(step,"rateSets")):
+                for mask_index, name in enumerate(step_value(rate_set,"maskMaterials") or []):
+                    if name not in names:
+                        issues.append(FieldIssue(f"steps[{i}].rateSets[{set_index}].maskMaterials[{mask_index}]",
+                                                 f"unknown or unavailable material {name!r}; choose a material from /api/materials"))
         if is_geometry_step(step) and step_value(step,"model")=="removeMaterial" and step_value(step,"material") not in names:
             issues.append(FieldIssue(f"steps[{i}].material",f"unknown or unavailable material {step_value(step,'material')!r}"))
         if is_geometry_step(step) and step_value(step,"model")=="planarize":

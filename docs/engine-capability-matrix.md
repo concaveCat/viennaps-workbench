@@ -37,7 +37,7 @@ what the docstring implies. Empty `dimensions` means the class never sees a doma
 | --- | --- | --- | --- |
 | `IsotropicProcess` | `model: isotropic` (schema 1+) | 2/3 | per-material rates via `rateMode: material`; no flux engine |
 | `SingleParticleProcess` | `model: singleParticle` | 2/3 | CPU_DISK / GPU_DISK, explicit seed + `raysPerPoint` |
-| `DirectionalProcess` | `model: directional` (schema 5+) | 2/3 | single-velocity overload only |
+| `DirectionalProcess` | `model: directional` (schema 5+) | 2/3 | scalar overload by default; optional `rateSets` uses the native `Sequence[RateSet]` overload |
 | `MultiParticleProcess` | `model: multiParticle` (schema 7) | 2/3 | declarative ion/neutral species + linear rate coefficients |
 | `SF6O2Etching` | `specialized/sf6o2` | 2/3 | flat 8-argument form or `advanced` → `PlasmaEtchingParameters`; fixed coverage tolerance |
 | `CF4O2Etching` | `specialized/cf4o2` | 2/3 | flat 10-argument form or `advanced` → `CF4O2Parameters` |
@@ -122,7 +122,7 @@ custom material catalog.
 | `CF4O2Parameters` | B1: `Ions`, `Mask`, `Passivation`, `Si`, `SiGe` (`beta_sigma`/`k_sigma`/`rho`), `gamma_*`, `fluxIncludeSticking` | `SiGe.A_ie/A_sp/Eth_ie/Eth_sp/x` (ignored by native SiGe branch); `k_sigma_SiGe` method | SiGe chemistry is represented by the three fields the native branch reads |
 | `CF4O2ParametersSiGe` | B1: `beta_sigma`, `k_sigma`, `rho` | sputter/yield fields and `x`; `k_sigma_SiGe` method | A full SiGe yield editor is not available because the native branch does not read those fields |
 | `CoverageParameters` | `tolerance = 1e-3` (hard-coded) | `tolerance`, `maxIterations`, `initialized` | Convergence cannot be tightened or loosened |
-| `RateSet` | 4 fields flattened into the scalar `directional` step | multi-`RateSet` sequences, per-set masks | Per-material direction/velocity impossible |
+| `RateSet` | `model: directional` `rateSets[]`: 1–8 sets, per-set direction, velocities, masks and visibility | `print()` (debug helper) | Multiple simultaneous directions and per-set masks are now declarative |
 | `SurfaceDiffusionParameters` | — | 7 members | No workbench code path constructs it; it is a level-set smoothing model, so an insertion point must be evidenced first |
 | `DenseCellSet` | OxideRegrowth by-product JSON only | generic per-step generation, height/cover/periodic options, filling fractions, user scalars, VTU export, continuation | No project can request a volumetric field of its own |
 | `Oxidation` advanced setters | 13 of ~40 | CFL, coupling/mechanics/Stokes/pressure iterations+tolerances, solve bounds, `maxGridPoints`, simple relaxation, mask contact/traction mechanics, `GpuMode`/`GpuPreconditioner`, model-level `saveSurfaceMesh`/`saveVolumeMesh` helpers (the workbench writes the same meshes through `Domain`), `estimatePlanarOxideThickness` | Separate solver surface; unproven on this host |
@@ -223,11 +223,16 @@ hashes when unused.
      is still pending;
   4. no UI field is added by this backend/API change.
 
-### Batch B2 — multi-`RateSet` directional model
+### Batch B2 — multi-`RateSet` directional model (exposed)
 
-- Acceptance: bounded `rateSets` list, mutually exclusive with the scalar fields; existing directional
-  hashes unchanged; a two-material run matches a native reference; per-set `maskMaterials` are either
-  supported or rejected, never silently ignored.
+The installed 4.6.2 binding has a real `DirectionalProcess(rateSets: Sequence[RateSet])` overload in
+both `viennaps.d2` and `viennaps.d3`; `worker/probe_ratesets_native.py` verifies that directional and
+isotropic velocities are additive, that opposite sets cancel, and that per-set `maskMaterials` and
+`calculateVisibility` are honoured. The additive schema surface is `steps[].rateSets[]`, mutually
+exclusive with the scalar fields. `maskMaterials` omitted inherits the geometry-derived masks; an
+explicit list (including `[]`) is used verbatim and recorded per set, so no mask is silently ignored.
+See [`directional-contract.md`](directional-contract.md). Remaining native overload: the per-material
+`materialRates` mapping, which stays unexposed because the per-set form covers the modelling need.
 
 ### Batch B3 — `SurfaceDiffusionParameters`
 
