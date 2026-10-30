@@ -52,6 +52,8 @@ export type VtkScene = {
   getFps(): number;
   getTriangleCount(): number;
   getPointCount(): number;
+  /** Bounds of the geometry currently on screen (hidden/clipped removed). */
+  getVisibleBounds(): Bounds6 | null;
   readPixels(): { width: number; height: number; pixels: Uint8Array } | null;
   destroy(): void;
 };
@@ -702,6 +704,7 @@ export async function createVtkScene(container: HTMLElement): Promise<VtkScene> 
     getFps,
     getTriangleCount: () => currentMesh?.triangleCount ?? 0,
     getPointCount: () => currentMesh?.pointCount ?? 0,
+    getVisibleBounds: () => visibleBounds() ?? fullBounds(),
     readPixels,
     destroy,
   };

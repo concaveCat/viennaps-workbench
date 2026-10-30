@@ -130,6 +130,8 @@ export type Viewer3DHandle = {
   getFps(): number;
   getTriangleCount(): number;
   getPointCount(): number;
+  /** Bounds of the geometry currently on screen (hidden/clipped removed). */
+  getVisibleBounds(): [number, number, number, number, number, number] | null;
 };
 
 export type ClipState = {

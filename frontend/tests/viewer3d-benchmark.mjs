@@ -131,13 +131,22 @@ try {
   assert.ok(heavyPixels.nonBackground > 5000, 'simplified mesh did not render');
 
   // --- clipping plane is real ----------------------------------------------
+  // The viewer re-fits the camera to the visible half, so the painted pixel
+  // count no longer has to shrink; the visible *bounds* prove the cut.
   await page.evaluate(() => window.__viewer3dHarness.switchStep('step-1'));
   const beforeClip = await page.evaluate(() => window.__viewer3dHarness.analyze().nonBackground);
+  const fullBounds = await page.evaluate(() => window.__viewer3dHarness.visibleBounds());
   await page.getByLabel('截面', { exact: true }).check();
-  await page.waitForTimeout(250);
+  await page.waitForTimeout(400);
   const afterClip = await page.evaluate(() => window.__viewer3dHarness.analyze().nonBackground);
+  const clippedBounds = await page.evaluate(() => window.__viewer3dHarness.visibleBounds());
   await page.getByLabel('截面', { exact: true }).uncheck();
-  assert.ok(afterClip < beforeClip * 0.85, `clipping did not remove geometry (${beforeClip} -> ${afterClip})`);
+  assert.ok(fullBounds && clippedBounds, 'visible bounds must be available for the clip check');
+  const fullSpanX = fullBounds[3] - fullBounds[0];
+  const clippedSpanX = clippedBounds[3] - clippedBounds[0];
+  assert.ok(clippedSpanX < fullSpanX * 0.75,
+    `clipping did not remove geometry (x span ${fullSpanX} -> ${clippedSpanX})`);
+  assert.ok(afterClip > 5000, `the clipped half must stay visible (${beforeClip} -> ${afterClip} painted pixels)`);
   check('X/Y/Z clipping slider removes geometry', { before: beforeClip, after: afterClip });
 
   // --- wireframe toggle is real --------------------------------------------

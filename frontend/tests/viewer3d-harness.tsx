@@ -52,6 +52,8 @@ type HarnessApi = {
   /** Same report for the 2D canvas renderer. */
   analyze2d(): PixelReport | null;
   resetView(): void;
+  /** Visible geometry bounds, used to prove the clip plane is real. */
+  visibleBounds(): [number, number, number, number, number, number] | null;
   /** Synchronous single frame, for isolating render cost from vsync. */
   renderFrame(): number;
   /** Raw WebGL2 floor for the same triangle count and canvas size. */
@@ -286,6 +288,7 @@ function Harness() {
         return summarizePixels(canvas.width, canvas.height, image.data, [247, 249, 251]);
       },
       resetView: () => handleRef.current?.resetView(),
+      visibleBounds: () => handleRef.current?.getVisibleBounds() ?? null,
       webglBaseline: (width: number, height: number, triangles: number) => webglBaseline(width, height, triangles),
       renderFrame: () => {
         const handle = handleRef.current;

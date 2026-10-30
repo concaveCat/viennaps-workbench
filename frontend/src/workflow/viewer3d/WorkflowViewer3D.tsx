@@ -215,6 +215,7 @@ export default function WorkflowViewer3D({
           getFps: () => created.getFps(),
           getTriangleCount: () => created.getTriangleCount(),
           getPointCount: () => created.getPointCount(),
+          getVisibleBounds: () => created.getVisibleBounds(),
         };
         callbacks.current.onSceneReady?.(handle);
         setSceneVersion((value) => value + 1);
