@@ -1600,6 +1600,60 @@ def capability_verified(dimension: int, model: str, operation: str, boundary: st
         return False
 
 
+def slice_axis_bounds(project: dict[str, Any], slice_request: dict[str, Any]) -> dict[str, Any]:
+    """Return the native Slice axis, output extent and source-axis bound.
+
+    The slice position moves along the normal axis, so it is bounded by that
+    axis' domain extent. Half-domain geometries (HALF/QUARTER holes and
+    halfFin/halfTrench) only occupy the positive half of the halved axes.
+    z has no finite computational boundary; its bound is the measured source
+    surface range and is checked by the worker after the initial snapshot.
+    """
+    axis_label = str(slice_request.get("sliceAxis") or "y")
+    if axis_label not in {"x", "y", "z"}:
+        raise ValueError(f"native Slice axis must be x, y or z, not {axis_label!r}")
+    axis = {"x": 0, "y": 1, "z": 2}[axis_label]
+    domain = project["domain"]
+    geometry = project.get("geometry") or {}
+    hole_shape = str(geometry.get("holeShape") or "FULL")
+    half_x = (hole_shape in ("HALF", "QUARTER")
+              or bool(geometry.get("halfTrench")) or bool(geometry.get("halfFin")))
+    half_y = hole_shape == "QUARTER"
+    x_extent = float(domain["xExtent"])
+    y_extent = float(domain["yExtent"])
+    if axis == 0:
+        return {"axis": axis, "axisName": "x", "outputExtent": y_extent,
+                "min": 0.0 if half_x else -x_extent / 2,
+                "max": x_extent / 2, "halfDomain": half_x,
+                "lateralAxis": "y", "verticalAxis": "z", "normal": [1.0, 0.0, 0.0]}
+    if axis == 1:
+        return {"axis": axis, "axisName": "y", "outputExtent": x_extent,
+                "min": 0.0 if half_y else -y_extent / 2,
+                "max": y_extent / 2, "halfDomain": half_y,
+                "lateralAxis": "x", "verticalAxis": "z", "normal": [0.0, 1.0, 0.0]}
+    return {"axis": axis, "axisName": "z", "outputExtent": x_extent,
+            "min": None, "max": None, "halfDomain": False,
+            "lateralAxis": "x", "verticalAxis": "y", "normal": [0.0, 0.0, 1.0]}
+
+
+def slice_position_issue(project: dict[str, Any], slice_request: dict[str, Any]) -> str | None:
+    """Return a 422-ready reason when the Slice position misses its axis."""
+    try:
+        position = float(slice_request["position"])
+    except (KeyError, TypeError, ValueError):
+        return "native Slice requires a finite position"
+    if not math.isfinite(position):
+        return "native Slice requires a finite position"
+    bounds = slice_axis_bounds(project, slice_request)
+    if bounds["min"] is None:
+        return None
+    if bounds["min"] - 1e-12 <= position <= bounds["max"] + 1e-12:
+        return None
+    half_note = " (half-domain limit)" if bounds["halfDomain"] else ""
+    return (f"native Slice {bounds['axisName']} position {position:g} lies outside the source "
+            f"{bounds['axisName']} range [{bounds['min']:g}, {bounds['max']:g}]{half_note}")
+
+
 def select_engine(project: dict, step: dict, *, analysis_mode: str = "process") -> str:
     if not (uses_flux(step) if project.get("schemaVersion") in (4,5,6,7) else step["model"] == "singleParticle" and step["rateMagnitude"] > 0):
         return "not-applicable"

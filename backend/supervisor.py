@@ -24,7 +24,7 @@ from . import materials as material_registry
 from .validation import (GPU_MULTIPARTICLE_FLUX_STRATEGY, GPU_MULTIPARTICLE_SPLIT_STRATEGY,
                          GPU_MULTIPARTICLE_NATIVE_STRATEGY, GPU_MULTIPARTICLE_NATIVE_FLUX_STRATEGY,
                          select_engine, capability_verified, experimental_cpu_replay_allowed,
-                         gpu_project_signature)
+                         gpu_project_signature, slice_position_issue)
 from .native_build import configured_runtime
 from .rates import uses_flux
 from .runtime_limits import max_log_bytes, max_log_mib, rss_limit_mib
@@ -199,6 +199,8 @@ class Supervisor:
                 except ValueError as exc:
                     raise ReplayMismatch(f"native Slice request is invalid: {exc}") from exc
                 slice_request = normalized_slice
+                if issue := slice_position_issue(project, slice_request):
+                    raise ReplayMismatch(issue)
                 request_hash = hashlib.sha256((request_hash + json.dumps(slice_request, sort_keys=True, separators=(",", ":"), allow_nan=False)).encode("utf-8")).hexdigest()
             if kind == "simulate":
                 enabled_steps = [step for step in project["steps"] if step["enabled"]]
@@ -493,8 +495,17 @@ class Supervisor:
                 random_config = project["solver"]["random"]
                 replay_actual_seed = int(random_config.get("seed", 0))
             replay_project["solver"]["random"] = {"mode": "fixed", "seed": replay_actual_seed}
-            replay_engine = next((item["engine"] for item in actual_steps if item["engine"] in {"CPU_DISK", "GPU_DISK", "CPU_TRIANGLE", "GPU_TRIANGLE"}), "CPU_DISK")
-            replay_project["solver"]["enginePreference"] = "gpu" if replay_engine.startswith("GPU_") else "cpu"
+            replay_engine = next((item["engine"] for item in actual_steps if item["engine"] in {"CPU_DISK", "GPU_DISK", "CPU_TRIANGLE", "GPU_TRIANGLE"}), None)
+            if replay_engine is not None:
+                replay_project["solver"]["enginePreference"] = "gpu" if replay_engine.startswith("GPU_") else "cpu"
+            elif replay_project["solver"].get("gpuEngine") is not None:
+                # A preview has no executed particle step, so there is no
+                # actual engine to pin. Keep the requested gpu/gpuEngine pair
+                # intact; forcing "cpu" here would leave an invalid
+                # combination that the replay schema rejects.
+                replay_project["solver"]["enginePreference"] = "gpu"
+            else:
+                replay_project["solver"]["enginePreference"] = "cpu"
             if selected_gpu_device is not None and project["schemaVersion"] == 7:
                 replay_project["solver"]["gpuDeviceId"] = selected_gpu_device["uuid"]
             replay_requirements = [

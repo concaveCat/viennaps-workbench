@@ -12,8 +12,11 @@ import copy
 import json
 import math
 import os
+import subprocess
 import sys
+import tempfile
 import unittest
+from importlib.metadata import version
 from pathlib import Path
 from unittest.mock import patch
 
@@ -225,6 +228,67 @@ class NativeCapabilityRelease(unittest.IsolatedAsyncioTestCase):
                 "directReference": str(direct_path.relative_to(ROOT)),
             }, indent=2) + "\n", encoding="utf-8")
 
+    def run_direct_worker(self, project: dict, *, step_engines: dict | None = None,
+                          device: bool = True, timeout: int = 240) -> tuple[int, str, dict]:
+        workdir = Path(tempfile.mkdtemp(prefix="direct-worker-", dir=str(ROOT / "var")))
+        self.addCleanup(lambda: __import__("shutil").rmtree(workdir, ignore_errors=True))
+        config = {
+            "kind": "simulate", "runId": "direct-worker", "project": project,
+            "runSeed": 271828,
+            "expectedVersions": {"viennaps": version("viennaps"), "viennals": version("viennals")},
+        }
+        if step_engines is not None:
+            config["stepEngines"] = step_engines
+        if device:
+            config["selectedGpuDevice"] = DEVICE
+        input_path = workdir / "input.json"
+        input_path.write_text(json.dumps(config), encoding="utf-8")
+        run_dir = workdir / "run"
+        run_dir.mkdir()
+        completed = subprocess.run(
+            [str(ROOT / ".venv/bin/python"), str(ROOT / "worker/simulate.py"),
+             str(input_path), str(run_dir)],
+            cwd=ROOT, capture_output=True, text=True, timeout=timeout)
+        result_path = run_dir / "worker-result.json"
+        result = json.loads(result_path.read_text()) if result_path.is_file() else {}
+        return completed.returncode, completed.stdout + completed.stderr, result
+
+    def test_worker_direct_input_enforces_gpu_triangle_evidence_gate(self):
+        project = self.gpu_triangle_project(2)
+        parsed, _ = validate_project(project, kind="simulate")
+        normalized = parsed.model_dump(mode="json", exclude_none=True)
+        normalized["geometry"] = {"kind": "plane", "height": 0.0, "substrateMaterial": "Si"}
+        code, output, result = self.run_direct_worker(normalized, device=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("GPU_TRIANGLE has no direct-reference acceptance row", output)
+        self.assertIn("instead of falling back", output)
+        self.assertNotIn("WORKER_COMPLETE", output)
+        self.assertEqual(result, {})
+
+    def test_worker_omitted_step_engines_inherits_explicit_gpu_triangle(self):
+        project = self.gpu_triangle_project(2)
+        parsed, _ = validate_project(project, kind="simulate")
+        normalized = parsed.model_dump(mode="json", exclude_none=True)
+        code, output, result = self.run_direct_worker(normalized, step_engines=None)
+        if code != 0:
+            if any(token in output for token in ("CUDA", "cuda", "GPU", "device")):
+                self.skipTest(f"GPU unavailable in this sandbox: {output.strip().splitlines()[-1]}")
+            self.fail(output)
+        self.assertIn("WORKER_COMPLETE", output)
+        self.assertEqual(result["actualSteps"][0]["engine"], "GPU_TRIANGLE")
+        self.assertEqual(result["cudaDeviceReadback"]["uuid"], DEVICE["uuid"])
+
+    def test_worker_pinned_engine_must_match_explicit_gpu_engine(self):
+        project = self.gpu_triangle_project(2)
+        parsed, _ = validate_project(project, kind="simulate")
+        normalized = parsed.model_dump(mode="json", exclude_none=True)
+        step_id = normalized["steps"][0]["id"]
+        code, output, result = self.run_direct_worker(
+            normalized, step_engines={step_id: "GPU_DISK"}, device=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("differs from solver.gpuEngine GPU_TRIANGLE", output)
+        self.assertEqual(result, {})
+
     # ---------------------------------------------------------------------- Slice
     def slice_project(self, geometry: dict | None = None) -> dict:
         return project_v7(3, geometry or {
@@ -344,6 +408,89 @@ class NativeCapabilityRelease(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(snapshot["sliceReadback"]["reflectX"])
         self.assertEqual(signature(snapshot), direct_signature(direct, "slice"))
         self.assertLessEqual(bounds(snapshot)["x"][1], 0.0)
+
+    async def test_slice_position_uses_normal_axis_extent(self):
+        # Reproduces the swapped-bounds finding: X extent 2, Y extent 4,
+        # grid 0.2. x-normal is limited by X (±1) even though its output plane
+        # is Y-wide; y-normal is limited by Y (±2).
+        project = project_v7(3, {"kind": "plane", "height": 0.0, "substrateMaterial": "Si"},
+                             name="axis bounds")
+        project["domain"].update({"xExtent": 2.0, "yExtent": 4.0, "gridDelta": 0.2})
+        for axis, position, expected in (("x", 0.8, 202), ("x", 1.5, 422),
+                                         ("y", 1.5, 202), ("y", 2.5, 422)):
+            with self.subTest(axis=axis, position=position):
+                response = await asgi_request("/api/runs/slice", method="POST",
+                                              payload={"project": project,
+                                                       "sliceRequest": {"sliceAxis": axis,
+                                                                        "position": position}})
+                self.assertEqual(response[0], expected, response[2].decode("utf-8", errors="replace"))
+                if response[0] == 202:
+                    result = await self.wait_run(json_body(response)["runId"])
+                    self.assertEqual(result["status"], "succeeded", result.get("failureReason"))
+
+    async def test_slice_half_domain_positions_are_bounded(self):
+        hole = project_v7(3, {"kind": "hole", "radius": 1.0, "depth": 1.0, "taperAngle": 0.0,
+                              "maskHeight": 0.5, "maskTaperAngle": 0.0, "holeShape": "HALF",
+                              "substrateMaterial": "Si", "maskMaterial": "Mask"},
+                          name="half domain slice")
+        hole["domain"].update({"xExtent": 8.0, "yExtent": 8.0, "gridDelta": 0.25})
+        for position, expected in ((-0.2, 422), (0.25, 202)):
+            with self.subTest(position=position):
+                response = await asgi_request("/api/runs/slice", method="POST",
+                                              payload={"project": hole,
+                                                       "sliceRequest": {"sliceAxis": "x",
+                                                                        "position": position}})
+                self.assertEqual(response[0], expected, response[2].decode("utf-8", errors="replace"))
+                if expected == 422:
+                    detail = json.loads(response[2])["detail"]
+                    self.assertIn("half-domain", detail["message"])
+                else:
+                    result = await self.wait_run(json_body(response)["runId"])
+                    self.assertEqual(result["status"], "succeeded", result.get("failureReason"))
+        quarter = copy.deepcopy(hole)
+        quarter["geometry"]["holeShape"] = "QUARTER"
+        response = await asgi_request("/api/runs/slice", method="POST",
+                                      payload={"project": quarter,
+                                               "sliceRequest": {"sliceAxis": "y", "position": -0.25}})
+        self.assertEqual(response[0], 422, response[2].decode("utf-8", errors="replace"))
+
+    async def test_slice_metadata_uses_native_half_away_from_zero_rounding(self):
+        project = project_v7(3, {"kind": "plane", "height": 0.0, "substrateMaterial": "Si"},
+                             name="rounding slice")
+        project["domain"].update({"xExtent": 2.0, "yExtent": 4.0, "gridDelta": 0.2})
+        response = await asgi_request("/api/runs/slice", method="POST",
+                                      payload={"project": project,
+                                               "sliceRequest": {"sliceAxis": "y", "position": 0.1}})
+        self.assertEqual(response[0], 202, response[2].decode("utf-8", errors="replace"))
+        run_id = json_body(response)["runId"]
+        result = await self.wait_run(run_id)
+        self.assertEqual(result["status"], "succeeded", result.get("failureReason"))
+        snapshot = await self.snapshot(run_id, "true-slice")
+        readback = snapshot["sliceReadback"]
+        self.assertAlmostEqual(readback["requestedPosition"], 0.1)
+        self.assertAlmostEqual(readback["position"], 0.2)
+        self.assertTrue(readback["positionAdjustedToGrid"])
+
+    async def test_preview_replay_document_keeps_a_valid_gpu_engine_pair(self):
+        for engine in ("GPU_DISK", "GPU_TRIANGLE"):
+            with self.subTest(engine=engine):
+                project = self.gpu_triangle_project(2)
+                project["steps"] = []
+                project["solver"]["gpuEngine"] = engine
+                response = await asgi_request("/api/runs", method="POST",
+                                              payload={"kind": "preview", "project": project})
+                self.assertEqual(response[0], 202, response[2].decode("utf-8", errors="replace"))
+                run_id = json_body(response)["runId"]
+                result = await self.wait_run(run_id)
+                self.assertEqual(result["status"], "succeeded", result.get("failureReason"))
+                replay = json_body(await asgi_request(f"/api/runs/{run_id}/replay-project"))
+                self.assertEqual(replay["normalizedProject"]["solver"]["enginePreference"], "gpu")
+                self.assertEqual(replay["normalizedProject"]["solver"]["gpuEngine"], engine)
+                replay_response = await asgi_request("/api/runs/replay", method="POST", payload=replay)
+                self.assertEqual(replay_response[0], 202,
+                                 replay_response[2].decode("utf-8", errors="replace"))
+                replay_result = await self.wait_run(json_body(replay_response)["runId"])
+                self.assertEqual(replay_result["status"], "succeeded", replay_result.get("failureReason"))
 
     # ------------------------------------------------------------- Hole/fin/trench
     def test_omitted_native_shape_flags_keep_historical_hashes(self):

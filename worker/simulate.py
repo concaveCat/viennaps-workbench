@@ -31,7 +31,8 @@ from backend.rates import has_motion, is_geometry_step, uses_flux, signed_rates,
 from backend.models import normalized_geometry_v3, parse_project, project_structure_hash
 from backend.runtime_limits import MAX_CELL_SET_CELLS, artifact_limit_bytes, artifact_limit_label
 from backend.preflight import CELL_SET_JSON_BYTES, CELL_SET_VTU_BYTES_PER_CELL
-from backend.validation import fin_construction_decision
+from backend.validation import (capability_verified, fin_construction_decision,
+                               gpu_project_signature, slice_axis_bounds)
 from backend.gpu_devices import cuda_devices, resolve_gpu_device
 from backend.gds import MAX_GDS_BLUR_CELLS, blur_exposure_cell_count
 from worker.gds_mask import CONSTRUCTION as GDS_MASK_CONSTRUCTION
@@ -52,6 +53,52 @@ GPU_MULTIPARTICLE_SPLIT_STRATEGY = "symmetric-operator-splitting-v1"
 GPU_MULTIPARTICLE_FLUX_STRATEGY = "per-species-native-mesh-merge-v1"
 GPU_MULTIPARTICLE_NATIVE_STRATEGY = "native-multi-ion-v1"
 GPU_MULTIPARTICLE_NATIVE_FLUX_STRATEGY = "native-multi-ion-flux-v1"
+
+
+def requested_engine_for_step(project: dict[str, Any], step: dict[str, Any],
+                              step_engines: dict[str, Any]) -> str:
+    """Resolve one worker engine without ever contradicting solver.gpuEngine.
+
+    Direct worker input does not pass through backend.validation, so an
+    omitted ``stepEngines`` entry must not silently downgrade an explicit
+    schema-7 GPU engine to GPU_DISK. A pinned entry that disagrees with the
+    requested engine is a hard error.
+    """
+    explicit = step_engines.get(step["id"])
+    solver = project.get("solver") or {}
+    requested = solver.get("gpuEngine") if project.get("schemaVersion") == 7 else None
+    if requested is not None:
+        if solver.get("enginePreference") != "gpu":
+            raise RuntimeError(
+                "solver.gpuEngine requires solver.enginePreference=gpu in the worker input")
+        if explicit is not None and explicit != requested:
+            raise RuntimeError(
+                f"pinned engine {explicit} for step {step['id']} differs from solver.gpuEngine {requested}")
+        return str(requested)
+    if explicit is not None:
+        return str(explicit)
+    return "GPU_DISK" if solver.get("enginePreference") == "gpu" else "CPU_DISK"
+
+
+def verify_worker_engine_evidence(project: dict[str, Any], step: dict[str, Any], engine: str) -> None:
+    """Apply the API capability gate to direct worker input.
+
+    The worker is independently reachable through a bounded run directory.
+    GPU_TRIANGLE must be checked against the archived product/direct matrix
+    here too, otherwise a normalized but unproven project could still call
+    Process.setFluxEngineType(GPU_TRIANGLE).
+    """
+    if engine != "GPU_TRIANGLE":
+        return
+    model = f"specialized:{step['nativeModel']}" if step.get("model") == "specialized" else step["model"]
+    boundary = project["domain"].get("boundaryXY", project["domain"].get("xBoundary"))
+    signature = gpu_project_signature(project, step)
+    if not capability_verified(project["dimension"], model, step["operation"], boundary, engine,
+                               schema_version=project.get("schemaVersion"), **signature):
+        raise RuntimeError(
+            f"GPU_TRIANGLE has no direct-reference acceptance row for {model} "
+            f"{step['operation']} on {boundary} in {project['dimension']}D; the worker refuses "
+            "the request instead of falling back to GPU_DISK or CPU_DISK")
 
 
 def configure_native_materials(ps: Any, custom_rows: list[dict[str, Any]]) -> None:
@@ -3087,9 +3134,22 @@ def execute(input_path: Path, run_dir: Path) -> None:
     run_seed = int(config["runSeed"]) if config.get("runSeed") is not None else None
     engine_preference = project["solver"]["enginePreference"]
     actual_steps = [step for step in project["steps"] if step["enabled"]] if kind == "simulate" else []
-    step_engines = config.get("stepEngines", {})
-    if kind == "flux" and config.get("analysisStepId"):
-        step_engines = {**step_engines, config["analysisStepId"]: step_engines.get(config["analysisStepId"])}
+    step_engines = dict(config.get("stepEngines", {}))
+    # Resolve every particle step before CUDA setup. This makes an omitted
+    # stepEngines entry inherit an explicit solver.gpuEngine instead of
+    # silently selecting GPU_DISK, and gates GPU_TRIANGLE exactly like the API.
+    if kind == "simulate":
+        engine_steps = [step for step in actual_steps if uses_flux(step)]
+    elif kind == "flux":
+        flux_id = config.get("analysisStepId")
+        candidate = next((step for step in project["steps"] if step.get("id") == flux_id), None)
+        engine_steps = [candidate] if candidate is not None and candidate.get("enabled") and uses_flux(candidate) else []
+    else:
+        engine_steps = []
+    for step in engine_steps:
+        resolved = requested_engine_for_step(project, step, step_engines)
+        verify_worker_engine_evidence(project, step, resolved)
+        step_engines[step["id"]] = resolved
     uses_cuda_engine = any(isinstance(engine, str) and engine.startswith("GPU_") for engine in step_engines.values())
     selected_gpu_device = None
     cuda_readback = None
@@ -3256,11 +3316,15 @@ def execute(input_path: Path, run_dir: Path) -> None:
         slice_request = config.get("sliceRequest")
         if project["dimension"] != 3 or not isinstance(slice_request, dict):
             raise RuntimeError("native Slice requires a 3D source domain")
-        axis_label = slice_request.get("sliceAxis") or "y"
-        axis_map = {"x": 0, "y": 1, "z": 2}
-        if axis_label not in axis_map:
-            raise RuntimeError(f"native Slice axis must be x, y or z, not {axis_label!r}")
-        slice_axis = axis_map[axis_label]
+        try:
+            axis_bounds = slice_axis_bounds(project, slice_request)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(str(exc)) from exc
+        axis_label = axis_bounds["axisName"]
+        slice_axis = axis_bounds["axis"]
+        output_extent = axis_bounds["outputExtent"]
+        lateral_axis, vertical_axis = axis_bounds["lateralAxis"], axis_bounds["verticalAxis"]
+        normal = axis_bounds["normal"]
         reflect_x = bool(slice_request.get("reflectX", False))
         slice_position = float(slice_request["position"])
         if not math.isfinite(slice_position):
@@ -3269,33 +3333,33 @@ def execute(input_path: Path, run_dir: Path) -> None:
         # Native ViennaLS maps the two remaining coordinates into the output
         # x/h plane in ascending source-axis order:
         #   x-normal -> (y, z), y-normal -> (x, z), z-normal -> (x, y).
-        if slice_axis == 0:
-            lateral_extent = float(project["domain"]["yExtent"])
-            lateral_axis, vertical_axis = "y", "z"
-            normal = [1.0, 0.0, 0.0]
-            if abs(slice_position) > lateral_extent / 2 + 1e-12:
-                raise RuntimeError("native Slice x position must lie inside the 3D y domain")
-        elif slice_axis == 1:
-            lateral_extent = float(project["domain"]["xExtent"])
-            lateral_axis, vertical_axis = "x", "z"
-            normal = [0.0, 1.0, 0.0]
-            if abs(slice_position) > lateral_extent / 2 + 1e-12:
-                raise RuntimeError("native Slice y position must lie inside the 3D x domain")
+        # The slice position moves along the normal axis, so x/y are bounded
+        # by that axis' (possibly halved) domain extent.
+        if axis_bounds["min"] is not None:
+            if not (axis_bounds["min"] - 1e-12 <= slice_position <= axis_bounds["max"] + 1e-12):
+                half_note = " (half-domain limit)" if axis_bounds["halfDomain"] else ""
+                raise RuntimeError(
+                    f"native Slice {axis_label} position {slice_position:g} lies outside the source "
+                    f"{axis_label} range [{axis_bounds['min']:g}, {axis_bounds['max']:g}]{half_note}")
         else:
-            lateral_extent = float(project["domain"]["xExtent"])
-            lateral_axis, vertical_axis = "x", "y"
-            normal = [0.0, 0.0, 1.0]
+            # The z computational boundary is infinite; use the measured
+            # source surface range instead of a lateral extent.
             bounds = initial.get("surfaceBounds") or []
             if len(bounds) == 2:
-                z_min, z_max = float(bounds[0][2]), float(bounds[1][2])
-                if slice_position < z_min - delta or slice_position > z_max + delta:
+                axis_min, axis_max = float(bounds[0][2]), float(bounds[1][2])
+                if slice_position < axis_min - delta or slice_position > axis_max + delta:
                     raise RuntimeError(
                         f"native Slice z position {slice_position:g} lies outside the source surface "
-                        f"z range [{z_min:g}, {z_max:g}]")
-        native_position = round(slice_position / delta) * delta
+                        f"z range [{axis_min:g}, {axis_max:g}]")
+        # Native ViennaLS uses std::round(): half away from zero. Python's
+        # round() is ties-to-even, which would record a different position for
+        # requests such as 0.1 um at gridDelta=0.2 um.
+        grid_index = slice_position / delta
+        native_index = math.floor(grid_index + 0.5) if grid_index >= 0 else math.ceil(grid_index - 0.5)
+        native_position = native_index * delta
         ps.setDimension(2)
         slice_boundary = ps.BoundaryType.REFLECTIVE_BOUNDARY if project["domain"]["boundaryXY"] == "reflective" else ps.BoundaryType.PERIODIC_BOUNDARY
-        sliced_domain = ps.d2.Domain(delta, lateral_extent, slice_boundary)
+        sliced_domain = ps.d2.Domain(delta, output_extent, slice_boundary)
         slice_operation = ps.Slice(domain, sliced_domain, slice_axis, slice_position)
         if reflect_x:
             slice_operation.setReflectX(True)
@@ -3306,7 +3370,7 @@ def execute(input_path: Path, run_dir: Path) -> None:
         slice_project = json.loads(json.dumps(project, ensure_ascii=False))
         slice_project["dimension"] = 2
         slice_project["domain"] = {"gridDelta":delta,
-                                    "xExtent":lateral_extent,
+                                    "xExtent":output_extent,
                                     "xBoundary":project["domain"]["boundaryXY"]}
         slice_project.pop("view3D", None)
         mapped = f"{lateral_axis}/{vertical_axis} mapped to x/h"
@@ -3320,7 +3384,9 @@ def execute(input_path: Path, run_dir: Path) -> None:
                           "position":native_position,
                           "positionAdjustedToGrid":native_position != slice_position,
                           "sourceDimension":3, "outputDimension":2,
-                          "outputLateralExtent":lateral_extent,
+                          "outputLateralExtent":output_extent,
+                          "sourceAxisRange":[axis_bounds["min"], axis_bounds["max"]]
+                          if axis_bounds["min"] is not None else "infinite",
                           "viewerClipping":False, "levelSetCount":int(sliced_domain.getNumberOfLevelSets()),
                           "materialIdsByLevelSetIndex":material_map(sliced_domain)}
         slice_result = save_snapshot(ps, sliced_domain, run_dir, run_id=run_id, step_id="true-slice",
@@ -3330,9 +3396,10 @@ def execute(input_path: Path, run_dir: Path) -> None:
         event(run_dir, {"type":"snapshot", **slice_result})
         ps.setDimension(3)
     if flux_step is not None:
-        selected_engine = config.get("stepEngines", {}).get(flux_step["id"])
+        selected_engine = step_engines.get(flux_step["id"])
         if selected_engine is None:
-            raise RuntimeError("single flux calculation has no selected concrete engine")
+            selected_engine = requested_engine_for_step(project, flux_step, step_engines)
+        verify_worker_engine_evidence(project, flux_step, selected_engine)
         if run_seed is None:
             raise RuntimeError("single flux calculation requires a recorded fixed random seed")
         flux_multi_ion = (flux_step.get("model") == "multiParticle"
@@ -3583,9 +3650,10 @@ def execute(input_path: Path, run_dir: Path) -> None:
             elif step.get("model") != "multiParticle" and not specialized and not csv_process:
                 rate, signed_material_rates = signed_rates(step)
             particle = uses_flux(step)
-            configured_engine = config.get("stepEngines", {}).get(step["id"])
+            configured_engine = step_engines.get(step["id"]) if particle else None
             if configured_engine is None and particle:
-                configured_engine = "GPU_DISK" if engine_preference == "gpu" else "CPU_DISK"
+                configured_engine = requested_engine_for_step(project, step, step_engines)
+                verify_worker_engine_evidence(project, step, configured_engine)
             gpu_multi_ion = (project["schemaVersion"] == 7 and step.get("model") == "multiParticle"
                              and configured_engine == "GPU_DISK"
                              and sum(row.get("kind") == "ion" for row in step.get("species", [])) > 1)
@@ -3640,9 +3708,10 @@ def execute(input_path: Path, run_dir: Path) -> None:
                                 "native model does not use a stochastic ray flux engine" if specialized and not particle else
                                 "isotropic model does not use a ray flux engine")
             if particle:
-                engine = config.get("stepEngines",{}).get(step["id"])
+                engine = step_engines.get(step["id"])
                 if engine is None:
-                    engine = "GPU_DISK" if engine_preference == "gpu" else "CPU_DISK"
+                    engine = requested_engine_for_step(project, step, step_engines)
+                verify_worker_engine_evidence(project, step, engine)
                 if engine not in {"CPU_DISK","GPU_DISK","CPU_TRIANGLE","GPU_TRIANGLE"}:
                     raise RuntimeError("no verified concrete flux engine for step")
                 if process is not None:
@@ -3750,7 +3819,7 @@ def execute(input_path: Path, run_dir: Path) -> None:
                     os.chdir(previous_cwd)
             next_gpu_step_pending = any(
                 uses_flux(future)
-                and str(config.get("stepEngines", {}).get(
+                and str(step_engines.get(
                     future["id"], "GPU_DISK" if engine_preference == "gpu" else "CPU_DISK")).startswith("GPU_")
                 for future in actual_steps[index:]
             )
@@ -3871,7 +3940,7 @@ def execute(input_path: Path, run_dir: Path) -> None:
         event(run_dir, {"type": "snapshot", **metadata})
         future_gpu_process = any(
             uses_flux(future)
-            and str(config.get("stepEngines", {}).get(
+            and str(step_engines.get(
                 future["id"], "GPU_DISK" if engine_preference == "gpu" else "CPU_DISK")).startswith("GPU_")
             for future in actual_steps[index:]
         )

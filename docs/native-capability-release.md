@@ -61,6 +61,17 @@ The run manifest records `plannedExecution[].engine = GPU_TRIANGLE`,
 GPU_TRIANGLE`, and the worker's `cudaDeviceReadback` (UUID/PCI bus/readback
 status).
 
+The worker re-applies the same capability/evidence gate before
+`Process.setFluxEngineType`, because direct worker input bypasses the API. An
+omitted `stepEngines` entry inherits `solver.gpuEngine` instead of defaulting to
+`GPU_DISK`; a pinned entry that contradicts `solver.gpuEngine` is rejected.
+Passing an unproven normalized project directly to the worker therefore fails
+before any native GPU process is built.
+
+A preview (no particle steps) has no executed engine to pin. Its replay
+document keeps the requested `gpu`/`gpuEngine` pair instead of forcing `cpu`
+and leaving an invalid combination.
+
 ## 2. Any-axis Slice
 
 ### Request
@@ -95,11 +106,15 @@ existing request hashes and replay documents are unchanged.
 | `z` | 2 | `[0,0,1]` | source x / source y |
 
 The output 2D domain lateral extent follows the mapped coordinate
-(`yExtent` for x-normal, `xExtent` for y- and z-normal). x/y positions are
-bounded by that lateral half-extent; z positions must lie inside the source
-surface z range. The worker rounds the position to the native grid and records
-both `requestedPosition` and the actual `position`. A slice plane with no
-defined points raises instead of exporting an empty mesh.
+(`yExtent` for x-normal, `xExtent` for y- and z-normal). The slice position
+moves along the **normal** axis, so x-normal positions are bounded by the
+source x range, y-normal positions by the y range, and z-normal positions by
+the measured source surface z range. Half-domain geometries (`holeShape`
+HALF/QUARTER, `halfTrench`, `halfFin`) only retain the positive half of the
+halved axes, so a HALF hole rejects `sliceAxis=x` positions below 0. The worker
+rounds the position with the native half-away-from-zero rule and records both
+`requestedPosition` and the actual `position`. A slice plane with no defined
+points raises instead of exporting an empty mesh.
 
 `sliceReadback` records `axis`, `axisName`, `planeNormal`,
 `outputCoordinateMapping`, `reflectX`, requested/actual position,
@@ -150,7 +165,14 @@ There is no silent full-shape fallback.
   if the sandbox cannot reach CUDA.
 - x/y/z slices on a 3D geometry against an independent native Slice, plane
   normals, output coordinate extents, reflect-X mirroring, default hash
-  stability, 2D rejection, invalid axes and replay.
+  stability, normal-axis bounds (including half-domain limits), native
+  half-away-from-zero position rounding, 2D rejection, invalid axes and
+  replay.
+- Direct worker input: the GPU_TRIANGLE evidence gate, omitted-`stepEngines`
+  inheritance of `solver.gpuEngine`, and rejection of a pinned engine that
+  contradicts it.
+- Preview replay documents for both `GPU_DISK` and `GPU_TRIANGLE`, parsed and
+  replayed through the API.
 - HALF/QUARTER/halfFin/halfTrench product/direct comparisons in 2D and 3D,
   x/y bounds, QUARTER symmetry, omitted-hash stability, invalid combinations
   and replay.
