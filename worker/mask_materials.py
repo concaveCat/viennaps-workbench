@@ -1,7 +1,7 @@
 """Material names that a native process must not move.
 
 This is the single implementation shared by the particle/directional paths and
-the CSV rate-grid path. It covers the built-in trench/hole mask, stack mask
+the CSV rate-grid path. It covers the built-in trench/hole/fin mask, stack mask
 layers and the legacy stack ``gdsMask`` overlay (only when it protects etch),
 plus GDS geometry layers explicitly marked as masks.
 """
@@ -14,7 +14,7 @@ def protected_material_names(project: dict[str, Any], step: dict[str, Any] | Non
     if project["schemaVersion"] in (4, 5, 6, 7) and step is not None and step.get("rateMode") == "material":
         return []
     geometry = project["geometry"]
-    if geometry["kind"] in ("trench", "hole") and float(geometry.get("maskHeight", 0)) > 0:
+    if geometry["kind"] in ("trench", "hole", "fin") and float(geometry.get("maskHeight", 0)) > 0:
         return [geometry.get("maskMaterial", "Mask")]
     if geometry["kind"] == "stack":
         values = [layer["material"] for layer in geometry["layers"] if layer["role"] == "mask"]

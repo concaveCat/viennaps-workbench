@@ -22,8 +22,9 @@ canonical form that is known-native-safe:
 * comment lines (leading ASCII whitespace, then ``#``) and blank lines are
   removed; an inline ``#`` in a data row is rejected because the native reader
   would try to parse it as a number;
-* only plain decimal/exponent numbers are accepted, with no NaN/Inf/hex and no
-  underflow-to-zero;
+* only plain decimal/exponent numbers are accepted, with no NaN/Inf/hex, no
+  underflow-to-zero and no nonzero subnormal doubles (the native reader rejects
+  subnormals while Python would still represent them);
 * every number is re-emitted with Python's shortest round-trip decimal form;
 * output is LF-terminated ASCII with exactly D comma-separated columns per row.
 
@@ -40,6 +41,7 @@ from __future__ import annotations
 import hashlib
 import math
 import re
+import sys
 from typing import Any
 
 MAX_CSV_BYTES = 16 * 1024 * 1024
@@ -79,6 +81,13 @@ def _finite(text: str, *, line: int, column: str) -> float:
                 f"line {line}: column {column} underflows to zero; use a representable rate or an explicit 0")
         # Normalize negative zero so the canonical file is deterministic.
         value = 0.0
+    elif abs(value) < sys.float_info.min:
+        # The native RateGrid reader rejects subnormal literals even though
+        # Python can represent them. IDW then returns without moving and LINEAR
+        # can crash, so they must never reach the native constructor.
+        raise RateCsvError(
+            f"line {line}: column {column} is a subnormal double ({value:g}); "
+            f"use 0 or a magnitude at least {sys.float_info.min:g}")
     return value
 
 
