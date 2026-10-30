@@ -20,7 +20,7 @@ evidence=[]
 for dim in [2,3]:
     ps.setDimension(dim)
     ps.setNumThreads(1)
-    dom=ps.Domain(.2,4.,4.,ps.BoundaryType.REFLECTIVE_BOUNDARY) if dim==3 else ps.Domain(.2,4.,ps.BoundaryType.REFLECTIVE_BOUNDARY)
+    dom=ps.Domain(.2,4.,4.,ps.BoundaryType.REFLECTIVE_BOUNDARY) if dim==3 else ps.Domain(.2, 4., boundary=ps.BoundaryType.REFLECTIVE_BOUNDARY)
     ps.MakePlane(dom,height=0.,material=registry.getMaterial('Si'),addToExisting=False).apply()
     ps.MakePlane(dom,height=.6,material=registry.getMaterial('SiO2'),addToExisting=True).apply()
     ps.MakePlane(dom,height=1.2,material=registry.getMaterial('Si3N4'),addToExisting=True).apply()

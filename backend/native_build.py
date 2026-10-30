@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path
 
+from .engine import PATCHED_RUNTIME_VERSIONS, version_label
+
 
 def fingerprint_package(package: Path) -> str:
     package = package.resolve(strict=True)
@@ -51,8 +53,11 @@ def configured_runtime(expected_fingerprint: str | None = None) -> tuple[Path, s
     for root in _runtime_roots():
         packages = [d for d in importlib.metadata.distributions(path=[str(root)])
                     if d.metadata.get("Name", "").lower() == "viennaps"]
-        if len(packages) != 1 or packages[0].version != "4.6.2":
-            failures.append(f"{root} is not exactly ViennaPS 4.6.2")
+        if len(packages) != 1 or packages[0].version not in PATCHED_RUNTIME_VERSIONS:
+            failures.append(
+                f"{root} is not a supported patched ViennaPS runtime "
+                f"({version_label(PATCHED_RUNTIME_VERSIONS)}); found "
+                f"{packages[0].version if len(packages) == 1 else 'no unique viennaps distribution'}")
             continue
         try:
             fingerprint = fingerprint_package(root / "viennaps")
@@ -64,4 +69,4 @@ def configured_runtime(expected_fingerprint: str | None = None) -> tuple[Path, s
     if expected_fingerprint is not None:
         raise RuntimeError(f"no retained ViennaPS runtime matches replay fingerprint {expected_fingerprint}")
     detail = "; ".join(failures)
-    raise RuntimeError(detail or "no valid ViennaPS 4.6.2 runtime is configured")
+    raise RuntimeError(detail or "no valid patched ViennaPS multi-ion runtime is configured")

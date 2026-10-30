@@ -5,6 +5,8 @@ import math
 from typing import Any
 
 from backend.specialized_models import advanced_spec, model_spec, oxidation_advanced_spec
+from backend.engine import (ald_surface_diffusion_error, engine_version,
+                           oxidation_advanced_supported)
 
 
 def _set_native_path(target: Any, path: str, value: Any) -> None:
@@ -303,6 +305,12 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
         extra.append(atomic)
         surface_diffusion = step.get("surfaceDiffusion")
         if surface_diffusion is not None and surface_diffusion.get("enabled", True):
+            # Same rule as API validation: a hand-edited worker input must not
+            # reach the known hanging 4.7.0 native stencil. Fail before any
+            # SurfaceDiffusionParameters setter is constructed.
+            gate_message = ald_surface_diffusion_error()
+            if gate_message is not None:
+                raise RuntimeError(gate_message)
             coefficient = float(p["coverageDiffusionCoefficient"])
             if not math.isfinite(coefficient) or coefficient <= 0.0:
                 # ViennaPS 4.6.2 sets the ALP surface-diffusion flag only from
@@ -349,7 +357,13 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
             resolved["surfaceDiffusion"] = recorded
     elif model_id == "oxidation":
         model = ps.Oxidation()
-        model.setOxidant(getattr(ps.OxidantType, p["oxidant"]))
+        # viennals 5.8.5 spelled these enum members ``Dry``/``Wet``; 5.10.0
+        # renamed them to ``DRY``/``WET``. Accept both so the worker keeps
+        # working on either installed runtime.
+        oxidant = getattr(ps.OxidantType, p["oxidant"], None)
+        if oxidant is None:
+            oxidant = getattr(ps.OxidantType, str(p["oxidant"]).upper())
+        model.setOxidant(oxidant)
         model.setOrientation(getattr(ps.SiliconOrientation, p["orientation"]))
         model.setTemperature(float(p["temperatureC"]))
         model.setPressure(float(p["pressureAtm"]))
@@ -393,10 +407,23 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
             if effective["couplingTolerance"] < effective["mechanicsTolerance"]:
                 raise RuntimeError(
                     "advancedOxidation.couplingTolerance must be at least mechanicsTolerance")
+            for restricted in ("simplePressureRelaxation", "mechanicsTolerance",
+                               "couplingTolerance"):
+                if (effective[restricted] != fields[restricted]["default"]
+                        and not oxidation_advanced_supported(restricted)):
+                    raise RuntimeError(
+                        f"ViennaPS {engine_version()} does not honour "
+                        f"advancedOxidation.{restricted}; use the ViennaPS 4.6.2 runtime "
+                        f"or omit this override")
             model.setCFLFactor(effective["cflFactor"])
             model.setMechanicsTolerance(effective["mechanicsTolerance"])
             model.setCouplingTolerance(effective["couplingTolerance"])
-            model.setSimplePressureRelaxation(effective["simplePressureRelaxation"])
+            # 4.7.0 removed setSimplePressureRelaxation (pressure/stokes
+            # controls moved into OxidationParameters). Keep sending it when
+            # the binding has it; otherwise record that the knob is inert.
+            pressure_relaxation_applied = hasattr(model, "setSimplePressureRelaxation")
+            if pressure_relaxation_applied:
+                model.setSimplePressureRelaxation(effective["simplePressureRelaxation"])
             # ``Oxidation`` has no getters for these solver controls. The only
             # native readback available on the installed binding is the
             # Deal-Grove planar estimate, which also re-reads the orientation.
@@ -404,8 +431,10 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
                 "orientation": str(p["orientation"]),
                 "planarOxideThicknessUm": float(model.estimatePlanarOxideThickness(
                     float(p["initialOxideThicknessUm"]))),
-                "solverControls": "no native getters in viennaps 4.6.2; requested == effective after schema validation",
+                "solverControls": "no native getters in the installed viennaps; requested == effective after schema validation",
                 "nativeGetters": "not exposed",
+                "pressureRelaxationSetter": ("applied" if pressure_relaxation_applied
+                                             else "removed by the installed viennaps (4.7.0)"),
             }
             resolved["advancedOxidation"] = {
                 "schemaVersion": 1,
@@ -422,6 +451,7 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
                 "nativeSetters": {key: field["nativeSetter"] for key, field in fields.items()},
                 "nativeReadback": readback,
                 "defaultsSource": spec["defaultsSource"],
+                "runtimeGate": spec.get("runtimeGate", {}),
             }
     elif model_id == "oxideRegrowth":
         surface = domain.getSurfaceMesh(addInterfaces=True, sharpCorners=False, minNodeDistanceFactor=0.01)

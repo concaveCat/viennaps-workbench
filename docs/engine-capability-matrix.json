@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "kind": "engine-capability-matrix",
   "checkedAt": "2026-10-30",
-  "scope": "Installed ViennaPS 4.6.2 public Python surface vs. ViennaPS Workbench schema 7 project API.",
+  "scope": "Installed ViennaPS 4.6.2 public Python surface (audited) and the ViennaPS 4.7.0 release (evaluated, version-qualified) vs. ViennaPS Workbench schema 7 project API.",
   "environment": {
     "python": "3.12.14",
     "viennaps": "4.6.2",
@@ -11,7 +11,16 @@
     "workbenchCommit": "3eacc2c99b88e42dc82382891f1bb03eb0537694",
     "workbenchSchema": 7,
     "engineSitePackages": "/root/.local/lib/python3.12/site-packages/viennaps",
-    "probeMethod": "python -c introspection of viennaps/viennaps.d2/viennaps.d3; each behavioural probe ran as its own subprocess with a 40-120 s wall clock timeout in /tmp/opencode (no workbench state touched)"
+    "probeMethod": "python -c introspection of viennaps/viennaps.d2/viennaps.d3; each behavioural probe ran as its own subprocess with a 40-120 s wall clock timeout in /tmp/opencode (no workbench state touched)",
+    "evaluatedViennaPS": [
+      "4.6.2",
+      "4.7.0"
+    ],
+    "evaluatedViennaLS": [
+      "5.8.5",
+      "5.10.0"
+    ],
+    "runtimePolicy": "4.6.2 is the production runtime; 4.7.0 is supported through the same backend with version-gated ALD surface diffusion and advancedOxidation controls."
   },
   "classifications": {
     "exposed": "Reachable from a submitted project today, with its user-facing parameters.",
@@ -2721,9 +2730,9 @@
         "DirectionalProcess(rateSets)"
       ],
       "risk": "medium",
-      "notes": "Implemented as steps[].rateSets[] on model:directional, mutually exclusive with the scalar fields. Each set carries its own direction, directional/isotropic velocities, optional maskMaterials and calculateVisibility; 1–8 sets are accepted and the worker uses the native Sequence[RateSet] overload. The scalar form remains the default and keeps historical hashes.",
+      "notes": "Implemented as steps[].rateSets[] on model:directional, mutually exclusive with the scalar fields. Each set carries its own direction, directional/isotropic velocities, optional maskMaterials and calculateVisibility; 1\u20138 sets are accepted and the worker uses the native Sequence[RateSet] overload. The scalar form remains the default and keeps historical hashes.",
       "acceptanceCriteria": [
-        "A rateSets list (1–8 sets) is accepted alongside, and mutually exclusive with, the scalar fields.",
+        "A rateSets list (1\u20138 sets) is accepted alongside, and mutually exclusive with, the scalar fields.",
         "Existing directional projects keep their request hashes and results when rateSets is omitted.",
         "A multi-set run matches a direct native reference within 1e-6 um; opposite sets cancel additively.",
         "Per-set maskMaterials are fully supported (including an explicit empty list), not silently ignored.",

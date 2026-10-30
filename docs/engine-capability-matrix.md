@@ -1,4 +1,4 @@
-# Engine capability audit — installed ViennaPS 4.6.2 vs. the Workbench
+# Engine capability audit — ViennaPS 4.6.2 (audited) / 4.7.0 (evaluated) vs. the Workbench
 
 Machine-readable companion: [`engine-capability-matrix.json`](engine-capability-matrix.json)
 (`schemaVersion: 1`, 96 native classes/enums, 8 SPX-only capability rows, 10 implementation batches).
@@ -6,6 +6,7 @@ Machine-readable companion: [`engine-capability-matrix.json`](engine-capability-
 | Item | Value |
 | --- | --- |
 | Audited engine | `viennaps` 4.6.2 + `viennals` 5.8.5 (`/root/.local/lib/python3.12/site-packages/viennaps`) |
+| Evaluated engine | `viennaps` 4.7.0 + `viennals` 5.10.0 (PyPI wheels, isolated `/root/wb-v470/.venv`) |
 | Python | 3.12.14 |
 | Workbench | app 0.1.0, project schema 7, base commit `3eacc2c` |
 | Audit date | 2026-10-30 |

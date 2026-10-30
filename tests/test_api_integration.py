@@ -647,7 +647,10 @@ class ApiIntegrationTests(unittest.IsolatedAsyncioTestCase):
         unsupported["executionRequirements"]["viennapsVersion"] = "0.0.0"
         rejected = await asgi_request("/api/runs/replay", method="POST", payload=unsupported)
         self.assertEqual(rejected[0], 422)
-        self.assertIn("requires ViennaPS", json_body(rejected)["detail"]["message"])
+        detail = json_body(rejected)["detail"]
+        self.assertIn("requires ViennaPS", detail["message"])
+        self.assertIn("never reinterpreted", detail["message"])
+        self.assertEqual(detail["requiredVersions"]["viennaps"], "0.0.0")
 
         replayed = await asgi_request("/api/runs/replay", method="POST", payload=replay)
         self.assertEqual(replayed[0], 202, replayed[2].decode("utf-8", errors="replace"))
@@ -662,6 +665,7 @@ class ApiIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_schema7_replay_rejects_engine_preference_mismatch(self) -> None:
         from tests.test_stage7 import multi_project
+        from backend.engine import engine_version, viennals_version
 
         for preference, engine in (("cpu", "GPU_DISK"), ("gpu", "CPU_DISK")):
             with self.subTest(preference=preference, engine=engine):
@@ -671,13 +675,37 @@ class ApiIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     "format": "viennaps-replay", "schemaVersion": 7, "replayMode": "from-initial",
                     "analysisMode": "process", "normalizedProject": project,
                     "executionRequirements": {
-                        "viennapsVersion": "4.6.2", "viennalsVersion": "5.8.5", "cpuThreads": 1,
+                        "viennapsVersion": engine_version(),
+                        "viennalsVersion": viennals_version(), "cpuThreads": 1,
                         "steps": [{"stepId": project["steps"][0]["id"], "engine": engine, "seed": 271828}],
                     },
                 }
                 response = await asgi_request("/api/runs/replay", method="POST", payload=replay)
                 self.assertEqual(response[0], 422, response[2].decode("utf-8", errors="replace"))
                 self.assertIn("match normalizedProject.solver.enginePreference", json_body(response)["detail"]["message"])
+
+    async def test_old_runtime_replay_is_rejected_not_reinterpreted(self) -> None:
+        from tests.test_stage7 import multi_project
+        from backend.engine import engine_version
+
+        if engine_version() == "4.6.2":
+            self.skipTest("running on the original 4.6.2 runtime; nothing to reject")
+        project = multi_project(2, "etch")
+        replay = {
+            "format": "viennaps-replay", "schemaVersion": 7, "replayMode": "from-initial",
+            "analysisMode": "process", "normalizedProject": project,
+            "executionRequirements": {
+                "viennapsVersion": "4.6.2", "viennalsVersion": "5.8.5", "cpuThreads": 1,
+                "steps": [{"stepId": project["steps"][0]["id"], "engine": "CPU_DISK", "seed": 271828}],
+            },
+        }
+        response = await asgi_request("/api/runs/replay", method="POST", payload=replay)
+        self.assertEqual(response[0], 422, response[2].decode("utf-8", errors="replace"))
+        detail = json_body(response)["detail"]
+        self.assertEqual(detail["requiredVersions"], {"viennaps": "4.6.2", "viennals": "5.8.5"})
+        self.assertIn("never reinterpreted", detail["message"])
+        self.assertIn("4.6.2", detail["message"])
+        self.assertIn(engine_version(), detail["message"])
 
     async def test_schema7_gpu_project_validation_does_not_gate_multiion_species_signatures(self) -> None:
         from tests.test_stage7 import multi_project

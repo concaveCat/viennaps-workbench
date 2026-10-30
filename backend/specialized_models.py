@@ -5,6 +5,8 @@ import math
 from copy import deepcopy
 from typing import Any
 
+from .engine import OXIDATION_ADVANCED_RESTRICTED, engine_version
+
 
 def number(key: str, default: float, *, minimum: float = 0.0, maximum: float = 1_000_000.0,
            step: float = 0.1, label: str | None = None, unit: str | None = None) -> dict[str, Any]:
@@ -286,7 +288,8 @@ def oxidation_advanced_spec() -> dict[str, Any]:
         "nativeClass": OXIDATION_ADVANCED_NATIVE_CLASS,
         "requiresNativeModel": "oxidation",
         "objectShape": "strict object; unknown keys are rejected",
-        "defaultsSource": "installed viennaps 4.6.2 Oxidation member defaults",
+        "defaultsSource": "installed viennaps 4.6.2 Oxidation member defaults; re-probed on 4.7.0",
+        "runtimeGate": {key: reason for key, reason in OXIDATION_ADVANCED_RESTRICTED.items()},
         "fields": deepcopy(OXIDATION_ADVANCED_FIELDS),
         "excluded": [
             {"member": "setGpuMode", "reason": "CPU-only batch; GPU oxidation has no host evidence"},
@@ -427,7 +430,7 @@ BY_ID = {row["id"]: row for row in CATALOG}
 
 
 def specialized_catalog() -> dict[str, Any]:
-    return {"schemaVersion": 1, "engineVersion": "4.6.2", "unitsNote": "安装版绑定未声明单位的数值按原样传入；只对原生文档明确标注单位的氧化字段显示单位。",
+    return {"schemaVersion": 1, "engineVersion": engine_version(), "unitsNote": "安装版绑定未声明单位的数值按原样传入；只对原生文档明确标注单位的氧化字段显示单位。",
             "models": deepcopy(CATALOG)}
 
 

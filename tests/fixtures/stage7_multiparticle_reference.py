@@ -42,7 +42,7 @@ def make_domain(project):
     boundary_name = settings.get("xBoundary", settings.get("boundaryXY"))
     boundary = ps.BoundaryType.REFLECTIVE_BOUNDARY if boundary_name == "reflective" else ps.BoundaryType.PERIODIC_BOUNDARY
     if dim == 2:
-        domain = ps.Domain(float(settings["gridDelta"]), float(settings["xExtent"]), boundary)
+        domain = ps.Domain(float(settings["gridDelta"]), float(settings["xExtent"]), boundary=boundary)
     else:
         domain = ps.Domain(float(settings["gridDelta"]), float(settings["xExtent"]), float(settings["yExtent"]), boundary)
     geometry = project["geometry"]
@@ -229,7 +229,7 @@ def main(project_path, output_path, engine="CPU_DISK", initial_state_path=None):
         boundary_name = project["domain"].get("xBoundary", project["domain"].get("boundaryXY"))
         boundary = ps.BoundaryType.REFLECTIVE_BOUNDARY if boundary_name == "reflective" else ps.BoundaryType.PERIODIC_BOUNDARY
         if project["dimension"] == 2:
-            domain = ps.Domain(float(project["domain"]["gridDelta"]), float(project["domain"]["xExtent"]), boundary)
+            domain = ps.Domain(float(project["domain"]["gridDelta"]), float(project["domain"]["xExtent"]), boundary=boundary)
         else:
             domain = ps.Domain(float(project["domain"]["gridDelta"]), float(project["domain"]["xExtent"]),
                                float(project["domain"]["yExtent"]), boundary)

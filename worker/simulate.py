@@ -2928,7 +2928,11 @@ def execute(input_path: Path, run_dir: Path) -> None:
         readback_delta=float(domain.getGridDelta())
     else:
         boundary = ps.BoundaryType.REFLECTIVE_BOUNDARY if project["domain"]["xBoundary"] == "reflective" else ps.BoundaryType.PERIODIC_BOUNDARY
-        domain = ps.Domain(float(project["domain"]["gridDelta"]), float(project["domain"]["xExtent"]), boundary)
+        # Keyword form is required: viennaps 4.7.0 binds the three positional
+        # arguments to the (gridDelta, xExtent, yExtent) overload, silently
+        # dropping the boundary (4.6.2 bound the (gridDelta, xExtent, boundary)
+        # overload). Both versions accept the keyword form.
+        domain = ps.Domain(float(project["domain"]["gridDelta"]), float(project["domain"]["xExtent"]), boundary=boundary)
         if initial_state_path is not None:
             ps.Reader(domain, str(initial_state_path)).apply()
         else:
