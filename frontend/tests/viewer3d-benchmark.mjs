@@ -34,6 +34,7 @@ const report = {
   avgFrameMs: null,
   p50FrameMs: null,
   webglBaselineMs: null,
+  apiMode: null,
   p95FrameMs: null,
   switchMs: { first: null, cached: null, heavy: null },
   staticFullDetailMs: null,
@@ -180,6 +181,66 @@ try {
     painted: pixels2d.nonBackground,
     materials: pixels2d.materials.filter((entry) => entry.pixels > 100).length,
   });
+
+  // --- production path: worker fetches the snapshot, prefetch warms the next
+  const apiSnapshot = (phase) => {
+    const grid = 122;                       // ~30k triangles, JSON stays small
+    const side = grid + 1;
+    const points = [];
+    const triangles = [];
+    const materialIds = [];
+    for (let j = 0; j < side; j++) {
+      for (let i = 0; i < side; i++) {
+        const x = -4 + (8 * i) / grid;
+        const y = -4 + (8 * j) / grid;
+        points.push(x, y, 0.4 * Math.sin(x * 1.3 + phase) * Math.cos(y * 1.1));
+      }
+    }
+    for (let j = 0; j < grid; j++) {
+      for (let i = 0; i < grid; i++) {
+        const a = j * side + i;
+        const b = a + 1;
+        const c = a + side;
+        const d = c + 1;
+        triangles.push(a, c, b, b, c, d);
+        materialIds.push((a % 3) * 10, (a % 3) * 10);
+      }
+    }
+    return {
+      dimension: 3,
+      points,
+      triangles,
+      cellData: { materialIds },
+      materials: { '0': { name: 'Mask', color: '#3b82f6' }, '10': { name: 'Si', color: '#f59e0b' }, '20': { name: 'SiO2', color: '#22c55e' } },
+      coordinateUnit: 'um',
+      stepName: `API 步骤 ${phase}`,
+    };
+  };
+  const apiPage = await context.newPage();
+  apiPage.on('console', (message) => {
+    if (message.type() === 'error') report.consoleErrors.push(message.text());
+  });
+  apiPage.on('pageerror', (error) => report.consoleErrors.push(String(error)));
+  const manifest = { snapshots: [{ stepId: 'api-1', name: 'API 1', stepIndex: 0 }, { stepId: 'api-2', name: 'API 2', stepIndex: 1 }] };
+  await apiPage.route('**/api/runs/**', async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname.endsWith('/snapshots/api-1')) return route.fulfill({ json: apiSnapshot(0.4) });
+    if (url.pathname.endsWith('/snapshots/api-2')) return route.fulfill({ json: apiSnapshot(1.9) });
+    if (url.pathname.endsWith('/api/runs/benchmark-run')) return route.fulfill({ json: manifest });
+    return route.fulfill({ status: 404, json: { detail: 'not found' } });
+  });
+  await apiPage.goto(`${baseUrl}/viewer3d-harness.html?source=api`, { waitUntil: 'domcontentloaded' });
+  await apiPage.waitForFunction(() => window.__viewer3dHarness?.getState().ready === true, null, { timeout: 60000 });
+  const apiState = await apiPage.evaluate(() => window.__viewer3dHarness.getState());
+  assert.ok(apiState.stats.triangles > 20_000, `API snapshot did not render (${apiState.stats.triangles} triangles)`);
+  // Idle prefetch should have warmed api-2, so switching must be a cache hit.
+  await apiPage.waitForTimeout(1500);
+  const apiSwitch = await apiPage.evaluate(() => window.__viewer3dHarness.switchStep('api-2'));
+  assert.equal(apiSwitch.stats.parseMs, 0, 'neighbouring step was not prefetched');
+  assert.ok(apiSwitch.ms < CACHED_SWITCH_BUDGET_MS, `prefetched switch took ${apiSwitch.ms} ms`);
+  report.apiMode = { triangles: apiState.stats.triangles, prefetchedSwitchMs: Number(apiSwitch.ms.toFixed(1)) };
+  await apiPage.close();
+  check('worker fetch path + idle prefetch of the next step', report.apiMode);
 
   // --- raw WebGL2 floor on the same canvas ---------------------------------
   const baseline = await page.evaluate(

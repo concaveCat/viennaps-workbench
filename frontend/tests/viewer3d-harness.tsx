@@ -66,6 +66,8 @@ declare global {
 
 const params = new URLSearchParams(window.location.search);
 const dimension = params.get('dimension') === '2' ? 2 : 3;
+/** `source=api` exercises the production path: the worker fetches the snapshot. */
+const source = params.get('source') === 'api' ? 'api' : 'prop';
 const baseTriangles = Number(params.get('tris') ?? 240_000);
 const heavyTriangles = Number(params.get('heavyTris') ?? 700_000);
 
@@ -158,6 +160,12 @@ function Harness() {
   const readyRef = useRef(false);
 
   const steps = useMemo<StepSpec[]>(() => {
+    if (source === 'api') {
+      return [
+        { stepId: 'api-1', name: '接口步骤 1', snapshot: null as unknown as SnapshotDoc },
+        { stepId: 'api-2', name: '接口步骤 2', snapshot: null as unknown as SnapshotDoc },
+      ];
+    }
     if (dimension === 2) {
       return [{ stepId: 'profile-2d', name: '二维剖面', snapshot: profileSnapshot() }];
     }
@@ -208,7 +216,7 @@ function Harness() {
         steps: steps.map((step) => ({
           stepId: step.stepId,
           name: step.name,
-          triangles: Number((step.snapshot.triangles as ArrayLike<number>)?.length ?? 0) / 3,
+          triangles: Number((step.snapshot?.triangles as ArrayLike<number> | undefined)?.length ?? 0) / 3,
         })),
         errors,
         simplified: statsRef.current?.simplified ?? false,
@@ -298,7 +306,7 @@ function Harness() {
       <header className="harness__bar">
         <strong>viewer3d benchmark harness</strong>
         <span className="harness__meta">
-          {dimension}D · {stats ? `${stats.triangles.toLocaleString()} 三角形` : '解析中'}
+          {dimension}D{source === 'api' ? ' · API' : ''} · {stats ? `${stats.triangles.toLocaleString()} 三角形` : '解析中'}
           {stats?.simplified ? ` · 已简化自 ${stats.sourceTriangles?.toLocaleString()}` : ''}
           {stats ? ` · ${Math.round(stats.parseMs)} ms` : ''}
         </span>
@@ -320,7 +328,7 @@ function Harness() {
           runId="benchmark-run"
           stepId={current.stepId}
           dimension={dimension as 2 | 3}
-          snapshot={current.snapshot}
+          snapshot={source === 'api' ? undefined : current.snapshot}
           height={height}
           onStats={onStats}
           onSceneReady={onSceneReady}
