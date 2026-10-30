@@ -90,6 +90,7 @@ type Measurement = {
   value: number | null;
   unit: string;
   reason: string | null;
+  createdAt?: string;
   bindingStatus: string;
   equivalenceStatus: string;
   sourceRunId: string | null;
@@ -240,14 +241,23 @@ type ExperimentDoc = {
   status: string;
   kind?: string;
   recipeVersion: number;
+  unit?: string;
   design?: { conditionCount: number; logicalRunCount: number; replicates: number };
   queue?: { total: number; pending: number; running: number; succeeded: number; failed: number; retries: number; estimatedSecondsRemaining: number; estimatedCostUsd: number };
   aggregation?: { rows: Array<{ ordinal: number; n: number; mean: number | null; std: number | null; ci95: number | null; unit: string; statisticalStatus: string }>; ciMethod?: string };
   retention?: { mode: string };
   baseCompileId?: string | null;
-  variants: Array<{ ordinal: number; replicates: Array<{ status: string; value?: number | null; unit?: string; runId?: string; seed?: number; attemptCount?: number; statisticalSample?: boolean }> }>;
+  variants: Array<{
+    ordinal: number;
+    parameters?: Record<string, Record<string, number>>;
+    replicates: Array<{
+      status: string; value?: number | null; unit?: string; runId?: string; seed?: number;
+      attemptCount?: number; statisticalSample?: boolean; measurementId?: string; reason?: string;
+    }>;
+  }>;
   project?: { steps: Array<{ id: string }> };
 };
+type ExperimentSummaryRow = { experimentId: string; name: string; updatedAt: string; status: string; variantCount: number };
 type SnapshotSummary = {
   runId: string;
   stepId: string;
@@ -424,12 +434,13 @@ const ZONES = [
   { id: 'flow', num: '02', label: '流程', title: '流程编辑', desc: '从库插入步骤，编辑参数并编译流程。' },
   { id: 'run', num: '03', label: '运行', title: '运行与测量', desc: '执行 Segment、测量并查看指标。' },
   { id: 'experiment', num: '04', label: '实验', title: '实验设计', desc: '手工实验、全因子 DOE、队列与聚合。' },
-  { id: 'analyze', num: '05', label: '分析', title: '分析', desc: '候选对比、结构 diff、process window 与标定。' },
-  { id: 'report', num: '06', label: '报告', title: '报告', desc: '生成包含 provenance 的 HTML 报告。' },
+  { id: 'analyze', num: '05', label: '分析', title: '分析', desc: '候选对比、结构差异、工艺窗口与基础标定。' },
+  { id: 'report', num: '06', label: '报告', title: '报告', desc: '生成包含来源证据、结构视图与实验结果的 HTML 报告。' },
 ] as const;
 
 const STATUS_LABELS: Record<string, string> = {
   planned: '待执行',
+  queued: '排队中',
   running: '运行中',
   succeeded: '成功',
   failed: '失败',
@@ -437,9 +448,13 @@ const STATUS_LABELS: Record<string, string> = {
   interrupted: '已中断',
   verified: '已核验',
   measured: '已测量',
+  ambiguous: '有歧义',
+  region_empty: '区域为空',
+  no_intersection: '无交点',
   stale: '待重跑',
   completed: '已完成',
   pending: '待处理',
+  evaluated: '已评估',
   not_evaluated: '未评估',
   pass: '通过',
   fail: '失败',
@@ -513,6 +528,72 @@ function statusLabel(status: string): string {
   return STATUS_LABELS[status] ?? status;
 }
 
+const TOLERANCE_LABELS: Record<string, string> = {
+  identical: '一致',
+  within_tolerance: '在公差内',
+  WITHIN_TOLERANCE: '在公差内',
+  different: '超出公差',
+  OUTSIDE_TOLERANCE: '超出公差',
+  not_evaluated: '未评估',
+  NOT_EVALUATED: '未评估',
+};
+
+function toleranceLabel(status: string): string {
+  return TOLERANCE_LABELS[status] ?? status;
+}
+
+const TOPOLOGY_LABELS: Record<string, string> = {
+  lines: '线框',
+  triangles: '三角面',
+  points: '点云',
+};
+
+function topologyLabel(topology: string): string {
+  return TOPOLOGY_LABELS[topology] ?? topology;
+}
+
+/** Backend stores `um`; the UI shows the micro sign. */
+function displayUnit(unit: string | null | undefined): string {
+  if (!unit) return 'µm';
+  return unit === 'um' ? 'µm' : unit;
+}
+
+/** Compact number for tables: 4 significant digits, no float noise, no needless exponents. */
+function formatNumber(value: number | null | undefined, digits = 4): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '—';
+  if (value === 0) return '0';
+  const abs = Math.abs(value);
+  if (abs >= 1e6 || abs < 1e-6) return value.toExponential(3);
+  return String(Number(value.toPrecision(digits)));
+}
+
+/** `V1 · 0.02 s · seed 20261029` — condition label used by 04 results and 05 candidates. */
+function variantConditionLabel(variant: ExperimentDoc['variants'][number], replicateSeed?: number): string {
+  const parameters = variant.parameters ?? {};
+  const parts: string[] = [`V${variant.ordinal}`];
+  for (const [stepId, values] of Object.entries(parameters)) {
+    for (const [parameter, value] of Object.entries(values ?? {})) {
+      const unit = parameter === 'duration' ? ' s' : parameter === 'rateMagnitude' ? ' µm/s' : '';
+      parts.push(`${parameter === 'duration' ? '' : `${parameter} `}${formatNumber(value)}${unit}`);
+    }
+    if (!Object.keys(values ?? {}).length) parts.push(stepId);
+  }
+  const seed = replicateSeed ?? variant.replicates.find(item => item.seed !== undefined)?.seed;
+  if (seed !== undefined) parts.push(`seed ${seed}`);
+  return parts.join(' · ');
+}
+
+function experimentVariantStatus(variant: ExperimentDoc['variants'][number]): string {
+  const statuses = variant.replicates.map(item => item.status);
+  if (!statuses.length) return 'planned';
+  if (statuses.some(status => status === 'running')) return 'running';
+  if (statuses.some(status => status === 'queued')) return 'pending';
+  if (statuses.every(status => status === 'succeeded')) return 'succeeded';
+  if (statuses.some(status => status === 'failed')) return 'failed';
+  if (statuses.every(status => status === 'planned')) return 'planned';
+  return statuses[0];
+}
+
 function newStepId(): string {
   return `step_${Math.random().toString(16).slice(2, 10)}${Math.random().toString(16).slice(2, 6)}`;
 }
@@ -575,6 +656,11 @@ function errorText(payload: unknown): string {
     return JSON.stringify(payload);
   }
   return '请求失败';
+}
+
+function stepOptionLabel(step: ProjectStep, index: number): string {
+  const operation = step.operation === 'deposit' ? '沉积' : step.operation === 'etch' ? '刻蚀' : (step.operation ?? '');
+  return `${step.name || `步骤 ${index + 1}`}${operation ? ` · ${operation}` : ''}`;
 }
 
 function parseAuthoredParameters(text: string, label: string): Record<string, Record<string, unknown>> {
@@ -868,7 +954,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [windowLower, setWindowLower] = useState('');
   const [windowUpper, setWindowUpper] = useState('');
   const [windowResult, setWindowResult] = useState<ProcessWindowResult | null>(null);
-  const [reportTitle, setReportTitle] = useState('Workflow report');
+  const [reportTitle, setReportTitle] = useState('工作流报告');
   const [reportConclusions, setReportConclusions] = useState('');
   const [reportDocument, setReportDocument] = useState<ReportDocument | null>(null);
   const [calibrationCsv, setCalibrationCsv] = useState('');
@@ -880,9 +966,19 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [previousCompile, setPreviousCompile] = useState<CompileInfo | null>(null);
   const [compileDiff, setCompileDiff] = useState<{ addedStepIds: string[]; removedStepIds: string[]; movedStepIds: string[]; changedStepIds: string[]; affectedStepIds: string[]; details?: Array<{ stepId: string; before: Record<string, unknown>; after: Record<string, unknown> }> } | null>(null);
   const [templateVariable, setTemplateVariable] = useState('0.02');
-  const [experimentRows, setExperimentRows] = useState(Array.from({ length: 10 }, (_, index) => ({
-    duration: (0.01 + index * 0.001).toFixed(4), replicates: index === 0 ? 2 : 1, seed: 20261029 + index,
-  })));
+  const [experimentRows, setExperimentRows] = useState<Array<{ duration: string; replicates: number; seed: string }>>([
+    { duration: '0.01', replicates: 2, seed: '20261029' },
+    { duration: '0.02', replicates: 2, seed: '20261030' },
+    { duration: '0.03', replicates: 2, seed: '20261031' },
+  ]);
+  const [experimentName, setExperimentName] = useState('');
+  const [experimentStepId, setExperimentStepId] = useState('');
+  const [experimentMaxAttempts, setExperimentMaxAttempts] = useState(2);
+  const [experimentCost, setExperimentCost] = useState('0');
+  const [experimentList, setExperimentList] = useState<ExperimentSummaryRow[]>([]);
+  const [experimentInputsOpen, setExperimentInputsOpen] = useState(true);
+  const [autoAnalysisId, setAutoAnalysisId] = useState('');
+  const autoAnalysisRef = useRef('');
   const [provenance, setProvenance] = useState<Provenance | null>(null);
   const [moduleJson, setModuleJson] = useState(DEFAULT_MODULE_JSON);
   const [definitionJson, setDefinitionJson] = useState(DEFAULT_DEFINITION_JSON);
@@ -1159,6 +1255,20 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   }, [project]);
 
   useEffect(() => {
+    const steps = (project?.steps ?? []).filter(step => step.enabled);
+    setExperimentStepId(previous => steps.some(step => step.id === previous) ? previous : (steps[steps.length - 1]?.id ?? ''));
+  }, [project?.steps]);
+
+  useEffect(() => {
+    setExperimentName(previous => previous.trim() ? previous : (project?.name ? `${project.name} · 实验` : ''));
+  }, [project?.name]);
+
+  useEffect(() => {
+    void refreshExperimentList();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
     if (!segment || segment.status !== 'running') return;
     const timer = window.setInterval(() => {
       void api<RoutePlan['segments'][number]>(`/api/v1/workflow/segments/${segment.segmentId}`)
@@ -1258,6 +1368,26 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const canRoute = !!compile && !compileStale && !busy;
   const canRun = !!segment && segment.status === 'planned' && !busy;
   const canMeasure = !!segment && segment.status === 'succeeded' && !!segment.runId && !busy;
+  const experimentRunCount = (experimentDoc?.variants ?? []).reduce(
+    (total, variant) => total + variant.replicates.filter(replicate => !!replicate.runId).length, 0,
+  );
+  const hasExecutedRun = !!segment?.runId
+    && !segment.runId.startsWith('pending_')
+    && ['succeeded', 'failed'].includes(segment.status);
+  const experimentReady = !!project && !!compile && !compileStale && !!activeRecipeId && authoredSteps.length > 0;
+  const experimentBlockReason = !project
+    ? '还没有工程：先在 01 新建、打开或导入工程。'
+    : !authoredSteps.length
+      ? '流程为空：先在 02 添加步骤。'
+      : !compile
+        ? '流程未编译：先在 02 编译流程。'
+        : compileStale
+          ? '流程已修改：先在 02 重新编译。'
+          : !activeRecipeId
+            ? '还没有测量配方：先在 03 执行 Run 并完成一次测量。'
+            : '';
+  const analysisReady = !!project && !!compile && (experimentRunCount > 0 || !!measurement);
+  const reportReady = hasExecutedRun || !!measurement || experimentRunCount > 0;
   const routeStale = !!route && !!compile && route.attempts.some(attempt => attempt.compileId !== compile.compileId);
 
   const runStructureSteps = useMemo(() => {
@@ -1730,32 +1860,107 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setMeasurement(null); setProvenance(null); setMetrics([]);
   });
 
+  const refreshExperimentList = async (): Promise<ExperimentSummaryRow[]> => {
+    try {
+      const data = await api<{ experiments: Array<{ experimentId: string; name: string; updatedAt: string }> }>('/api/v1/workflow/experiments');
+      const rows = await Promise.all(data.experiments.slice(0, 8).map(async row => {
+        try {
+          const doc = await api<ExperimentDoc>(`/api/v1/workflow/experiments/${row.experimentId}`);
+          return { ...row, status: doc.status, variantCount: doc.variants.length };
+        } catch {
+          return { ...row, status: 'unknown', variantCount: 0 };
+        }
+      }));
+      setExperimentList(rows);
+      return rows;
+    } catch {
+      setExperimentList([]);
+      return [];
+    }
+  };
+
+  const resizeVariants = (count: number) => {
+    const size = Math.max(1, Math.min(16, Math.floor(count) || 1));
+    setExperimentRows(previous => {
+      if (size <= previous.length) return previous.slice(0, size);
+      return [...previous, ...Array.from({ length: size - previous.length }, (_, offset) => {
+        const index = previous.length + offset;
+        return { duration: (0.01 + index * 0.01).toFixed(2), replicates: 2, seed: String(20261029 + index) };
+      })];
+    });
+  };
+
+  const updateVariantRow = (index: number, patch: Partial<{ duration: string; replicates: number; seed: string }>) => {
+    setExperimentRows(previous => previous.map((row, rowIndex) => rowIndex === index ? { ...row, ...patch } : row));
+  };
+
+  const removeVariantRow = (index: number) => {
+    setExperimentRows(previous => previous.length <= 1 ? previous : previous.filter((_, rowIndex) => rowIndex !== index));
+  };
+
+  const experimentTargetStep = (project?.steps ?? []).filter(step => step.enabled)
+    .find(step => step.id === experimentStepId) ?? null;
+
   const createPersistentExperiment = () => run('experiment', async () => {
-    if (!project || !compile || !activeRecipeId) throw new Error('先完成一次测量以固定配方');
-    const tail = compile.compile.project.steps.filter(step => step.enabled).slice(-1)[0];
-    const authored = compile.compile.sourceMap?.find(entry => entry.stepId === tail.id)?.authoredStepId ?? tail.id;
-    const variants = experimentRows.map(row => ({
-      parameters: { [authored]: { duration: Number(row.duration) || 0.01 } },
-      replicates: row.replicates,
-      seed: row.seed,
-    }));
+    if (!project || !compile || !activeRecipeId) throw new Error('先在 03 完成一次测量以固定配方');
+    if (compileStale) throw new Error('流程已修改，请先在 02 重新编译');
+    const target = experimentTargetStep;
+    if (!target) throw new Error('流程没有可调步骤');
+    if (experimentRows.length < 1 || experimentRows.length > 16) throw new Error('变体数必须在 1–16 之间');
+    const variants = experimentRows.map((row, index) => {
+      const duration = Number(row.duration);
+      if (!Number.isFinite(duration) || duration <= 0) throw new Error(`变体 ${index + 1} 的 duration 必须是正数（s）`);
+      const replicates = Math.round(Number(row.replicates));
+      if (!Number.isFinite(replicates) || replicates < 1 || replicates > 8) throw new Error(`变体 ${index + 1} 的重复数必须在 1–8 之间`);
+      const seed = Number(row.seed);
+      if (!Number.isFinite(seed)) throw new Error(`变体 ${index + 1} 的 seed 必须是整数`);
+      return { parameters: { [target.id]: { duration } }, replicates, seed: Math.round(seed) };
+    });
+    const name = experimentName.trim() || `${compile.projectName} · 实验`;
     const doc = await postJson<ExperimentDoc>('/api/v1/workflow/experiments', {
-      name: `${compile.projectName} · 10 variants`, project, flowId: compile.flowId,
-      compileId: compile.compileId,
+      name, project, flowId: compile.flowId, compileId: compile.compileId,
       recipeId: activeRecipeId, recipeVersion: activeRecipeVersion, variants,
+      maxAttempts: Math.min(4, Math.max(1, Math.round(experimentMaxAttempts) || 1)),
+      costPerRunUsd: Number(experimentCost) || 0,
     });
     setExperimentDoc(doc);
+    setExperimentTable(null);
+    setComparison(null);
+    setCandidateViews({});
+    setAutoAnalysisId('');
+    await refreshExperimentList();
   });
 
   const runPersistentExperiment = () => run('experiment', async () => {
     if (!experimentDoc) throw new Error('先创建实验');
-    await postJson(`/api/v1/workflow/experiments/${experimentDoc.experimentId}/run`, {});
-    for (let index = 0; index < 600; index += 1) {
-      const doc = await api<typeof experimentDoc>(`/api/v1/workflow/experiments/${experimentDoc.experimentId}`);
+    const experimentId = experimentDoc.experimentId;
+    await postJson(`/api/v1/workflow/experiments/${experimentId}/run`, {});
+    let finished: ExperimentDoc | null = null;
+    for (let index = 0; index < 900; index += 1) {
+      const doc = await api<ExperimentDoc>(`/api/v1/workflow/experiments/${experimentId}`);
       setExperimentDoc(doc);
-      if (doc && ['completed', 'failed'].includes(doc.status)) return;
+      if (['completed', 'failed'].includes(doc.status)) { finished = doc; break; }
       await new Promise(resolve => window.setTimeout(resolve, 500));
     }
+    setExperimentInputsOpen(false);
+    await refreshExperimentList();
+    if (finished) {
+      setExperimentTable(null);
+      setAutoAnalysisId('');
+      autoAnalysisRef.current = '';
+    }
+  });
+
+  const openExperiment = (experimentId: string) => run('experiment-open', async () => {
+    const doc = await api<ExperimentDoc>(`/api/v1/workflow/experiments/${experimentId}`);
+    setExperimentDoc(doc);
+    setExperimentTable(null);
+    setComparison(null);
+    setCandidateViews({});
+    setAutoAnalysisId('');
+    autoAnalysisRef.current = '';
+    setExperimentInputsOpen(!['completed', 'failed'].includes(doc.status));
+    setZone('experiment');
   });
 
   const refreshLayouts = async () => {
@@ -2348,24 +2553,36 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   });
 
   const createDoe = () => run('doe', async () => {
-    if (!project || !compile || !activeRecipeId) throw new Error('先完成一次测量以固定配方');
-    const factors = doeFactors
-      .map(row => ({
-        stepId: row.stepId,
-        parameter: row.parameter,
-        values: row.values.split(',').map(value => Number(value.trim())).filter(value => Number.isFinite(value)),
-      }))
-      .filter(row => row.stepId && row.values.length > 0);
-    if (!factors.length) throw new Error('至少配置一个因子');
+    if (!project || !compile || !activeRecipeId) throw new Error('先在 03 完成一次测量以固定配方');
+    if (compileStale) throw new Error('流程已修改，请先在 02 重新编译');
+    if (doeFactors.length < 1 || doeFactors.length > 5) throw new Error('DOE 因子数必须在 1–5 之间');
+    const factors = doeFactors.map((row, index) => {
+      if (!row.stepId) throw new Error(`因子 ${index + 1} 还没有选择步骤`);
+      const values = row.values.split(',').map(value => Number(value.trim())).filter(value => Number.isFinite(value));
+      if (values.length < 2 || values.length > 10) throw new Error(`因子 ${index + 1} 需要 2–10 个数值（逗号分隔）`);
+      return { stepId: row.stepId, parameter: row.parameter, values };
+    });
+    const duplicates = new Set(factors.map(row => `${row.stepId}/${row.parameter}`));
+    if (duplicates.size !== factors.length) throw new Error('同一 (步骤, 参数) 只能配置一次');
+    const replicates = Math.round(Number(doeReplicates));
+    if (!Number.isFinite(replicates) || replicates < 1 || replicates > 8) throw new Error('DOE 重复数必须在 1–8 之间');
+    const seed = Number(doeSeed);
+    if (!Number.isFinite(seed)) throw new Error('DOE 种子必须是整数');
+    const name = experimentName.trim() || `${compile.projectName} · DOE`;
     const document = await postJson<ExperimentDoc>('/api/v1/workflow/experiments/doe', {
-      name: `${compile.projectName} · DOE`, project, flowId: compile.flowId,
+      name, project, flowId: compile.flowId,
       compileId: compile.compileId,
       recipeId: activeRecipeId, recipeVersion: activeRecipeVersion, factors,
-      replicates: doeReplicates, seed: Number(doeSeed) || 20261029,
-      maxAttempts: 2, costPerRunUsd: Number(doeCost) || 0,
+      replicates, seed: Math.round(seed),
+      maxAttempts: Math.min(4, Math.max(1, Math.round(experimentMaxAttempts) || 1)),
+      costPerRunUsd: Number(doeCost) || 0,
     });
     setExperimentDoc(document);
     setExperimentTable(null);
+    setComparison(null);
+    setCandidateViews({});
+    setAutoAnalysisId('');
+    await refreshExperimentList();
   });
 
   const previewRetention = () => run('retention', async () => {
@@ -2414,37 +2631,105 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setMetricDetail({ measurement: item, recipe, provenance });
   });
 
-  const loadExperimentCandidates = () => {
-    if (!experimentDoc) return;
+  const analysisStepId = useMemo(() => {
     const steps = (compile?.compile.project.steps ?? []).filter(step => step.enabled);
-    const stepId = steps[steps.length - 1]?.id ?? '';
-    const rows = experimentDoc.variants.slice(0, 3).map(variant => {
+    return steps[steps.length - 1]?.id ?? '';
+  }, [compile]);
+
+  const experimentCandidates = (doc: ExperimentDoc | null): Array<{ runId: string; stepId: string; label: string }> => {
+    if (!doc || !analysisStepId) return [];
+    return doc.variants.slice(0, 3).map(variant => {
       const replicate = variant.replicates.find(item => item.runId) ?? variant.replicates[0];
-      return { runId: replicate?.runId ?? '', stepId, label: `V${variant.ordinal}` };
+      return {
+        runId: replicate?.runId ?? '',
+        stepId: analysisStepId,
+        label: variantConditionLabel(variant, replicate?.seed),
+      };
     }).filter(row => row.runId && row.stepId);
+  };
+
+  const loadAnalysis = async (rows: Array<{ runId: string; stepId: string; label: string }>) => {
+    const candidates = rows.filter(item => item.runId && item.stepId);
+    if (!candidates.length) throw new Error('实验还没有可分析的 Run');
+    if (candidates.length >= 2) {
+      const result = await postJson<CompareResult>('/api/v1/workflow/analysis/compare', {
+        candidates, tolerance: 1e-4,
+      });
+      setComparison(result);
+    } else {
+      setComparison(null);
+    }
+    const views = await Promise.all(candidates.map(item => api<CandidateView>(
+      `/api/v1/workflow/analysis/candidates/${item.runId}/${item.stepId}/view`,
+    )));
+    setCandidateViews(Object.fromEntries(candidates.map((item, index) => [`${item.runId}:${item.stepId}`, views[index]])));
+  };
+
+  const loadExperimentCandidates = () => {
+    const rows = experimentCandidates(experimentDoc);
+    if (!rows.length) return;
     setCompareCandidates(rows);
   };
 
   const addCurrentCandidate = () => {
-    if (!segment?.runId) return;
+    if (!hasExecutedRun || !segment?.runId) return;
     setCompareCandidates(previous => [
       ...previous.filter(item => item.runId !== segment.runId),
-      { runId: segment.runId!, stepId: segment.throughStepId, label: 'current' },
+      { runId: segment.runId!, stepId: segment.throughStepId, label: `当前 Run · ${statusLabel(segment.status)}` },
     ].slice(0, 3));
   };
 
   const runComparison = () => run('compare', async () => {
     const candidates = compareCandidates.filter(item => item.runId && item.stepId);
-    if (candidates.length < 2) throw new Error('至少需要两个候选');
-    const result = await postJson<CompareResult>('/api/v1/workflow/analysis/compare', {
-      candidates, tolerance: 1e-4,
-    });
-    setComparison(result);
-    const views = await Promise.all(candidates.map(item => api<CandidateView>(
-      `/api/v1/workflow/analysis/candidates/${item.runId}/${item.stepId}/view`,
-    )));
-    setCandidateViews(Object.fromEntries(candidates.map((item, index) => [`${item.runId}:${item.stepId}`, views[index]])));
+    if (candidates.length < 1) throw new Error('实验还没有可分析的 Run');
+    await loadAnalysis(candidates);
   });
+
+  // 04 → 05 hand-off: once the experiment has results, 05 presents them without
+  // asking the user to press "load candidates" again.
+  useEffect(() => {
+    if (zone !== 'analyze') return;
+    if (!experimentDoc || !['completed', 'failed'].includes(experimentDoc.status)) return;
+    if (autoAnalysisRef.current === experimentDoc.experimentId) return;
+    const rows = experimentCandidates(experimentDoc);
+    if (!rows.length) return;
+    autoAnalysisRef.current = experimentDoc.experimentId;
+    setAutoAnalysisId(experimentDoc.experimentId);
+    setCompareCandidates(rows);
+    void run('compare', () => loadAnalysis(rows)).catch(() => undefined);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [zone, experimentDoc, analysisStepId]);
+
+  const experimentConditionRows = useMemo(() => {
+    if (!experimentDoc) return [];
+    return experimentDoc.variants.map(variant => ({
+      ordinal: variant.ordinal,
+      label: variantConditionLabel(variant),
+      status: experimentVariantStatus(variant),
+    }));
+  }, [experimentDoc]);
+
+  const experimentResultRows = useMemo(() => {
+    if (!experimentDoc) return [];
+    return experimentDoc.variants.map(variant => {
+      const values = variant.replicates
+        .map(replicate => replicate.value)
+        .filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
+      const mean = values.length ? values.reduce((total, value) => total + value, 0) / values.length : null;
+      const std = values.length > 1 && mean !== null
+        ? Math.sqrt(values.reduce((total, value) => total + (value - mean) ** 2, 0) / (values.length - 1))
+        : null;
+      return {
+        ordinal: variant.ordinal,
+        condition: variantConditionLabel(variant),
+        status: experimentVariantStatus(variant),
+        replicates: variant.replicates,
+        mean,
+        std,
+        unit: displayUnit(variant.replicates.find(replicate => replicate.unit)?.unit ?? experimentDoc.unit),
+      };
+    });
+  }, [experimentDoc]);
 
   const computeProcessWindow = () => run('window', async () => {
     if (!experimentDoc) throw new Error('先创建实验');
@@ -2457,18 +2742,24 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   });
 
   const generateReport = () => run('report', async () => {
+    if (!reportReady) throw new Error('先完成 03 运行与测量，或在 04 运行一个实验');
     const lower = Number(windowLower);
     const upper = Number(windowUpper);
     const payload: Record<string, unknown> = {
-      title: reportTitle || `${compile?.projectName ?? 'Workflow'} report`,
+      title: reportTitle.trim() || '工作流报告',
       conclusions: reportConclusions,
     };
     if (experimentDoc) payload.experimentId = experimentDoc.experimentId;
     if (measurement) payload.measurementId = measurement.measurementId;
-    if (segment?.runId) { payload.runId = segment.runId; payload.stepId = segment.throughStepId; }
+    if (hasExecutedRun && segment?.runId) { payload.runId = segment.runId; payload.stepId = segment.throughStepId; }
     if (Number.isFinite(lower) && Number.isFinite(upper) && lower < upper) { payload.lower = lower; payload.upper = upper; }
     setReportDocument(await postJson<ReportDocument>('/api/v1/workflow/analysis/report', payload));
   });
+
+  const reportFileName = (): string => {
+    const title = (reportDocument?.title || reportTitle || '报告').replace(/[\\/:*?"<>|]+/g, '-').trim();
+    return `${title || '报告'}.html`;
+  };
 
   const openReport = () => {
     if (!reportDocument) return;
@@ -2482,7 +2773,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     const url = URL.createObjectURL(new Blob([reportDocument.html], { type: 'text/html' }));
     const anchor = document.createElement('a');
     anchor.href = url;
-    anchor.download = `${reportDocument.reportId}.html`;
+    anchor.download = reportFileName();
     anchor.click();
     URL.revokeObjectURL(url);
   };
@@ -2560,6 +2851,21 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     }
     return `配方 · ${String(item.payload.recipeId ?? '—')} v${String(item.payload.recipeVersion ?? 1)}`;
   };
+
+  const renderExperimentList = () => experimentList.length === 0 ? null : (
+    <div className="wf-experiment-list" aria-label="实验列表">
+      <div className="wf-card-subhead">实验列表（点击切换查看）</div>
+      {experimentList.map(row => <button
+        type="button"
+        key={row.experimentId}
+        className={row.experimentId === experimentDoc?.experimentId ? 'wf-experiment-row active' : 'wf-experiment-row'}
+        onClick={() => void openExperiment(row.experimentId)}
+      >
+        <strong>{row.name}</strong>
+        <span>{statusLabel(row.status)} · {row.variantCount} 变体 · {formatDateTime(row.updatedAt)}</span>
+      </button>)}
+    </div>
+  );
 
   const renderFlowBar = () => (
     <div className="spx-flow-bar">
@@ -2920,7 +3226,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     ['Route', route?.route.name ?? '—'],
     ['Segment', segment ? `${statusLabel(segment.status)} · ${segment.segmentId.slice(0, 12)}…` : '—'],
     ['Run', segment?.runId ? `${segment.runId.slice(0, 16)}…` : '—'],
-    ['测量', measurement ? `${measurement.value === null ? '—' : measurement.value.toFixed(4)} ${measurement.unit}` : '—'],
+    ['测量', measurement ? `${measurement.value === null ? '—' : formatNumber(measurement.value)} ${displayUnit(measurement.unit)}` : '—'],
     ['引擎', health ? `ViennaPS ${health.viennaps ?? '—'}` : '—'],
   ];
 
@@ -3036,7 +3342,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 {
                   label: '测量',
                   target: 'run' as const,
-                  value: measurement ? `${measurement.value === null ? '—' : measurement.value.toFixed(4)} ${measurement.unit}` : '—',
+                  value: measurement ? `${measurement.value === null ? '—' : formatNumber(measurement.value)} ${displayUnit(measurement.unit)}` : '—',
                   badge: measurement ? '已测量' : '未测量',
                   badgeClass: measurement ? 'measured' : 'planned',
                   title: measurement ? `Measurement ${measurement.measurementId}` : '尚未测量',
@@ -3060,10 +3366,10 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 {
                   label: '报告',
                   target: 'report' as const,
-                  value: reportDocument ? reportDocument.reportId.slice(0, 10) : '—',
+                  value: reportDocument ? `已生成 · ${formatDateTime(reportDocument.createdAt)}` : '未生成',
                   badge: reportDocument ? '已生成' : '未生成',
                   badgeClass: reportDocument ? 'succeeded' : 'planned',
-                  title: reportDocument ? `Report ${reportDocument.reportId}` : '尚未生成报告',
+                  title: reportDocument ? `${reportDocument.title} · ${formatDateTime(reportDocument.createdAt)}` : '尚未生成报告',
                 },
               ].map(item => <div
                 key={item.label}
@@ -3953,145 +4259,407 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
 
         {zone === 'experiment' && <section className="wf-card wf-wide">
           <div className="wf-card-head"><span>04</span><h2>实验设计</h2></div>
-          <p className="wf-muted">保存 10 个可分别设置变体参数的实验，可设重复数与种子，串行执行并使用当前配方测量。</p>
-          <button className="wf-button primary" disabled={!compile || !activeRecipeId || !!busy} onClick={() => void createPersistentExperiment()}>创建 10 变体实验</button>
-          <button className="wf-button ghost" disabled={!experimentDoc || !!busy} onClick={() => void runPersistentExperiment()}>{busy === 'experiment' ? '实验运行中…' : '运行持久化实验'}</button>
-          <table className="wf-table"><thead><tr><th>#</th><th>时长</th><th>重复</th><th>Seed</th></tr></thead><tbody>{experimentRows.map((row, index) => <tr key={index}><td>{index + 1}</td><td><input aria-label={`变体 ${index + 1} duration`} value={row.duration} onChange={event => setExperimentRows(previous => previous.map((item, itemIndex) => itemIndex === index ? { ...item, duration: event.target.value } : item))} /></td><td><input aria-label={`变体 ${index + 1} replicates`} type="number" min={1} max={8} value={row.replicates} onChange={event => setExperimentRows(previous => previous.map((item, itemIndex) => itemIndex === index ? { ...item, replicates: Number(event.target.value) || 1 } : item))} /></td><td><input aria-label={`变体 ${index + 1} seed`} type="number" value={row.seed} onChange={event => setExperimentRows(previous => previous.map((item, itemIndex) => itemIndex === index ? { ...item, seed: Number(event.target.value) || 0 } : item))} /></td></tr>)}</tbody></table>
-          {experimentDoc && <div className="wf-muted">实验状态：{statusLabel(experimentDoc.status)}{experimentDoc.kind === 'doe' ? ' · DOE' : ''}</div>}
-          {experimentDoc?.queue && <div className="wf-summary"><strong>队列</strong><span>{experimentDoc.queue.succeeded}/{experimentDoc.queue.total} 已成功 · 待处理 {experimentDoc.queue.pending} · 运行中 {experimentDoc.queue.running}</span><span>预计剩余 {experimentDoc.queue.estimatedSecondsRemaining}s</span><span>成本 ${experimentDoc.queue.estimatedCostUsd.toFixed(4)}</span><span>重试 {experimentDoc.queue.retries}</span></div>}
-          {experimentDoc && <table className="wf-table"><thead><tr><th>#</th><th>状态</th><th>数值</th><th>Run</th></tr></thead><tbody>{experimentDoc.variants.map(variant => <tr key={variant.ordinal}><td>{variant.ordinal}</td><td>{variant.replicates[0]?.status}</td><td>{variant.replicates[0]?.value ?? '—'} {variant.replicates[0]?.unit ?? ''}</td><td><code>{variant.replicates[0]?.runId?.slice(0, 8) ?? '—'}</code></td></tr>)}</tbody></table>}
-          <div className="wf-card-subhead">DOE 全因子</div>
-          {(project?.steps ?? []).filter(step => step.enabled).length === 0 && <div className="wf-muted">先在 02 编译流程后可配置因子。</div>}
-          {doeFactors.map((row, index) => <div className="wf-doe-row" key={index}>
-            <select aria-label={`因子 ${index + 1} 步骤`} value={row.stepId} onChange={event => setDoeFactors(previous => previous.map((item, itemIndex) => itemIndex === index ? { ...item, stepId: event.target.value } : item))}>
-              <option value="">步骤</option>
-              {(project?.steps ?? []).filter(step => step.enabled).map(step => <option key={step.id} value={step.id}>{step.id}</option>)}
-            </select>
-            <select aria-label={`因子 ${index + 1} 参数`} value={row.parameter} onChange={event => setDoeFactors(previous => previous.map((item, itemIndex) => itemIndex === index ? { ...item, parameter: event.target.value } : item))}>
-              <option value="rateMagnitude">rateMagnitude</option>
-              <option value="duration">duration</option>
-              <option value="stickingProbability">stickingProbability</option>
-            </select>
-            <input aria-label={`因子 ${index + 1} 取值`} value={row.values} onChange={event => setDoeFactors(previous => previous.map((item, itemIndex) => itemIndex === index ? { ...item, values: event.target.value } : item))} />
-          </div>)}
-          <div className="wf-template-row">
-            <input aria-label="DOE 重复数" type="number" min={1} max={8} value={doeReplicates} onChange={event => setDoeReplicates(Number(event.target.value) || 1)} />
-            <input aria-label="DOE 种子" value={doeSeed} onChange={event => setDoeSeed(event.target.value)} />
-            <input aria-label="单次成本" value={doeCost} onChange={event => setDoeCost(event.target.value)} />
-            <button className="wf-button primary" disabled={!compile || !activeRecipeId || !!busy} onClick={() => void createDoe()}>设计 DOE</button>
-          </div>
-          {experimentDoc?.design && <div className="wf-summary"><strong>DOE</strong><span>{experimentDoc.design.conditionCount} 条件 × {experimentDoc.design.replicates} 重复 = {experimentDoc.design.logicalRunCount} 逻辑执行</span></div>}
-          {experimentDoc?.kind === 'doe' && <div className="wf-template-row">
-            <input aria-label="筛选最小均值" value={tableMin} onChange={event => setTableMin(event.target.value)} placeholder="mean ≥" />
-            <input aria-label="筛选最大均值" value={tableMax} onChange={event => setTableMax(event.target.value)} placeholder="mean ≤" />
-            <select aria-label="排序字段" value={tableSort} onChange={event => setTableSort(event.target.value)}>
-              <option value="ordinal">#</option>
-              <option value="mean">mean</option>
-              <option value="std">std</option>
-              <option value="n">n</option>
-            </select>
-            <button className="wf-button ghost" disabled={!!busy} onClick={() => void loadExperimentTable()}>筛选 / 排序</button>
-            <a className="wf-button ghost" href={`/api/v1/workflow/experiments/${experimentDoc.experimentId}/export.csv`} download>导出 CSV</a>
+
+          {experimentDoc && <div className="wf-result-panel" aria-label="实验结果">
+            <div className="wf-result-head">
+              <strong>{experimentDoc.name}</strong>
+              <span className={`wf-status ${experimentDoc.status}`}>{statusLabel(experimentDoc.status)}</span>
+              <span className="wf-muted">实验状态：{statusLabel(experimentDoc.status)}{experimentDoc.kind === 'doe' ? ' · DOE' : ''}</span>
+              <span className="wf-muted">{experimentDoc.variants.length} 变体 · 配方 v{experimentDoc.recipeVersion}</span>
+              <span className="wf-spacer" />
+              <button className={experimentRunCount > 0 ? 'wf-button' : 'wf-button primary'} disabled={!!busy} onClick={() => void runPersistentExperiment()}>
+                {busy === 'experiment' ? '实验运行中…' : experimentRunCount > 0 ? '重新运行实验' : '运行实验'}
+              </button>
+              <button className={experimentRunCount > 0 ? 'wf-button primary' : 'wf-button'} disabled={experimentRunCount === 0 || !!busy} onClick={() => setZone('analyze')}>在 05 分析</button>
+            </div>
+            {experimentDoc.queue && <div className="wf-summary">
+              <strong>队列</strong>
+              <span>{experimentDoc.queue.succeeded}/{experimentDoc.queue.total} 已成功 · 待处理 {experimentDoc.queue.pending} · 运行中 {experimentDoc.queue.running}</span>
+              <span>预计剩余 {experimentDoc.queue.estimatedSecondsRemaining} s</span>
+              <span>成本 ${experimentDoc.queue.estimatedCostUsd.toFixed(4)}</span>
+              <span>重试 {experimentDoc.queue.retries}</span>
+            </div>}
+            {experimentResultRows.length > 0 ? <table className="wf-table wf-result-table" aria-label="实验结果表">
+              <thead><tr><th>变体</th><th>条件</th><th>重复结果（每次）</th><th>均值（{experimentResultRows[0].unit}）</th><th>标准差（{experimentResultRows[0].unit}）</th><th>状态</th></tr></thead>
+              <tbody>{experimentResultRows.map(row => <tr key={row.ordinal}>
+                <td>V{row.ordinal}</td>
+                <td className="wf-condition">{row.condition}</td>
+                <td><div className="wf-repeats">{row.replicates.map((replicate, index) => <span className="wf-repeat" key={`${row.ordinal}-${index}`}>
+                  <span>#{index + 1}</span>
+                  <code>{formatNumber(replicate.value)}</code>
+                  <span>{displayUnit(replicate.unit ?? row.unit)}</span>
+                  <span className={`wf-status ${replicate.status}`}>{statusLabel(replicate.status)}</span>
+                </span>)}</div></td>
+                <td>{formatNumber(row.mean)}</td>
+                <td>{formatNumber(row.std)}</td>
+                <td><span className={`wf-status ${row.status}`}>{statusLabel(row.status)}</span></td>
+              </tr>)}</tbody>
+            </table> : <div className="wf-empty">实验已创建，点击“运行实验”后在这里显示每个变体的重复测量与统计。</div>}
           </div>}
-          {experimentTable && <table className="wf-table"><thead><tr><th>#</th><th>n</th><th>均值</th><th>标准差</th><th>CI95</th><th>状态</th></tr></thead><tbody>{experimentTable.rows.map(row => <tr key={row.ordinal}><td>{row.ordinal}</td><td>{row.n}</td><td>{row.mean === null ? '—' : row.mean.toFixed(6)}</td><td>{row.std === null ? '—' : row.std.toFixed(6)}</td><td>{row.ci95 === null ? '—' : row.ci95.toFixed(6)}</td><td>{row.statisticalStatus}</td></tr>)}</tbody></table>}
-          {experimentDoc && <details className="spx-advanced">
-            <summary>高级：保留策略</summary>
+
+          {!experimentReady && <div className="wf-empty" aria-label="实验空态">
+            <strong>还不能创建实验</strong>
+            <span>{experimentBlockReason}</span>
+            <div className="wf-empty-actions">
+              {!project && <button className="wf-button primary" onClick={() => setZone('setup')}>去 01 新建工程</button>}
+              {project && (!compile || compileStale) && <button className="wf-button primary" onClick={() => setZone('flow')}>去 02 编译流程</button>}
+              {project && compile && !compileStale && !activeRecipeId && <button className="wf-button primary" onClick={() => setZone('run')}>去 03 运行测量</button>}
+            </div>
+          </div>}
+
+          {renderExperimentList()}
+
+          {experimentReady && <details className="spx-advanced wf-experiment-inputs" open={experimentInputsOpen}
+            onToggle={event => setExperimentInputsOpen((event.currentTarget as HTMLDetailsElement).open)}>
+            <summary>实验输入（名称 / 变体 / DOE 因子）</summary>
             <div className="spx-advanced-body">
-              <div className="wf-template-row">
-                <button className="wf-button ghost" disabled={!!busy} onClick={() => void previewRetention()}>预览释放</button>
-                <button className="wf-button ghost" disabled={!!busy} onClick={() => void applyRetention('release-runs')}>应用 release-runs</button>
-                <button className="wf-button ghost" disabled={!!busy} onClick={() => void applyRetention('keep-all')}>恢复 keep-all</button>
-                <span className="wf-muted">当前 {experimentDoc.retention?.mode ?? 'keep-all'}</span>
+              <div className="spx-field-grid">
+                <label className="spx-field span-2"><span>实验名称</span>
+                  <input aria-label="实验名称" value={experimentName} onChange={event => setExperimentName(event.target.value)} />
+                </label>
+                <label className="spx-field"><span>变体数（1–16）</span>
+                  <input aria-label="变体数" type="number" min={1} max={16} value={experimentRows.length} onChange={event => resizeVariants(Number(event.target.value))} />
+                </label>
+                <label className="spx-field"><span>可调步骤（duration）</span>
+                  <select aria-label="实验可调步骤" value={experimentTargetStep?.id ?? ''} onChange={event => setExperimentStepId(event.target.value)}>
+                    {(project?.steps ?? []).filter(step => step.enabled).map((step, index) => <option key={step.id} value={step.id}>{stepOptionLabel(step, index)}</option>)}
+                  </select>
+                </label>
+                <label className="spx-field"><span>失败重试（1–4）</span>
+                  <input aria-label="实验失败重试" type="number" min={1} max={4} value={experimentMaxAttempts} onChange={event => setExperimentMaxAttempts(Number(event.target.value) || 1)} />
+                </label>
+                <label className="spx-field"><span>单次成本（USD）</span>
+                  <input aria-label="实验单次成本" type="number" min={0} step="0.01" value={experimentCost} onChange={event => setExperimentCost(event.target.value)} />
+                </label>
               </div>
-              {retentionInfo && <div className="wf-summary"><strong>Retention</strong><span>可释放 {retentionInfo.releasable.length} run</span><span>受保护 {retentionInfo.protected.length} run</span></div>}
+
+              <div className="wf-card-subhead">变体条件 · 作用于 {experimentTargetStep?.name ?? '—'} 的 duration</div>
+              <table className="wf-table wf-variant-table" aria-label="变体输入表">
+                <thead><tr><th>#</th><th>条件摘要</th><th>duration（s）</th><th>重复数（1–8）</th><th>seed</th><th>操作</th></tr></thead>
+                <tbody>{experimentRows.map((row, index) => <tr key={index}>
+                  <td>V{index + 1}</td>
+                  <td className="wf-condition">V{index + 1} · {formatNumber(Number(row.duration))} s · seed {row.seed} · ×{row.replicates}</td>
+                  <td><input aria-label={`变体 ${index + 1} duration`} value={row.duration} onChange={event => updateVariantRow(index, { duration: event.target.value })} /></td>
+                  <td><input aria-label={`变体 ${index + 1} replicates`} type="number" min={1} max={8} value={row.replicates} onChange={event => updateVariantRow(index, { replicates: Number(event.target.value) || 1 })} /></td>
+                  <td><input aria-label={`变体 ${index + 1} seed`} type="number" value={row.seed} onChange={event => updateVariantRow(index, { seed: event.target.value })} /></td>
+                  <td><button type="button" className="wf-link" disabled={experimentRows.length <= 1} onClick={() => removeVariantRow(index)}>移除</button></td>
+                </tr>)}</tbody>
+              </table>
+              <div className="spx-run-actions">
+                <button className="wf-button ghost" disabled={experimentRows.length >= 16} onClick={() => resizeVariants(experimentRows.length + 1)}>＋ 添加变体</button>
+                <button className="wf-button primary" disabled={!!busy} onClick={() => void createPersistentExperiment()}>{busy === 'experiment' ? '创建中…' : '创建实验'}</button>
+                <span className="wf-muted">{experimentRows.length} 变体 × 平均 {formatNumber(experimentRows.reduce((total, row) => total + row.replicates, 0) / Math.max(1, experimentRows.length), 3)} 次重复</span>
+              </div>
+
+              <div className="wf-card-subhead">DOE 全因子</div>
+              <p className="wf-muted">每个因子 2–10 个取值（逗号分隔），1–5 个因子；组合数 = 各因子取值数相乘。</p>
+              <div className="wf-doe-factors">
+                {doeFactors.map((row, index) => <div className="wf-doe-factor" key={index}>
+                  <label className="spx-field"><span>因子 {index + 1} 步骤</span>
+                    <select aria-label={`因子 ${index + 1} 步骤`} value={row.stepId} onChange={event => setDoeFactors(previous => previous.map((item, itemIndex) => itemIndex === index ? { ...item, stepId: event.target.value } : item))}>
+                      {(project?.steps ?? []).filter(step => step.enabled).map((step, stepIndex) => <option key={step.id} value={step.id}>{stepOptionLabel(step, stepIndex)}</option>)}
+                    </select>
+                  </label>
+                  <label className="spx-field"><span>参数</span>
+                    <select aria-label={`因子 ${index + 1} 参数`} value={row.parameter} onChange={event => setDoeFactors(previous => previous.map((item, itemIndex) => itemIndex === index ? { ...item, parameter: event.target.value } : item))}>
+                      <option value="duration">duration（s）</option>
+                      <option value="rateMagnitude">rateMagnitude（µm/s）</option>
+                      <option value="stickingProbability">stickingProbability</option>
+                    </select>
+                  </label>
+                  <label className="spx-field"><span>取值（2–10 个，逗号分隔）</span>
+                    <input aria-label={`因子 ${index + 1} 取值`} value={row.values} onChange={event => setDoeFactors(previous => previous.map((item, itemIndex) => itemIndex === index ? { ...item, values: event.target.value } : item))} />
+                  </label>
+                  <button type="button" className="wf-link" disabled={doeFactors.length <= 1} onClick={() => setDoeFactors(previous => previous.filter((_, itemIndex) => itemIndex !== index))}>移除</button>
+                </div>)}
+              </div>
+              <div className="spx-run-actions">
+                <button className="wf-button ghost" disabled={doeFactors.length >= 5} onClick={() => setDoeFactors(previous => [...previous, { stepId: experimentTargetStep?.id ?? '', parameter: 'duration', values: '0.01,0.02' }])}>＋ 添加因子</button>
+              </div>
+              <div className="spx-field-grid">
+                <label className="spx-field"><span>DOE 重复数（1–8）</span>
+                  <input aria-label="DOE 重复数" type="number" min={1} max={8} value={doeReplicates} onChange={event => setDoeReplicates(Number(event.target.value) || 1)} />
+                </label>
+                <label className="spx-field"><span>随机种子</span>
+                  <input aria-label="DOE 种子" value={doeSeed} onChange={event => setDoeSeed(event.target.value)} />
+                </label>
+                <label className="spx-field"><span>单次成本（USD）</span>
+                  <input aria-label="单次成本" type="number" min={0} step="0.01" value={doeCost} onChange={event => setDoeCost(event.target.value)} />
+                </label>
+              </div>
+              <div className="spx-run-actions">
+                <button className="wf-button primary" disabled={!!busy} onClick={() => void createDoe()}>设计 DOE</button>
+              </div>
+              {experimentDoc?.design && <div className="wf-summary"><strong>DOE</strong><span>{experimentDoc.design.conditionCount} 条件 × {experimentDoc.design.replicates} 重复 = {experimentDoc.design.logicalRunCount} 逻辑执行</span></div>}
+              {experimentDoc?.kind === 'doe' && <div className="spx-field-grid">
+                <label className="spx-field"><span>均值下限（{displayUnit(experimentResultRows[0]?.unit)}）</span>
+                  <input aria-label="筛选最小均值" value={tableMin} onChange={event => setTableMin(event.target.value)} placeholder="均值 ≥" />
+                </label>
+                <label className="spx-field"><span>均值上限（{displayUnit(experimentResultRows[0]?.unit)}）</span>
+                  <input aria-label="筛选最大均值" value={tableMax} onChange={event => setTableMax(event.target.value)} placeholder="均值 ≤" />
+                </label>
+                <label className="spx-field"><span>排序字段</span>
+                  <select aria-label="排序字段" value={tableSort} onChange={event => setTableSort(event.target.value)}>
+                    <option value="ordinal">#</option>
+                    <option value="mean">均值</option>
+                    <option value="std">标准差</option>
+                    <option value="n">样本数</option>
+                  </select>
+                </label>
+              </div>}
+              {experimentDoc?.kind === 'doe' && <div className="spx-run-actions">
+                <button className="wf-button ghost" disabled={!!busy} onClick={() => void loadExperimentTable()}>筛选 / 排序</button>
+                <a className="wf-button ghost" href={`/api/v1/workflow/experiments/${experimentDoc.experimentId}/export.csv`} download>导出 CSV</a>
+              </div>}
+              {experimentTable && <table className="wf-table"><thead><tr><th>#</th><th>样本数</th><th>均值</th><th>标准差</th><th>CI95</th><th>统计状态</th></tr></thead><tbody>{experimentTable.rows.map(row => <tr key={row.ordinal}><td>{row.ordinal}</td><td>{row.n}</td><td>{formatNumber(row.mean)}</td><td>{formatNumber(row.std)}</td><td>{formatNumber(row.ci95)}</td><td>{statusLabel(row.statisticalStatus)}</td></tr>)}</tbody></table>}
+
+              {experimentDoc && <details className="spx-advanced">
+                <summary>高级：保留策略</summary>
+                <div className="spx-advanced-body">
+                  <div className="spx-run-actions">
+                    <button className="wf-button ghost" disabled={!!busy} onClick={() => void previewRetention()}>预览释放</button>
+                    <button className="wf-button ghost" disabled={!!busy} onClick={() => void applyRetention('release-runs')}>应用 release-runs</button>
+                    <button className="wf-button ghost" disabled={!!busy} onClick={() => void applyRetention('keep-all')}>恢复 keep-all</button>
+                    <span className="wf-muted">当前 {experimentDoc.retention?.mode ?? 'keep-all'}</span>
+                  </div>
+                  {retentionInfo && <div className="wf-summary"><strong>保留策略</strong><span>可释放 {retentionInfo.releasable.length} 个 Run</span><span>受保护 {retentionInfo.protected.length} 个 Run</span></div>}
+                </div>
+              </details>}
             </div>
           </details>}
         </section>}
         {zone === 'analyze' && <section className="wf-card wf-wide">
           <div className="wf-card-head"><span>05</span><h2>分析</h2></div>
-          <p className="wf-muted">候选快照对比、结构 diff、process window 与基础标定；数值等价独立于绑定状态。</p>
-          {measurement ? <div className="wf-summary"><strong>{measurement.status}</strong><span>{measurement.value === null ? measurement.reason : `${measurement.value.toFixed(4)} ${measurement.unit}`}</span><span>绑定 {bindingLabel(measurement.bindingStatus)} · 等价 {bindingLabel(measurement.equivalenceStatus)}</span></div> : <div className="wf-empty">完成一次运行与测量后显示指标。</div>}
-          <div className="wf-card-subhead">候选 / 多视图</div>
-          <div className="wf-template-row">
-            <button className="wf-button ghost" disabled={!experimentDoc || !!busy} onClick={loadExperimentCandidates}>载入实验前 3 个候选</button>
-            <button className="wf-button ghost" disabled={!segment?.runId || !!busy} onClick={addCurrentCandidate}>加入当前 Run</button>
-            <button className="wf-button primary" disabled={compareCandidates.length < 2 || !!busy} onClick={() => void runComparison()}>比较并加载视图</button>
-          </div>
-          {compareCandidates.length > 0 && <table className="wf-table"><thead><tr><th>候选</th><th>Run</th><th>Step</th></tr></thead><tbody>{compareCandidates.map(item => <tr key={item.runId}><td>{item.label}</td><td><code>{item.runId.slice(0, 10)}…</code></td><td><code>{item.stepId.slice(0, 10)}…</code></td></tr>)}</tbody></table>}
-          {comparison && <div className="wf-compare-controls">
-            <label>同步缩放 <input aria-label="同步缩放" type="range" min="0.5" max="3" step="0.1" value={syncZoom} onChange={event => setSyncZoom(Number(event.target.value))} /></label>
-            <select aria-label="同步轴" value={syncAxis} onChange={event => setSyncAxis(event.target.value as typeof syncAxis)}>
-              <option value="xy">XY</option>
-              <option value="xz">XZ</option>
-              <option value="yz">YZ</option>
-            </select>
+
+          {!analysisReady && <div className="wf-empty" aria-label="分析空态">
+            <strong>还没有可分析的结果</strong>
+            <span>{!project
+              ? '先在 01 新建、打开或导入工程。'
+              : !compile
+                ? '先在 02 编译流程。'
+                : '先在 04 创建并运行实验，或先在 03 完成一次运行与测量。'}</span>
+            <div className="wf-empty-actions">
+              {!project && <button className="wf-button primary" onClick={() => setZone('setup')}>去 01 新建工程</button>}
+              {project && !compile && <button className="wf-button primary" onClick={() => setZone('flow')}>去 02 编译流程</button>}
+              <button className="wf-button primary" onClick={() => setZone('experiment')}>去 04 创建实验</button>
+              <button className="wf-button ghost" onClick={() => setZone('run')}>去 03 运行测量</button>
+            </div>
           </div>}
-          {comparison && <div className="wf-compare-grid">
-            {comparison.candidates.map((candidate, index) => {
-              const view = candidateViews[`${candidate.runId}:${candidate.stepId}`];
-              return <figure key={`${candidate.runId}:${candidate.stepId}`}>
-                <figcaption><strong>{candidate.label ?? `candidate ${index + 1}`}</strong><span>{candidate.summary.dimension}D · {candidate.summary.measureKind} · {JSON.stringify(candidate.summary.materialMeasures)}</span></figcaption>
-                {view && analysisFrame ? <StructureCanvas
-                  view={view}
-                  frame={analysisFrame}
-                  axis={syncAxis}
-                  className="wf-compare-canvas"
-                  label={`候选 ${index + 1} 视图`}
-                  showAxes={false}
-                /> : <div className="wf-empty">视图加载中…</div>}
-              </figure>;
-            })}
-          </div>}
-          {comparison && <table className="wf-table"><thead><tr><th>Pair</th><th>Status</th><th>max point Δ</th><th>bounds Δ</th><th>material Δ</th><th>Reasons</th></tr></thead><tbody>{comparison.pairwise.map((row, index) => <tr key={index}><td>{row.left} ↔ {row.right}</td><td><span className={`wf-status ${row.status}`}>{row.status}</span></td><td>{row.maxPointDelta === null ? '—' : row.maxPointDelta.toExponential(3)}</td><td>{row.boundsDelta.toExponential(3)}</td><td>{JSON.stringify(row.materialDelta)}</td><td>{row.reasons.join('; ') || '—'}</td></tr>)}</tbody></table>}
-          <div className="wf-card-subhead">Process Window</div>
-          <div className="wf-template-row">
-            <input aria-label="窗口下限" value={windowLower} onChange={event => setWindowLower(event.target.value)} placeholder="lower" />
-            <input aria-label="窗口上限" value={windowUpper} onChange={event => setWindowUpper(event.target.value)} placeholder="upper" />
-            <button className="wf-button primary" disabled={!experimentDoc || !!busy} onClick={() => void computeProcessWindow()}>计算窗口</button>
-          </div>
-          {windowResult && <>
-            <div className="wf-summary"><strong>Window</strong><span>pass {windowResult.summary.pass} · fail {windowResult.summary.fail} · uncertain {windowResult.summary.uncertain} · n/e {windowResult.summary.notEvaluated}</span><span>[{windowResult.lower}, {windowResult.upper}]</span></div>
-            <table className="wf-table"><thead><tr><th>#</th><th>Mean</th><th>CI95</th><th>Status</th><th>Margin</th></tr></thead><tbody>{windowResult.rows.map(row => <tr key={row.ordinal}><td>{row.ordinal}</td><td>{row.mean === null ? '—' : row.mean.toExponential(4)}</td><td>{row.ci95 === null ? '—' : row.ci95.toExponential(3)}</td><td>{row.status}</td><td>{windowResult.candidates.find(item => item.ordinal === row.ordinal)?.margin?.toExponential(3) ?? '—'}</td></tr>)}</tbody></table>
-            {windowResult.factorWindows.length > 0 && <div className="wf-muted">factor windows: {windowResult.factorWindows.map(item => `${item.stepId}/${item.parameter} [${item.min ?? '—'}, ${item.max ?? '—'}]`).join(' · ')}</div>}
-          </>}
-          <div className="wf-card-subhead">基础标定</div>
-          <input aria-label="标定 CSV 文件" type="file" accept=".csv,text/csv" onChange={event => { const file = event.target.files?.[0]; if (file) void loadCalibrationFile(file); }} />
-          <div className="wf-template-row">
-            <select aria-label="标定模型" value={calibrationModel} onChange={event => setCalibrationModel(event.target.value)}>
-              <option value="scale">scale (1p)</option>
-              <option value="scale_offset">scale + offset (2p)</option>
-              <option value="quadratic">quadratic (3p)</option>
-              <option value="power">power (2p)</option>
-              <option value="power_offset">power + offset (3p)</option>
-            </select>
-            <select aria-label="标定方法" value={calibrationMethod} onChange={event => setCalibrationMethod(event.target.value as typeof calibrationMethod)}>
-              <option value="least-squares">least-squares</option>
-              <option value="nelder-mead">nelder-mead</option>
-            </select>
-            <button className="wf-button ghost" disabled={!calibrationCsv || !!busy} onClick={() => void createCalibrationDataset()}>创建数据集</button>
-            <button className="wf-button primary" disabled={!calibrationDataset || !!busy} onClick={() => void fitCalibration()}>拟合</button>
-          </div>
-          {calibrationDataset && <div className="wf-muted">dataset {calibrationDataset.name} · train {calibrationDataset.trainCount} / validation {calibrationDataset.validationCount} · {calibrationDataset.sha256.slice(0, 12)}…</div>}
-          {calibrationFit && <>
-            <div className="wf-summary"><strong>{calibrationFit.model} / {calibrationFit.method}</strong><span>{calibrationFit.parameterNames.map((name, index) => `${name}=${calibrationFit.parameters[index].toPrecision(5)}`).join(' · ')}</span><span className={calibrationFit.validationStatus === 'validated' ? 'wf-status verified' : 'wf-status'}>{calibrationFit.validationStatus}</span></div>
-            <table className="wf-table"><thead><tr><th>Split</th><th>n</th><th>RMSE</th><th>MAE</th><th>Max abs</th></tr></thead><tbody>
-              <tr><td>train</td><td>{calibrationFit.trainResiduals.n}</td><td>{calibrationFit.trainResiduals.rmse?.toPrecision(5) ?? '—'}</td><td>{calibrationFit.trainResiduals.mae?.toPrecision(5) ?? '—'}</td><td>{calibrationFit.trainResiduals.maxAbs?.toPrecision(5) ?? '—'}</td></tr>
-              <tr><td>validation</td><td>{calibrationFit.validationResiduals.n}</td><td>{calibrationFit.validationResiduals.rmse?.toPrecision(5) ?? '—'}</td><td>{calibrationFit.validationResiduals.mae?.toPrecision(5) ?? '—'}</td><td>{calibrationFit.validationResiduals.maxAbs?.toPrecision(5) ?? '—'}</td></tr>
-            </tbody></table>
+
+          {analysisReady && <>
+            {measurement && <div className="wf-summary" aria-label="测量结果">
+              <strong>{statusLabel(measurement.status)}</strong>
+              <span>{measurement.value === null ? (measurement.reason || '无数值') : `${formatNumber(measurement.value)} ${displayUnit(measurement.unit)}`}</span>
+              <span>绑定：{bindingLabel(measurement.bindingStatus)} · 等价：{bindingLabel(measurement.equivalenceStatus)}</span>
+              <span>配方 v{measurement.recipeVersion}{measurement.createdAt ? ` · ${formatDateTime(measurement.createdAt)}` : ''}</span>
+            </div>}
+
+            {experimentDoc && <div className="wf-analysis-conditions" aria-label="实验条件">
+              <div className="wf-result-head">
+                <strong>{experimentDoc.name}</strong>
+                <span className={`wf-status ${experimentDoc.status}`}>{statusLabel(experimentDoc.status)}</span>
+                <span className="wf-muted">{experimentDoc.variants.length} 变体 · 配方 v{experimentDoc.recipeVersion}{experimentDoc.kind === 'doe' ? ' · DOE' : ''}</span>
+              </div>
+              <div className="wf-condition-chips">
+                {experimentConditionRows.map(row => <span className="wf-condition-chip" key={row.ordinal}>
+                  <strong>{row.label}</strong>
+                  <span className={`wf-status ${row.status}`}>{statusLabel(row.status)}</span>
+                </span>)}
+              </div>
+            </div>}
+
+            <div className="wf-card-subhead">候选 / 多视图</div>
+            <div className="spx-run-actions">
+              <button className="wf-button ghost" disabled={!experimentDoc || !!busy} onClick={loadExperimentCandidates}>刷新候选</button>
+              <button className="wf-button ghost" disabled={!hasExecutedRun || !!busy} onClick={addCurrentCandidate}>加入当前 Run</button>
+              <button className="wf-button primary" disabled={compareCandidates.length < 1 || !!busy} onClick={() => void runComparison()}>
+                {busy === 'compare' ? '比较中…' : '刷新视图 / 比较'}
+              </button>
+              {autoAnalysisId && autoAnalysisId === experimentDoc?.experimentId && <span className="wf-muted">已自动载入该实验的候选</span>}
+            </div>
+
+            {Object.keys(candidateViews).length > 0 && <div className="wf-compare-controls">
+              <label>同步缩放 <input aria-label="同步缩放" type="range" min="0.5" max="3" step="0.1" value={syncZoom} onChange={event => setSyncZoom(Number(event.target.value))} /></label>
+              <label>视图轴
+                <select aria-label="同步轴" value={syncAxis} onChange={event => setSyncAxis(event.target.value as typeof syncAxis)}>
+                  <option value="xy">XY</option>
+                  <option value="xz">XZ</option>
+                  <option value="yz">YZ</option>
+                </select>
+              </label>
+              <span className="wf-muted">单位 µm · 所有候选共用同一坐标范围</span>
+            </div>}
+
+            {compareCandidates.length > 0 && <div className="wf-compare-grid">
+              {compareCandidates.map((candidate, index) => {
+                const view = candidateViews[`${candidate.runId}:${candidate.stepId}`];
+                const firstLabel = comparison?.candidates[0]?.label ?? compareCandidates[0]?.label;
+                const pairRow = index > 0
+                  ? comparison?.pairwise.find(row =>
+                    (row.left === candidate.label && row.right === firstLabel) || (row.right === candidate.label && row.left === firstLabel))
+                  : undefined;
+                return <figure key={`${candidate.runId}:${candidate.stepId}`}>
+                  <figcaption>
+                    <strong>{candidate.label}</strong>
+                    <span>{view ? `${view.dimension}D · ${topologyLabel(view.topology)} · ${syncAxis.toUpperCase()} · ${structureUnit(view)}` : '视图加载中…'}</span>
+                    {pairRow && <span>与 {firstLabel} 最大点偏差 {formatNumber(pairRow.maxPointDelta)} µm · 边界偏差 {formatNumber(pairRow.boundsDelta)} µm</span>}
+                  </figcaption>
+                  {view && analysisFrame ? <StructureCanvas
+                    view={view}
+                    frame={analysisFrame}
+                    axis={syncAxis}
+                    className="wf-compare-canvas"
+                    label={`候选 ${index + 1} 结构视图`}
+                  /> : <div className="wf-empty">视图加载中…</div>}
+                  {view && <div className="wf-compare-legend">
+                    {structureLegend(view).map(row => <span key={row.id}><i style={{ background: row.color }} aria-hidden="true" />{row.name}<em>{row.count}</em></span>)}
+                  </div>}
+                </figure>;
+              })}
+            </div>}
+
+            {comparison && <table className="wf-table" aria-label="候选对比表">
+              <thead><tr><th>对比</th><th>状态</th><th>最大点偏差（µm）</th><th>边界偏差（µm）</th><th>材料偏差</th><th>原因</th></tr></thead>
+              <tbody>{comparison.pairwise.map((row, index) => <tr key={index}>
+                <td>{row.left} ↔ {row.right}</td>
+                <td><span className={`wf-status ${row.status}`}>{toleranceLabel(row.status)}</span></td>
+                <td>{formatNumber(row.maxPointDelta)}</td>
+                <td>{formatNumber(row.boundsDelta)}</td>
+                <td>{Object.keys(row.materialDelta).length
+                  ? Object.entries(row.materialDelta).map(([key, value]) => `${key} ${formatNumber(value)}`).join(' · ')
+                  : '—'}</td>
+                <td>{row.reasons.join('；') || '—'}</td>
+              </tr>)}</tbody>
+            </table>}
+
+            <details className="spx-advanced wf-analysis-advanced">
+              <summary>高级：Process Window（工艺窗口）与基础标定</summary>
+              <div className="spx-advanced-body">
+                <div className="wf-card-subhead">Process Window（工艺窗口）</div>
+                <p className="wf-muted">窗口按测量单位（{displayUnit(experimentDoc?.unit)}）给出；每个条件至少 2 次重复才能评估置信区间。</p>
+                {!experimentDoc && <div className="wf-muted">需要实验数据：先在 04 创建并运行实验。</div>}
+                {experimentDoc && experimentRunCount === 0 && <div className="wf-muted">实验尚未运行，窗口无法计算。</div>}
+                <div className="spx-field-grid">
+                  <label className="spx-field"><span>窗口下限（{displayUnit(experimentDoc?.unit)}）</span>
+                    <input aria-label="窗口下限" value={windowLower} onChange={event => setWindowLower(event.target.value)} placeholder="下限" />
+                  </label>
+                  <label className="spx-field"><span>窗口上限（{displayUnit(experimentDoc?.unit)}）</span>
+                    <input aria-label="窗口上限" value={windowUpper} onChange={event => setWindowUpper(event.target.value)} placeholder="上限" />
+                  </label>
+                  <div className="wf-field-action">
+                    <button className="wf-button primary" disabled={!experimentDoc || experimentRunCount === 0 || !!busy} onClick={() => void computeProcessWindow()}>计算窗口</button>
+                  </div>
+                </div>
+                {windowResult && <>
+                  <div className="wf-summary"><strong>工艺窗口 [{formatNumber(windowResult.lower)}, {formatNumber(windowResult.upper)}] {displayUnit(experimentDoc?.unit)}</strong>
+                    <span>通过 {windowResult.summary.pass} · 超出 {windowResult.summary.fail} · 不确定 {windowResult.summary.uncertain} · 未评估 {windowResult.summary.notEvaluated}</span>
+                  </div>
+                  <table className="wf-table" aria-label="工艺窗口表"><thead><tr><th>变体</th><th>均值</th><th>CI95</th><th>状态</th><th>余量</th></tr></thead><tbody>{windowResult.rows.map(row => <tr key={row.ordinal}>
+                    <td>V{row.ordinal}</td>
+                    <td>{formatNumber(row.mean)}</td>
+                    <td>{formatNumber(row.ci95)}</td>
+                    <td><span className={`wf-status ${row.status}`}>{statusLabel(row.status)}</span></td>
+                    <td>{formatNumber(windowResult.candidates.find(item => item.ordinal === row.ordinal)?.margin ?? null)}</td>
+                  </tr>)}</tbody></table>
+                  {windowResult.factorWindows.length > 0 && <div className="wf-muted">因子窗口：{windowResult.factorWindows.map(item => `${item.parameter} [${formatNumber(item.min)}, ${formatNumber(item.max)}]`).join(' · ')}</div>}
+                </>}
+
+                <div className="wf-card-subhead">基础标定</div>
+                <label className="spx-field"><span>标定数据 CSV</span>
+                  <input aria-label="标定 CSV 文件" type="file" accept=".csv,text/csv" onChange={event => { const file = event.target.files?.[0]; if (file) void loadCalibrationFile(file); }} />
+                </label>
+                <div className="spx-field-grid">
+                  <label className="spx-field"><span>模型</span>
+                    <select aria-label="标定模型" value={calibrationModel} onChange={event => setCalibrationModel(event.target.value)}>
+                      <option value="scale">scale (1p)</option>
+                      <option value="scale_offset">scale + offset (2p)</option>
+                      <option value="quadratic">quadratic (3p)</option>
+                      <option value="power">power (2p)</option>
+                      <option value="power_offset">power + offset (3p)</option>
+                    </select>
+                  </label>
+                  <label className="spx-field"><span>方法</span>
+                    <select aria-label="标定方法" value={calibrationMethod} onChange={event => setCalibrationMethod(event.target.value as typeof calibrationMethod)}>
+                      <option value="least-squares">least-squares</option>
+                      <option value="nelder-mead">nelder-mead</option>
+                    </select>
+                  </label>
+                </div>
+                {!calibrationCsv && <div className="wf-muted">选择 CSV 后可创建数据集。</div>}
+                <div className="spx-run-actions">
+                  <button className="wf-button ghost" disabled={!calibrationCsv || !!busy} onClick={() => void createCalibrationDataset()}>创建数据集</button>
+                  <button className="wf-button primary" disabled={!calibrationDataset || !!busy} onClick={() => void fitCalibration()}>拟合</button>
+                </div>
+                {calibrationDataset && <div className="wf-muted">数据集 {calibrationDataset.name} · 训练 {calibrationDataset.trainCount} / 验证 {calibrationDataset.validationCount} · {calibrationDataset.sha256.slice(0, 12)}…</div>}
+                {calibrationFit && <>
+                  <div className="wf-summary"><strong>{calibrationFit.model} / {calibrationFit.method}</strong><span>{calibrationFit.parameterNames.map((name, index) => `${name}=${formatNumber(calibrationFit.parameters[index], 5)}`).join(' · ')}</span><span className={calibrationFit.validationStatus === 'validated' ? 'wf-status verified' : 'wf-status'}>{calibrationFit.validationStatus === 'validated' ? '已验证' : calibrationFit.validationStatus}</span></div>
+                  <table className="wf-table"><thead><tr><th>数据集</th><th>样本数</th><th>RMSE</th><th>MAE</th><th>最大绝对误差</th></tr></thead><tbody>
+                    <tr><td>训练</td><td>{calibrationFit.trainResiduals.n}</td><td>{formatNumber(calibrationFit.trainResiduals.rmse, 5)}</td><td>{formatNumber(calibrationFit.trainResiduals.mae, 5)}</td><td>{formatNumber(calibrationFit.trainResiduals.maxAbs, 5)}</td></tr>
+                    <tr><td>验证</td><td>{calibrationFit.validationResiduals.n}</td><td>{formatNumber(calibrationFit.validationResiduals.rmse, 5)}</td><td>{formatNumber(calibrationFit.validationResiduals.mae, 5)}</td><td>{formatNumber(calibrationFit.validationResiduals.maxAbs, 5)}</td></tr>
+                  </tbody></table>
+                </>}
+              </div>
+            </details>
           </>}
         </section>}
         {zone === 'report' && <section className="wf-card wf-wide">
           <div className="wf-card-head"><span>06</span><h2>报告</h2></div>
-          <p className="wf-muted">服务端 HTML 报告包含 Flow/Compile、Clip、变量、引擎版本、种子、指标、视图、process window 与结论；浏览器打印可保存 PDF。</p>
-          <div className="wf-template-row">
-            <input aria-label="报告标题" value={reportTitle} onChange={event => setReportTitle(event.target.value)} />
-            <button className="wf-button primary" disabled={!!busy} onClick={() => void generateReport()}>{busy === 'report' ? '生成中…' : '生成 HTML 报告'}</button>
+
+          <div className="spx-summary-grid wf-report-summary" aria-label="报告内容摘要">
+            <div><span>工程</span><strong>{project?.name ?? '未提供'}</strong></div>
+            <div><span>流程</span><strong>{compile ? `${compile.projectName} · ${compile.stepCount} 步` : '未提供'}</strong></div>
+            <div><span>编译</span><strong>{compile ? `${compile.dimension}D · ${compile.stepCount} 步` : '未提供'}</strong></div>
+            <div><span>Route</span><strong>{route ? `${route.route.name} · ${route.segments.length} Segment` : '未提供'}</strong></div>
+            <div><span>Run</span><strong>{hasExecutedRun && segment ? statusLabel(segment.status) : '未提供'}</strong></div>
+            <div><span>测量</span><strong>{measurement ? `${formatNumber(measurement.value)} ${displayUnit(measurement.unit)}` : '未提供'}</strong></div>
+            <div><span>实验</span><strong>{experimentDoc ? `${experimentDoc.name} · ${experimentDoc.variants.length} 变体` : '未提供'}</strong></div>
+            <div><span>报告</span><strong>{reportDocument ? '已生成' : '未生成'}</strong></div>
+          </div>
+
+          <div className="spx-field-grid wf-report-form">
+            <label className="spx-field span-2"><span>报告标题</span>
+              <input aria-label="报告标题" value={reportTitle} onChange={event => setReportTitle(event.target.value)} />
+            </label>
+            <label className="spx-field span-2"><span>结论 / 候选说明（写入报告）</span>
+              <textarea aria-label="报告结论" value={reportConclusions} onChange={event => setReportConclusions(event.target.value)} placeholder="例如：选择 V2（0.02 s），CD 在公差内。" />
+            </label>
+          </div>
+
+          {!reportReady && <div className="wf-block-reason" aria-label="报告禁用原因">
+            生成报告前需先完成 03 运行与测量，或在 04 运行一个实验。
+          </div>}
+
+          <div className="spx-run-actions">
+            <button className="wf-button primary" disabled={!reportReady || !!busy || !reportTitle.trim()} onClick={() => void generateReport()}>
+              {busy === 'report' ? '生成中…' : '生成报告'}
+            </button>
             <button className="wf-button ghost" disabled={!reportDocument} onClick={openReport}>打开报告</button>
             <button className="wf-button ghost" disabled={!reportDocument} onClick={downloadReportHtml}>下载 HTML</button>
+            {!reportReady && <button className="wf-button ghost" onClick={() => setZone('run')}>去 03 运行测量</button>}
           </div>
-          <textarea aria-label="报告结论" value={reportConclusions} onChange={event => setReportConclusions(event.target.value)} placeholder="结论 / 候选选择说明" />
-          {reportDocument && <div className="wf-summary"><strong>{reportDocument.reportId}</strong><span>{reportDocument.createdAt}</span><span><code>{reportDocument.sha256.slice(0, 16)}…</code></span></div>}
-          <div className="wf-summary"><strong>工作流摘要</strong><span>Flow {compile?.flowId ?? '—'}</span><span>Compile {compile?.compileId ?? '—'}</span><span>Run {segment?.runId ?? '—'}</span><span>Measurement {measurement?.measurementId ?? '—'}</span><span>绑定 {measurement ? bindingLabel(measurement.bindingStatus) : '—'}</span></div>
+
+          {!reportReady && <div className="wf-empty" aria-label="报告空态">
+            <strong>还没有可报告的结果</strong>
+            <span>报告包含流程/编译、Route、Run、测量、实验统计与结构视图；先完成 03 运行与测量。</span>
+            <div className="wf-empty-actions">
+              <button className="wf-button primary" onClick={() => setZone('run')}>去 03 运行测量</button>
+              <button className="wf-button ghost" onClick={() => setZone('experiment')}>去 04 创建实验</button>
+            </div>
+          </div>}
+
+          {reportDocument && <>
+            <div className="wf-result-head wf-report-result">
+              <strong>{reportDocument.title}</strong>
+              <span className="wf-status succeeded">已生成</span>
+              <span className="wf-muted">{formatDateTime(reportDocument.createdAt)}</span>
+              <span className="wf-muted">SHA256 {reportDocument.sha256.slice(0, 16)}…</span>
+            </div>
+            <div className="wf-report-conclusions">
+              <strong>结论 / 候选说明</strong>
+              <p>{reportConclusions.trim() || '未提供'}</p>
+            </div>
+            <iframe className="wf-report-preview" title="报告预览" srcDoc={reportDocument.html} />
+          </>}
         </section>}
           </main>
 

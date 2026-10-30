@@ -93,9 +93,11 @@ try {
   await page.getByLabel('DOE 重复数').fill('1');
   await page.getByRole('button', { name: '设计 DOE' }).click();
   await page.getByText(/8 条件 × 1 重复 = 8 逻辑执行/).waitFor();
-  await page.getByRole('button', { name: '运行持久化实验' }).click();
+  await page.getByRole('button', { name: '运行实验', exact: true }).click();
   await page.getByText('实验状态：已完成').waitFor({ timeout: 180000 });
   assert.match(await page.locator('.wf-summary').filter({ hasText: '队列' }).innerText(), /8\/8 已成功/);
+  // Results come first; the inputs fold away after a run and reopen on demand.
+  await page.locator('.wf-experiment-inputs > summary').click();
   await page.getByRole('button', { name: '筛选 / 排序' }).click();
   await page.locator('.wf-table').last().locator('tbody tr').first().waitFor();
   assert.equal(await page.locator('.wf-table').last().locator('tbody tr').count(), 8);
@@ -103,9 +105,9 @@ try {
   assert.match(csv ?? '', /\/experiments\/exp_[a-f0-9]+\/export\.csv$/);
 
   // Retention preview/release/restore must complete without a 405 error.
-  await page.getByText('高级：保留策略').click();
+  await page.locator('.wf-experiment-inputs details > summary').filter({ hasText: '高级：保留策略' }).click();
   await page.getByRole('button', { name: '预览释放' }).click();
-  await page.getByText(/可释放 8 run/).waitFor();
+  await page.getByText(/可释放 8 个 Run/).waitFor();
   await page.getByRole('button', { name: '应用 release-runs' }).click();
   await page.getByText(/当前 release-runs/).waitFor();
   assert.equal(await page.locator('.wf-error').count(), 0);
