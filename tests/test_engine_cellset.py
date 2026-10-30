@@ -23,8 +23,10 @@ from backend import preflight, storage
 from backend.hashing import requested_input, requested_input_hash
 from backend.main import app
 from backend.models import parse_project
+from backend.runtime_limits import MAX_CELL_SET_CELLS
 from backend.validation import ProjectInputError, validate_project
 from backend import snapshots as snapshot_store
+from worker.simulate import _cell_set_upper_bound, _level_set_band_half_cells
 from tests.test_api_integration import asgi_request, json_body
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,17 +52,19 @@ def solver() -> dict:
 
 def project(dimension: int = 2, *, cell_set: dict | None = None, boundary: str = "reflective",
             grid_delta: float = 0.1, x_extent: float = 2.0, y_extent: float = 1.0,
-            steps: int = 1) -> dict:
+            steps: int = 1, plane_height: float = 0.2,
+            step_list: list[dict] | None = None) -> dict:
     value = {
         "schemaVersion": 7, "name": f"cell set {dimension}D", "dimension": dimension,
         "units": {"length": "um", "time": "s", "rate": "um/s", "angle": "deg"},
         "domain": {"gridDelta": grid_delta, "xExtent": x_extent,
                    **({"xBoundary": boundary} if dimension == 2
                       else {"yExtent": y_extent, "boundaryXY": boundary})},
-        "geometry": {"kind": "plane", "height": 0.2, "substrateMaterial": "Si"},
-        "steps": [{"id": f"cellset_etch_{index + 1:02d}", "name": "etch", "enabled": True,
-                   "operation": "etch", "model": "isotropic", "rateMagnitude": 0.1,
-                   "duration": 0.1, "rateMode": "uniform"} for index in range(steps)],
+        "geometry": {"kind": "plane", "height": plane_height, "substrateMaterial": "Si"},
+        "steps": step_list if step_list is not None else [
+            {"id": f"cellset_etch_{index + 1:02d}", "name": "etch", "enabled": True,
+             "operation": "etch", "model": "isotropic", "rateMagnitude": 0.1,
+             "duration": 0.1, "rateMode": "uniform"} for index in range(steps)],
         "solver": solver(),
         "outputSettings": {"levelSets": False, "levelSetMeshes": False, "surfaceMeshVtk": False,
                            "volumeMesh": False, "nativeMetadata": False},
@@ -86,6 +90,18 @@ def enabled(**overrides) -> dict:
 
 def normalized(value: dict) -> dict:
     return parse_project(value).model_dump(mode="json", exclude_none=True)
+
+
+def no_op_project() -> dict:
+    """A normal etch followed by an enabled zero-rate step."""
+    value = project(2, cell_set=enabled())
+    value["steps"] = [
+        {"id": "cellset_etch_01", "name": "etch", "enabled": True, "operation": "etch",
+         "model": "isotropic", "rateMagnitude": 0.1, "duration": 0.1, "rateMode": "uniform"},
+        {"id": "cellset_noop_01", "name": "zero rate", "enabled": True, "operation": "etch",
+         "model": "isotropic", "rateMagnitude": 0.0, "duration": 0.1, "rateMode": "uniform"},
+    ]
+    return value
 
 
 def vtu_counts(path: Path) -> tuple[str, int, int, set[str]]:
@@ -159,6 +175,75 @@ class CellSetSchema(unittest.TestCase):
         direct = preflight.rejection_detail(rejected)
         self.assertEqual(direct["code"], "artifact-budget-preflight")
         self.assertIn("64 MiB", direct["message"])
+
+    def test_preflight_uses_structure_span_not_absolute_elevation(self) -> None:
+        # A plane at z=2 in a 1x1 um, 0.01 um-grid 3D domain is only a plane;
+        # its elevation must not be charged as cell-set thickness. The old
+        # estimate added |height| and crossed the hard cell limit.
+        low = normalized(project(3, cell_set=enabled(), grid_delta=0.01,
+                                 x_extent=1.0, y_extent=1.0, plane_height=0.2))
+        high = normalized(project(3, cell_set=enabled(), grid_delta=0.01,
+                                  x_extent=1.0, y_extent=1.0, plane_height=2.0))
+        low_estimate = preflight.estimate_artifacts(low)
+        high_estimate = preflight.estimate_artifacts(high)
+        self.assertEqual(low_estimate["cellSetCellsUpperBound"],
+                         high_estimate["cellSetCellsUpperBound"])
+        self.assertEqual(low_estimate["estimatedBytes"], high_estimate["estimatedBytes"])
+        self.assertEqual(high_estimate["risk"], "ok")
+        self.assertLess(high_estimate["cellSetCellsUpperBound"], MAX_CELL_SET_CELLS)
+        self.assertEqual(preflight._structure_vertical_extent(low), 0.0)
+        self.assertEqual(preflight._structure_vertical_extent(high), 0.0)
+        low_stack = {"geometry": {"kind": "stack", "baseHeight": 0.0,
+                                  "layers": [{"thickness": 0.3}, {"thickness": 0.4}]}}
+        high_stack = {"geometry": {"kind": "stack", "baseHeight": 5.0,
+                                   "layers": [{"thickness": 0.3}, {"thickness": 0.4}]}}
+        self.assertAlmostEqual(preflight._structure_vertical_extent(low_stack), 0.7)
+        self.assertAlmostEqual(preflight._structure_vertical_extent(high_stack), 0.7)
+        self.assertEqual(preflight._structure_vertical_extent(
+            {"geometry": {"kind": "trench", "depth": 0.8, "maskHeight": 0.2}}), 1.0)
+
+    def test_expanded_level_set_band_is_bounded_before_allocation(self) -> None:
+        import viennaps as ps
+
+        ps.setDimension(2)
+        domain = ps.Domain(0.1, 2.0)
+        ps.MakePlane(domain, 0.2, ps.Material.Si, False).apply()
+        level_set = domain.getLevelSets()[0]
+        ps.ls.Expand(level_set, 20).apply()
+        self.assertGreaterEqual(_level_set_band_half_cells(domain), 10)
+        mesh = domain.getSurfaceMesh(addInterfaces=True, sharpCorners=False,
+                                     minNodeDistanceFactor=0.01)
+        top = max(float(point[1]) for point in mesh.getNodes())
+        bottom = min(float(point[1]) for point in mesh.getNodes())
+        request = project(2)
+        bound = _cell_set_upper_bound(request, height=0.5, top=top, bottom=bottom,
+                                      delta=0.1, domain=domain)
+        cell_set = ps.DenseCellSet()
+        cell_set.setCellSetPosition(True)
+        cell_set.setCoverMaterial(int(ps.Material.GAS))
+        cell_set.fromLevelSets(domain.getLevelSets(), domain.getMaterialMap().getMaterialMap(),
+                               top + 0.5)
+        actual = int(cell_set.getNumberOfCells())
+        self.assertGreaterEqual(bound, actual)
+        # The old surface+4-row bound was 198 for this 300-cell probe; it
+        # rejected after the dense allocation had already happened.
+        self.assertGreater(actual, 198)
+        self.assertGreater(bound, 198)
+
+        # The same expanded band plus a large cover height exceeds the hard
+        # limit; the bound must show that before any DenseCellSet is created.
+        ps.setDimension(2)
+        huge = ps.Domain(0.01, 20.0)
+        ps.MakePlane(huge, 0.2, ps.Material.Si, False).apply()
+        ps.ls.Expand(huge.getLevelSets()[0], 20).apply()
+        huge_mesh = huge.getSurfaceMesh(addInterfaces=True, sharpCorners=False,
+                                        minNodeDistanceFactor=0.01)
+        huge_top = max(float(point[1]) for point in huge_mesh.getNodes())
+        huge_bottom = min(float(point[1]) for point in huge_mesh.getNodes())
+        huge_bound = _cell_set_upper_bound(
+            project(2, grid_delta=0.01, x_extent=20.0), height=100.0,
+            top=huge_top, bottom=huge_bottom, delta=0.01, domain=huge)
+        self.assertGreater(huge_bound, MAX_CELL_SET_CELLS)
 
     def test_oversized_cell_set_is_rejected_before_the_worker_starts(self) -> None:
         huge = project(3, cell_set=enabled(height=10000.0), grid_delta=0.1,
@@ -295,6 +380,34 @@ class CellSetWorkflow(unittest.IsolatedAsyncioTestCase):
             response = await asgi_request("/api/runs", method="POST",
                                           payload={"kind": "simulate", "project": value})
             self.assertEqual(response[0], 422, response[2])
+
+    async def test_zero_rate_step_owns_its_cell_set_outputs(self) -> None:
+        for lazy in (True, False):
+            with self.subTest(lazy=lazy):
+                with patch.dict(os.environ, {
+                    "VIENNAPS_WORKBENCH_LAZY_SNAPSHOTS": "1" if lazy else "0"}):
+                    run_id, manifest = await self.run_project(no_op_project())
+                self.assertEqual((storage.run_path(run_id) / "cellset_etch_01.json").is_file(), not lazy)
+                step_id = "cellset_noop_01"
+                rows = self.outputs(manifest, step_id)
+                kinds = {row["kind"] for row in rows}
+                self.assertEqual(kinds, {"cellSet", "cellSetSummary"}, rows)
+                for row in rows:
+                    self.assertIn(step_id, row["fileName"])
+                    path = storage.run_path(run_id) / row["fileName"]
+                    self.assertTrue(path.is_file() and path.stat().st_size > 0, row)
+                summary_row = next(row for row in rows if row["kind"] == "cellSetSummary")
+                summary = storage.read_json(storage.run_path(run_id) / summary_row["fileName"])
+                self.assertGreater(summary["numberOfCells"], 0)
+                snapshot = self.snapshot(run_id, step_id)
+                self.assertTrue(snapshot["noOp"])
+                snapshot_outputs = snapshot.get("outputs") or []
+                self.assertEqual({row["kind"] for row in snapshot_outputs},
+                                 {"cellSet", "cellSetSummary"}, snapshot_outputs)
+                self.assertTrue(all(step_id in row["fileName"] for row in snapshot_outputs))
+                response = await asgi_request(
+                    f"/api/runs/{run_id}/artifacts/{step_id}?fileName={rows[0]['fileName']}")
+                self.assertEqual(response[0], 200, response[2])
 
     async def test_periodic_domain_uses_the_real_cell_set_boundary(self) -> None:
         configured = project(2, cell_set=enabled(periodic=True, format="json"), boundary="periodic")

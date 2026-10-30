@@ -135,13 +135,45 @@ def artifact_bytes_used(run_dir: Path) -> int:
     return total
 
 
+def _surface_vertical_bounds(points: list, *, is3d: bool) -> tuple[float, float]:
+    axis = 2 if is3d else 1
+    values = [float(point[axis]) for point in points]
+    if not values:
+        raise RuntimeError("DenseCellSet output requires the extracted native surface")
+    if any(not math.isfinite(value) for value in values):
+        raise RuntimeError("DenseCellSet surface bounds contain a non-finite coordinate")
+    return max(values), min(values)
+
+
+def _level_set_band_half_cells(domain: Any) -> int:
+    """Return the native band half-width in grid cells, with a safety margin.
+
+    ``DenseCellSet.fromLevelSets`` builds its grid from the stored level-set
+    bounds, not from the extracted surface. A level set widened by
+    ``viennals.Expand`` can therefore reach many cells beyond the surface
+    (probe: width 20 at gridDelta 0.1 gives a 10-cell band). The stored width
+    is the only bound API the Python bindings expose, so use it instead of a
+    fixed surface margin. The artificial cell-set position plane adds a small
+    default-width band, covered by the extra cells.
+    """
+    widest = 2
+    for level_set in domain.getLevelSets():
+        try:
+            width = int(level_set.getLevelSetWidth())
+        except (AttributeError, TypeError, ValueError):
+            width = 2
+        widest = max(widest, max(1, width))
+    return math.ceil(widest / 2) + 2
+
+
 def _cell_set_upper_bound(requested: dict[str, Any], *, height: float, top: float, bottom: float,
-                          delta: float) -> int:
+                          delta: float, domain: Any) -> int:
     """Upper-bound the native cell count before allocating the dense grid.
 
-    The installed generator walks the active level-set band (roughly one cell
-    below the lowest surface point) up to the requested position. Domain cells
-    are fixed laterally, so the bound is exact up to the band margin.
+    The installed generator walks the actual stored level-set band (which can
+    be much wider than the surface) up to the requested position. Domain cells
+    are fixed laterally; the vertical band width comes from every stored level
+    set, so an expanded band cannot under-bound the dense allocation.
     """
     x_extent = float(requested["domain"]["xExtent"])
     nx = max(1, math.ceil(x_extent / delta))
@@ -150,7 +182,10 @@ def _cell_set_upper_bound(requested: dict[str, Any], *, height: float, top: floa
         lateral = (nx + 2) * (ny + 2)
     else:
         lateral = nx + 2
-    rows = math.ceil((top + height - bottom) / delta) + 4
+    band = _level_set_band_half_cells(domain)
+    top_bound = max(top + height, top + band * delta)
+    bottom_bound = bottom - band * delta
+    rows = math.ceil((top_bound - bottom_bound) / delta) + 2
     return lateral * max(rows, 2)
 
 
@@ -182,9 +217,10 @@ def _cell_set_field_row(label: str, values: list[float],
     return row
 
 
-def write_cell_set_outputs(ps: Any, domain: Any, report: dict[str, Any], run_dir: Path, run_id: str,
+def write_cell_set_outputs(ps: Any, domain: Any, run_dir: Path, run_id: str,
                            step_id: str, requested: dict[str, Any], settings: dict[str, Any],
-                           *, is3d: bool) -> list[dict[str, Any]]:
+                           *, surface_top: float, surface_bottom: float,
+                           is3d: bool) -> list[dict[str, Any]]:
     """Write the optional native DenseCellSet VTU and compact JSON summary.
 
     A fresh ``DenseCellSet`` is built directly from the domain's level sets.
@@ -194,11 +230,8 @@ def write_cell_set_outputs(ps: Any, domain: Any, report: dict[str, Any], run_dir
     """
     dimension = int(requested["dimension"])
     axis = 2 if is3d else 1
-    points = report.get("points") or []
-    if not points:
-        raise RuntimeError("DenseCellSet output requires the extracted native surface")
-    top = max(float(point[axis]) for point in points)
-    bottom = min(float(point[axis]) for point in points)
+    top = float(surface_top)
+    bottom = float(surface_bottom)
     delta = float(domain.getGridDelta())
     height = float(settings["height"])
     if height + 1e-12 < delta:
@@ -214,7 +247,8 @@ def write_cell_set_outputs(ps: Any, domain: Any, report: dict[str, Any], run_dir
     if format_ not in {"vtu", "json", "both"}:
         raise RuntimeError(f"unsupported cellSet.format {format_!r}")
     position = top + height
-    cells_upper = _cell_set_upper_bound(requested, height=height, top=top, bottom=bottom, delta=delta)
+    cells_upper = _cell_set_upper_bound(requested, height=height, top=top, bottom=bottom,
+                                        delta=delta, domain=domain)
     if cells_upper > MAX_CELL_SET_CELLS:
         raise RuntimeError(
             f"cell-set output needs at least {cells_upper:,} cells, above the "
@@ -2114,9 +2148,11 @@ def save_snapshot(
                                            association="domain metadata", nativeUnit=None,
                                            metadataLevel=str(domain.getMetaDataLevel())))
     if cell_set_enabled:
+        surface_top, surface_bottom = _surface_vertical_bounds(report.get("points") or [], is3d=is3d)
         output_rows.extend(write_cell_set_outputs(
-            ps, render_domain, report, run_dir, run_id, step_id, requested,
-            cell_set_settings, is3d=is3d))
+            ps, render_domain, run_dir, run_id, step_id, requested,
+            cell_set_settings, surface_top=surface_top, surface_bottom=surface_bottom,
+            is3d=is3d))
     check_artifact_budget(run_dir)
     ids = display_material_ids
     if is3d:
@@ -2900,8 +2936,7 @@ def execute(input_path: Path, run_dir: Path) -> None:
             previous_path = run_dir / previous["snapshot"]
             copied = None
             if previous_path.is_file():
-                shutil.copyfile(previous_path, run_dir / f"{step['id']}.json")
-                copied = json.loads((run_dir / f"{step['id']}.json").read_text(encoding="utf-8"))
+                copied = json.loads(previous_path.read_text(encoding="utf-8"))
                 copied_mesh = dict(copied["mesh"])
                 if previous.get("vtk"):
                     copied_mesh["vtk"] = next_vtk_name
@@ -2913,6 +2948,26 @@ def execute(input_path: Path, run_dir: Path) -> None:
                 # add/remove record belongs to that step, not to this no-op.
                 for key in ("measuredRemoval", "measuredAdded"):
                     copied.pop(key, None)
+            # A zero-rate step still owns its requested output settings. Build
+            # this step's real cell set from the unchanged Domain instead of
+            # inheriting the predecessor's artifact rows (whose URLs point at
+            # the predecessor step).
+            no_op_cell_set_settings = (project.get("outputSettings") or {}).get("cellSet")
+            no_op_cell_set_enabled = (isinstance(no_op_cell_set_settings, dict)
+                                      and bool(no_op_cell_set_settings.get("enabled")))
+            no_op_outputs: list[dict[str, Any]] = []
+            if no_op_cell_set_enabled:
+                no_op_mesh = domain.getSurfaceMesh(addInterfaces=True, sharpCorners=False,
+                                                   minNodeDistanceFactor=0.01)
+                no_op_top, no_op_bottom = _surface_vertical_bounds(
+                    no_op_mesh.getNodes(), is3d=project["dimension"] == 3)
+                no_op_outputs = write_cell_set_outputs(
+                    ps, domain, run_dir, run_id, step["id"], project,
+                    no_op_cell_set_settings, surface_top=no_op_top,
+                    surface_bottom=no_op_bottom, is3d=project["dimension"] == 3)
+            if copied is not None:
+                if no_op_cell_set_enabled:
+                    copied["outputs"] = no_op_outputs
                 atomic_json(run_dir / f"{step['id']}.json", copied)
             check_artifact_budget(run_dir)
             metadata = {"stepId": step["id"], "name": step["name"], "stepIndex": index, "snapshot": f"{step['id']}.json",
@@ -2921,6 +2976,8 @@ def execute(input_path: Path, run_dir: Path) -> None:
                         "materialIds": previous["materialIds"], "materialIdsByLevelSetIndex": previous["materialIdsByLevelSetIndex"], "noOp": True,
                         "measuredGeometry": (copied or previous).get("measuredGeometry"),
                         "materialTops": previous.get("materialTops")}
+            if no_op_cell_set_enabled:
+                metadata["outputs"] = no_op_outputs
             if copied is None:
                 # Previous step is deferred: this no-op step shares its native
                 # state and is materialised from state-<step>.vpsd on first read.

@@ -250,14 +250,20 @@ def _structure_vertical_extent(project: dict[str, Any]) -> float:
 
     kind = geometry.get("kind")
     if kind == "plane":
-        return number("height")
-    if kind in {"trench", "hole"}:
-        return max(number("depth"), number("maskHeight"))
+        # ``height`` is the absolute plane elevation, not a thickness. The cell
+        # set starts from the level-set band around that plane, so translation
+        # must not change its vertical span.
+        return 0.0
+    if kind == "trench":
+        return number("depth") + number("maskHeight")
+    if kind == "hole":
+        return number("depth") + number("maskHeight")
     if kind == "fin":
-        return max(number("height"), number("maskHeight"))
+        return number("height") + number("maskHeight")
     if kind == "stack":
-        base = number("baseHeight")
-        return base + sum(abs(float(row.get("thickness") or 0.0)) for row in geometry.get("layers") or [])
+        # ``baseHeight`` is an absolute offset; only the layer thicknesses add
+        # vertical span above the substrate.
+        return sum(abs(float(row.get("thickness") or 0.0)) for row in geometry.get("layers") or [])
     if kind == "gds":
         heights: list[float] = []
         for row in geometry.get("layers") or []:
