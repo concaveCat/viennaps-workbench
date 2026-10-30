@@ -2949,13 +2949,17 @@ def execute(input_path: Path, run_dir: Path) -> None:
                 for key in ("measuredRemoval", "measuredAdded"):
                     copied.pop(key, None)
             # A zero-rate step still owns its requested output settings. Build
-            # this step's real cell set from the unchanged Domain instead of
-            # inheriting the predecessor's artifact rows (whose URLs point at
-            # the predecessor step).
+            # this step's real cell set from the unchanged Domain. Only the
+            # generic cell-set rows are replaced/relocated to this step; every
+            # unrelated output row (nativeMetadata, level sets, surface mesh,
+            # ...) stays exactly as copied from the predecessor.
             no_op_cell_set_settings = (project.get("outputSettings") or {}).get("cellSet")
             no_op_cell_set_enabled = (isinstance(no_op_cell_set_settings, dict)
                                       and bool(no_op_cell_set_settings.get("enabled")))
             no_op_outputs: list[dict[str, Any]] = []
+            inherited_outputs = ([row for row in (copied.get("outputs") or [])
+                                  if row.get("kind") not in {"cellSet", "cellSetSummary"}]
+                                 if copied is not None else [])
             if no_op_cell_set_enabled:
                 no_op_mesh = domain.getSurfaceMesh(addInterfaces=True, sharpCorners=False,
                                                    minNodeDistanceFactor=0.01)
@@ -2965,6 +2969,7 @@ def execute(input_path: Path, run_dir: Path) -> None:
                     ps, domain, run_dir, run_id, step["id"], project,
                     no_op_cell_set_settings, surface_top=no_op_top,
                     surface_bottom=no_op_bottom, is3d=project["dimension"] == 3)
+                no_op_outputs = no_op_outputs + inherited_outputs
             if copied is not None:
                 if no_op_cell_set_enabled:
                     copied["outputs"] = no_op_outputs
