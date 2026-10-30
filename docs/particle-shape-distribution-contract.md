@@ -310,8 +310,16 @@ model = ps.BoxDistribution([sx, sy, sz])       # 2D 传 [sx, sy, 0.0]
 model = ps.SphereDistribution(sign * radius)
 for name in masked_materials:                  # 只有 etch 且材料 level set 非空
     model.addMaskMaterial(material_handle(ps, name))
-ps.Process(domain, model, 0.0).apply()         # duration 原生不参与，固定记录 0.0
+process = ps.Process(domain, model, 0.0)       # duration 原生不参与，固定记录 0.0
+process.setFluxEngineType(ps.FluxEngineType.CPU_DISK)
+process.apply()
 ```
+
+`CPU_DISK` 必须显式固定：`Process` 默认是 `AUTO`，即使是纯几何推进也会解析通量引擎并
+初始化 CUDA（`cuInit`）。实测把 `CUDA_VISIBLE_DEVICES` 置空后，修复前的最小平面刻蚀
+直接失败（`Cuda Error CUDA_ERROR_NO_DEVICE` / `Failed to load CUDA symbol via
+cuGetProcAddress: cuInit`），修复后同样的 CPU 运行正常完成。参考 fixture 与两个探针
+也固定同一后端，避免参考实现和生产路径走不同的引擎。
 
 掩膜材料来自 `worker/mask_materials.py::protected_material_names(project, step)`
 （与通量/方向性/CSV 步骤同一份规则）：
@@ -330,6 +338,11 @@ ps.Process(domain, model, 0.0).apply()         # duration 原生不参与，固�
 - `nativeSignedRadiusUm` / `nativeSignedHalfAxesUm` / `nativeHalfAxesUm`（实际传入值）；
 - `expectedOffsetUm`（球半径或盒最大半轴）；
 - `surfaceBoundsBeforeUm` / `surfaceBoundsAfterUm`（真实表面网格包围盒）；
+- `surfaceSignatureBefore` / `surfaceSignatureAfter`（表面网格 SHA-256：全部节点坐标、
+  line/triangle 拓扑、逐 cell 的 `MaterialIds`、域材料映射与标量标签）；
+- `surfacePointCountBefore/After`、`surfaceCellCountBefore/After`；
+- `nativeProcessBackend`：固定为
+  `CPU_DISK pinned; geometric distribution has no stochastic flux engine`；
 - `levelSetPointCountsBefore` / `After`、`materialIdsByLevelSetIndex`；
 - `nativeMask`：
   - `mode`：`material` 或 `none`；
@@ -341,9 +354,16 @@ ps.Process(domain, model, 0.0).apply()         # duration 原生不参与，固�
 - `nativeProcessDurationSeconds: 0.0`、`nativeDurationIgnored`；
 - `scopedSurface`：沉积只推进顶层材料，刻蚀会与下层 level set 求交。
 
-worker 在调用前后各测一次表面包围盒；如果完全没变，会抛错而不是记录一个静默 no-op
-（错误信息里会带上生效的掩膜材料名，因为“掩膜覆盖整个暴露表面”正是一种合法的
-原生 no-op）。`actualEngine` 固定为 `not-applicable`，`actualSeed` 为 `null`。
+worker 在调用前后各取一次表面网格签名；只有签名完全相同才算 no-op，否则抛错而不是记录
+一个静默 no-op（错误信息里会带上生效的掩膜材料名，因为“掩膜覆盖整个暴露表面”正是
+一种合法的原生 no-op）。
+
+**不能只用包围盒判断**：带掩膜的球刻蚀作用在图案化叠层上时，被保护的掩膜顶面与衬底
+底面把每个轴的包围盒都钉住，而开口底部的表面仍在移动。实测同一工程的包围盒逐位
+相同，但表面节点 2D `48 → 50`、3D `816 → 850`，cell 数 `46 → 48`、`1472 → 1536`；
+只比较包围盒会把这步真实刻蚀误判成 no-op 并失败。签名覆盖坐标、拓扑与材料，因此
+真实变化一定被发现，而完全没变（例如顶层 level set 本身就是被保护的掩膜）仍然判为
+no-op。`actualEngine` 固定为 `not-applicable`，`actualSeed` 为 `null`。
 
 面板/校验提示（`backend/validation.py::_particle_shape_warnings`）按操作分别说明：
 刻蚀保护原生掩膜材料；沉积因为原生缺陷始终无掩膜、项目掩膜材料也会一起长大。
@@ -364,15 +384,23 @@ worker 在调用前后各测一次表面包围盒；如果完全没变，会抛�
 5. **自定义材料注册表**：`POST /api/materials` 注册的 `WB_A4_Mask` 用作
    `geometry.maskMaterial`，刻蚀运行记录写 `materials == ["WB_A4_Mask"]`，重放逐位一致；
 6. 连续两个形状步骤 + replay 逐位一致；
-7. 掩膜/周期边界/零半径/低于网格间距/错误维度/额外字段全部 422；
-8. 既有项目请求哈希固定在基线值 `605a109b...c42`，新增步骤只在启用时改变哈希；
-9. 项目保存/重开保持字段；
-10. bounded child 复跑的实测证据：
+7. **图案化叠层上的掩膜球刻蚀**（2D/3D）：包围盒逐位相同但节点/cell 数增加、签名改变，
+   步骤必须成功并写出可重放的快照——这是“包围盒误判 no-op”的回归；
+8. **真 no-op 仍然失败**：顶层 level set 就是被保护的掩膜时签名不变，步骤必须报
+   `left the surface unchanged`；
+9. **CPU-only 执行**：`CUDA_VISIBLE_DEVICES` 置空时，无掩膜平面刻蚀与带掩膜沟槽刻蚀
+   都必须成功，记录 `nativeProcessBackend = CPU_DISK pinned...`，且 `run.log` 中没有
+   `Cuda Error` / `cuGetProcAddress`；
+10. 掩膜/周期边界/零半径/低于网格间距/错误维度/额外字段全部 422；
+11. 既有项目请求哈希固定在基线值 `605a109b...c42`，新增步骤只在启用时改变哈希；
+12. 项目保存/重开保持字段；
+13. bounded child 复跑的实测证据：
     - `CustomSphereDistribution` 2D/3D `-6`；
     - 掩膜沉积 `-11`（材料掩膜、原始 `viennals` 掩膜、远离表面的掩膜盒、覆盖全
       域的掩膜盒）；
     - 零半轴 `-11`；
-    - **掩膜刻蚀 2D/3D `0`，掩膜顶面不动、衬底下降**（`probe_particle_mask.py`）。
+    - **掩膜刻蚀 2D/3D `0`，掩膜顶面不动、衬底下降**（`probe_particle_mask.py`，
+      探针记录 `processBackend: CPU_DISK`）。
 
 ## 10. 仍未覆盖 / 不声称
 

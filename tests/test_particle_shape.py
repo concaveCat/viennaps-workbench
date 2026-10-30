@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 import unittest
 from pathlib import Path
 
@@ -75,6 +76,25 @@ def shape_step(dimension: int, *, step_id: str = "step_shape_0001", **overrides)
             "model": "particleShape", "shape": "sphere", "radius": 0.5}
     step.update(overrides)
     return step
+
+
+def patterned_stack_geometry(pattern: str = "trench") -> dict:
+    """Stack whose opening floor is interior to the bounds.
+
+    The top ``role=mask`` layer pins the upper z bound and the substrate pins
+    the lower one, so a masked etch of the opening floor changes the surface
+    mesh while every axis bound stays identical — the case a bounds-only no-op
+    check wrongly rejects. With ``pattern="none"`` the top level set *is* the
+    mask, which is a genuine no-op.
+    """
+    return {
+        "kind": "stack", "substrateMaterial": "Si", "baseHeight": 0.0,
+        "layers": [
+            {"id": "film1", "name": "oxide", "material": "SiO2", "thickness": 0.5, "role": "film"},
+            {"id": "mask1", "name": "hardmask", "material": "Mask", "thickness": 0.5, "role": "mask"},
+        ],
+        "pattern": {"kind": "trench", "width": 1.0, "taperAngle": 0.0} if pattern == "trench" else {"kind": pattern},
+    }
 
 
 def hash_baseline_project() -> dict:
@@ -286,6 +306,7 @@ class UnsafeNativePathEvidenceTests(unittest.IsolatedAsyncioTestCase):
                 before = output["diagnostics"]["before"]
                 after = output["after"]
                 self.assertEqual(output["processCall"], "ps.Process(domain, model).apply()")
+                self.assertEqual(output.get("processBackend"), "CPU_DISK")
                 self.assertAlmostEqual(after["boundingBox"][-1][1], before["boundingBox"][-1][1], places=6)
                 self.assertLess(after["boundingBox"][-1][0], before["boundingBox"][-1][0] - 0.05)
                 self.assertEqual(after["materialIdsByLevelSetIndex"],
@@ -351,14 +372,18 @@ class ParticleShapeRunTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.life.__aexit__(None, None, None)
 
-    async def wait(self, run_id: str) -> dict:
+    async def wait_for_terminal(self, run_id: str) -> dict:
         for _ in range(2400):
             info = json_body(await asgi_request(f"/api/runs/{run_id}"))
             if info["status"] in {"succeeded", "failed", "cancelled", "timed_out", "interrupted"}:
-                self.assertEqual(info["status"], "succeeded", info.get("failureReason"))
                 return info
             await asyncio.sleep(0.05)
         self.fail("bounded native worker exceeded acceptance timeout")
+
+    async def wait(self, run_id: str) -> dict:
+        info = await self.wait_for_terminal(run_id)
+        self.assertEqual(info["status"], "succeeded", info.get("failureReason"))
+        return info
 
     async def execute(self, project: dict) -> tuple[str, dict]:
         response = await asgi_request("/api/runs", method="POST", payload={"kind": "simulate", "project": project})
@@ -409,7 +434,7 @@ class ParticleShapeRunTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parameters["nativeMask"]["mode"], "material" if mask_applied else "none")
         self.assertEqual(parameters["nativeMask"]["applied"], mask_applied)
         self.assertIn("ignored", parameters["nativeDurationIgnored"])
-        self.assertNotEqual(parameters["surfaceBoundsBeforeUm"], parameters["surfaceBoundsAfterUm"])
+        self.assertNotEqual(parameters["surfaceSignatureBefore"], parameters["surfaceSignatureAfter"])
         self.assertTrue(parameters["levelSetPointCountsAfter"])
 
         replay = json_body(await asgi_request(f"/api/runs/{run_id}/replay-project"))
@@ -468,6 +493,84 @@ class ParticleShapeRunTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(parameters["nativeMask"]["materials"], ["Mask"])
                 self.assertEqual(parameters["nativeMask"]["omittedMaterials"], [])
                 self.assertEqual(parameters["nativeMaskConstructor"], "addMaskMaterial")
+
+    async def test_masked_etch_on_a_patterned_stack_changes_the_mesh_without_moving_the_bounds(self):
+        # Regression for the bounds-only no-op check. This masked sphere etch
+        # moves the opening floor while the protected mask top and the
+        # substrate bottom keep every axis bound identical (measured 48 -> 50
+        # surface nodes in 2D, 816 -> 850 in 3D). Bounds alone cannot see it.
+        for dimension in (2, 3):
+            with self.subTest(dimension=dimension):
+                project = base_project(dimension, patterned_stack_geometry())
+                project["steps"] = [shape_step(dimension, operation="etch", radius=0.25)]
+                run_id, _info = await self.execute(project)
+                parameters = storage.read_json(
+                    storage.run_path(run_id) / "manifest.json")["actualExecution"][-1]["actualParameters"]
+                self.assertEqual(parameters["surfaceBoundsBeforeUm"], parameters["surfaceBoundsAfterUm"])
+                self.assertNotEqual(parameters["surfaceSignatureBefore"], parameters["surfaceSignatureAfter"])
+                self.assertGreater(parameters["surfacePointCountAfter"], parameters["surfacePointCountBefore"])
+                self.assertGreater(parameters["surfaceCellCountAfter"], parameters["surfaceCellCountBefore"])
+                self.assertEqual(parameters["nativeMask"]["materials"], ["Mask"])
+                self.assertEqual(parameters["nativeProcessBackend"],
+                                 "CPU_DISK pinned; geometric distribution has no stochastic flux engine")
+                step_id = project["steps"][0]["id"]
+                first = await self.snapshot(run_id, step_id)
+                self.assertGreater(len(first["points"]), 0)
+                replay = json_body(await asgi_request(f"/api/runs/{run_id}/replay-project"))
+                replay_id = json_body(await asgi_request("/api/runs/replay", method="POST",
+                                                         payload=replay))["runId"]
+                await self.wait(replay_id)
+                repeated = await self.snapshot(replay_id, step_id)
+                for field in ("points", "cellData", "materialIdsByLevelSetIndex"):
+                    self.assertEqual(first[field], repeated[field], field)
+
+    async def test_a_fully_protected_etch_is_still_reported_as_a_no_op(self):
+        # The digest must not turn a real no-op into a success: without a
+        # pattern the top level set is the mask itself, so protecting it leaves
+        # the surface unchanged and the step must keep failing loudly.
+        project = base_project(2, patterned_stack_geometry(pattern="none"))
+        project["steps"] = [shape_step(2, operation="etch", radius=0.25)]
+        response = await asgi_request("/api/runs", method="POST",
+                                      payload={"kind": "simulate", "project": project})
+        self.assertEqual(response[0], 202, response[2])
+        info = await self.wait_for_terminal(json_body(response)["runId"])
+        self.assertEqual(info["status"], "failed")
+        self.assertIn("left the surface unchanged", info.get("failureReason") or "")
+        self.assertIn("mask", info.get("failureReason") or "")
+
+    async def test_particle_shape_pins_cpu_disk_and_runs_without_a_cuda_device(self):
+        # The Process default is AUTO, which resolved a flux engine and called
+        # cuInit even for a purely geometric distribution; on a host without a
+        # usable CUDA device that aborted the CPU geometry step. The worker now
+        # pins CPU_DISK, so maskless and masked particleShape must both run
+        # with no visible CUDA device and leave no CUDA error in the worker log.
+        cases = {
+            "maskless-plane": (base_project(2), shape_step(2, operation="etch", radius=0.25), False),
+            "masked-trench": (base_project(2, geometry={
+                "kind": "trench", "width": 2.0, "depth": 1.0, "taperAngle": 0.0,
+                "maskHeight": 0.5, "maskTaperAngle": 0.0, "substrateMaterial": "Si"}),
+                shape_step(2, operation="etch", radius=0.25), True),
+        }
+        saved = os.environ.get("CUDA_VISIBLE_DEVICES")
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        try:
+            for label, (project, step, masked) in cases.items():
+                with self.subTest(case=label):
+                    project["steps"] = [step]
+                    run_id, _info = await self.execute(project)
+                    parameters = storage.read_json(
+                        storage.run_path(run_id) / "manifest.json")["actualExecution"][-1]["actualParameters"]
+                    self.assertEqual(parameters["nativeProcessBackend"],
+                                     "CPU_DISK pinned; geometric distribution has no stochastic flux engine")
+                    self.assertEqual(parameters["nativeMask"]["applied"], masked)
+                    log = (storage.run_path(run_id) / "run.log").read_text(encoding="utf-8", errors="replace")
+                    self.assertNotIn("Cuda Error", log)
+                    self.assertNotIn("cuGetProcAddress", log)
+        finally:
+            if saved is None:
+                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            else:
+                os.environ["CUDA_VISIBLE_DEVICES"] = saved
 
     async def test_mask_changes_the_geometry_versus_an_unmasked_native_run(self):
         # Localization: the protected mask material does not move, so a masked

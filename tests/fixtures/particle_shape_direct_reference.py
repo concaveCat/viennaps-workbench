@@ -97,7 +97,11 @@ def apply_step(domain, project, step, mask_mode="native"):
             level_set = domain.getMaterialLevelSet(material(name))
             if level_set is not None and int(level_set.getNumberOfPoints()) > 0:
                 model.addMaskMaterial(material(name))
-    ps.Process(domain, model, 0.0).apply()
+    process = ps.Process(domain, model, 0.0)
+    # Mirror the worker: the Process default is AUTO and initialises CUDA even
+    # for a geometric distribution, so the reference pins the CPU backend.
+    process.setFluxEngineType(ps.FluxEngineType.CPU_DISK)
+    process.apply()
 
 
 def main() -> None:

@@ -246,13 +246,21 @@ def main() -> None:
     started = time.monotonic()
     model = build_distribution(case, domain)
     record["nativeClass"] = type(model).__name__
+    pin_cpu = bool(case.get("pinCpu", True))
     if str(case.get("process", "three-arg")) == "two-arg":
-        ps.Process(domain, model).apply()
+        process = ps.Process(domain, model)
         record["processCall"] = "ps.Process(domain, model).apply()"
     else:
         duration = float(case.get("duration", 0.0))
-        ps.Process(domain, model, duration).apply()
+        process = ps.Process(domain, model, duration)
         record["processCall"] = f"ps.Process(domain, model, {duration!r}).apply()"
+    if pin_cpu:
+        # Mirror the worker: AUTO resolves a flux engine and initialises CUDA
+        # even for a geometric distribution. ``pinCpu: false`` reproduces the
+        # raw default for evidence on hosts where CUDA is broken.
+        process.setFluxEngineType(ps.FluxEngineType.CPU_DISK)
+    record["processBackend"] = "CPU_DISK" if pin_cpu else "AUTO"
+    process.apply()
     elapsed = time.monotonic() - started
 
     record["after"] = summary(domain, dimension)

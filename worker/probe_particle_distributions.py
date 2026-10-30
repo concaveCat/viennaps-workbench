@@ -120,7 +120,11 @@ def main() -> None:
     before = summary(domain, dimension)
     started = time.monotonic()
     model = distribution(case, domain)
-    ps.Process(domain, model, float(case.get("duration", 0.0))).apply()
+    process = ps.Process(domain, model, float(case.get("duration", 0.0)))
+    # AUTO resolves a flux engine and initialises CUDA even for a geometric
+    # distribution; mirror the worker's explicit CPU backend.
+    process.setFluxEngineType(ps.FluxEngineType.CPU_DISK)
+    process.apply()
     elapsed = time.monotonic() - started
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps({

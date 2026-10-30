@@ -14,6 +14,7 @@ import math
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -2347,14 +2348,62 @@ def _gds_boolean_operand(ps: Any, domain: Any, project: dict[str, Any], step: di
     return operand, transform
 
 
-def surface_axis_bounds(domain: Any, dimension: int) -> list[list[float]]:
-    """Return the surface extent used by particle-shape diagnostics."""
+def surface_state(domain: Any, dimension: int) -> dict[str, Any]:
+    """Return surface bounds plus an exact digest of the exposed surface mesh.
+
+    A particle-shape step is a no-op only when the surface really did not
+    change. Axis-aligned bounds are not enough: a masked sphere etch on a
+    patterned stack moved the opening floor while the protected mask top and
+    the substrate pinned every axis bound, so the bounds stayed identical and a
+    bounds-only check rejected a real etch (measured 48 -> 50 surface nodes in
+    2D and 816 -> 850 in 3D). The digest therefore covers every node
+    coordinate, the line/triangle topology, the per-cell material IDs and the
+    domain material map; an unchanged surface hashes identically, any changed
+    node, cell, material or level-set material mapping does not.
+    """
     mesh = domain.getSurfaceMesh(addInterfaces=True, sharpCorners=False, minNodeDistanceFactor=0.01)
     points = mesh.getNodes()
     if not points:
         raise RuntimeError("the native surface mesh is empty; the particle-shape offset removed every point")
-    return [[float(min(point[axis] for point in points)), float(max(point[axis] for point in points))]
-            for axis in range(dimension)]
+    cells = mesh.getLines() if dimension == 2 else mesh.getTriangles()
+    mapping = domain.getMaterialMap()
+    material_map = [int(mapping.getMaterialIdAtIdx(index)) for index in range(mapping.size())]
+    cell_data = mesh.getCellData()
+    labels: list[str] = []
+    material_ids: list[int] = []
+    for index in range(cell_data.getScalarDataSize()):
+        label = str(cell_data.getScalarDataLabel(index))
+        labels.append(label)
+        if label == "MaterialIds":
+            material_ids = [int(value) for value in cell_data.getScalarData(index)]
+    digest = hashlib.sha256()
+    digest.update(struct.pack("<I", int(dimension)))
+    digest.update(struct.pack("<Q", len(points)))
+    for point in points:
+        # ``+ 0.0`` folds -0.0 into 0.0 so an unchanged coordinate cannot flip
+        # the digest through a signed zero.
+        digest.update(struct.pack("<" + "d" * dimension,
+                                  *(float(point[axis]) + 0.0 for axis in range(dimension))))
+    digest.update(struct.pack("<Q", len(cells)))
+    for cell in cells:
+        digest.update(struct.pack("<Q", len(cell)))
+        for node in cell:
+            digest.update(struct.pack("<Q", int(node)))
+    digest.update(struct.pack("<Q", len(material_ids)))
+    for value in material_ids:
+        digest.update(struct.pack("<q", value))
+    digest.update(struct.pack("<Q", len(material_map)))
+    for value in material_map:
+        digest.update(struct.pack("<q", value))
+    digest.update("\x00".join(labels).encode("utf-8"))
+    return {
+        "bounds": [[float(min(point[axis] for point in points)),
+                    float(max(point[axis] for point in points))]
+                   for axis in range(dimension)],
+        "pointCount": len(points),
+        "cellCount": len(cells),
+        "digest": digest.hexdigest(),
+    }
 
 
 def apply_particle_shape(ps: Any, domain: Any, project: dict[str, Any], step: dict[str, Any]) -> dict[str, Any]:
@@ -2428,15 +2477,22 @@ def apply_particle_shape(ps: Any, domain: Any, project: dict[str, Any], step: di
         native_class = "SphereDistribution"
         native_half_axes = None
         expected_offset = radius
-    before = surface_axis_bounds(domain, dimension)
+    before_state = surface_state(domain, dimension)
+    before = before_state["bounds"]
     counts_before = [int(level_set.getNumberOfPoints()) for level_set in domain.getLevelSets()]
     for _name, handle in applied_masks:
         model.addMaskMaterial(handle)
     # The geometric process strategy ignores the duration entirely; measure it
-    # as zero so the run record never implies a rate.
-    ps.Process(domain, model, 0.0).apply()
-    after = surface_axis_bounds(domain, dimension)
-    if before == after:
+    # as zero so the run record never implies a rate. The 4.6.2/4.7.0 Process
+    # default is AUTO, which resolves and initialises a flux engine even for a
+    # pure geometric distribution (`cuInit`); pin CPU_DISK like the other
+    # non-particle steps so a CPU-only run never touches CUDA.
+    process = ps.Process(domain, model, 0.0)
+    process.setFluxEngineType(ps.FluxEngineType.CPU_DISK)
+    process.apply()
+    after_state = surface_state(domain, dimension)
+    after = after_state["bounds"]
+    if before_state["digest"] == after_state["digest"]:
         raise RuntimeError(
             "native particle-shape distribution left the surface unchanged; refusing to record a "
             "silent no-op (check that the magnitude exceeds the grid resolution"
@@ -2458,6 +2514,13 @@ def apply_particle_shape(ps: Any, domain: Any, project: dict[str, Any], step: di
         "expectedOffsetUm": expected_offset,
         "surfaceBoundsBeforeUm": before,
         "surfaceBoundsAfterUm": after,
+        "surfaceSignatureBefore": before_state["digest"],
+        "surfaceSignatureAfter": after_state["digest"],
+        "surfacePointCountBefore": before_state["pointCount"],
+        "surfacePointCountAfter": after_state["pointCount"],
+        "surfaceCellCountBefore": before_state["cellCount"],
+        "surfaceCellCountAfter": after_state["cellCount"],
+        "nativeProcessBackend": "CPU_DISK pinned; geometric distribution has no stochastic flux engine",
         "levelSetPointCountsBefore": counts_before,
         "levelSetPointCountsAfter": [int(level_set.getNumberOfPoints()) for level_set in domain.getLevelSets()],
         "materialIdsByLevelSetIndex": [int(mapping.getMaterialIdAtIdx(i)) for i in range(mapping.size())],
