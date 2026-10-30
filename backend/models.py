@@ -646,6 +646,21 @@ def _directional_rate_set_directions(step: "DirectionalStepV5") -> list[tuple[in
     return [(None, step.direction)]
 
 
+# A 2D direction is projected onto [x, h] by the schema and by the worker's
+# normalization. Checking the raw third component with an absolute tolerance is
+# not enough: [0, -1e-12, 1e-12] passes an absolute <= 1e-12 test but normalizes
+# to [0, -0.707, 0.707], i.e. a mostly out-of-plane beam. Compare the normalized
+# third component instead so the tolerance is relative to the vector length.
+PLANAR_DIRECTION_TOLERANCE = 1e-12
+
+
+def normalized_out_of_plane_component(direction: list[float]) -> float:
+    length = math.sqrt(sum(float(value) ** 2 for value in direction))
+    if length <= 0.0:
+        return 0.0
+    return abs(float(direction[2])) / length
+
+
 class DirectionalRateSetV5(StrictModel):
     """One real ``viennaps.RateSet`` of the native multi-set overload.
 
@@ -707,11 +722,12 @@ class DirectionalStepV5(StrictModel):
             if any(name in self.model_fields_set for name in scalar_fields):
                 raise ValueError(
                     "rateSets is mutually exclusive with direction, directionalRateMagnitude "
-                    "and isotropicRateMagnitude")
+                    "and isotropicRateMagnitude: omit all three fields in rateSets mode; send them "
+                    "only for scalar directional steps, never as 0 placeholders")
             if self.calculateVisibility is not True:
                 raise ValueError(
                     "rateSets uses per-set calculateVisibility; omit the step-level flag "
-                    "or leave it true")
+                    "instead of materializing it (or leave it true)")
         if self.operation == "deposit" and self.depositMaterial is None:
             raise ValueError("deposit steps require depositMaterial")
         if self.operation == "etch" and "depositMaterial" in self.model_fields_set:
@@ -1024,11 +1040,14 @@ class ProjectV6(StrictModel):
         if len(ids) != len(set(ids)):
             raise ValueError("step IDs must be unique")
         for index, step in enumerate(self.steps):
-            if isinstance(step, DirectionalStepV5):
+            if isinstance(step, DirectionalStepV5) and self.dimension == 2:
                 for set_index, direction in _directional_rate_set_directions(step):
-                    if self.dimension == 2 and abs(direction[2]) > 1e-12:
+                    out_of_plane = normalized_out_of_plane_component(direction)
+                    if out_of_plane > PLANAR_DIRECTION_TOLERANCE:
                         path = f"{index}" if set_index is None else f"{index}.rateSets[{set_index}]"
-                        raise ValueError(f"2D directional step {path} must use [x, h, 0]; its third direction component must be zero")
+                        raise ValueError(
+                            f"2D directional step {path} must use [x, h, 0]; its third direction component must be zero "
+                            f"after normalization (raw {direction[2]!r} gives |z|={out_of_plane:.6g} on the unit vector)")
             if isinstance(step, BooleanStepV5):
                 if self.dimension == 2 and (abs(step.position[2]) > 1e-12 or step.depth is not None):
                     raise ValueError(f"2D boolean step {index} requires position [x, h, 0] and no depth")
@@ -1181,11 +1200,14 @@ class ProjectV5(StrictModel):
         if len(ids) != len(set(ids)):
             raise ValueError("step IDs must be unique")
         for index, step in enumerate(self.steps):
-            if isinstance(step, DirectionalStepV5):
+            if isinstance(step, DirectionalStepV5) and self.dimension == 2:
                 for set_index, direction in _directional_rate_set_directions(step):
-                    if self.dimension == 2 and abs(direction[2]) > 1e-12:
+                    out_of_plane = normalized_out_of_plane_component(direction)
+                    if out_of_plane > PLANAR_DIRECTION_TOLERANCE:
                         path = f"{index}" if set_index is None else f"{index}.rateSets[{set_index}]"
-                        raise ValueError(f"2D directional step {path} must use [x, h, 0]; its third direction component must be zero")
+                        raise ValueError(
+                            f"2D directional step {path} must use [x, h, 0]; its third direction component must be zero "
+                            f"after normalization (raw {direction[2]!r} gives |z|={out_of_plane:.6g} on the unit vector)")
             elif isinstance(step, BooleanStepV5):
                 if self.dimension == 2 and (abs(step.position[2]) > 1e-12 or step.depth is not None):
                     raise ValueError(f"2D boolean step {index} requires position [x, h, 0] and no depth")

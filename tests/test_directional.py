@@ -182,6 +182,22 @@ class DirectionalContract(unittest.TestCase):
             "zero direction")
         bad(lambda value: value["steps"][0]["rateSets"][0].update(direction=[0.0, 1.0, 0.5]),
             "2D third component")
+        # A raw third component within 1e-12 can still normalize to a mostly
+        # out-of-plane beam; the 2D check must use the normalized direction.
+        bad(lambda value: value["steps"][0]["rateSets"][0].update(direction=[0.0, -1e-12, 1e-12]),
+            "2D rate-set normalized third component")
+        bad(lambda value: value["steps"][0].update(rateSets=None, direction=[0.0, -1e-12, 1e-12],
+                                                   directionalRateMagnitude=0.1,
+                                                   isotropicRateMagnitude=0.0),
+            "2D scalar normalized third component")
+        # An in-plane vector with a negligible normalized z stays legal.
+        tiny = copy.deepcopy(p)
+        tiny["steps"][0]["rateSets"][0]["direction"] = [0.0, 1.0, 1e-13]
+        validate_project(tiny)
+        tiny_scalar = copy.deepcopy(p)
+        tiny_scalar["steps"][0].update(rateSets=None, direction=[0.0, 1.0, 1e-13],
+                                       directionalRateMagnitude=0.1, isotropicRateMagnitude=0.0)
+        validate_project(tiny_scalar)
         bad(lambda value: value["steps"][0]["rateSets"][0].update(directionalVelocity=-0.1),
             "negative rate")
         bad(lambda value: value["steps"][0]["rateSets"][0].update(isotropicVelocity=2.5),
@@ -198,6 +214,21 @@ class DirectionalContract(unittest.TestCase):
         bad(lambda value: value["steps"][0]["rateSets"][0].update(maskMaterials=["NotAMaterial"]),
             "unknown mask")
         bad(lambda value: value["steps"][0].update(rateFunction="lambda x: x"), "custom callable")
+
+        # The mutual-exclusion 422 tells an unchanged scalar-mode consumer how
+        # to branch instead of materializing absent fields as zero.
+        regressed = copy.deepcopy(p)
+        regressed["steps"][0].update(direction=[0.0, 0.0, 0.0],
+                                     directionalRateMagnitude=0.0,
+                                     isotropicRateMagnitude=0.0)
+        with self.assertRaises(ProjectInputError) as raised:
+            validate_project(regressed)
+        message = " ".join(issue.message for issue in raised.exception.issues)
+        self.assertIn("omit all three fields in rateSets mode", message)
+        self.assertIn("never as 0 placeholders", message)
+        self.assertIn("rateSets", message)
+        self.assertTrue(any(issue.path.endswith(".directional") for issue in raised.exception.issues),
+                        [issue.path for issue in raised.exception.issues])
 
         # A mask list that drops geometry protection is explicit and warned about.
         masked = project(2, "trench")
@@ -425,6 +456,43 @@ class DirectionalWorkflow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parameters_3d["rateSets"][1]["nativeIsotropicVelocity"], 0.0)
         self.assertIn(70, storage.read_json(storage.run_path(run_3d) / "manifest.json")["snapshots"][-1]["materialIds"])
 
+    async def test_rate_sets_mixed_visibility_and_masks_match_native_reference(self):
+        # Both sets used to share one visibility toggle, which a single global
+        # flag could satisfy. The reference fixture builds one RateSet per entry
+        # from the request, so a mixed True/False pair must match only if the
+        # worker also applies visibility per set.
+        for dimension in (2, 3):
+            value = project(dimension, "trench")
+            positive = [0.6, -0.8, 0.0] if dimension == 2 else [0.6, 0.0, -0.8]
+            value["steps"] = [rate_set_step(rate_sets=[
+                {"direction": positive, "directionalVelocity": 0.3, "calculateVisibility": True},
+                {"direction": [-component for component in positive],
+                 "directionalVelocity": 0.3, "calculateVisibility": False},
+            ])]
+            label = f"directional-ratesets-visibility-mixed-{dimension}d"
+            _run_id, info = await self.assert_reference(value, label)
+            self.assertEqual([item["calculateVisibility"] for item in
+                              info["actualExecution"][0]["actualParameters"]["rateSets"]],
+                             [True, False])
+
+        # Per-set masks, mixed: one set protects the geometry Mask and the other
+        # explicitly acts on it. A global mask list cannot produce this result.
+        value = project(2, "trench")
+        value["steps"] = [rate_set_step(rate_sets=[
+            {"direction": [0.0, -1.0, 0.0], "directionalVelocity": 0.2,
+             "maskMaterials": ["Mask"]},
+            {"direction": [0.0, -1.0, 0.0], "directionalVelocity": 0.2,
+             "maskMaterials": []},
+        ])]
+        _run_id, info = await self.assert_reference(value, "directional-ratesets-mask-mixed-2d")
+        parameters = info["actualExecution"][0]["actualParameters"]
+        self.assertEqual([item["maskMaterials"] for item in parameters["rateSets"]],
+                         [["Mask"], []])
+        self.assertEqual([item["maskSource"] for item in parameters["rateSets"]],
+                         ["request", "request"])
+        self.assertEqual([item["maskMaterialIds"] for item in parameters["rateSets"]],
+                         [[0], []])
+
     async def test_rate_sets_additivity_per_set_mask_and_visibility(self):
         # Two 0.15 sets in the same direction are the scalar 0.3 field: the
         # native sequence overload sums each RateSet contribution.
@@ -533,6 +601,22 @@ class DirectionalWorkflow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json_body(validated)["normalizedProject"], normalized)
         self.assertEqual(json_body(validated)["requestedInputHash"],
                          requested_input_hash(validate_project(value)[0]))
+
+        # An unchanged scalar-mode consumer writing back zero placeholders must
+        # get the documented 422 instead of a silent mode switch.
+        regressed = copy.deepcopy(reopened)
+        regressed["steps"][0].update(direction=[0.0, 0.0, 0.0],
+                                     directionalRateMagnitude=0.0,
+                                     isotropicRateMagnitude=0.0)
+        rejected = await asgi_request("/api/runs", method="POST",
+                                      payload={"kind": "simulate", "project": regressed})
+        self.assertEqual(rejected[0], 422, rejected[2])
+        detail = json_body(rejected)["detail"]
+        self.assertTrue(any("omit all three fields in rateSets mode" in item["message"]
+                            for item in detail), detail)
+        self.assertTrue(all(item["path"].endswith("steps[0].directional") for item in detail), detail)
+        validate_rejected = await asgi_request("/api/projects/validate", method="POST", payload=regressed)
+        self.assertEqual(validate_rejected[0], 422, validate_rejected[2])
 
         replay = json_body(await asgi_request(f"/api/runs/{run_id}/replay-project"))
         self.assertEqual(replay["schemaVersion"], 5)
