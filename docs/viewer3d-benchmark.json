@@ -1,0 +1,120 @@
+{
+  "status": "passed",
+  "generatedAt": "2026-10-30T16:50:08.835Z",
+  "baseUrl": "http://127.0.0.1:8813",
+  "browser": "chromium headless (swiftshader)",
+  "triangles": 239432,
+  "avgFrameMs": 137.84,
+  "p50FrameMs": 158.7,
+  "webglBaselineMs": 49.85,
+  "p95FrameMs": 320.9,
+  "switchMs": {
+    "first": 156.8,
+    "cached": 11,
+    "heavy": 923.2
+  },
+  "staticFullDetailMs": {
+    "avg": 180.91,
+    "p95": 310.5
+  },
+  "materials": [
+    {
+      "color": "#3b82f6",
+      "pixels": 15317
+    },
+    {
+      "color": "#f59e0b",
+      "pixels": 17417
+    },
+    {
+      "color": "#22c55e",
+      "pixels": 22616
+    },
+    {
+      "color": "#ef4444",
+      "pixels": 11950
+    },
+    {
+      "color": "#a855f7",
+      "pixels": 16634
+    }
+  ],
+  "checks": [
+    {
+      "name": "harness ready",
+      "triangles": 239432,
+      "parseMs": 49
+    },
+    {
+      "name": "canvas has pixels and all 5 material colours",
+      "painted": 85368,
+      "uniqueColors": 711,
+      "size": "1254x594"
+    },
+    {
+      "name": "120 rotating frames measured",
+      "avgMs": 137.84,
+      "p50Ms": 158.7,
+      "p95Ms": 320.9,
+      "maxMs": 358,
+      "fps": 6
+    },
+    {
+      "name": "full-detail static frames",
+      "avg": 180.91,
+      "p95": 310.5
+    },
+    {
+      "name": "first switch (cold parse)",
+      "ms": 156.8,
+      "parseMs": 109
+    },
+    {
+      "name": "cached switch (LRU hit)",
+      "ms": 11,
+      "parseMs": 0
+    },
+    {
+      "name": "canvas still painted after switching",
+      "painted": 68000
+    },
+    {
+      "name": "vertex clustering keeps the heavy step under budget",
+      "ms": 923.2,
+      "from": 700928,
+      "to": 188298
+    },
+    {
+      "name": "X/Y/Z clipping slider removes geometry",
+      "before": 67999,
+      "after": 32064
+    },
+    {
+      "name": "wireframe/surface toggle changes the image",
+      "surfacePixels": 66868,
+      "wireframePixels": 68628
+    },
+    {
+      "name": "material visibility toggle hides only that material",
+      "before": 17417,
+      "after": 19
+    },
+    {
+      "name": "2D snapshots render on a canvas with material colours",
+      "painted": 9913,
+      "materials": 3
+    },
+    {
+      "name": "raw WebGL2 baseline (no vtk)",
+      "ms": 49.85,
+      "triangles": 239432
+    },
+    {
+      "name": "no console errors"
+    }
+  ],
+  "consoleErrors": [],
+  "limitations": [
+    "平均帧时间 137.84 ms 超过 33 ms：无头 Chromium 只能用 SwiftShader 软件光栅化。同机同分辨率的裸 WebGL2 基线（单 draw call、最简着色器、同样 239432 个三角形）为 49.85 ms/帧，因此瓶颈是 SwiftShader 软件光栅化而不是查看器的 draw call 数量；查看器相对基线的开销约为 2.8x。"
+  ]
+}
