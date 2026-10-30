@@ -28,8 +28,8 @@ behaviour changed.
 `dimensions` in the JSON always means *the domain dimension the class was actually exercised on*, not
 what the docstring implies. Empty `dimensions` means the class never sees a domain (`Logger`,
 `MetaDataLevel`). The counts are the 2026-10-30 audit snapshot; later batches move individual rows
-(for example A4 moved `BoxDistribution`/`SphereDistribution` to the exposed surface as the maskless
-`particleShape` step) without rewriting the snapshot counts.
+(for example A4 moved `BoxDistribution`/`SphereDistribution` to the exposed surface as the
+`particleShape` step, no-mask deposit and geometry-mask etch) without rewriting the snapshot counts.
 
 ## 2. What the Workbench exposes today
 
@@ -95,8 +95,9 @@ the schema-7 `particleShape` step is a post-audit addition.)
 
 `MakePlane`, `MakeTrench`, `MakeHole` (`FULL` only), `MakeFin` (native + boolean construction),
 multi-layer `stack` (composed from `MakePlane` + `GeometryFactory`),
-the maskless `particleShape` geometry step (`BoxDistribution` / `SphereDistribution`, schema 7;
-see [`particle-shape-distribution-contract.md`](particle-shape-distribution-contract.md)), `GeometryFactory`,
+the `particleShape` geometry step (`BoxDistribution` / `SphereDistribution`, schema 7;
+no-mask deposition, geometry-mask etch — see
+[`particle-shape-distribution-contract.md`](particle-shape-distribution-contract.md)), `GeometryFactory`,
 `GDSGeometry`, `GDSReader`, `Extrude`, `Slice` (y-normal only), `Planarize` (cutoff or measured
 `stopMaterial`), `Domain`, `Process`; outputs are surface mesh VTK, snapshot JSON, native state,
 intermediate VTP/VTU, the optional generic `DenseCellSet` VTU/JSON export from
@@ -198,18 +199,24 @@ hashes when unused.
   4. the request hash changes with CSV content and an old hash fails replay explicitly;
   5. no API field can reach `setCustomInterpolator`.
 
-### Batch A4 — particle shape distributions (implemented: maskless only)
+### Batch A4 — particle shape distributions (implemented: no-mask deposit, masked etch)
 
 - These are geometry sources, not process steps (the native mask is a `viennals` Domain).
 - Implemented as schema-7 geometry step `particleShape`: `BoxDistribution` / `SphereDistribution`,
-  no mask, no duration, positive radii/half-axes with `operation` selecting the sign.
+  no duration, positive radii/half-axes with `operation` selecting the sign.
   Contract and raw probe record: [`particle-shape-distribution-contract.md`](particle-shape-distribution-contract.md).
+- Masks are not a step field: they are the project geometry's native mask materials
+  (`protected_material_names`, the same rule as the flux/CSV steps). `operation: etch` passes
+  them through `addMaskMaterial`; `operation: deposit` cannot, because any non-empty mask with
+  positive displacement SIGSEGVs in 2D/3D on 4.6.2 and 4.7.0. The run record lists the applied
+  and omitted mask materials.
 - Acceptance:
   1. design note proves the `viennals` mask is derived from the existing project domain, with no second
-     geometry source of truth. **The derivation works (`getMaterialLevelSet`), but every masked deposition
-     SIGSEGVs in 2D/3D and masked etch is a silent no-op, so no mask field is exposed.** The note records
-     the material mask, raw `viennals` mask and `applyToSingleMaterial` results;
-  2. `Box`/`Sphere` surfaces equal direct native references (2D/3D, plane/trench, deposit/etch, replay);
+     geometry source of truth (`addMaskMaterial` over `getMaterialLevelSet`). **Masked etch is safe
+     (2D/3D, material/raw mask, `applyToSingleMaterial`); masked deposition is a native `-11` and is
+     never constructed** — the note records the whole matrix, including the upstream ViennaLS TODO;
+  2. `Box`/`Sphere` surfaces equal direct native references (2D/3D, plane/trench, deposit/etch, masked
+     etch, replay);
   3. count and magnitude of radii/half-axes are bounded (`> 0`, `≤ 2 µm`, `≥ gridDelta`, 2 axes in 2D,
      3 in 3D); zero/mixed-sign parameters are unreachable;
   4. `CustomSphereDistribution` stays unexposed: it aborts in 2D **and** 3D even without a mask, because it

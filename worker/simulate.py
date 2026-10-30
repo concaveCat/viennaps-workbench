@@ -2358,18 +2358,45 @@ def surface_axis_bounds(domain: Any, dimension: int) -> list[list[float]]:
 
 
 def apply_particle_shape(ps: Any, domain: Any, project: dict[str, Any], step: dict[str, Any]) -> dict[str, Any]:
-    """Run the native no-mask Box/Sphere geometric-advection distribution.
+    """Run the native Box/Sphere geometric-advection distribution.
 
-    The installed 4.6.2 masked overload is not reachable from a project: every
-    masked deposition probe SIGSEGVs (2D and 3D, material mask and raw
-    viennals mask alike), and a masked etch silently leaves the surface
-    untouched. The step therefore always constructs the no-mask overload and
-    records that decision instead of pretending to support a mask.
+    Measured 4.6.2/4.7.0 behaviour (one bounded subprocess per case, see
+    docs/particle-shape-distribution-contract.md):
+
+    * negative (etch) displacement plus ``addMaskMaterial`` is the officially
+      supported combination: ``GeometricProcessStrategy`` builds the mask from
+      the material level set exactly like the native FinFET example, and the
+      protected material does not move;
+    * positive (deposit) displacement plus any non-empty mask SIGSEGVs in 2D
+      and 3D, regardless of the mask construction or whether the mask overlaps
+      the surface. ViennaLS 5.8.5/5.10.0 even carries the comment "There are
+      still issues with positive box distributions if there is a mask used!".
+
+    The step therefore applies the project's native mask materials for etches
+    and records the mask it really passed. A deposition is always constructed
+    with the no-mask overload and records the omitted mask materials and the
+    crash-backed reason instead of pretending the mask was honoured.
     """
     dimension = int(project["dimension"])
     grid_delta = float(project["domain"]["gridDelta"])
     shape = str(step["shape"])
     sign = -1.0 if step["operation"] == "etch" else 1.0
+    requested_masks = protected_material_names(project, step)
+    applied_masks: list[tuple[str, Any]] = []
+    omitted_masks: list[str] = []
+    if sign > 0.0:
+        omitted_masks = list(requested_masks)
+    else:
+        for name in requested_masks:
+            handle = material_handle(ps, name)
+            material_level_set = domain.getMaterialLevelSet(handle)
+            if material_level_set is None or int(material_level_set.getNumberOfPoints()) == 0:
+                # The geometry declared the material but the domain does not
+                # carry it (e.g. maskHeight 0). Passing it would make the
+                # native strategy log "not found" and silently stay maskless.
+                omitted_masks.append(name)
+                continue
+            applied_masks.append((name, handle))
     requested: dict[str, Any]
     if shape == "box":
         axes = [float(value) for value in step["halfAxes"]]
@@ -2403,6 +2430,8 @@ def apply_particle_shape(ps: Any, domain: Any, project: dict[str, Any], step: di
         expected_offset = radius
     before = surface_axis_bounds(domain, dimension)
     counts_before = [int(level_set.getNumberOfPoints()) for level_set in domain.getLevelSets()]
+    for _name, handle in applied_masks:
+        model.addMaskMaterial(handle)
     # The geometric process strategy ignores the duration entirely; measure it
     # as zero so the run record never implies a rate.
     ps.Process(domain, model, 0.0).apply()
@@ -2410,13 +2439,16 @@ def apply_particle_shape(ps: Any, domain: Any, project: dict[str, Any], step: di
     if before == after:
         raise RuntimeError(
             "native particle-shape distribution left the surface unchanged; refusing to record a "
-            "silent no-op (check that the magnitude exceeds the grid resolution)")
+            "silent no-op (check that the magnitude exceeds the grid resolution"
+            + (f", and that the mask {[name for name, _ in applied_masks]} does not cover the whole "
+               "exposed surface" if applied_masks else "") + ")")
     mapping = domain.getMaterialMap()
     return {
         "geometryOperation": "particleShape",
         "nativeClass": native_class,
         "nativeConstructor": (f"viennaps.d{dimension}.{native_class}("
                               + ("halfAxes" if shape == "box" else "radius") + ")"),
+        "nativeMaskConstructor": ("addMaskMaterial" if applied_masks else None),
         "dimension": dimension,
         "operation": step["operation"],
         "shape": shape,
@@ -2431,11 +2463,24 @@ def apply_particle_shape(ps: Any, domain: Any, project: dict[str, Any], step: di
         "materialIdsByLevelSetIndex": [int(mapping.getMaterialIdAtIdx(i)) for i in range(mapping.size())],
         "gridDeltaUm": grid_delta,
         "nativeMask": {
-            "mode": "none",
-            "supported": False,
-            "reason": ("ViennaPS 4.6.2 masked geometric advection is unsafe: material/raw viennals-mask "
-                       "deposition SIGSEGVs in 2D and 3D, and a masked etch can silently leave the surface "
-                       "unchanged; this step therefore constructs the no-mask overload"),
+            "mode": "material" if applied_masks else "none",
+            "applied": bool(applied_masks),
+            "materials": [name for name, _ in applied_masks],
+            "omittedMaterials": omitted_masks,
+            "reason": (
+                "the etch protects the project's native mask materials through addMaskMaterial; "
+                "GeometricProcessStrategy builds the mask from their material level sets"
+                if applied_masks else
+                "ViennaPS 4.6.2/4.7.0 SIGSEGV on every non-empty mask with positive geometric "
+                "advection (2D and 3D, material and raw viennals masks, overlapping or far away), so "
+                "a deposition is always constructed with the no-mask overload and every exposed "
+                "surface, including the mask material, grows"
+                if sign > 0.0 else
+                "the etch declares mask materials but none of them is present in the domain, so the "
+                "native no-mask overload is used"
+                if omitted_masks else
+                "the project geometry declares no native mask material, so the no-mask overload is used"
+            ),
         },
         "nativeProcessDurationSeconds": 0.0,
         "nativeDurationIgnored": ("the process duration is ignored: GeometricProcessStrategy calls "

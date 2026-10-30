@@ -1071,11 +1071,13 @@ class ParticleShapeStepV7(StrictModel):
 
     These are ViennaLS geometric-advection distributions, not velocity models:
     ``ps.Process(domain, model, duration)`` ignores the duration and moves the
-    exposed surface by exactly one radius / half-axis set. The installed 4.6.2
-    binding SIGSEGVs on the masked deposition path in 2D and 3D, so this step
-    deliberately has no mask field: the worker always constructs the no-mask
-    overload. ``operation`` only selects the sign (deposit grows, etch erodes);
-    individual half-axes are positive magnitudes.
+    exposed surface by exactly one radius / half-axis set. A masked *etch*
+    through ``addMaskMaterial`` is the officially supported native combination
+    and uses the project's geometry mask materials; a masked *deposition*
+    SIGSEGVs in 2D and 3D on 4.6.2 and 4.7.0, so depositions stay maskless and
+    the run record lists the omitted mask materials. ``operation`` only selects
+    the sign (deposit grows, etch erodes); individual half-axes are positive
+    magnitudes.
     """
 
     id: Annotated[str, Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")]

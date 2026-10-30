@@ -2,13 +2,17 @@
 
 The installed ViennaPS 4.6.2 ``BoxDistribution`` / ``SphereDistribution`` are
 ViennaLS geometric-advection distributions, not velocity models. Bounded
-subprocess probes established the only safe surface this batch exposes:
+subprocess probes established the surface this batch exposes:
 
 * the no-mask overload moves the exposed surface by exactly one radius or
   half-axis set and ignores the process duration;
-* every masked deposition probe SIGSEGVs in 2D and 3D (material mask, raw
+* a masked *etch* through ``addMaskMaterial`` is the officially supported
+  combination (the native FinFET example uses it) and protects the project's
+  geometry mask materials;
+* every masked *deposition* SIGSEGVs in 2D and 3D (material mask, raw
   ``viennals`` mask from the project material level set, and
-  ``applyToSingleMaterial`` alike), so the JSON schema has no mask field;
+  ``applyToSingleMaterial`` alike), so a deposition stays maskless and records
+  the omitted mask materials;
 * ``CustomSphereDistribution`` aborts with ``std::runtime_error`` because it
   indexes one radius per surface point; it stays unexposed;
 * zero magnitudes and mixed-sign half-axes also crash or delete the surface.
@@ -152,6 +156,36 @@ class ParticleShapeValidationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ProjectInputError, "periodic"):
                     validate_project(project, kind="simulate")
 
+    def test_material_handle_matches_the_native_registry(self):
+        # worker.material_handle is registry.getMaterial; the Mask handle must be
+        # the same object as the enum-style ps.Material.Mask for built-ins.
+        from worker.simulate import material_handle
+        import viennaps as ps
+        ps.setDimension(2)
+        registry = ps.MaterialRegistry.instance()
+        for name in ("Mask", "Si"):
+            with self.subTest(material=name):
+                handle = material_handle(ps, name)
+                self.assertEqual(handle, getattr(ps.Material, name))
+                self.assertEqual(handle, registry.findMaterial(name))
+                self.assertEqual(handle, registry.getMaterial(name))
+        self.assertEqual(ps.Material.Mask.legacyId(), 0)
+        self.assertTrue(ps.Material.Mask.isBuiltIn())
+        self.assertFalse(ps.Material.Mask.isCustom())
+
+    def test_particle_shape_warnings_describe_the_mask_difference(self):
+        trench = {"kind": "trench", "width": 2.0, "depth": 1.0, "taperAngle": 0.0,
+                  "maskHeight": 0.5, "maskTaperAngle": 0.0, "substrateMaterial": "Si"}
+        project = base_project(2, trench)
+        project["steps"] = [shape_step(2, operation="etch", radius=0.5)]
+        _, warnings = validate_project(project, kind="simulate")
+        self.assertIn("addMaskMaterial", " ".join(warnings))
+        project["steps"][0]["operation"] = "deposit"
+        _, warnings = validate_project(project, kind="simulate")
+        text = " ".join(warnings)
+        self.assertIn("SIGSEGV", text)
+        self.assertIn("无掩膜重载", text)
+
     def test_existing_request_hash_is_unchanged_and_the_new_step_is_additive(self):
         # Captured from the base commit before particleShape existed. Adding a
         # model to the schema-7 union must not move any existing request hash.
@@ -182,7 +216,8 @@ class ParticleShapeValidationTests(unittest.TestCase):
 class UnsafeNativePathEvidenceTests(unittest.IsolatedAsyncioTestCase):
     """Keep the rejected native paths measured, not merely asserted in prose."""
 
-    async def probe(self, label: str, case: dict) -> tuple[int, dict, str]:
+    async def probe(self, label: str, case: dict,
+                    script: str = "worker/probe_particle_distributions.py") -> tuple[int, dict, str]:
         REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
         case_path = REFERENCE_DIR / f"{label}.case.json"
         output_path = REFERENCE_DIR / f"{label}.out.json"
@@ -192,7 +227,7 @@ class UnsafeNativePathEvidenceTests(unittest.IsolatedAsyncioTestCase):
         command = [str(ROOT / ".venv/bin/python"), str(ROOT / "scripts/bounded_child.py"),
                    "--cwd", str(ROOT), "--record", str(guard_path), "--log-path", str(log_path),
                    "--timeout-seconds", "40", "--max-rss-mib", "2048", "--max-log-bytes", "1048576", "--",
-                   str(ROOT / ".venv/bin/python"), str(ROOT / "worker/probe_particle_distributions.py"),
+                   str(ROOT / ".venv/bin/python"), str(ROOT / script),
                    str(case_path), str(output_path)]
         completed = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.DEVNULL)
         await completed.wait()
@@ -232,6 +267,80 @@ class UnsafeNativePathEvidenceTests(unittest.IsolatedAsyncioTestCase):
         after = output["after"]["boundingBox"][2]
         self.assertAlmostEqual(after[1] - before[1], 0.2, places=6)
 
+    async def test_masked_etch_moves_the_substrate_but_not_the_mask(self):
+        # The officially supported masked direction, measured per dimension
+        # with the dedicated mask probe (it records the pre-run state, so even
+        # a crash would leave a readable record).
+        for dimension in (2, 3):
+            with self.subTest(dimension=dimension):
+                label = f"masked-etch-{dimension}d"
+                code, guard, log = await self.probe(
+                    label,
+                    {"dimension": dimension, "geometry": "trench", "shape": "sphere",
+                     "magnitude": -0.1, "mask": "material", "maskMaterial": "Mask",
+                     "process": "two-arg"},
+                    script="worker/probe_particle_mask.py")
+                self.assertEqual(code, 0, log)
+                self.assertFalse(guard["timedOut"])
+                output = json.loads((REFERENCE_DIR / f"{label}.out.json").read_text(encoding="utf-8"))
+                before = output["diagnostics"]["before"]
+                after = output["after"]
+                self.assertEqual(output["processCall"], "ps.Process(domain, model).apply()")
+                self.assertAlmostEqual(after["boundingBox"][-1][1], before["boundingBox"][-1][1], places=6)
+                self.assertLess(after["boundingBox"][-1][0], before["boundingBox"][-1][0] - 0.05)
+                self.assertEqual(after["materialIdsByLevelSetIndex"],
+                                 before["materialIdsByLevelSetIndex"])
+
+    async def test_custom_registry_mask_material_etch_protects_the_mask(self):
+        # A MaterialRegistry custom material is accepted by addMaskMaterial and
+        # by insertNextLevelSetAsMaterial; the custom mask material is not
+        # etched even though its native id/legacyId differ from built-in Mask.
+        label = "masked-etch-custom-material-3d"
+        code, guard, log = await self.probe(
+            label,
+            {"dimension": 3, "geometry": "mask-box", "shape": "sphere",
+             "magnitude": -0.15, "mask": "material",
+             "registerCustomMaterial": "WB_Mask_Probe", "process": "two-arg"},
+            script="worker/probe_particle_mask.py")
+        self.assertEqual(code, 0, log)
+        self.assertFalse(guard["timedOut"])
+        output = json.loads((REFERENCE_DIR / f"{label}.out.json").read_text(encoding="utf-8"))
+        material_info = output["diagnostics"]["maskMaterial"]
+        self.assertIn("WB_Mask_Probe", material_info["repr"])
+        self.assertTrue(material_info["isCustom"])
+        self.assertFalse(material_info["isBuiltIn"])
+        self.assertGreaterEqual(material_info["legacyId"], 177)
+        before = output["diagnostics"]["before"]
+        after = output["after"]
+        self.assertTrue(any("WB_Mask_Probe" in handle
+                            for handle in before["materialHandlesByLevelSetIndex"]))
+        self.assertAlmostEqual(after["boundingBox"][-1][1], before["boundingBox"][-1][1], places=6)
+        self.assertLess(after["boundingBox"][-1][0], before["boundingBox"][-1][0] - 0.1)
+
+    async def test_masked_deposition_segfaults_with_any_non_empty_mask(self):
+        # Every mask construction crashes on positive displacement: a material
+        # mask, a raw viennals mask derived from the project material level
+        # set, a mask box far away from the surface and a mask covering the
+        # whole domain. The parent never dies because each case is bounded.
+        for label, dimension, geometry in (
+            ("mask-probe-depo-material-3d", 3, "mask-box"),
+            ("mask-probe-depo-material-2d", 2, "mask-box"),
+            ("mask-probe-depo-raw-3d", 3, "mask-box"),
+            ("mask-probe-depo-far-3d", 3, "mask-box"),
+            ("mask-probe-depo-full-2d", 2, "mask-full"),
+        ):
+            case = {"dimension": dimension, "geometry": geometry, "shape": "sphere",
+                    "magnitude": 0.2,
+                    "mask": "getMaterialLevelSet" if "raw" in label else "material",
+                    "maskMaterial": "Mask", "process": "two-arg"}
+            if "far" in label:
+                case["maskBox"] = ([-1.0, -1.0, 1.2], [1.0, 1.0, 1.8])
+            with self.subTest(label=label):
+                code, guard, _log = await self.probe(
+                    label, case, script="worker/probe_particle_mask.py")
+                self.assertFalse(guard["timedOut"])
+                self.assertEqual(code, -11)
+
 
 class ParticleShapeRunTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -257,7 +366,7 @@ class ParticleShapeRunTests(unittest.IsolatedAsyncioTestCase):
         run_id = json_body(response)["runId"]
         return run_id, await self.wait(run_id)
 
-    async def reference(self, project: dict, label: str) -> dict:
+    async def reference(self, project: dict, label: str, mask_mode: str = "native") -> dict:
         input_path = REFERENCE_DIR / f"{label}-input.json"
         output_path = REFERENCE_DIR / f"{label}-direct-reference.json"
         guard_path = REFERENCE_DIR / f"{label}-reference-guard.json"
@@ -267,7 +376,7 @@ class ParticleShapeRunTests(unittest.IsolatedAsyncioTestCase):
                    "--cwd", str(ROOT), "--record", str(guard_path), "--log-path", str(log_path),
                    "--timeout-seconds", "90", "--max-rss-mib", "2048", "--max-log-bytes", "2097152", "--",
                    str(ROOT / ".venv/bin/python"), str(ROOT / "tests/fixtures/particle_shape_direct_reference.py"),
-                   str(input_path), str(output_path)]
+                   str(input_path), str(output_path), mask_mode]
         completed = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.DEVNULL)
         self.assertEqual(await completed.wait(), 0, log_path.read_text(encoding="utf-8", errors="replace"))
         return json.loads(output_path.read_text(encoding="utf-8"))
@@ -276,8 +385,9 @@ class ParticleShapeRunTests(unittest.IsolatedAsyncioTestCase):
         snapshot_store.ensure_materialized(storage.run_path(run_id), step_id)
         return json_body(await asgi_request(f"/api/runs/{run_id}/snapshots/{step_id}"))
 
-    async def compare(self, project: dict, label: str) -> dict:
-        reference = await self.reference(project, label)
+    async def compare(self, project: dict, label: str, *, mask_mode: str = "native",
+                      mask_applied: bool = False) -> dict:
+        reference = await self.reference(project, label, mask_mode)
         run_id, info = await self.execute(project)
         dimension = project["dimension"]
         topology = "lines" if dimension == 2 else "triangles"
@@ -296,8 +406,8 @@ class ParticleShapeRunTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("actualRate", manifest["actualExecution"][-1])
         parameters = manifest["actualExecution"][-1]["actualParameters"]
         self.assertEqual(parameters["geometryOperation"], "particleShape")
-        self.assertEqual(parameters["nativeMask"]["mode"], "none")
-        self.assertFalse(parameters["nativeMask"]["supported"])
+        self.assertEqual(parameters["nativeMask"]["mode"], "material" if mask_applied else "none")
+        self.assertEqual(parameters["nativeMask"]["applied"], mask_applied)
         self.assertIn("ignored", parameters["nativeDurationIgnored"])
         self.assertNotEqual(parameters["surfaceBoundsBeforeUm"], parameters["surfaceBoundsAfterUm"])
         self.assertTrue(parameters["levelSetPointCountsAfter"])
@@ -339,6 +449,56 @@ class ParticleShapeRunTests(unittest.IsolatedAsyncioTestCase):
         parameters = storage.read_json(storage.run_path(result["runId"]) / "manifest.json")["actualExecution"][-1]["actualParameters"]
         self.assertEqual(parameters["nativeHalfAxesUm"], [0.5, 0.25, 0.0])
         self.assertGreater(len(parameters["levelSetPointCountsAfter"]), 1)
+        # A deposition cannot be masked natively, so the trench mask is omitted
+        # instead of silently pretending the mask was honoured.
+        self.assertFalse(parameters["nativeMask"]["applied"])
+        self.assertEqual(parameters["nativeMask"]["omittedMaterials"], ["Mask"])
+
+    async def test_masked_etch_on_a_trench_matches_native_reference_in_2d_and_3d(self):
+        for dimension in (2, 3):
+            with self.subTest(dimension=dimension):
+                project = base_project(dimension, geometry={
+                    "kind": "trench", "width": 2.0, "depth": 1.0, "taperAngle": 0.0,
+                    "maskHeight": 0.5, "maskTaperAngle": 0.0, "substrateMaterial": "Si"})
+                project["steps"] = [shape_step(dimension, operation="etch", radius=0.25)]
+                result = await self.compare(project, f"masked-etch-{dimension}d", mask_applied=True)
+                parameters = storage.read_json(
+                    storage.run_path(result["runId"]) / "manifest.json")["actualExecution"][-1]["actualParameters"]
+                self.assertEqual(parameters["nativeMask"]["mode"], "material")
+                self.assertEqual(parameters["nativeMask"]["materials"], ["Mask"])
+                self.assertEqual(parameters["nativeMask"]["omittedMaterials"], [])
+                self.assertEqual(parameters["nativeMaskConstructor"], "addMaskMaterial")
+
+    async def test_mask_changes_the_geometry_versus_an_unmasked_native_run(self):
+        # Localization: the protected mask material does not move, so a masked
+        # etch must differ from the same native etch without a mask. This does
+        # not compare workbench output, only the two native references.
+        project = base_project(2, geometry={
+            "kind": "trench", "width": 2.0, "depth": 1.0, "taperAngle": 0.0,
+            "maskHeight": 0.5, "maskTaperAngle": 0.0, "substrateMaterial": "Si"})
+        project["steps"] = [shape_step(2, operation="etch", radius=0.25)]
+        masked = await self.reference(project, "mask-localization-masked", "native")
+        unmasked = await self.reference(project, "mask-localization-unmasked", "none")
+        step_id = project["steps"][0]["id"]
+        masked_top = max(point[1] for point in masked[step_id]["points"])
+        unmasked_top = max(point[1] for point in unmasked[step_id]["points"])
+        self.assertAlmostEqual(masked_top, 0.5, places=3)
+        self.assertLess(unmasked_top, masked_top - 0.2)
+        deviation = max(math.dist(a, b) for a, b in zip(masked[step_id]["points"], unmasked[step_id]["points"]))
+        self.assertGreater(deviation, 0.2)
+
+    async def test_masked_deposition_stays_maskless_and_is_recorded(self):
+        project = base_project(3, geometry={
+            "kind": "trench", "width": 2.0, "depth": 1.0, "taperAngle": 0.0,
+            "maskHeight": 0.5, "maskTaperAngle": 0.0, "substrateMaterial": "Si"})
+        project["steps"] = [shape_step(3, operation="deposit", radius=0.25)]
+        result = await self.compare(project, "masked-deposit-3d")
+        parameters = storage.read_json(
+            storage.run_path(result["runId"]) / "manifest.json")["actualExecution"][-1]["actualParameters"]
+        self.assertEqual(parameters["nativeMask"]["mode"], "none")
+        self.assertFalse(parameters["nativeMask"]["applied"])
+        self.assertEqual(parameters["nativeMask"]["omittedMaterials"], ["Mask"])
+        self.assertIn("SIGSEGV", parameters["nativeMask"]["reason"])
 
     async def test_two_consecutive_shape_steps_replay_identically(self):
         project = base_project(3)

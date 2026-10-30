@@ -390,13 +390,16 @@ def _validate_particle_shape_steps(project: Any) -> list[FieldIssue]:
     """Reject the native particle-shape configurations that are not safe.
 
     ``BoxDistribution`` / ``SphereDistribution`` are ViennaLS geometric
-    advection distributions. Measured 4.6.2 behaviour (one bounded subprocess
-    per case, see docs/particle-shape-distribution-contract.md):
+    advection distributions. Measured 4.6.2/4.7.0 behaviour (one bounded
+    subprocess per case, see docs/particle-shape-distribution-contract.md):
 
     * an active half-axis or radius of exactly 0 SIGSEGVs;
     * an active magnitude below one grid interval logs "smaller than the grid
       Delta" and can break the distribution;
-    * any masked deposition SIGSEGVs in 2D and 3D, so no mask is exposed;
+    * a masked etch through ``addMaskMaterial`` is the officially supported
+      combination and is used for ``operation=etch``;
+    * any masked deposition SIGSEGVs in 2D and 3D, so a deposition never gets a
+      mask (the project's mask materials are reported as omitted in the run);
     * mixed-sign half-axes can delete the surface or SIGSEGV, so the sign comes
       from ``operation`` and every native axis is positive.
     """
@@ -433,18 +436,25 @@ def _particle_shape_warnings(project: Any) -> list[str]:
 
     The native object is a geometric advection distribution: it offsets the
     exposed surface by exactly one radius / half-axis set and ignores the
-    process duration. It is not a flux or velocity process, and the masked
-    overload is not exposed because it crashes in both dimensions.
+    process duration. Etches protect the project's native mask materials
+    through ``addMaskMaterial``; depositions cannot, because the native positive
+    masked path SIGSEGVs, so their mask materials are omitted and recorded.
     """
     warnings: list[str] = []
     for index, step in enumerate(project.steps):
         if step_value(step, "model") != "particleShape":
             continue
         shape = "BoxDistribution" if step_value(step, "shape") == "box" else "SphereDistribution"
+        if step_value(step, "operation") == "etch":
+            mask_note = ("刻蚀会把项目几何的原生掩膜材料通过 addMaskMaterial 传给几何推进，"
+                         "被保护的材料不动；掩膜覆盖整个暴露表面时原生会静默不动，工作台会因此报错。")
+        else:
+            mask_note = ("原生 4.6.2/4.7.0 的正向几何推进在有掩膜时 2D/3D 都会 SIGSEGV，"
+                         "因此沉积步骤始终使用无掩膜重载：项目里的掩膜材料也会一起长大。")
         warnings.append(
             f"steps[{index}]: particleShape 使用原生 viennaps.{shape}（ViennaLS 几何推进），"
             "对当前整个暴露表面做一次形态学膨胀/收缩，位移等于半径/半轴，原生 Process 忽略持续时间。"
-            "它不是通量或速度刻蚀/沉积模型；4.6.2 的掩膜沉积路径在 2D/3D 均 SIGSEGV，因此该步骤不提供掩膜字段"
+            f"它不是通量或速度刻蚀/沉积模型；{mask_note}"
             "（详见 docs/particle-shape-distribution-contract.md）。")
     return warnings
 

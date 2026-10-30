@@ -4,6 +4,11 @@ Always run this fixture inside scripts/bounded_child.py. It never imports
 workbench worker code: it builds the domain from the submitted project, applies
 the native ``BoxDistribution`` / ``SphereDistribution`` to every enabled
 ``particleShape`` step in order and records one surface snapshot per step.
+
+``argv[3]`` selects the mask contract: ``native`` (default) re-derives the
+geometry mask materials and calls ``addMaskMaterial`` for masked etches, while
+``none`` runs the no-mask overload. Tests use both to prove the mask changes
+the geometry instead of asserting it in prose.
 """
 from __future__ import annotations
 
@@ -46,6 +51,20 @@ def build_domain(project):
     return domain
 
 
+def geometry_mask_names(project, step):
+    """Re-derive the project mask contract independently of the worker.
+
+    A geometric etch protects the geometry's native mask material(s); a
+    deposition cannot be masked natively in 4.6.2/4.7.0, so it never gets one.
+    """
+    if step["operation"] != "etch":
+        return []
+    geometry = project["geometry"]
+    if geometry["kind"] in ("trench", "hole", "fin") and float(geometry.get("maskHeight", 0)) > 0:
+        return [geometry.get("maskMaterial", "Mask")]
+    return []
+
+
 def material_map(domain):
     mapping = domain.getMaterialMap()
     return [int(mapping.getMaterialIdAtIdx(index)) for index in range(mapping.size())]
@@ -65,7 +84,7 @@ def snapshot(domain, step_id, dimension):
             "materialIds": material_ids, "materialMap": material_map(domain)}
 
 
-def apply_step(domain, project, step):
+def apply_step(domain, project, step, mask_mode="native"):
     dimension = int(project["dimension"])
     sign = -1.0 if step["operation"] == "etch" else 1.0
     if step["shape"] == "box":
@@ -73,12 +92,20 @@ def apply_step(domain, project, step):
         model = ps.BoxDistribution(axes + [0.0] if dimension == 2 else axes)
     else:
         model = ps.SphereDistribution(sign * float(step["radius"]))
+    if mask_mode == "native":
+        for name in geometry_mask_names(project, step):
+            level_set = domain.getMaterialLevelSet(material(name))
+            if level_set is not None and int(level_set.getNumberOfPoints()) > 0:
+                model.addMaskMaterial(material(name))
     ps.Process(domain, model, 0.0).apply()
 
 
 def main() -> None:
     project = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     target = Path(sys.argv[2])
+    mask_mode = sys.argv[3] if len(sys.argv) > 3 else "native"
+    if mask_mode not in ("native", "none"):
+        raise ValueError("mask mode must be 'native' or 'none'")
     dimension = int(project["dimension"])
     domain = build_domain(project)
     reference = {"initial": snapshot(domain, "initial", dimension)}
@@ -87,7 +114,7 @@ def main() -> None:
             continue
         if step.get("model") != "particleShape":
             raise ValueError(f"reference fixture only supports particleShape steps, got {step.get('model')!r}")
-        apply_step(domain, project, step)
+        apply_step(domain, project, step, mask_mode)
         reference[step["id"]] = snapshot(domain, step["id"], dimension)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(reference, indent=2) + "\n", encoding="utf-8")
