@@ -40,6 +40,7 @@ type Measurement = {
   sourceStepId: string | null;
   sourceStateId: string | null;
 };
+type TemplateSummary = { templateId: string; name: string; stepCount: number };
 type Provenance = {
   measurementId: string;
   bindingStatus: string;
@@ -93,6 +94,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [segment, setSegment] = useState<RoutePlan['segments'][number] | null>(null);
   const [measurement, setMeasurement] = useState<Measurement | null>(null);
   const [experiments, setExperiments] = useState<Array<{ index: number; routeId: string; segmentId: string; status: string; runId: string | null }>>([]);
+  const [templates, setTemplates] = useState<TemplateSummary[]>([]);
+  const [templateId, setTemplateId] = useState('');
   const [provenance, setProvenance] = useState<Provenance | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [zone, setZone] = useState<'setup' | 'flow' | 'run' | 'experiment' | 'analyze' | 'report'>('setup');
@@ -102,6 +105,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
 
   useEffect(() => {
     void api<Health>('/api/health').then(setHealth).catch(() => setHealth(null));
+    void api<{ templates: TemplateSummary[] }>('/api/v1/workflow/templates').then(data => setTemplates(data.templates)).catch(() => undefined);
   }, []);
 
   useEffect(() => {
@@ -171,6 +175,26 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setCompile(result);
     setRoute(null);
     setSegment(null);
+  });
+
+  const saveTemplate = () => run('template', async () => {
+    if (!compile) throw new Error('先采纳工程');
+    const templateId = `tpl_${Date.now().toString(36)}`;
+    await postJson('/api/v1/workflow/templates', {
+      schemaVersion: 1, templateId, name: `${compile.projectName} · template`, description: '',
+      steps: compile.compile.project.steps, variables: [],
+    });
+    const data = await api<{ templates: TemplateSummary[] }>('/api/v1/workflow/templates');
+    setTemplates(data.templates);
+    setTemplateId(templateId);
+  });
+
+  const applyTemplate = () => run('template', async () => {
+    if (!project || !templateId) throw new Error('先选择模板');
+    const result = await postJson<CompileInfo>('/api/v1/workflow/flows/from-template', {
+      project, templateId, variables: {},
+    });
+    setCompile(result); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);
   });
 
   const createRoute = () => run('route', async () => {
@@ -331,6 +355,14 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             <button className="wf-button primary" disabled={!canRoute} onClick={() => void createRoute()}>
               {busy === 'route' ? '创建中…' : '创建首个 Route'}
             </button>
+            <button className="wf-button ghost" disabled={!compile || !!busy} onClick={() => void saveTemplate()}>保存当前步骤为模板</button>
+            <div className="wf-template-row">
+              <select value={templateId} onChange={event => setTemplateId(event.target.value)}>
+                <option value="">选择模板</option>
+                {templates.map(item => <option key={item.templateId} value={item.templateId}>{item.name} · {item.stepCount} 步</option>)}
+              </select>
+              <button className="wf-button ghost" disabled={!project || !templateId || !!busy} onClick={() => void applyTemplate()}>应用</button>
+            </div>
           </>}
           {route && <div className="wf-summary"><strong>{route.route.name}</strong><span>{route.segments.length} Segment · {route.stepOrder.length} Step · head {route.route.headAttemptId.slice(0, 10)}…</span></div>}
         </section>
@@ -340,6 +372,12 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
           {!segment && <div className="wf-empty">创建 Route 后可执行 Segment。</div>}
           {segment && <>
             <div className="wf-status-row"><span className={`wf-status ${segment.status}`}>{segment.status}</span><code>{segment.runId ?? 'no run yet'}</code></div>
+            {route && <div className="wf-route-tree">
+              {route.attempts.map(attempt => <div key={attempt.attemptId} className="wf-attempt">
+                <div className="wf-attempt-title"><strong>{attempt.attemptId.slice(0, 10)}…</strong><span>{attempt.status}</span></div>
+                {route.segments.filter(item => item.attemptId === attempt.attemptId).map(item => <div key={item.segmentId} className="wf-segment-row"><span className={`wf-status ${item.status}`}>{item.status}</span><code>{item.startAfterStepId ? 'after ' + item.startAfterStepId.slice(0, 8) : 'start'} → {item.throughStepId.slice(0, 8)}</code></div>)}
+              </div>)}
+            </div>}
             <div className="wf-muted">steps {segment.startAfterStepId ?? 'start'} → {segment.throughStepId}</div>
             <button className="wf-button primary" disabled={!canRun} onClick={() => void execute()}>
               {busy === 'execute' ? '启动中…' : '执行 Segment'}

@@ -15,9 +15,10 @@ from .metrology import MeasurementResultV1, MetrologyRecipeV1, MetricDefinitionV
 from .adoption import adopt_project, first_route
 from .equivalence import ComparisonProtocolV1, EquivalenceResultV1, compare_snapshots
 from .execution import execute_segment
-from .models import CompiledWorkflowV1
+from .models import CompileDiffV1, CompiledWorkflowV1
 from .provenance import ProvenanceVerificationV1, VerificationRecordV1
 from .routes import AttemptV1, RoutePlanV1, SegmentRefV1, SegmentReuseV1, SegmentV1
+from .templates import FlowTemplateV1, resolve_template
 from .store import WorkflowConflict, WorkflowError, WorkflowNotFound, WorkflowStore, WorkflowValidation
 
 
@@ -151,6 +152,24 @@ class EquivalenceCheckRequest(StrictModel):
     rightSegmentId: str | None = None
     leftStepId: str | None = None
     rightStepId: str | None = None
+
+
+class TemplateSummaryV1(StrictModel):
+    templateId: str
+    name: str
+    stepCount: int
+    createdAt: str
+
+
+class TemplateListResponse(StrictModel):
+    templates: list[TemplateSummaryV1]
+
+
+class FromTemplateRequest(StrictModel):
+    project: ProjectV7
+    templateId: str
+    flowId: str | None = None
+    variables: dict[str, float | int | str] = Field(default_factory=dict)
 
 
 class ProtocolSummaryV1(StrictModel):
@@ -499,6 +518,60 @@ async def route_from_compile(request: RouteFromCompileRequest) -> RoutePlanRespo
         plan = first_route(compiled, name=request.name)
         get_store().create_plan(plan)
         return RoutePlanResponse(plan=plan)
+    return _call(operation)
+
+
+@router.post("/templates", response_model=FlowTemplateV1, status_code=201)
+async def register_template(template: FlowTemplateV1) -> FlowTemplateV1:
+    return _call(lambda: get_store().register_template(template))
+
+
+@router.get("/templates", response_model=TemplateListResponse)
+async def list_templates() -> TemplateListResponse:
+    rows = _call(get_store().list_templates)
+    return TemplateListResponse(templates=[TemplateSummaryV1.model_validate(row) for row in rows])
+
+
+@router.get("/templates/{template_id}", response_model=FlowTemplateV1)
+async def get_template(template_id: str) -> FlowTemplateV1:
+    return _call(lambda: get_store().get_template(template_id))
+
+
+@router.post("/flows/from-template", response_model=AdoptProjectResponse, status_code=201)
+async def adopt_template(request: FromTemplateRequest) -> AdoptProjectResponse:
+    def operation():
+        template = get_store().get_template(request.templateId)
+        steps = resolve_template(template, request.variables)
+        flow, binding, compiled = adopt_project(
+            request.project.model_dump(mode="json", exclude_none=True),
+            flow_id=request.flowId,
+            steps=steps,
+        )
+        get_store().register_compile(compiled)
+        return AdoptProjectResponse(
+            flowId=flow.flowId, bindingId=binding.bindingId,
+            compileId=compiled.compileRecord.compileId, projectName=compiled.project.name,
+            dimension=compiled.project.dimension, stepCount=len(compiled.project.steps),
+            compile=compiled,
+        )
+    return _call(operation)
+
+
+@router.get("/compiles/{left_id}/diff/{right_id}", response_model=CompileDiffV1)
+async def compile_diff(left_id: str, right_id: str) -> CompileDiffV1:
+    def operation():
+        store = get_store()
+        left = store.get_compile(left_id)
+        right = store.get_compile(right_id)
+        left_steps = {step.id: step.model_dump(mode="json", exclude_none=True) for step in left.project.steps}
+        right_steps = {step.id: step.model_dump(mode="json", exclude_none=True) for step in right.project.steps}
+        added = sorted(set(right_steps) - set(left_steps))
+        removed = sorted(set(left_steps) - set(right_steps))
+        changed = sorted(key for key in set(left_steps) & set(right_steps) if left_steps[key] != right_steps[key])
+        return CompileDiffV1(
+            addedStepIds=added, removedStepIds=removed, changedStepIds=changed,
+            affectedStepIds=changed, changedVariables=[],
+        )
     return _call(operation)
 
 

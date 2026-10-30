@@ -13,7 +13,12 @@ from .models import FlowRevisionV1, GeometryBindingV1
 from .routes import AttemptV1, RoutePlanV1, RouteV1, SegmentV1
 
 
-def adopt_project(project_payload: dict[str, Any], *, flow_id: str | None = None) -> tuple[FlowRevisionV1, GeometryBindingV1, Any]:
+def adopt_project(
+    project_payload: dict[str, Any],
+    *,
+    flow_id: str | None = None,
+    steps: list[Any] | None = None,
+) -> tuple[FlowRevisionV1, GeometryBindingV1, Any]:
     try:
         project = parse_project(project_payload)
         validated, _warnings = validate_project(project_payload, kind="simulate")
@@ -38,7 +43,7 @@ def adopt_project(project_payload: dict[str, Any], *, flow_id: str | None = None
         flowId=flow_id,
         revision=1,
         name=validated.name,
-        steps=validated.steps,
+        steps=steps if steps is not None else validated.steps,
         solver=validated.solver,
     )
     compiled = compile_flow(flow, binding)

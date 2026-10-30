@@ -24,9 +24,9 @@ try {
   await page.getByRole('button', { name: '02 流程' }).click();
   await page.getByRole('button', { name: '创建首个 Route' }).click();
   await page.getByRole('button', { name: '03 运行' }).click();
-  await page.locator('.wf-status.planned').waitFor();
+  await page.locator('.wf-status.planned').first().waitFor();
   await page.getByRole('button', { name: '执行 Segment' }).click();
-  await page.locator('.wf-status.succeeded').waitFor({ timeout: 30000 });
+  await page.locator('.wf-status.succeeded').first().waitFor({ timeout: 30000 });
 
   await page.getByRole('button', { name: '测量并绑定 Provenance' }).click();
   await page.getByText('Measurement · measured').waitFor({ timeout: 30000 });

@@ -789,6 +789,66 @@
         "title": "ComparisonProtocolV1",
         "type": "object"
       },
+      "CompileDiffV1": {
+        "additionalProperties": false,
+        "properties": {
+          "addedStepIds": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Addedstepids",
+            "type": "array"
+          },
+          "affectedStepIds": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Affectedstepids",
+            "type": "array"
+          },
+          "changedStepIds": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Changedstepids",
+            "type": "array"
+          },
+          "changedVariables": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Changedvariables",
+            "type": "array"
+          },
+          "movedStepIds": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Movedstepids",
+            "type": "array"
+          },
+          "removedStepIds": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Removedstepids",
+            "type": "array"
+          },
+          "suggestedBaseCheckpoint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Suggestedbasecheckpoint"
+          }
+        },
+        "title": "CompileDiffV1",
+        "type": "object"
+      },
       "CompileListResponse": {
         "additionalProperties": false,
         "properties": {
@@ -1798,6 +1858,103 @@
           "seed"
         ],
         "title": "FixedRandom",
+        "type": "object"
+      },
+      "FlowTemplateV1": {
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "schemaVersion": {
+            "const": 1,
+            "title": "Schemaversion",
+            "type": "integer"
+          },
+          "steps": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Steps",
+            "type": "array"
+          },
+          "templateId": {
+            "maxLength": 64,
+            "minLength": 3,
+            "pattern": "^[A-Za-z0-9_-]+$",
+            "title": "Templateid",
+            "type": "string"
+          },
+          "variables": {
+            "items": {
+              "$ref": "#/components/schemas/TemplateVariableV1"
+            },
+            "title": "Variables",
+            "type": "array"
+          }
+        },
+        "required": [
+          "schemaVersion",
+          "templateId",
+          "name",
+          "steps"
+        ],
+        "title": "FlowTemplateV1",
+        "type": "object"
+      },
+      "FromTemplateRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "flowId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Flowid"
+          },
+          "project": {
+            "$ref": "#/components/schemas/ProjectV7"
+          },
+          "templateId": {
+            "title": "Templateid",
+            "type": "string"
+          },
+          "variables": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "string"
+                }
+              ]
+            },
+            "title": "Variables",
+            "type": "object"
+          }
+        },
+        "required": [
+          "project",
+          "templateId"
+        ],
+        "title": "FromTemplateRequest",
         "type": "object"
       },
       "GcDryRunResponse": {
@@ -4611,6 +4768,100 @@
         "title": "TargetStepEvidenceV1",
         "type": "object"
       },
+      "TemplateListResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "templates": {
+            "items": {
+              "$ref": "#/components/schemas/TemplateSummaryV1"
+            },
+            "title": "Templates",
+            "type": "array"
+          }
+        },
+        "required": [
+          "templates"
+        ],
+        "title": "TemplateListResponse",
+        "type": "object"
+      },
+      "TemplateSummaryV1": {
+        "additionalProperties": false,
+        "properties": {
+          "createdAt": {
+            "title": "Createdat",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "stepCount": {
+            "title": "Stepcount",
+            "type": "integer"
+          },
+          "templateId": {
+            "title": "Templateid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "templateId",
+          "name",
+          "stepCount",
+          "createdAt"
+        ],
+        "title": "TemplateSummaryV1",
+        "type": "object"
+      },
+      "TemplateVariableV1": {
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+            "title": "Name",
+            "type": "string"
+          },
+          "unit": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unit"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "title": "Value"
+          }
+        },
+        "required": [
+          "name",
+          "value"
+        ],
+        "title": "TemplateVariableV1",
+        "type": "object"
+      },
       "Units": {
         "additionalProperties": false,
         "properties": {
@@ -6554,6 +6805,57 @@
         ]
       }
     },
+    "/api/v1/workflow/compiles/{left_id}/diff/{right_id}": {
+      "get": {
+        "operationId": "compile_diff_api_v1_workflow_compiles__left_id__diff__right_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "left_id",
+            "required": true,
+            "schema": {
+              "title": "Left Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "right_id",
+            "required": true,
+            "schema": {
+              "title": "Right Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompileDiffV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Compile Diff",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
     "/api/v1/workflow/equivalence/check": {
       "post": {
         "operationId": "equivalence_check_api_v1_workflow_equivalence_check_post",
@@ -6673,6 +6975,47 @@
           }
         },
         "summary": "Adopt Project Endpoint",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/flows/from-template": {
+      "post": {
+        "operationId": "adopt_template_api_v1_workflow_flows_from_template_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FromTemplateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdoptProjectResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Adopt Template",
         "tags": [
           "workflow"
         ]
@@ -7607,6 +7950,108 @@
           }
         },
         "summary": "Execute Segment Endpoint",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/templates": {
+      "get": {
+        "operationId": "list_templates_api_v1_workflow_templates_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TemplateListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Templates",
+        "tags": [
+          "workflow"
+        ]
+      },
+      "post": {
+        "operationId": "register_template_api_v1_workflow_templates_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FlowTemplateV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FlowTemplateV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Register Template",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/templates/{template_id}": {
+      "get": {
+        "operationId": "get_template_api_v1_workflow_templates__template_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "template_id",
+            "required": true,
+            "schema": {
+              "title": "Template Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FlowTemplateV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Template",
         "tags": [
           "workflow"
         ]

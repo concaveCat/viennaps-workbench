@@ -184,6 +184,11 @@ class WorkflowStore:
                 CREATE INDEX IF NOT EXISTS attempts_route_idx ON attempts(route_id);
                 CREATE INDEX IF NOT EXISTS segments_attempt_idx ON segments(attempt_id);
                 CREATE INDEX IF NOT EXISTS reuse_attempt_idx ON reuse(attempt_id);
+                CREATE TABLE IF NOT EXISTS flow_templates (
+                    template_id TEXT PRIMARY KEY,
+                    template_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS comparison_protocols (
                     protocol_id TEXT NOT NULL,
                     version INTEGER NOT NULL,
@@ -1294,6 +1299,50 @@ class WorkflowStore:
     def materialize(self, route_id: str, attempt_id: str) -> list[SegmentRefV1]:
         plan = self.get_plan(route_id)
         return materialize_attempt(plan, attempt_id)
+
+    def register_template(self, template) -> Any:
+        payload = template.model_dump(mode="json", exclude_none=True)
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT template_json FROM flow_templates WHERE template_id = ?",
+                (template.templateId,),
+            ).fetchone()
+            if existing is not None:
+                if sha256_hex(json.loads(existing["template_json"])) != sha256_hex(payload):
+                    raise WorkflowConflict("templateId already exists with different content")
+                return template
+            connection.execute(
+                "INSERT INTO flow_templates (template_id, template_json, created_at) VALUES (?, ?, ?)",
+                (template.templateId, self._dump(payload), self._now()),
+            )
+        return template
+
+    def get_template(self, template_id: str) -> Any:
+        from .templates import FlowTemplateV1
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT template_json FROM flow_templates WHERE template_id = ?",
+                (template_id,),
+            ).fetchone()
+        if row is None:
+            raise WorkflowNotFound(f"flow template {template_id!r} does not exist")
+        return FlowTemplateV1.model_validate(json.loads(row["template_json"]))
+
+    def list_templates(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT template_id, template_json, created_at FROM flow_templates ORDER BY created_at DESC"
+            ).fetchall()
+        return [
+            {
+                "templateId": row["template_id"],
+                "name": json.loads(row["template_json"]).get("name"),
+                "stepCount": len(json.loads(row["template_json"]).get("steps") or []),
+                "createdAt": row["created_at"],
+            }
+            for row in rows
+        ]
 
     def register_comparison_protocol(self, protocol) -> Any:
         payload = protocol.model_dump(mode="json", exclude_none=True)
