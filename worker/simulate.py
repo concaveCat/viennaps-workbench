@@ -26,7 +26,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from backend.rates import has_motion, is_geometry_step, uses_flux, signed_rates, signed_directional_rates
+from backend.rates import has_motion, is_geometry_step, uses_flux, signed_rates, signed_directional_rates, signed_directional_rate_sets
 from backend.models import normalized_geometry_v3, parse_project, project_structure_hash
 from backend.runtime_limits import artifact_limit_bytes, artifact_limit_label
 from backend.validation import fin_construction_decision
@@ -768,6 +768,60 @@ def material_handle(ps: Any, name: str):
     if material is None:
         raise RuntimeError(f"material {name!r} is absent from the native MaterialRegistry")
     return registry.getMaterial(name)
+
+
+RATE_SET_OVERLOAD = "DirectionalProcess(rateSets: Sequence[RateSet])"
+
+
+def directional_rate_set_records(project: dict[str, Any], step: dict[str, Any]) -> list[dict[str, Any]]:
+    """Resolve the request into the exact native ``ps.RateSet`` payloads.
+
+    ``maskMaterials`` omitted means the geometry-derived masks shared with the
+    scalar directional path; an explicit list (including ``[]``) is used
+    verbatim. Every name must exist in the material catalog, and the record
+    keeps both names and native IDs so a run is auditable without the project.
+    """
+    rows = signed_directional_rate_sets(step)
+    if rows is None:
+        raise RuntimeError("directional step does not use the native rate-set overload")
+    default_masks = protected_material_names(project, step)
+    records: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        requested_masks = row["requestedMaskMaterials"]
+        masks = list(default_masks) if requested_masks is None else list(requested_masks)
+        for name in masks:
+            if name not in MATERIAL_IDS:
+                raise RuntimeError(f"rateSets[{index}] mask material {name!r} is absent from the material catalog")
+        active = row["directionalRateMagnitude"] > 0.0
+        records.append({
+            "index": index,
+            "requestedDirection": row["requestedDirection"],
+            "nativeUnitDirection": row["nativeUnitDirection"],
+            "directionalRateMagnitude": row["directionalRateMagnitude"],
+            "isotropicRateMagnitude": row["isotropicRateMagnitude"],
+            "nativeDirectionalVelocity": row["nativeDirectionalVelocity"],
+            "nativeIsotropicVelocity": row["nativeIsotropicVelocity"],
+            "requestedMaskMaterials": requested_masks,
+            "maskMaterials": masks,
+            "maskMaterialIds": [MATERIAL_IDS[name] for name in masks],
+            "maskSource": "geometry" if requested_masks is None else "request",
+            "requestedCalculateVisibility": row["requestedCalculateVisibility"],
+            "calculateVisibility": (row["requestedCalculateVisibility"] if active
+                                    else "not-applicable: directional velocity is zero"),
+        })
+    return records
+
+
+def native_rate_sets(ps: Any, records: list[dict[str, Any]]) -> list[Any]:
+    """Build real ``ps.RateSet`` objects for the native sequence overload."""
+    return [
+        ps.RateSet(list(record["nativeUnitDirection"]),
+                   float(record["nativeDirectionalVelocity"]),
+                   float(record["nativeIsotropicVelocity"]),
+                   [material_handle(ps, name) for name in record["maskMaterials"]],
+                   bool(record["requestedCalculateVisibility"]) and record["directionalRateMagnitude"] > 0.0)
+        for record in records
+    ]
 
 
 def build_multi_particle_model(ps: Any, step: dict[str, Any]) -> tuple[Any, dict[str, Any], dict[str, Any]]:
@@ -2597,13 +2651,24 @@ def execute(input_path: Path, run_dir: Path) -> None:
                                   "actualMaterialRatesById":{str(MATERIAL_IDS[name]):value for name,value in no_op_rates.items()},
                                   "nativeRateTable":[{"name":name,"id":MATERIAL_IDS[name],"rate":value} for name,value in sorted(no_op_rates.items())]}
             if project["schemaVersion"] in (5,6,7) and step.get("model")=="directional":
-                native_directional,native_isotropic=signed_directional_rates(step)
-                raw_direction=[float(value) for value in step["direction"]]
-                length=math.sqrt(sum(value*value for value in raw_direction))
-                no_op_parameters={"direction":raw_direction,"nativeUnitDirection":[value/length for value in raw_direction],
-                    "directionalRateMagnitude":float(step["directionalRateMagnitude"]),"isotropicRateMagnitude":float(step["isotropicRateMagnitude"]),
-                    "nativeDirectionalVelocity":native_directional,"nativeIsotropicVelocity":native_isotropic,
-                    "calculateVisibility":"not-applicable: no rate is active"}
+                if step.get("rateSets") is not None:
+                    records=directional_rate_set_records(project,step)
+                    for record in records:
+                        record["calculateVisibility"]="not-applicable: no rate is active"
+                    no_op_parameters={"mode":"rateSets","nativeOverload":RATE_SET_OVERLOAD,
+                        "rateSets":records,"rateSetCount":len(records),
+                        "maskMaterials":records[0]["maskMaterials"] if records else [],
+                        "maskMaterialIds":records[0]["maskMaterialIds"] if records else [],
+                        "maskSource":records[0]["maskSource"] if records else None,
+                        "nativeProcess":"viennaps.DirectionalProcess (not called: every rate is zero)"}
+                else:
+                    native_directional,native_isotropic=signed_directional_rates(step)
+                    raw_direction=[float(value) for value in step["direction"]]
+                    length=math.sqrt(sum(value*value for value in raw_direction))
+                    no_op_parameters={"direction":raw_direction,"nativeUnitDirection":[value/length for value in raw_direction],
+                        "directionalRateMagnitude":float(step["directionalRateMagnitude"]),"isotropicRateMagnitude":float(step["isotropicRateMagnitude"]),
+                        "nativeDirectionalVelocity":native_directional,"nativeIsotropicVelocity":native_isotropic,
+                        "calculateVisibility":"not-applicable: no rate is active"}
             if step.get("model")=="multiParticle":
                 no_op_parameters={"nativeProcess":"viennaps.MultiParticleProcess (not called: zero coefficient)",
                     "species":step["species"],"rateCoefficients":step["rateCoefficients"],
@@ -2674,34 +2739,51 @@ def execute(input_path: Path, run_dir: Path) -> None:
             material_mode = project["schemaVersion"] in (4,5,6,7) and step.get("rateMode")=="material"
             directional_parameters: dict[str,Any] | None = None
             if directional:
-                raw_direction=[float(value) for value in step["direction"]]
-                length=math.sqrt(sum(value*value for value in raw_direction))
-                if not math.isfinite(length) or length <= 1e-12:
-                    raise RuntimeError("direction must be a finite nonzero vector")
-                native_direction=[value/length for value in raw_direction]
-                directional_velocity,isotropic_velocity=signed_directional_rates(step)
-                mask_names=protected_material_names(project,step)
-                mask_materials=[material_handle(ps,name) for name in mask_names]
-                visibility=bool(step["calculateVisibility"]) if float(step["directionalRateMagnitude"])>0 else False
-                # ViennaPS 4.6.2 accepts a list under the positional argument
-                # named ``maskMaterial``; ``maskMaterials=`` is not a bound
-                # keyword, even though a sequence is accepted by the overload.
-                model=ps.DirectionalProcess(native_direction,directional_velocity,isotropic_velocity,mask_materials,visibility)
-                directional_parameters={
-                    "requestedDirection":raw_direction,
-                    "nativeUnitDirection":native_direction,
-                    "directionCoordinateMap":"2D [x,h,0] -> native [x,h,0]; 3D [x,y,z] -> native [x,y,z] (z vertical)",
-                    "directionalRateMagnitude":float(step["directionalRateMagnitude"]),
-                    "isotropicRateMagnitude":float(step["isotropicRateMagnitude"]),
-                    "nativeDirectionalVelocity":directional_velocity,
-                    "nativeIsotropicVelocity":isotropic_velocity,
-                    "calculateVisibility":visibility if float(step["directionalRateMagnitude"])>0 else "not-applicable: directional rate is zero",
-                    "maskMaterials":mask_names,
-                    "maskMaterialIds":[MATERIAL_IDS[name] for name in mask_names],
-                    "nativeProcessBackend":"CPU_DISK pinned; directional model has no stochastic flux engine",
-                    "raysPerPoint":"not-applicable",
-                    "randomSeed":"not-applicable",
-                }
+                if step.get("rateSets") is not None:
+                    set_records=directional_rate_set_records(project,step)
+                    model=ps.DirectionalProcess(native_rate_sets(ps,set_records))
+                    directional_parameters={
+                        "mode":"rateSets",
+                        "nativeOverload":RATE_SET_OVERLOAD,
+                        "directionCoordinateMap":"2D [x,h,0] -> native [x,h,0]; 3D [x,y,z] -> native [x,y,z] (z vertical)",
+                        "rateSetCount":len(set_records),
+                        "rateSets":set_records,
+                        "maskMaterials":set_records[0]["maskMaterials"] if set_records else [],
+                        "maskMaterialIds":set_records[0]["maskMaterialIds"] if set_records else [],
+                        "nativeProcessBackend":"CPU_DISK pinned; directional model has no stochastic flux engine",
+                        "raysPerPoint":"not-applicable",
+                        "randomSeed":"not-applicable",
+                    }
+                else:
+                    raw_direction=[float(value) for value in step["direction"]]
+                    length=math.sqrt(sum(value*value for value in raw_direction))
+                    if not math.isfinite(length) or length <= 1e-12:
+                        raise RuntimeError("direction must be a finite nonzero vector")
+                    native_direction=[value/length for value in raw_direction]
+                    directional_velocity,isotropic_velocity=signed_directional_rates(step)
+                    mask_names=protected_material_names(project,step)
+                    mask_materials=[material_handle(ps,name) for name in mask_names]
+                    visibility=bool(step["calculateVisibility"]) if float(step["directionalRateMagnitude"])>0 else False
+                    # ViennaPS 4.6.2 accepts a list under the positional argument
+                    # named ``maskMaterial``; ``maskMaterials=`` is not a bound
+                    # keyword, even though a sequence is accepted by the overload.
+                    model=ps.DirectionalProcess(native_direction,directional_velocity,isotropic_velocity,mask_materials,visibility)
+                    directional_parameters={
+                        "mode":"scalar",
+                        "requestedDirection":raw_direction,
+                        "nativeUnitDirection":native_direction,
+                        "directionCoordinateMap":"2D [x,h,0] -> native [x,h,0]; 3D [x,y,z] -> native [x,y,z] (z vertical)",
+                        "directionalRateMagnitude":float(step["directionalRateMagnitude"]),
+                        "isotropicRateMagnitude":float(step["isotropicRateMagnitude"]),
+                        "nativeDirectionalVelocity":directional_velocity,
+                        "nativeIsotropicVelocity":isotropic_velocity,
+                        "calculateVisibility":visibility if float(step["directionalRateMagnitude"])>0 else "not-applicable: directional rate is zero",
+                        "maskMaterials":mask_names,
+                        "maskMaterialIds":[MATERIAL_IDS[name] for name in mask_names],
+                        "nativeProcessBackend":"CPU_DISK pinned; directional model has no stochastic flux engine",
+                        "raysPerPoint":"not-applicable",
+                        "randomSeed":"not-applicable",
+                    }
             elif step.get("model") != "multiParticle" and not specialized and not csv_process:
                 rate, signed_material_rates = signed_rates(step)
             particle = uses_flux(step)
@@ -2819,7 +2901,10 @@ def execute(input_path: Path, run_dir: Path) -> None:
                                               "cpuThreads":int(project["solver"]["cpuThreads"])})
             if directional:
                 actual_parameters = {"timeStepRatio":float(advection.timeStepRatio),"duration":float(step["duration"]),**(directional_parameters or {})}
-                rate = directional_parameters["nativeDirectionalVelocity"] if directional_parameters else None
+                # A rate-set step has no single native rate; per-set values live
+                # in actualParameters.rateSets and actualRate stays null.
+                rate = (directional_parameters.get("nativeDirectionalVelocity")
+                        if directional_parameters and "nativeDirectionalVelocity" in directional_parameters else None)
             elif specialized:
                 if specialized_actual is not None:
                     specialized_actual.update({"actualSeed": step_seed, "actualEngine": engine,

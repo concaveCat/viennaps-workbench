@@ -69,23 +69,47 @@ def snapshot(domain, step_id):
 def run_step(domain, project, step):
     if step["operation"] == "deposit":
         domain.duplicateTopLevelSet(material(step["depositMaterial"]))
-    direction = [float(value) for value in step["direction"]]
-    norm = math.sqrt(sum(value * value for value in direction))
-    if norm <= 1e-12:
-        raise RuntimeError("invalid zero reference direction")
-    direction = [value / norm for value in direction]
     sign = -1.0 if step["operation"] == "etch" else 1.0
-    directional_velocity = float(step["directionalRateMagnitude"]) * sign
-    isotropic_velocity = float(step["isotropicRateMagnitude"]) * sign
-    masks = [material(name) for name in mask_material_names(project)]
-    visibility = bool(step["calculateVisibility"]) if step["directionalRateMagnitude"] > 0 else False
-    model = ps.DirectionalProcess(direction, directional_velocity, isotropic_velocity, masks, visibility)
+    default_masks = [material(name) for name in mask_material_names(project)]
+    if step.get("rateSets") is not None:
+        rate_sets = []
+        for item in step["rateSets"]:
+            direction = [float(value) for value in item["direction"]]
+            norm = math.sqrt(sum(value * value for value in direction))
+            if norm <= 1e-12:
+                raise RuntimeError("invalid zero reference direction")
+            direction = [value / norm for value in direction]
+            masks = (default_masks if item.get("maskMaterials") is None
+                     else [material(name) for name in item["maskMaterials"]])
+            directional = float(item["directionalVelocity"])
+            rate_sets.append(ps.RateSet(
+                direction, directional * sign, float(item.get("isotropicVelocity", 0.0)) * sign,
+                masks, bool(item.get("calculateVisibility", True)) and directional > 0))
+        model = ps.DirectionalProcess(rate_sets)
+    else:
+        direction = [float(value) for value in step["direction"]]
+        norm = math.sqrt(sum(value * value for value in direction))
+        if norm <= 1e-12:
+            raise RuntimeError("invalid zero reference direction")
+        direction = [value / norm for value in direction]
+        directional_velocity = float(step["directionalRateMagnitude"]) * sign
+        isotropic_velocity = float(step["isotropicRateMagnitude"]) * sign
+        visibility = bool(step["calculateVisibility"]) if step["directionalRateMagnitude"] > 0 else False
+        model = ps.DirectionalProcess(direction, directional_velocity, isotropic_velocity,
+                                      default_masks, visibility)
     process = ps.Process(domain, model, float(step["duration"]))
     process.setFluxEngineType(ps.FluxEngineType.CPU_DISK)
     advection = ps.AdvectionParameters()
     advection.timeStepRatio = float(project["solver"]["timeStepRatio"])
     process.setParameters(advection)
     process.apply()
+
+
+def has_motion(step):
+    if step.get("rateSets") is not None:
+        return any(float(item["directionalVelocity"]) > 0 or float(item["isotropicVelocity"]) > 0
+                   for item in step["rateSets"])
+    return step["directionalRateMagnitude"] != 0 or step["isotropicRateMagnitude"] != 0
 
 
 def main():
@@ -97,7 +121,7 @@ def main():
     for step in project["steps"]:
         if not step["enabled"]:
             continue
-        if step["directionalRateMagnitude"] == 0 and step["isotropicRateMagnitude"] == 0:
+        if not has_motion(step):
             output[step["id"]] = snapshot(domain, step["id"])
             continue
         run_step(domain, project, step)

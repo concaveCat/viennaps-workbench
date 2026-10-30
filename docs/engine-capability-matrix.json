@@ -102,19 +102,19 @@
         "model:directional (schema 5+)",
         "backend/models.py:DirectionalStepV5"
       ],
-      "notes": "Only the single-velocity overload is used; per-material direction/velocity sets require batch B2.",
+      "notes": "The scalar overload remains the default for schema-5 `directional` steps. Providing the additive `rateSets` list builds real `viennaps.RateSet` objects and calls the native `DirectionalProcess(rateSets: Sequence[RateSet])` overload; the probe in worker/probe_ratesets_native.py verifies additive directional and isotropic velocities, per-set maskMaterials and per-set calculateVisibility in 2D and 3D. The per-material `materialRates` mapping overload stays unexposed.",
       "members": {
         "exposed": [
           "direction",
           "directionalRateMagnitude",
           "isotropicRateMagnitude",
           "calculateVisibility",
-          "maskMaterials (derived from geometry)"
+          "maskMaterials (derived from geometry)",
+          "rateSets[] -> RateSet(direction, directionalVelocity, isotropicVelocity, maskMaterials, calculateVisibility)",
+          "native rateSets sequence overload"
         ],
         "notExposed": [
-          "materialRates mapping overload",
-          "multi-RateSet overload",
-          "per-set maskMaterials"
+          "materialRates mapping overload"
         ]
       }
     },
@@ -1523,25 +1523,24 @@
       ],
       "constructor": "RateSet(direction=[0,0,0], directionalVelocity=0.0, isotropicVelocity=0.0, maskMaterials=[Material('Mask')], calculateVisibility=True)",
       "docSummary": "One directional+isotropic rate tuple, optionally selected per material or as one of many sets.",
-      "classification": "advanced-parameter-or-output-not-exposed",
+      "classification": "exposed",
       "exposedBy": [
-        "model:directional (fields flattened into DirectionalProcess scalars)"
+        "model:directional rateSets (schema 5+)"
       ],
-      "notes": "The schema stores the same four values as scalars, so the object itself never crosses the API boundary.",
+      "notes": "Each `rateSets` entry becomes one real `viennaps._core.RateSet`. `maskMaterials` omitted inherits the geometry-derived masks; an explicit list (including `[]`) is honoured verbatim and recorded per set. `print()` remains a debugging helper and is not called.",
       "members": {
         "exposed": [
           "direction",
           "directionalVelocity",
           "isotropicVelocity",
+          "maskMaterials",
           "calculateVisibility"
         ],
         "notExposed": [
-          "multi-RateSet sequences",
-          "per-set maskMaterials",
           "print()"
         ]
       },
-      "partialExposure": true
+      "partialExposure": false
     },
     {
       "className": "RateGrid",
