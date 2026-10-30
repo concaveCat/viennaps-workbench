@@ -27,7 +27,15 @@ from backend.workflow.store import (
 )
 from tests.test_api_integration import asgi_request, json_body
 
-CATALOG = ["Mask", "Si", "SiO2", "Si3N4", "PolySi", "Air"]
+CATALOG = {
+    "Mask": "Hardmask",
+    "Si": "Silicon",
+    "SiO2": "OxideNitride",
+    "Si3N4": "OxideNitride",
+    "PolySi": "Silicon",
+    "PMMA": "Hardmask",
+    "TiN": "Metal",
+}
 
 ISOTROPIC_ETCH = {
     "operation": "etch",
@@ -40,7 +48,8 @@ ISOTROPIC_ETCH = {
 
 def material_payload(**overrides) -> dict:
     payload = {
-        "catalogName": "Si",
+        "catalog": "Silicon",
+        "material": "Si",
         "displayName": "Silicon substrate",
         "color": "#c79a08",
         "role": "substrate",
@@ -75,32 +84,94 @@ def experiment_payload(**overrides) -> dict:
 
 
 class LibraryPayloadValidationTests(unittest.TestCase):
-    def test_material_preset_references_the_installed_catalog(self) -> None:
-        payload = validate_library_payload("material", material_payload(), catalog_names=CATALOG)
-        self.assertEqual(payload["catalogName"], "Si")
-
-    def test_material_preset_rejects_unknown_catalog_name(self) -> None:
-        with self.assertRaises(WorkflowValidation) as caught:
-            validate_library_payload(
-                "material", material_payload(catalogName="Unobtainium"), catalog_names=CATALOG
-            )
-        self.assertIn("not in the installed material catalog", str(caught.exception))
+    def test_material_preset_pairs_a_catalog_with_a_catalog_material(self) -> None:
+        payload = validate_library_payload("material", material_payload(), catalog=CATALOG)
+        self.assertEqual(payload["catalog"], "Silicon")
+        self.assertEqual(payload["material"], "Si")
+        oxide = validate_library_payload(
+            "material",
+            {"catalog": "OxideNitride", "material": "SiO2"},
+            catalog=CATALOG,
+        )
+        self.assertEqual(oxide, {"catalog": "OxideNitride", "material": "SiO2"})
 
     def test_material_preset_uses_the_real_catalog_by_default(self) -> None:
-        # The shipped catalog contains Si; the default path must not need an
-        # injected list, because the API validates against GET /api/materials.
-        payload = validate_library_payload("material", {"catalogName": "Si"})
-        self.assertEqual(payload, {"catalogName": "Si"})
+        # The shipped catalog has SiO2 in OxideNitride; the default path must not
+        # need an injected mapping because the API validates against
+        # GET /api/materials.
+        payload = validate_library_payload(
+            "material", {"catalog": "OxideNitride", "material": "SiO2"}
+        )
+        self.assertEqual(payload, {"catalog": "OxideNitride", "material": "SiO2"})
+
+    def test_material_preset_rejects_unknown_material(self) -> None:
+        with self.assertRaises(WorkflowValidation) as caught:
+            validate_library_payload(
+                "material", material_payload(material="Unobtainium"), catalog=CATALOG
+            )
+        self.assertIn("not in the installed material catalog", str(caught.exception))
+        # A case-only difference suggests the catalog spelling instead of
+        # silently normalizing the engine material name.
+        with self.assertRaises(WorkflowValidation) as caught:
+            validate_library_payload(
+                "material",
+                {"catalog": "OxideNitride", "material": "sio2"},
+                catalog=CATALOG,
+            )
+        self.assertIn("did you mean 'SiO2'", str(caught.exception))
+
+    def test_material_preset_rejects_unknown_or_mismatched_catalog(self) -> None:
+        with self.assertRaises(WorkflowValidation) as caught:
+            validate_library_payload(
+                "material",
+                {"catalog": "NotACategory", "material": "Si"},
+                catalog=CATALOG,
+            )
+        self.assertIn("MaterialCategory", str(caught.exception))
+
+        with self.assertRaises(WorkflowValidation) as caught:
+            validate_library_payload(
+                "material", {"catalog": "Metal", "material": "SiO2"}, catalog=CATALOG
+            )
+        self.assertIn("categorized as 'OxideNitride'", str(caught.exception))
+        self.assertIn("not catalog 'Metal'", str(caught.exception))
+
+        # A legal MaterialCategory the material does not belong to is still a
+        # mismatch, even when the value exists in the engine enum.
+        with self.assertRaises(WorkflowValidation):
+            validate_library_payload(
+                "material", {"catalog": "Generic", "material": "Si"}, catalog=CATALOG
+            )
+
+    def test_material_preset_rejects_the_legacy_catalog_name_field(self) -> None:
+        with self.assertRaises(WorkflowValidation) as caught:
+            validate_library_payload(
+                "material", {"catalogName": "Si"}, catalog=CATALOG
+            )
+        message = str(caught.exception)
+        self.assertIn("catalogName", message)
+        self.assertIn("'catalog'", message)
+        self.assertIn("'material'", message)
+
+    def test_material_preset_requires_both_references(self) -> None:
+        for payload in (
+            {"material": "Si"},
+            {"catalog": "Silicon"},
+            {},
+        ):
+            with self.subTest(payload=payload):
+                with self.assertRaises(WorkflowValidation):
+                    validate_library_payload("material", payload, catalog=CATALOG)
 
     def test_material_preset_rejects_engine_fields_and_bad_metadata(self) -> None:
         with self.assertRaises(WorkflowValidation):
             validate_library_payload(
-                "material", material_payload(densityGcm3=2.33), catalog_names=CATALOG
+                "material", material_payload(densityGcm3=2.33), catalog=CATALOG
             )
         with self.assertRaises(WorkflowValidation):
-            validate_library_payload("material", material_payload(color="blue"), catalog_names=CATALOG)
+            validate_library_payload("material", material_payload(color="blue"), catalog=CATALOG)
         with self.assertRaises(WorkflowValidation):
-            validate_library_payload("material", {"displayName": "no reference"}, catalog_names=CATALOG)
+            validate_library_payload("material", {"displayName": "no reference"}, catalog=CATALOG)
 
     def test_process_preset_accepts_a_valid_step_without_id(self) -> None:
         payload = validate_library_payload("process", ISOTROPIC_ETCH, item_name="isotropic etch")
@@ -194,14 +265,14 @@ class LibraryPayloadValidationTests(unittest.TestCase):
         with self.assertRaises(WorkflowValidation):
             validate_library_payload("process", "not-an-object")
         item = create_library_item(
-            category="material", name="Si", payload=material_payload(), catalog_names=CATALOG
+            category="material", name="Si", payload=material_payload(), catalog=CATALOG
         )
         with self.assertRaises(ValueError):
             LibraryItemV1(
                 itemId=item.itemId,
                 category=item.category,
                 name=item.name,
-                payload={"catalogName": "Si", "notes": "x" * (MAX_LIBRARY_ITEM_PAYLOAD_BYTES + 1)},
+                payload={"catalog": "Silicon", "material": "Si", "notes": "x" * (MAX_LIBRARY_ITEM_PAYLOAD_BYTES + 1)},
                 createdAt=item.createdAt,
                 updatedAt=item.updatedAt,
             )
@@ -229,7 +300,7 @@ class LibraryItemStoreTests(unittest.TestCase):
             name=name,
             description="local preset",
             payload=payload,
-            catalog_names=CATALOG,
+            catalog=CATALOG,
         )
 
     def test_crud_round_trip_and_category_filter(self) -> None:
@@ -268,7 +339,7 @@ class LibraryItemStoreTests(unittest.TestCase):
         self.store.save_library_item(item.model_dump(mode="json"))
         updated = update_library_item(
             item, name="Silicon (renamed)", description="edited", payload=material_payload(role="mask"),
-            catalog_names=CATALOG,
+            catalog=CATALOG,
         )
         stored = self.store.update_library_item(updated.model_dump(mode="json"))
         self.assertEqual(stored["itemId"], item.itemId)
@@ -314,11 +385,15 @@ class LibraryItemStoreTests(unittest.TestCase):
         # catalog must not make an existing library entry vanish on read.
         item = self._item()
         self.store.save_library_item(item.model_dump(mode="json"))
-        self.assertEqual(self.store.get_library_item(item.itemId)["payload"]["catalogName"], "Si")
+        stored = self.store.get_library_item(item.itemId)["payload"]
+        self.assertEqual(stored["catalog"], "Silicon")
+        self.assertEqual(stored["material"], "Si")
         with self.assertRaises(WorkflowValidation):
-            validate_library_payload("material", {"catalogName": "Si"}, catalog_names=["SiO2"])
+            validate_library_payload(
+                "material", {"catalog": "Silicon", "material": "Si"}, catalog={"SiO2": "OxideNitride"}
+            )
         with self.assertRaises(WorkflowValidation):
-            validate_library_payload("not-a-category", {"catalogName": "Si"}, catalog_names=CATALOG)
+            validate_library_payload("not-a-category", {"catalog": "Silicon", "material": "Si"}, catalog=CATALOG)
 
     def test_schema_9_migration_adds_the_library_items_table(self) -> None:
         path = self.root / "migrate.sqlite3"
@@ -395,7 +470,8 @@ class LibraryItemApiTests(unittest.IsolatedAsyncioTestCase):
         item = json_body(created)
         self.assertRegex(item["itemId"], r"^item_[a-f0-9]{24}$")
         self.assertEqual(item["schemaVersion"], 1)
-        self.assertEqual(item["payload"]["catalogName"], "Si")
+        self.assertEqual(item["payload"]["catalog"], "Silicon")
+        self.assertEqual(item["payload"]["material"], "Si")
         item_id = item["itemId"]
 
         fetched = await self.get(f"/api/v1/workflow/library/items/{item_id}")
@@ -431,9 +507,25 @@ class LibraryItemApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_payloads_and_categories_return_422(self) -> None:
         unknown_material = await self.post(
             "/api/v1/workflow/library/items",
-            {"category": "material", "name": "bogus", "payload": {"catalogName": "Unobtainium"}},
+            {"category": "material", "name": "bogus", "payload": {"catalog": "Silicon", "material": "Unobtainium"}},
         )
         self.assertEqual(unknown_material[0], 422, unknown_material[2])
+        legacy_field = await self.post(
+            "/api/v1/workflow/library/items",
+            {"category": "material", "name": "legacy", "payload": {"catalogName": "Si"}},
+        )
+        self.assertEqual(legacy_field[0], 422, legacy_field[2])
+        self.assertIn("catalog", json_body(legacy_field)["detail"])
+        mismatched_catalog = await self.post(
+            "/api/v1/workflow/library/items",
+            {
+                "category": "material",
+                "name": "mismatch",
+                "payload": {"catalog": "Metal", "material": "SiO2"},
+            },
+        )
+        self.assertEqual(mismatched_catalog[0], 422, mismatched_catalog[2])
+        self.assertIn("OxideNitride", json_body(mismatched_catalog)["detail"])
         bad_step = await self.post(
             "/api/v1/workflow/library/items",
             {"category": "process", "name": "bad", "payload": {**ISOTROPIC_ETCH, "duration": 0.0}},
@@ -454,7 +546,7 @@ class LibraryItemApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(missing[0], 404, missing[2])
         missing_put = await self.put(
             "/api/v1/workflow/library/items/item_" + "0" * 24,
-            {"name": "nothing", "payload": {"catalogName": "Si"}},
+            {"name": "nothing", "payload": {"catalog": "Silicon", "material": "Si"}},
         )
         self.assertEqual(missing_put[0], 404, missing_put[2])
 

@@ -18,18 +18,16 @@ try {
   await page.goto(`${baseUrl}/`);
   await page.getByText('ViennaPS Workbench').first().waitFor();
   await page.locator('input[type=file]').nth(1).setInputFiles(projectPath);
-  await page.getByRole('button', { name: '采纳为 Workflow' }).click();
-  await page.getByText('Compile 已冻结').waitFor();
-
-  await page.getByRole('button', { name: '02 流程' }).click();
-  await page.getByRole('button', { name: '创建首个 Route' }).click();
-  await page.getByRole('button', { name: '03 运行' }).click();
+  await page.getByRole('button', { name: '去 02 定义流程' }).click();
+  await page.getByRole('button', { name: '编译流程' }).click();
+  await page.getByText(/编译成功/).waitFor();
+  await page.getByRole('button', { name: '创建 Route / 去 03' }).click();
   await page.locator('.wf-status.planned').first().waitFor();
-  await page.getByRole('button', { name: '执行 Segment' }).click();
+  await page.getByRole('button', { name: '执行当前 Segment' }).click();
   await page.locator('.wf-status.succeeded').first().waitFor({ timeout: 30000 });
 
-  await page.getByRole('button', { name: '按配方测量并绑定' }).click();
-  await page.getByText('Measurement · measured').waitFor({ timeout: 30000 });
+  await page.getByRole('button', { name: '测量', exact: true }).click();
+  await page.getByText(/测量 · 已测量/).waitFor({ timeout: 30000 });
   await page.getByText(/2\.0000 um/).first().waitFor({ timeout: 30000 });
   await page.getByText(/binding: verified/).waitFor({ timeout: 30000 });
   await page.screenshot({ path: screenshot, fullPage: true });

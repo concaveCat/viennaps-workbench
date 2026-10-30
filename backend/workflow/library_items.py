@@ -4,10 +4,13 @@ The library is *not* a workflow stage entry point. It holds reusable, named
 objects that a user can drop into a flow, a project or an experiment later:
 
 ``material``
-    A material preset. It references a name that already exists in the verified
-    native material catalog (``GET /api/materials``) and only stores presentation
-    and role metadata. It never invents an engine material and never copies
-    density/conductivity, so a catalog change stays authoritative.
+    A material preset. It references a category that exists in the verified
+    native material catalog (``GET /api/materials`` -> ``category``) and one
+    concrete material from that catalog, and only stores presentation and role
+    metadata. The material's own catalog category must equal ``catalog``, so the
+    preset can never describe an engine material that does not exist. It never
+    invents an engine material and never copies density/conductivity, so a
+    catalog change stays authoritative.
 
 ``process``
     A single Step template (``operation``/``model``/rates/duration/...). It is
@@ -41,12 +44,13 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from datetime import datetime, timezone
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, get_args
 
 from pydantic import Field, TypeAdapter, ValidationError, model_validator
 
+from ..materials import MaterialCategory
 from ..models import (
     BooleanStepV5,
     DirectionalStepV5,
@@ -81,6 +85,9 @@ IdPattern = re.compile(r"^[A-Za-z0-9_-]{3,96}$")
 ColorPattern = re.compile(r"^#[0-9a-fA-F]{6}$")
 RolePattern = re.compile(r"^[A-Za-z][A-Za-z0-9 _-]{0,39}$")
 
+# The complete installed material-category enum (ViennaPS 4.6.2).
+MATERIAL_CATEGORY_VALUES: frozenset[str] = frozenset(get_args(MaterialCategory))
+
 _STEP_ADAPTER: TypeAdapter = TypeAdapter(StepV7)
 
 # Every field any StepV7 variant may carry. Kept as an explicit union of the
@@ -101,8 +108,12 @@ PROCESS_PAYLOAD_FIELDS: frozenset[str] = frozenset(
 )
 
 MATERIAL_PAYLOAD_FIELDS = frozenset(
-    {"catalogName", "displayName", "color", "role", "notes"}
+    {"catalog", "material", "displayName", "color", "role", "notes"}
 )
+# ``catalogName`` was an early draft field. It is rejected explicitly so a
+# client written against it gets a migration hint instead of a generic
+# "unknown field" error.
+LEGACY_MATERIAL_PAYLOAD_FIELDS = frozenset({"catalogName"})
 FLOW_PAYLOAD_FIELDS = frozenset(
     {"name", "definitionId", "templateId", "steps", "parameters", "notes"}
 )
@@ -252,34 +263,55 @@ def _positive_int(payload: Mapping[str, Any], key: str) -> int:
     return value
 
 
-def _catalog_names(catalog_names: Iterable[str] | None) -> list[str]:
-    if catalog_names is not None:
-        return list(catalog_names)
+def _catalog_entries(catalog: Mapping[str, str] | None) -> dict[str, str]:
+    """Return ``material name -> catalog category`` for the installed catalog."""
+
+    if catalog is not None:
+        return {str(name): str(category) for name, category in catalog.items()}
     from ..materials import material_catalog
 
     try:
         rows = material_catalog().get("materials") or []
     except (OSError, ValueError, AttributeError, TypeError) as exc:
         raise WorkflowValidation(f"material catalog is unavailable: {exc}") from exc
-    return [row["name"] for row in rows]
+    return {str(row["name"]): str(row.get("category") or "Generic") for row in rows}
 
 
 def _validate_material(
-    payload: Mapping[str, Any], *, catalog_names: Iterable[str] | None
+    payload: Mapping[str, Any], *, catalog: Mapping[str, str] | None
 ) -> dict[str, Any]:
+    legacy = sorted(set(payload) & LEGACY_MATERIAL_PAYLOAD_FIELDS)
+    if legacy:
+        raise WorkflowValidation(
+            "material payload field 'catalogName' is no longer supported; use "
+            "'catalog' (a /api/materials category such as 'OxideNitride') plus "
+            "'material' (a catalog material name such as 'SiO2')"
+        )
     _reject_unknown(payload, MATERIAL_PAYLOAD_FIELDS, "material")
-    catalog_name = _text(payload, "catalogName", required=True, max_length=80)
-    names = _catalog_names(catalog_names)
-    if catalog_name not in names:
-        folded = {name.casefold(): name for name in names}
-        suggestion = folded.get(catalog_name.casefold())
+    category_name = _text(payload, "catalog", required=True, max_length=40)
+    material_name = _text(payload, "material", required=True, max_length=80)
+    if category_name not in MATERIAL_CATEGORY_VALUES:
+        raise WorkflowValidation(
+            f"material catalog {category_name!r} is not a ViennaPS MaterialCategory; "
+            f"expected one of {', '.join(sorted(MATERIAL_CATEGORY_VALUES))}"
+        )
+    entries = _catalog_entries(catalog)
+    if material_name not in entries:
+        folded = {name.casefold(): name for name in entries}
+        suggestion = folded.get(material_name.casefold())
         hint = (
             f"; did you mean {suggestion!r}?"
             if suggestion is not None
             else "; the name must match GET /api/materials exactly"
         )
         raise WorkflowValidation(
-            f"material {catalog_name!r} is not in the installed material catalog{hint}"
+            f"material {material_name!r} is not in the installed material catalog{hint}"
+        )
+    actual_category = entries[material_name]
+    if actual_category != category_name:
+        raise WorkflowValidation(
+            f"material {material_name!r} is categorized as {actual_category!r}, "
+            f"not catalog {category_name!r}"
         )
     _text(payload, "displayName", max_length=80)
     color = _text(payload, "color", max_length=7)
@@ -411,12 +443,13 @@ def validate_library_payload(
     payload: Any,
     *,
     item_name: str = "",
-    catalog_names: Iterable[str] | None = None,
+    catalog: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Validate and detach one category-specific payload.
 
-    ``catalog_names`` is injectable so callers (and tests) can pin the material
-    catalog without touching the on-disk registry. Invalid content raises
+    ``catalog`` maps material names to their catalog categories and is
+    injectable so callers (and tests) can pin the material catalog without
+    touching the on-disk registry. Invalid content raises
     :class:`WorkflowValidation`, which the API maps to HTTP 422.
     """
 
@@ -430,7 +463,7 @@ def validate_library_payload(
             f"library item payload is {size} bytes; the limit is {MAX_LIBRARY_ITEM_PAYLOAD_BYTES}"
         )
     if category == "material":
-        return _validate_material(payload, catalog_names=catalog_names)
+        return _validate_material(payload, catalog=catalog)
     if category == "process":
         return _validate_process(payload, item_name=item_name)
     if category == "flow":
@@ -449,12 +482,12 @@ def create_library_item(
     name: str,
     description: str = "",
     payload: Any,
-    catalog_names: Iterable[str] | None = None,
+    catalog: Mapping[str, str] | None = None,
     now: str | None = None,
 ) -> LibraryItemV1:
     timestamp = now or _now()
     validated = validate_library_payload(
-        category, payload, item_name=name, catalog_names=catalog_names
+        category, payload, item_name=name, catalog=catalog
     )
     return LibraryItemV1(
         schemaVersion=1,
@@ -474,7 +507,7 @@ def update_library_item(
     name: str,
     description: str,
     payload: Any,
-    catalog_names: Iterable[str] | None = None,
+    catalog: Mapping[str, str] | None = None,
     now: str | None = None,
 ) -> LibraryItemV1:
     """Return the updated item; identity and category never change."""
@@ -482,7 +515,7 @@ def update_library_item(
     if not isinstance(existing, LibraryItemV1):
         existing = LibraryItemV1.model_validate(existing)
     validated = validate_library_payload(
-        existing.category, payload, item_name=name, catalog_names=catalog_names
+        existing.category, payload, item_name=name, catalog=catalog
     )
     return LibraryItemV1(
         schemaVersion=1,

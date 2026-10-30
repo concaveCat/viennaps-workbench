@@ -20,15 +20,13 @@ try {
   await page.goto(`${baseUrl}/`);
   await page.getByText('ViennaPS Workbench').first().waitFor();
   await page.locator('input[type=file]').nth(1).setInputFiles(projectPath);
-  await page.getByRole('button', { name: '采纳为 Workflow' }).click();
-  await page.getByText('Compile 已冻结').waitFor();
-
-  await page.getByRole('button', { name: '02 流程' }).click();
-  await page.getByRole('button', { name: '创建首个 Route' }).click();
-  await page.getByRole('button', { name: '03 运行' }).click();
+  await page.getByRole('button', { name: '去 02 定义流程' }).click();
+  await page.getByRole('button', { name: '编译流程' }).click();
+  await page.getByText(/编译成功/).waitFor();
+  await page.getByRole('button', { name: '创建 Route / 去 03' }).click();
   await page.getByRole('button', { name: '执行全部 Segment' }).click();
   await page.locator('.wf-status.succeeded').first().waitFor({ timeout: 60000 });
-  await page.getByRole('button', { name: '按配方测量并绑定' }).click();
+  await page.getByRole('button', { name: '测量', exact: true }).click();
   await page.getByText(/binding: verified/).first().waitFor();
 
   await page.getByRole('button', { name: '04 实验' }).click();
@@ -37,7 +35,7 @@ try {
   }
   await page.getByRole('button', { name: '创建 10 变体实验' }).click();
   await page.getByRole('button', { name: '运行持久化实验' }).click();
-  await page.getByText('Experiment status: completed').waitFor({ timeout: 180000 });
+  await page.getByText('实验状态：已完成').waitFor({ timeout: 180000 });
 
   await page.getByRole('button', { name: '05 分析' }).click();
   await page.getByRole('button', { name: '载入实验前 3 个候选' }).click();

@@ -4,7 +4,51 @@ import { SAMPLE_2D_PLANE, SAMPLE_2D_TRENCH, SAMPLE_3D_HOLE } from './samples';
 
 type Health = { status: string; applicationVersion?: string; viennaps?: string; viennals?: string; activeRunId?: string | null };
 type GdsAsset = { assetId: string; fileName: string };
-type ProjectStep = { id: string; name: string; model: string; operation?: string; enabled: boolean; duration?: number; thickness?: number; rateMagnitude?: number };
+type ProjectStep = {
+  id: string; name: string; model: string; operation?: string; enabled: boolean;
+  duration?: number; thickness?: number; rateMagnitude?: number;
+  depositMaterial?: string; stickingProbability?: number; sourceExponent?: number;
+  rateMode?: string;
+  [key: string]: unknown;
+};
+type ProjectGeometrySource = {
+  kind: 'parametric' | 'layout';
+  clipId?: string;
+  clipName?: string;
+  layoutId?: string;
+  clipHash?: string;
+};
+type ProjectDoc = {
+  name?: string;
+  dimension?: number;
+  steps?: ProjectStep[];
+  geometry?: Record<string, unknown>;
+  domain?: Record<string, unknown>;
+  solver?: Record<string, unknown>;
+  [key: string]: unknown;
+};
+type LibraryCategory = 'material' | 'process' | 'flow' | 'experiment';
+type LibraryItem = {
+  schemaVersion: number;
+  itemId: string;
+  category: LibraryCategory;
+  name: string;
+  description: string;
+  payload: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+};
+type MaterialRow = { id?: number; name: string; color?: string; category?: string; isCustom?: boolean };
+type FlowDefinitionSummary = {
+  definitionId: string;
+  flowId: string;
+  revision: number;
+  name: string;
+  nodeCount: number;
+  variableCount: number;
+  updatedAt: string;
+};
+type RecipeSummary = { recipeId: string; version: number; metricId: string; method: string; name: string; createdAt: string };
 type CompileInfo = {
   flowId: string;
   bindingId: string;
@@ -178,6 +222,7 @@ type Clip = ClipCanvas & {
   annotations: Array<{ annotationId: string; text: string; x: number; y: number }>;
   clipHash: string;
   gdsAssetId: string;
+  gdsFileName: string;
   createdAt: string;
 };
 type ExperimentDoc = {
@@ -326,13 +371,78 @@ const DEFAULT_DEFINITION_JSON = JSON.stringify({
 const LAYER_COLORS = ['#64d2ff', '#ffd166', '#7ee787', '#ff7b72', '#d2a8ff'];
 
 const ZONES = [
-  { id: 'setup', num: '01', label: '工程', title: 'Project Setup', desc: '导入工程 JSON 与可选版图，冻结第一个 Compile。' },
-  { id: 'flow', num: '02', label: '流程', title: 'Process Flow', desc: '编辑流程、模板、模块与 Compile。' },
-  { id: 'run', num: '03', label: '运行', title: 'Route / Run', desc: '执行 Segment，查看 Route 历史并完成测量。' },
-  { id: 'experiment', num: '04', label: '实验', title: 'Design of Experiments', desc: '手工实验、全因子 DOE、队列与聚合。' },
-  { id: 'analyze', num: '05', label: '分析', title: 'Explore', desc: '候选对比、结构 diff、process window 与标定。' },
-  { id: 'report', num: '06', label: '报告', title: 'Report', desc: '生成包含 provenance 的 HTML 报告。' },
+  { id: 'setup', num: '01', label: '工程', title: '工程定义', desc: '定义名称、维度、几何来源、计算域与求解器。' },
+  { id: 'flow', num: '02', label: '流程', title: '流程编辑', desc: '从库插入步骤，编辑参数并编译流程。' },
+  { id: 'run', num: '03', label: '运行', title: '运行与测量', desc: '执行 Segment、测量并查看指标。' },
+  { id: 'experiment', num: '04', label: '实验', title: '实验设计', desc: '手工实验、全因子 DOE、队列与聚合。' },
+  { id: 'analyze', num: '05', label: '分析', title: '分析', desc: '候选对比、结构 diff、process window 与标定。' },
+  { id: 'report', num: '06', label: '报告', title: '报告', desc: '生成包含 provenance 的 HTML 报告。' },
 ] as const;
+
+const STATUS_LABELS: Record<string, string> = {
+  planned: '待执行',
+  running: '运行中',
+  succeeded: '已成功',
+  failed: '失败',
+  cancelled: '已取消',
+  interrupted: '已中断',
+  verified: '已核验',
+  measured: '已测量',
+  stale: '待重跑',
+  completed: '已完成',
+  pending: '待处理',
+};
+
+const LIBRARY_CATEGORY_LABELS: Record<LibraryCategory, string> = {
+  material: 'Materials · 材料',
+  process: 'Processes · 工艺',
+  flow: 'Flows · 流程',
+  experiment: 'Experiments · 实验',
+};
+
+function isHexColor(value: string): boolean {
+  return /^#[0-9a-fA-F]{6}$/.test(value.trim());
+}
+
+function statusLabel(status: string): string {
+  return STATUS_LABELS[status] ?? status;
+}
+
+function newStepId(): string {
+  return `step_${Math.random().toString(16).slice(2, 10)}${Math.random().toString(16).slice(2, 6)}`;
+}
+
+function substituteTemplate(value: unknown, variables: Record<string, unknown>): unknown {
+  if (Array.isArray(value)) return value.map(item => substituteTemplate(item, variables));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .map(([key, item]) => [key, substituteTemplate(item, variables)]));
+  }
+  if (typeof value === 'string') {
+    const match = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/.exec(value.trim());
+    if (match && match[1] in variables) return variables[match[1]];
+  }
+  return value;
+}
+
+function blankStep(): ProjectStep {
+  return {
+    id: newStepId(), name: '新步骤', enabled: true,
+    operation: 'etch', model: 'isotropic', rateMagnitude: 0.02,
+    duration: 0.02, rateMode: 'uniform',
+  };
+}
+
+function stepFromLibrary(payload: Record<string, unknown>, name: string): ProjectStep {
+  const step = { ...payload } as Record<string, unknown>;
+  delete step.id;
+  return {
+    ...step,
+    id: newStepId(),
+    name: typeof step.name === 'string' && step.name.trim() ? String(step.name) : name,
+    enabled: true,
+  } as ProjectStep;
+}
 
 const STEP_LABELS: Record<string, string> = {
   isotropic: '各向同性',
@@ -395,7 +505,8 @@ function postJson<T>(path: string, body: unknown): Promise<T> {
 export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => void }) {
   const [health, setHealth] = useState<Health | null>(null);
   const [gds, setGds] = useState<GdsAsset | null>(null);
-  const [project, setProject] = useState<{ name?: string; dimension?: number; steps?: ProjectStep[]; geometry?: { kind?: string; assetId?: string } } | null>(null);
+  const [project, setProject] = useState<ProjectDoc | null>(null);
+  const [projectGeometrySource, setProjectGeometrySource] = useState<ProjectGeometrySource>({ kind: 'parametric' });
   const [compile, setCompile] = useState<CompileInfo | null>(null);
   const [route, setRoute] = useState<RoutePlan | null>(null);
   const [segment, setSegment] = useState<RoutePlan['segments'][number] | null>(null);
@@ -488,11 +599,38 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [error, setError] = useState('');
   const [activityLog, setActivityLog] = useState<string[]>([]);
   const [openMenu, setOpenMenu] = useState<string | null>(null);
-  const [clipToolsOpen, setClipToolsOpen] = useState(false);
+  const [compileStale, setCompileStale] = useState(true);
+  const [libraryItems, setLibraryItems] = useState<LibraryItem[]>([]);
+  const [libraryCategory, setLibraryCategory] = useState<LibraryCategory>('process');
+  const [libraryManagerOpen, setLibraryManagerOpen] = useState(false);
+  const [managerCategory, setManagerCategory] = useState<LibraryCategory>('material');
+  const [managerItems, setManagerItems] = useState<LibraryItem[]>([]);
+  const [managerSelectedId, setManagerSelectedId] = useState('');
+  const [managerForm, setManagerForm] = useState<Record<string, string>>({});
+  const [managerStatus, setManagerStatus] = useState('');
+  const [managerDeleteArmed, setManagerDeleteArmed] = useState(false);
+  const [managerLoading, setManagerLoading] = useState(false);
+  const [managerError, setManagerError] = useState('');
+  const [libraryLoading, setLibraryLoading] = useState(false);
+  const [libraryError, setLibraryError] = useState('');
+  const managerRequest = useRef(0);
+  const [materialCatalog, setMaterialCatalog] = useState<MaterialRow[]>([]);
+  const materialCategories = useMemo(
+    () => Array.from(new Set(materialCatalog.map(row => row.category ?? 'Generic'))).sort(),
+    [materialCatalog],
+  );
+  const [materialPreset, setMaterialPreset] = useState('');
+  const [flowDefinitions, setFlowDefinitions] = useState<FlowDefinitionSummary[]>([]);
+  const [recipes, setRecipes] = useState<RecipeSummary[]>([]);
+  const [confirmLibraryItemId, setConfirmLibraryItemId] = useState('');
+  const [outputTab, setOutputTab] = useState<'output' | 'problems' | 'provenance'>('output');
+  const [flowAdvancedOpen, setFlowAdvancedOpen] = useState(false);
+  const [libraryAdvancedOpen, setLibraryAdvancedOpen] = useState(false);
   const [setupMode, setSetupMode] = useState<'home' | 'new' | 'examples' | 'project'>('home');
   const [selectedFlowStepId, setSelectedFlowStepId] = useState<string | null>(null);
   const [draft, setDraft] = useState({
     name: 'New Project', dimension: 2 as 2 | 3, geometry: 'plane' as 'plane' | 'trench' | 'hole' | 'fin',
+    source: 'parametric' as 'parametric' | 'layout',
     gridDelta: 0.2, xExtent: 4, yExtent: 4,
     width: 1, depth: 2, radius: 1, finHeight: 1.2, height: 0,
     taperAngle: 0, maskHeight: 0,
@@ -502,21 +640,38 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const gdsInput = useRef<HTMLInputElement>(null);
   const projectInput = useRef<HTMLInputElement>(null);
 
+  const loadLibraryItems = async () => {
+    setLibraryLoading(true);
+    setLibraryError('');
+    try {
+      const data = await api<{ items: LibraryItem[] }>('/api/v1/workflow/library/items');
+      setLibraryItems(data.items);
+    } catch (exc) {
+      setLibraryItems([]);
+      setLibraryError(exc instanceof Error ? exc.message : String(exc));
+    } finally {
+      setLibraryLoading(false);
+    }
+  };
+
   useEffect(() => {
     void api<Health>('/api/health').then(setHealth).catch(() => setHealth(null));
     void api<{ templates: TemplateSummary[] }>('/api/v1/workflow/templates').then(data => setTemplates(data.templates)).catch(() => undefined);
     void api<{ bundles: LibraryBundleSummary[] }>('/api/v1/workflow/library/bundles')
       .then(data => setLibraryBundles(data.bundles)).catch(() => undefined);
+    void loadLibraryItems();
+    void api<{ materials: MaterialRow[] }>('/api/materials')
+      .then(data => setMaterialCatalog(data.materials)).catch(() => undefined);
+    void api<{ definitions: FlowDefinitionSummary[] }>('/api/v1/workflow/flows/definitions')
+      .then(data => setFlowDefinitions(data.definitions)).catch(() => undefined);
+    void api<{ recipes: RecipeSummary[] }>('/api/v1/workflow/metrology-recipes')
+      .then(data => setRecipes(data.recipes)).catch(() => undefined);
   }, []);
 
   useEffect(() => {
-    if (gds) setClipToolsOpen(true);
-  }, [gds]);
-
-  useEffect(() => {
-    const steps = compile?.compile.project.steps ?? [];
+    const steps = project?.steps ?? [];
     setSelectedFlowStepId(previous => steps.some(step => step.id === previous) ? previous : (steps[0]?.id ?? null));
-  }, [compile]);
+  }, [project?.steps]);
 
   useEffect(() => {
     const steps = (project?.steps ?? []).filter(step => step.enabled);
@@ -610,12 +765,13 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       : previous);
   }, [compile, decisionThroughId, authoredByCompiled]);
 
-  const activeSteps = useMemo(() => (compile?.compile.project.steps ?? []).filter(step => step.enabled), [compile]);
-  const selectedFlowStep = compile?.compile.project.steps.find(step => step.id === selectedFlowStepId) ?? null;
-  const canAdopt = !!project && !busy;
-  const canRoute = !!compile && !busy;
+  const authoredSteps = project?.steps ?? [];
+  const selectedFlowStep = authoredSteps.find(step => step.id === selectedFlowStepId) ?? null;
+  const canCompile = !!project && authoredSteps.length > 0 && !busy;
+  const canRoute = !!compile && !compileStale && !busy;
   const canRun = !!segment && segment.status === 'planned' && !busy;
   const canMeasure = !!segment && segment.status === 'succeeded' && !!segment.runId && !busy;
+  const routeStale = !!route && !!compile && route.attempts.some(attempt => attempt.compileId !== compile.compileId);
 
   const run = async (name: string, task: () => Promise<void>) => {
     const stamp = () => new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
@@ -661,9 +817,12 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setMeasurement(null);
     setProvenance(null);
     try {
-      const parsed = JSON.parse(await file.text()) as typeof project;
+      const parsed = JSON.parse(await file.text()) as ProjectDoc;
       setProject(parsed);
+      setProjectGeometrySource({ kind: 'parametric' });
+      setCompileStale(true);
       setSetupMode('project');
+      setActivityLog(previous => [...previous.slice(-79), `${new Date().toLocaleTimeString()}  已导入工程: ${parsed.name ?? '未命名'}`]);
     } catch {
       setError('项目 JSON 无法解析');
     }
@@ -679,7 +838,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   };
 
   const loadSample = (sample: Record<string, unknown>, label: string) => {
-    setProject(sample as typeof project);
+    setProject(sample as ProjectDoc);
+    setProjectGeometrySource({ kind: 'parametric' });
+    setCompileStale(true);
     setCompile(null); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);
     setSetupMode('project');
     setActivityLog(previous => [...previous.slice(-79), `${new Date().toLocaleTimeString()}  已载入示例: ${label}`]);
@@ -689,13 +850,23 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setDraft(previous => ({
       ...previous,
       dimension,
+      source: dimension === 3 ? 'parametric' : previous.source,
       geometry: dimension === 2
         ? (previous.geometry === 'trench' ? 'trench' : 'plane')
         : (previous.geometry === 'fin' ? 'fin' : 'hole'),
     }));
   };
 
+  const chooseDraftSource = (source: 'parametric' | 'layout') => {
+    if (source === 'layout' && draft.dimension === 3) return;
+    setDraft(prev => ({ ...prev, source }));
+  };
+
   const createDraftProject = () => {
+    if (draft.source === 'layout' && !activeClip) {
+      setError('GDS 几何需要先上传版图、保存 Clip 并选择该 Clip');
+      return;
+    }
     const dimension = draft.dimension;
     const is3d = dimension === 3;
     const name = draft.name.trim() || 'New Project';
@@ -709,28 +880,28 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       substrateMaterial: 'Si',
       maskMaterial: 'Mask',
     };
-    const geometry = draft.geometry === 'trench'
+    const parametric = draft.geometry === 'trench'
       ? { kind: 'trench', width: Number(draft.width) || 1, depth: Number(draft.depth) || 2, ...common }
       : draft.geometry === 'hole'
         ? { kind: 'hole', radius: Number(draft.radius) || 1, depth: Number(draft.depth) || 2, ...common }
         : draft.geometry === 'fin'
           ? { kind: 'fin', width: Number(draft.width) || 1, height: Number(draft.finHeight) || 1.2, ...common, construction: 'native' }
           : { kind: 'plane', height: Number(draft.height) || 0, substrateMaterial: 'Si' };
-    // The execution schema requires at least one step. A zero-rate no-op keeps
-    // the project immediately compilable; real process steps live in 02 Flow.
-    const step: Record<string, unknown> = {
-      id: 'step_initial_01', name: 'initial no-op', enabled: true,
-      operation: 'etch', model: 'isotropic', rateMagnitude: 0,
-      duration: 0.01, rateMode: 'uniform',
-    };
-    const projectPayload = {
+    const layout = !is3d && draft.source === 'layout' && activeClip
+      ? {
+        kind: 'gds', assetId: activeClip.gdsAssetId, fileName: activeClip.gdsFileName,
+        structure: 'CLIP', unitScale: 1, position: [0, 0, 0],
+        layers: activeClip.layers.map(item => ({ layer: item.layer, material: item.material || 'Si' })),
+      }
+      : null;
+    const projectPayload: ProjectDoc = {
       schemaVersion: 7, name, dimension,
       units: { length: 'um', time: 's', rate: 'um/s', angle: 'deg' },
       domain: is3d
         ? { gridDelta, xExtent, yExtent, boundaryXY: 'reflective' }
         : { gridDelta, xExtent, xBoundary: 'reflective' },
-      geometry,
-      steps: [step],
+      geometry: layout ?? parametric,
+      steps: [],
       solver: {
         timeStepRatio: 0.25,
         raysPerPoint: Math.max(1, Number(draft.raysPerPoint) || 16),
@@ -746,30 +917,55 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         section: { enabled: false, axis: 'y', position: 0.0 },
       } } : { view: { panX: 0, panH: 0, zoom: 1, showGrid: true } }),
     };
-    setProject(projectPayload as unknown as typeof project);
+    setProject(projectPayload);
+    setProjectGeometrySource(layout && activeClip
+      ? { kind: 'layout', clipId: activeClip.clipId, clipName: activeClip.name, layoutId: activeClip.layoutId, clipHash: activeClip.clipHash }
+      : { kind: 'parametric' });
+    setCompileStale(true);
     setCompile(null); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);
     setSetupMode('project');
-    setActivityLog(previous => [...previous.slice(-79), `${new Date().toLocaleTimeString()}  新工程已创建: ${name}`]);
+    setActivityLog(previous => [...previous.slice(-79), `${new Date().toLocaleTimeString()}  工程草稿已保存: ${name}`]);
   };
 
-  const adopt = () => run('adopt', async () => {
-    if (!project) throw new Error('先导入项目 JSON');
-    const result = await postJson<CompileInfo>('/api/v1/workflow/flows/from-project', { project });
+  const compileFlow = () => run('compile-flow', async () => {
+    if (!project) throw new Error('先创建或导入工程');
+    const steps = project.steps ?? [];
+    if (!steps.length) throw new Error('流程还没有步骤，先在 02 插入或添加步骤');
+    const source = projectGeometrySource;
+    if (source.kind === 'layout' && !source.clipId) throw new Error('GDS 几何需要先选择并保存 Clip');
+    let result: CompileInfo;
+    if (source.kind === 'layout' && source.clipId) {
+      result = await postJson<CompileInfo>(`/api/v1/workflow/clips/${source.clipId}/compile`, {
+        project, flowId: compile?.flowId,
+      });
+    } else {
+      result = await postJson<CompileInfo>('/api/v1/workflow/flows/from-project', {
+        project, flowId: compile?.flowId,
+      });
+    }
     if (compile) setPreviousCompile(compile);
     setCompile(result);
+    setCompileStale(false);
+    setProject(previous => previous
+      ? { ...previous, steps: (result.authoredSteps ?? previous.steps ?? []) as ProjectStep[] }
+      : previous);
     setRoute(null);
     setSegment(null);
+    setMeasurement(null);
+    setProvenance(null);
+    setActivityLog(previous => [...previous.slice(-79), `${new Date().toLocaleTimeString()}  流程已编译 · ${result.stepCount} 步`]);
   });
 
   const saveTemplate = () => run('template', async () => {
-    if (!compile || !project) throw new Error('先采纳工程');
+    if (!project) throw new Error('先创建或导入工程');
     const templateId = `tpl_${Date.now().toString(36)}`;
     const sourceSteps = (project.steps ?? []) as Array<Record<string, unknown>>;
+    if (!sourceSteps.length) throw new Error('流程还没有步骤');
     const enabled = sourceSteps.filter(step => step.enabled);
     const variableIds = new Set(enabled.slice(-2).map(step => step.id));
     const steps = sourceSteps.map(step => variableIds.has(step.id) ? { ...step, duration: '${duration}' } : step);
     await postJson('/api/v1/workflow/templates', {
-      schemaVersion: 1, templateId, name: `${compile.projectName} · duration variable`, description: '',
+      schemaVersion: 1, templateId, name: `${project.name ?? 'Project'} · duration variable`, description: '',
       steps, variables: [{ name: 'duration', value: Number(templateVariable) || 0.02, unit: 's' }],
     });
     const data = await api<{ templates: TemplateSummary[] }>('/api/v1/workflow/templates');
@@ -790,23 +986,26 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       project, templateId, flowId: compile?.flowId, variables: { duration: value }, mode,
     });
     if (compile) setPreviousCompile(compile);
-    setCompile(result); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);
-    setProject(previous => previous ? { ...previous, steps: result.authoredSteps ?? previous.steps } : previous);
+    setCompile(result); setCompileStale(false); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);
+    setProject(previous => previous ? { ...previous, steps: (result.authoredSteps ?? previous.steps ?? []) as ProjectStep[] } : previous);
   });
 
   const createRoute = () => run('route', async () => {
-    if (!compile) throw new Error('先采纳工程');
+    if (!compile) throw new Error('先编译流程');
+    if (compileStale) throw new Error('流程已修改，请重新编译');
     const enabledSteps = compile.compile.project.steps.filter(step => step.enabled);
     const splitAfterStepId = enabledSteps.length > 1 ? enabledSteps[enabledSteps.length - 2].id : undefined;
     const result = await postJson<{ plan: RoutePlan }>('/api/v1/workflow/routes/from-compile', {
       compileId: compile.compileId,
-      name: `${compile.projectName} · P1 route`,
+      name: `${compile.projectName} · Route`,
       splitAfterStepId,
     });
     setRoute(result.plan);
     setSegment(result.plan.segments[0] ?? null);
     setMeasurement(null);
     setProvenance(null);
+    setZone('run');
+    setActivityLog(previous => [...previous.slice(-79), `${new Date().toLocaleTimeString()}  Route 已创建 · ${result.plan.segments.length} Segment`]);
   });
 
   const execute = () => run('execute', async () => {
@@ -819,12 +1018,12 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   });
 
   const ensureRecipe = async (): Promise<{ recipeId: string; recipeVersion: number; metricId: string }> => {
-    if (!compile) throw new Error('先采纳工程');
+    if (!compile) throw new Error('先编译流程');
     const metricId = `metric_${compile.flowId}_${recipeMethod}`;
     const recipeId = `recipe_${compile.flowId}_${recipeMethod}`;
     const metricUnit = 'um';
     await postJson('/api/v1/workflow/metrics', {
-      schemaVersion: 1, metricId, name: `${recipeMethod} metric`, unit: metricUnit, description: 'P1 configurable recipe',
+      schemaVersion: 1, metricId, name: `${recipeMethod} metric`, unit: metricUnit, description: 'configurable recipe',
     });
     const parameters = recipeMethod === 'cd_at_height'
       ? { kind: 'cd_at_height', height: Number(recipeHeight) || 0, pairSelection: 'outermost' }
@@ -942,6 +1141,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     target.duration = Number(branchDuration) || 0.02;
     const adopted = await postJson<CompileInfo>('/api/v1/workflow/flows/from-project', { project: cloned, flowId: compile.flowId });
     setCompile(adopted);
+    setCompileStale(false);
     const result = await postJson<{ plan: RoutePlan }>(`/api/v1/workflow/routes/${route.route.routeId}/branches`, {
       compileId: adopted.compileId, startAfterStepId: prefix.id, changedStepIds: [tail.id],
     });
@@ -1071,14 +1271,34 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setAnnotationText('');
   });
 
-  const compileClip = () => run('clip-compile', async () => {
-    if (!activeClip) throw new Error('先保存或选择 Clip');
-    if (!project) throw new Error('先导入工程 JSON');
-    const result = await postJson<CompileInfo>(`/api/v1/workflow/clips/${activeClip.clipId}/compile`, {
-      project, flowId: compile?.flowId,
+  const useClipAsGeometry = (clip: Clip, compileNow: boolean) => run('clip-use', async () => {
+    if (!project) throw new Error('先创建或导入工程');
+    if (project.dimension === 3) throw new Error('GDS 版图几何仅支持 2D 工程');
+    setProjectGeometrySource({
+      kind: 'layout', clipId: clip.clipId, clipName: clip.name,
+      layoutId: clip.layoutId, clipHash: clip.clipHash,
+    });
+    const geometry = {
+      kind: 'gds', assetId: clip.gdsAssetId, fileName: clip.gdsFileName,
+      structure: 'CLIP', unitScale: 1, position: [0, 0, 0],
+      layers: clip.layers.map(item => ({ layer: item.layer, material: item.material || 'Si' })),
+    };
+    const nextProject: ProjectDoc = { ...project, geometry };
+    setProject(nextProject);
+    if (!compileNow) {
+      setCompileStale(true);
+      setActivityLog(previous => [...previous.slice(-79), `${new Date().toLocaleTimeString()}  工程几何已切换为 Clip ${clip.name}`]);
+      return;
+    }
+    if (!(nextProject.steps ?? []).length) throw new Error('流程还没有步骤，先在 02 插入或添加步骤');
+    const result = await postJson<CompileInfo>(`/api/v1/workflow/clips/${clip.clipId}/compile`, {
+      project: nextProject, flowId: compile?.flowId,
     });
     if (compile) setPreviousCompile(compile);
-    setCompile(result); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);
+    setCompile(result); setCompileStale(false); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);
+    setProject(previous => previous
+      ? { ...previous, steps: (result.authoredSteps ?? previous.steps ?? []) as ProjectStep[] }
+      : previous);
   });
 
   const parseJsonObject = (label: string, text: string): Record<string, unknown> => {
@@ -1138,7 +1358,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       { project, variables: readDefinitionVariables() },
     );
     if (compile) setPreviousCompile(compile);
-    setCompile(result); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);
+    setCompile(result); setCompileStale(false); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);
     setModuleStatus(`模块化流程已编译 · ${result.stepCount} 步`);
   });
 
@@ -1196,6 +1416,288 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setLibraryResult(result);
     setLibraryStatus(describeLibraryResult(result));
     await refreshLibraryBundles();
+  });
+
+  const refreshLibraryItems = async (category?: LibraryCategory) => {
+    const query = category ? `?category=${category}` : '';
+    const data = await api<{ items: LibraryItem[] }>(`/api/v1/workflow/library/items${query}`);
+    if (category) setManagerItems(data.items);
+    else setLibraryItems(data.items);
+    return data.items;
+  };
+
+  const managerDefaults = (category: LibraryCategory): Record<string, string> => {
+    if (category === 'material') {
+      const first = materialCatalog[0];
+      return {
+        name: '', catalog: first?.category ?? 'Generic', material: first?.name ?? 'Si',
+        displayName: '', color: first?.color ?? '#4c80ff', role: 'process', notes: '',
+      };
+    }
+    if (category === 'process') return {
+      name: '', operation: 'etch', model: 'isotropic', rateMagnitude: '0.1', duration: '0.1',
+      depositMaterial: '', stickingProbability: '1', sourceExponent: '1', notes: '',
+    };
+    if (category === 'flow') return { name: '', flowRef: '', notes: '' };
+    return {
+      name: '', recipeRef: recipes[0] ? `${recipes[0].recipeId}@${recipes[0].version}` : '',
+      designKind: 'doe', variantCount: '8', replicates: '1', seed: '20261029', notes: '',
+    };
+  };
+
+  const managerFormFromItem = (item: LibraryItem): Record<string, string> => {
+    if (item.category === 'material') {
+      return {
+        name: item.name,
+        catalog: String(item.payload.catalog ?? ''),
+        material: String(item.payload.material ?? ''),
+        displayName: String(item.payload.displayName ?? ''),
+        color: String(item.payload.color ?? '#4c80ff'),
+        role: String(item.payload.role ?? ''),
+        notes: String(item.payload.notes ?? ''),
+      };
+    }
+    if (item.category === 'process') {
+      return {
+        name: item.name,
+        operation: String(item.payload.operation ?? 'etch'),
+        model: String(item.payload.model ?? 'isotropic'),
+        rateMagnitude: String(item.payload.rateMagnitude ?? '0.1'),
+        duration: String(item.payload.duration ?? '0.1'),
+        depositMaterial: String(item.payload.depositMaterial ?? ''),
+        stickingProbability: String(item.payload.stickingProbability ?? '1'),
+        sourceExponent: String(item.payload.sourceExponent ?? '1'),
+        notes: item.description,
+      };
+    }
+    if (item.category === 'flow') {
+      const definitionId = typeof item.payload.definitionId === 'string' ? item.payload.definitionId : '';
+      const templateId = typeof item.payload.templateId === 'string' ? item.payload.templateId : '';
+      return {
+        name: item.name,
+        flowRef: definitionId ? `definition:${definitionId}` : templateId ? `template:${templateId}` : '',
+        notes: String(item.payload.notes ?? item.description),
+      };
+    }
+    const design = (item.payload.design ?? {}) as Record<string, unknown>;
+    return {
+      name: item.name,
+      recipeRef: `${String(item.payload.recipeId ?? '')}@${String(item.payload.recipeVersion ?? 1)}`,
+      designKind: String(design.kind ?? 'doe'),
+      variantCount: String(design.variantCount ?? design.variants ?? 1),
+      replicates: String(design.replicates ?? 1),
+      seed: String(design.seed ?? 0),
+      notes: String(item.payload.notes ?? item.description),
+    };
+  };
+
+  const loadManagerCategory = async (category: LibraryCategory) => {
+    const requestId = managerRequest.current + 1;
+    managerRequest.current = requestId;
+    setManagerCategory(category);
+    setManagerSelectedId('');
+    setManagerForm(managerDefaults(category));
+    setManagerStatus('');
+    setManagerDeleteArmed(false);
+    setManagerItems([]);
+    setManagerLoading(true);
+    setManagerError('');
+    try {
+      const data = await api<{ items: LibraryItem[] }>(`/api/v1/workflow/library/items?category=${category}`);
+      if (managerRequest.current !== requestId) return;
+      setManagerItems(data.items);
+    } catch (exc) {
+      if (managerRequest.current !== requestId) return;
+      setManagerItems([]);
+      setManagerError(exc instanceof Error ? exc.message : String(exc));
+    } finally {
+      if (managerRequest.current === requestId) setManagerLoading(false);
+    }
+  };
+
+  const openLibraryManager = (category: LibraryCategory = 'material') => {
+    setZone('flow');
+    setLibraryManagerOpen(true);
+    void loadManagerCategory(category);
+  };
+
+  const switchManagerCategory = (category: LibraryCategory) => {
+    void loadManagerCategory(category);
+  };
+
+  const selectManagerItem = (item: LibraryItem) => {
+    setManagerSelectedId(item.itemId);
+    setManagerForm(managerFormFromItem(item));
+    setManagerStatus('');
+    setManagerDeleteArmed(false);
+  };
+
+  const buildManagerPayload = (): Record<string, unknown> => {
+    if (managerCategory === 'material') {
+      const payload: Record<string, unknown> = {
+        catalog: managerForm.catalog ?? '',
+        material: managerForm.material ?? '',
+      };
+      if (managerForm.displayName?.trim()) payload.displayName = managerForm.displayName.trim();
+      if (managerForm.color?.trim()) payload.color = managerForm.color.trim();
+      if (managerForm.role?.trim()) payload.role = managerForm.role.trim();
+      if (managerForm.notes?.trim()) payload.notes = managerForm.notes.trim();
+      return payload;
+    }
+    if (managerCategory === 'process') {
+      const model = managerForm.model || 'isotropic';
+      const payload: Record<string, unknown> = {
+        operation: managerForm.operation || 'etch',
+        model,
+        rateMagnitude: Number(managerForm.rateMagnitude) || 0,
+        duration: Number(managerForm.duration) || 0.01,
+        rateMode: 'uniform',
+      };
+      if ((managerForm.operation || 'etch') === 'deposit') {
+        payload.depositMaterial = managerForm.depositMaterial?.trim() || 'SiO2';
+      }
+      if (model === 'singleParticle') {
+        payload.stickingProbability = Number(managerForm.stickingProbability) || 0;
+        payload.sourceExponent = Number(managerForm.sourceExponent) || 0;
+      }
+      if (model === 'directional') {
+        payload.direction = [0, 0, -1];
+        payload.directionalRateMagnitude = Number(managerForm.rateMagnitude) || 0;
+        payload.isotropicRateMagnitude = 0;
+        payload.calculateVisibility = true;
+        delete payload.rateMagnitude;
+        delete payload.rateMode;
+      }
+      return payload;
+    }
+    if (managerCategory === 'flow') {
+      const payload: Record<string, unknown> = { name: managerForm.name };
+      const [kind, value] = (managerForm.flowRef ?? '').split(':');
+      if (kind === 'definition' && value) payload.definitionId = value;
+      else if (kind === 'template' && value) payload.templateId = value;
+      else throw new Error('选择要引用的流程定义或模板');
+      if (managerForm.notes?.trim()) payload.notes = managerForm.notes.trim();
+      return payload;
+    }
+    const [recipeId, versionText] = (managerForm.recipeRef ?? '').split('@');
+    if (!recipeId) throw new Error('选择要引用的测量配方');
+    const payload: Record<string, unknown> = {
+      recipeId,
+      recipeVersion: Number(versionText) || 1,
+      design: {
+        kind: managerForm.designKind || 'doe',
+        variantCount: Math.max(1, Number(managerForm.variantCount) || 1),
+        replicates: Math.max(1, Number(managerForm.replicates) || 1),
+        seed: Number(managerForm.seed) || 0,
+      },
+    };
+    if (managerForm.notes?.trim()) payload.notes = managerForm.notes.trim();
+    return payload;
+  };
+
+  const saveManagerItem = () => run('library-save', async () => {
+    const name = (managerForm.name ?? '').trim();
+    if (!name) throw new Error('填写条目名称');
+    const payload = buildManagerPayload();
+    if (managerSelectedId) {
+      await api<LibraryItem>(`/api/v1/workflow/library/items/${managerSelectedId}`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, description: managerForm.notes ?? '', payload }),
+      });
+      setManagerStatus(`已保存 ${name}`);
+    } else {
+      const created = await postJson<LibraryItem>('/api/v1/workflow/library/items', {
+        category: managerCategory, name, description: managerForm.notes ?? '', payload,
+      });
+      setManagerSelectedId(created.itemId);
+      setManagerStatus(`已新增 ${name}`);
+    }
+    await refreshLibraryItems(managerCategory);
+    await refreshLibraryItems();
+  });
+
+  const deleteManagerItem = () => run('library-delete', async () => {
+    if (!managerSelectedId) throw new Error('先选择条目');
+    const target = managerItems.find(item => item.itemId === managerSelectedId);
+    await api(`/api/v1/workflow/library/items/${managerSelectedId}`, { method: 'DELETE' });
+    setManagerSelectedId('');
+    setManagerForm(managerDefaults(managerCategory));
+    setManagerStatus(`已删除 ${target?.name ?? managerSelectedId}`);
+    setManagerDeleteArmed(false);
+    await refreshLibraryItems(managerCategory);
+    await refreshLibraryItems();
+  });
+
+  const commitSteps = (updater: (steps: ProjectStep[]) => ProjectStep[]) => {
+    setProject(previous => previous ? { ...previous, steps: updater(previous.steps ?? []) } : previous);
+    setCompileStale(true);
+  };
+
+  const updateSelectedStep = (patch: Record<string, unknown>) => {
+    if (!selectedFlowStepId) return;
+    commitSteps(steps => steps.map(step => step.id === selectedFlowStepId ? { ...step, ...patch } : step));
+  };
+
+  const addAuthoredStep = () => {
+    const step = blankStep();
+    commitSteps(steps => [...steps, step]);
+    setSelectedFlowStepId(step.id);
+    setActivityLog(previous => [...previous.slice(-79), `${new Date().toLocaleTimeString()}  已添加步骤 ${step.name}`]);
+  };
+
+  const deleteAuthoredStep = (stepId: string) => {
+    commitSteps(steps => steps.filter(step => step.id !== stepId));
+    setActivityLog(previous => [...previous.slice(-79), `${new Date().toLocaleTimeString()}  已删除步骤 ${stepId}`]);
+  };
+
+  const insertLibraryItem = (item: LibraryItem, flowMode: 'append' | 'replace' = 'append') => run('library-insert', async () => {
+    if (item.category === 'material') {
+      setMaterialPreset(item.name);
+      if (selectedFlowStep && selectedFlowStep.operation === 'deposit') {
+        updateSelectedStep({ depositMaterial: String(item.payload.material ?? item.name) });
+      }
+      setManagerStatus('');
+      setActivityLog(previous => [...previous.slice(-79), `${new Date().toLocaleTimeString()}  材料预设 ${item.name} 已选中`]);
+      return;
+    }
+    if (!project) throw new Error('先创建或导入工程');
+    if (item.category === 'experiment') {
+      setZone('experiment');
+      setActivityLog(previous => [...previous.slice(-79), `${new Date().toLocaleTimeString()}  实验模板 ${item.name} 在 04 中使用`]);
+      return;
+    }
+    if (item.category === 'process') {
+      const step = stepFromLibrary(item.payload, item.name);
+      commitSteps(steps => flowMode === 'replace' ? [step] : [...steps, step]);
+      setSelectedFlowStepId(step.id);
+      setConfirmLibraryItemId('');
+      setActivityLog(previous => [...previous.slice(-79), `${new Date().toLocaleTimeString()}  已从库插入 process: ${item.name}`]);
+      return;
+    }
+    const templateId = typeof item.payload.templateId === 'string' ? item.payload.templateId : '';
+    const definitionId = typeof item.payload.definitionId === 'string' ? item.payload.definitionId : '';
+    let inserted: ProjectStep[] = [];
+    if (templateId) {
+      const template = await api<{ steps: Array<Record<string, unknown>>; variables?: Array<{ name: string; value: unknown }> }>(
+        `/api/v1/workflow/templates/${templateId}`,
+      );
+      const variables = Object.fromEntries((template.variables ?? []).map(row => [row.name, row.value]));
+      inserted = template.steps.map(row => stepFromLibrary(
+        substituteTemplate(row, variables) as Record<string, unknown>, item.name,
+      ));
+    } else if (definitionId) {
+      const expanded = await postJson<ModuleExpansion>(
+        `/api/v1/workflow/flows/definitions/${definitionId}/expand`, { variables: {} },
+      );
+      inserted = expanded.steps.map(row => stepFromLibrary(row.step as Record<string, unknown>, item.name));
+    } else {
+      throw new Error('该流程预设没有可插入的 templateId 或 definitionId');
+    }
+    if (!inserted.length) throw new Error('流程预设没有步骤');
+    commitSteps(steps => flowMode === 'replace' ? inserted : [...steps, ...inserted]);
+    setSelectedFlowStepId(inserted[0].id);
+    setConfirmLibraryItemId('');
+    setActivityLog(previous => [...previous.slice(-79), `${new Date().toLocaleTimeString()}  已插入流程 ${item.name} · ${inserted.length} 步`]);
   });
 
   const createDoe = () => run('doe', async () => {
@@ -1381,17 +1883,259 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     return `${x0 - padding + width * (1 - 1 / zoom) / 2} ${-(y1 + padding) + height * (1 - 1 / zoom) / 2} ${width / zoom} ${height / zoom}`;
   }, [candidateViews, syncAxis, syncZoom]);
 
+  const renderLibraryManager = () => (
+    <div className="spx-library-view" aria-label="库管理">
+      <div className="spx-library-view-head">
+        <strong>库管理</strong>
+        <span className="wf-muted">按分类维护可复用的材料、工艺、流程与实验条目。</span>
+        <button type="button" className="wf-button" onClick={() => setLibraryManagerOpen(false)}>返回流程编辑</button>
+      </div>
+          <div className="spx-library-manager-tabs">
+            {([
+              ['material', 'Materials'],
+              ['process', 'Processes'],
+              ['flow', 'Flows'],
+              ['experiment', 'Experiments'],
+            ] as Array<[LibraryCategory, string]>).map(([category, label]) => <button
+              key={category} type="button" className={managerCategory === category ? 'active' : ''}
+              onClick={() => switchManagerCategory(category)}
+            >{label}</button>)}
+          </div>
+          <div className="spx-library-category-head">
+            <strong>{LIBRARY_CATEGORY_LABELS[managerCategory]}</strong>
+            <span className={managerError ? 'spx-library-load-error' : 'wf-muted'}>
+              {managerLoading ? '加载中…' : managerError ? `加载失败：${managerError}` : `${managerItems.length} 条`}
+            </span>
+            {managerError && <button type="button" className="wf-button ghost" onClick={() => void loadManagerCategory(managerCategory)}>重试</button>}
+          </div>
+          <div className="spx-library-manager-body">
+            <div className="spx-library-manager-list">
+              {managerLoading && <div className="wf-muted spx-library-empty">加载中…</div>}
+              {!managerLoading && managerError && <div className="spx-library-load-error spx-library-empty">{managerError}<button type="button" className="wf-button ghost" onClick={() => void loadManagerCategory(managerCategory)}>重试</button></div>}
+              {!managerLoading && !managerError && managerItems.length === 0 && <div className="wf-muted spx-library-empty">该分类暂无条目。</div>}
+              {!managerLoading && !managerError && managerItems.map(item => <button
+                key={item.itemId} type="button"
+                className={managerSelectedId === item.itemId ? 'active' : ''}
+                onClick={() => selectManagerItem(item)}
+              >{item.name}</button>)}
+            </div>
+            <div className="spx-library-manager-actions">
+              <button type="button" aria-label="新增库条目" title="新增条目" onClick={() => {
+                setManagerSelectedId('');
+                setManagerForm(managerDefaults(managerCategory));
+                setManagerStatus('');
+                setManagerDeleteArmed(false);
+              }}>＋</button>
+              <button type="button" aria-label="删除库条目" title={managerSelectedId ? (managerDeleteArmed ? '再次点击确认删除' : '删除选中条目') : '先选择条目'}
+                disabled={!managerSelectedId}
+                className={managerDeleteArmed ? 'danger' : ''}
+                onClick={() => {
+                  if (!managerDeleteArmed) { setManagerDeleteArmed(true); return; }
+                  void deleteManagerItem();
+                }}>−</button>
+              {managerDeleteArmed && <button type="button" className="spx-link" onClick={() => setManagerDeleteArmed(false)}>取消</button>}
+            </div>
+            <div className="spx-library-manager-form">
+              <label className="spx-field"><span>名称</span><input aria-label="库条目名称" value={managerForm.name ?? ''} onChange={event => setManagerForm(prev => ({ ...prev, name: event.target.value }))} /></label>
+              {managerCategory === 'material' && <>
+                <label className="spx-field"><span>Catalog</span>
+                  <select aria-label="库材料 Catalog" value={managerForm.catalog ?? ''} onChange={event => {
+                    const catalog = event.target.value;
+                    const first = materialCatalog.find(row => (row.category ?? 'Generic') === catalog);
+                    setManagerForm(prev => ({
+                      ...prev, catalog,
+                      material: first?.name ?? '',
+                      color: first?.color ?? prev.color,
+                    }));
+                  }}>
+                    {materialCategories.map(category => <option key={category} value={category}>{category}</option>)}
+                  </select>
+                </label>
+                <label className="spx-field"><span>Material</span>
+                  <select aria-label="库材料名称" value={managerForm.material ?? ''} onChange={event => {
+                    const material = event.target.value;
+                    const row = materialCatalog.find(item => item.name === material);
+                    setManagerForm(prev => ({ ...prev, material, color: row?.color ?? prev.color }));
+                  }}>
+                    {materialCatalog.filter(row => (row.category ?? 'Generic') === (managerForm.catalog ?? '')).map(row => <option key={row.name} value={row.name}>{row.name}</option>)}
+                  </select>
+                </label>
+                <div className="spx-field"><span>color</span>
+                  <div className="spx-color-row">
+                    <input aria-label="库材料颜色" className={isHexColor(managerForm.color ?? '') ? '' : 'invalid'}
+                      value={managerForm.color ?? ''} placeholder="#rrggbb"
+                      onChange={event => setManagerForm(prev => ({ ...prev, color: event.target.value }))} />
+                    <label className={isHexColor(managerForm.color ?? '') ? 'spx-color-swatch' : 'spx-color-swatch invalid'}
+                      title={isHexColor(managerForm.color ?? '') ? '点击选择颜色' : '颜色必须是 #rrggbb'}
+                      style={isHexColor(managerForm.color ?? '') ? { background: managerForm.color } : undefined}>
+                      <input type="color" aria-label="库材料颜色选择器"
+                        value={isHexColor(managerForm.color ?? '') ? (managerForm.color ?? '#000000') : '#000000'}
+                        onChange={event => setManagerForm(prev => ({ ...prev, color: event.target.value }))} />
+                    </label>
+                  </div>
+                </div>
+                <label className="spx-field"><span>displayName</span><input aria-label="库材料显示名" value={managerForm.displayName ?? ''} onChange={event => setManagerForm(prev => ({ ...prev, displayName: event.target.value }))} /></label>
+                <label className="spx-field"><span>role</span><input aria-label="库材料角色" value={managerForm.role ?? ''} onChange={event => setManagerForm(prev => ({ ...prev, role: event.target.value }))} /></label>
+              </>}
+              {managerCategory === 'process' && <>
+                <label className="spx-field"><span>operation</span>
+                  <select aria-label="库工艺操作" value={managerForm.operation ?? 'etch'} onChange={event => setManagerForm(prev => ({ ...prev, operation: event.target.value }))}>
+                    <option value="etch">etch</option>
+                    <option value="deposit">deposit</option>
+                  </select>
+                </label>
+                <label className="spx-field"><span>model</span>
+                  <select aria-label="库工艺模型" value={managerForm.model ?? 'isotropic'} onChange={event => setManagerForm(prev => ({ ...prev, model: event.target.value }))}>
+                    <option value="isotropic">isotropic</option>
+                    <option value="singleParticle">singleParticle</option>
+                    <option value="directional">directional</option>
+                    <option value="multiParticle">multiParticle</option>
+                    <option value="removeMaterial">removeMaterial</option>
+                    <option value="planarize">planarize</option>
+                  </select>
+                </label>
+                <label className="spx-field"><span>rate</span><input aria-label="库工艺速率" type="number" step="0.01" value={managerForm.rateMagnitude ?? ''} onChange={event => setManagerForm(prev => ({ ...prev, rateMagnitude: event.target.value }))} /></label>
+                <label className="spx-field"><span>duration</span><input aria-label="库工艺时长" type="number" step="0.01" value={managerForm.duration ?? ''} onChange={event => setManagerForm(prev => ({ ...prev, duration: event.target.value }))} /></label>
+                {managerForm.operation === 'deposit' && <label className="spx-field"><span>depositMaterial</span>
+                  <select aria-label="库工艺沉积材料" value={managerForm.depositMaterial ?? ''} onChange={event => setManagerForm(prev => ({ ...prev, depositMaterial: event.target.value }))}>
+                    <option value="">选择材料</option>
+                    {materialCatalog.map(row => <option key={row.name} value={row.name}>{row.name}</option>)}
+                  </select>
+                </label>}
+                {managerForm.model === 'singleParticle' && <>
+                  <label className="spx-field"><span>stickingProbability</span><input aria-label="库工艺 stickingProbability" type="number" step="0.01" value={managerForm.stickingProbability ?? ''} onChange={event => setManagerForm(prev => ({ ...prev, stickingProbability: event.target.value }))} /></label>
+                  <label className="spx-field"><span>sourceExponent</span><input aria-label="库工艺 sourceExponent" type="number" step="0.1" value={managerForm.sourceExponent ?? ''} onChange={event => setManagerForm(prev => ({ ...prev, sourceExponent: event.target.value }))} /></label>
+                </>}
+              </>}
+              {managerCategory === 'flow' && <label className="spx-field"><span>引用流程定义 / 模板</span>
+                <select aria-label="库流程引用" value={managerForm.flowRef ?? ''} onChange={event => setManagerForm(prev => ({ ...prev, flowRef: event.target.value }))}>
+                  <option value="">选择引用</option>
+                  <optgroup label="Flow definitions">
+                    {flowDefinitions.map(row => <option key={row.definitionId} value={`definition:${row.definitionId}`}>{row.name} · {row.definitionId}</option>)}
+                  </optgroup>
+                  <optgroup label="Templates">
+                    {templates.map(row => <option key={row.templateId} value={`template:${row.templateId}`}>{row.name} · {row.templateId}</option>)}
+                  </optgroup>
+                </select>
+              </label>}
+              {managerCategory === 'experiment' && <>
+                <label className="spx-field"><span>recipe</span>
+                  <select aria-label="库实验配方" value={managerForm.recipeRef ?? ''} onChange={event => setManagerForm(prev => ({ ...prev, recipeRef: event.target.value }))}>
+                    <option value="">选择配方</option>
+                    {recipes.map(row => <option key={`${row.recipeId}@${row.version}`} value={`${row.recipeId}@${row.version}`}>{row.recipeId} v{row.version} · {row.method}</option>)}
+                  </select>
+                </label>
+                <label className="spx-field"><span>design</span>
+                  <select aria-label="库实验设计" value={managerForm.designKind ?? 'doe'} onChange={event => setManagerForm(prev => ({ ...prev, designKind: event.target.value }))}>
+                    <option value="doe">doe</option>
+                    <option value="manual">manual</option>
+                  </select>
+                </label>
+                <label className="spx-field"><span>变体数</span><input aria-label="库实验变体数" type="number" min={1} value={managerForm.variantCount ?? ''} onChange={event => setManagerForm(prev => ({ ...prev, variantCount: event.target.value }))} /></label>
+                <label className="spx-field"><span>重复数</span><input aria-label="库实验重复数" type="number" min={1} value={managerForm.replicates ?? ''} onChange={event => setManagerForm(prev => ({ ...prev, replicates: event.target.value }))} /></label>
+                <label className="spx-field"><span>seed</span><input aria-label="库实验种子" type="number" value={managerForm.seed ?? ''} onChange={event => setManagerForm(prev => ({ ...prev, seed: event.target.value }))} /></label>
+              </>}
+              <label className="spx-field"><span>notes / 描述</span><input aria-label="库条目备注" value={managerForm.notes ?? ''} onChange={event => setManagerForm(prev => ({ ...prev, notes: event.target.value }))} /></label>
+              <div className="spx-library-manager-form-actions">
+                <button type="button" className="wf-button primary" disabled={!!busy} onClick={() => void saveManagerItem()}>{busy === 'library-save' ? '保存中…' : 'Save'}</button>
+                <button type="button" className="wf-button" onClick={() => {
+                  if (managerSelectedId) {
+                    const item = managerItems.find(row => row.itemId === managerSelectedId);
+                    if (item) setManagerForm(managerFormFromItem(item));
+                  } else {
+                    setManagerForm(managerDefaults(managerCategory));
+                  }
+                  setManagerStatus('');
+                  setManagerDeleteArmed(false);
+                }}>Cancel</button>
+              </div>
+              {managerStatus && <div className="wf-summary" role="status">{managerStatus}</div>}
+            </div>
+          </div>
+    </div>
+  );
+
+  const renderClipEditor = (mode: 'draft' | 'project') => (
+    <div className="wf-clip-editor">
+      <div className="spx-file-row">
+        <div className={gds ? 'spx-file-name filled' : 'spx-file-name'}>{gds ? gds.fileName : '未选择 GDS 文件'}</div>
+        <button type="button" className="wf-button ghost spx-browse" disabled={!!busy} onClick={() => gdsInput.current?.click()}>{gds ? '更换 GDS' : '上传 GDS'}</button>
+      </div>
+      {gds && <div className="spx-form-note">asset {gds.assetId.slice(0, 20)}…</div>}
+      <div className="wf-template-row">
+        <button className="wf-button ghost" disabled={!!busy || !gds} title={!gds ? '先上传 GDS' : '注册为版图'} onClick={() => void registerLayout()}>注册为 Layout</button>
+        <select aria-label="版图选择" value={activeLayout?.layoutId ?? ''} onChange={event => void chooseLayout(event.target.value)}>
+          <option value="">选择 Layout</option>
+          {layouts.map(item => <option key={item.layoutId} value={item.layoutId}>{item.fileName} · {item.structureCount} 结构</option>)}
+        </select>
+      </div>
+      {activeLayout && <>
+        <div className="wf-template-row">
+          <select aria-label="版图结构" value={layoutStructure} onChange={event => selectStructure(activeLayout, event.target.value)}>
+            {activeLayout.structures.map(item => <option key={item.name} value={item.name}>{item.name}</option>)}
+          </select>
+          <input aria-label="Clip 名称" value={clipName} onChange={event => setClipName(event.target.value)} placeholder="Clip 名称" />
+        </div>
+        <div className="wf-layer-picks">
+          {(activeLayout.structures.find(item => item.name === layoutStructure)?.layerDatatypes ?? []).map(([layer, datatype]) => {
+            const key = `${layer}:${datatype}`;
+            return <label key={key}><input type="checkbox" checked={selectedPairs.includes(key)} onChange={event => setSelectedPairs(previous => event.target.checked ? [...previous, key] : previous.filter(item => item !== key))} /> L{layer}/{datatype}</label>;
+          })}
+        </div>
+        <div className="wf-bounds">
+          {(['x0', 'y0', 'x1', 'y1'] as const).map(key => <input key={key} aria-label={`Clip ${key}`} value={String(clipBounds[key])} onChange={event => setClipBounds(previous => ({ ...previous, [key]: Number(event.target.value) }))} />)}
+          <button className="wf-button ghost" disabled={!!busy} onClick={() => void previewClip()}>预览</button>
+          <button className="wf-button ghost" disabled={!!busy} onClick={() => void saveClip()}>保存 Clip</button>
+        </div>
+      </>}
+      {canvas && <div className="wf-canvas-wrap">
+        <svg viewBox={`0 0 ${canvas.width} ${canvas.height}`} className="wf-clip-canvas" role="img" aria-label="版图 Clip 画布">
+          {canvas.polygons.map((polygon, index) => <polygon
+            key={`${polygon.layer}-${index}`}
+            points={polygon.points.map(([x, y]) => `${x},${canvas.height - y}`).join(' ')}
+            fill={LAYER_COLORS[polygon.layer % LAYER_COLORS.length]}
+            fillOpacity="0.45"
+            stroke={LAYER_COLORS[polygon.layer % LAYER_COLORS.length]}
+            strokeWidth={Math.max(canvas.width, canvas.height) / 500}
+          />)}
+          {activeClip?.annotations.map(annotation => <g key={annotation.annotationId}>
+            <circle cx={annotation.x} cy={activeClip.height - annotation.y} r={Math.max(canvas.width, canvas.height) / 80} className="wf-annotation" />
+            <text x={annotation.x} y={activeClip.height - annotation.y} className="wf-annotation-text">{annotation.text}</text>
+          </g>)}
+        </svg>
+        <div className="wf-muted">{canvas.polygonCount} 多边形 · {canvas.pointCount} 点 · {canvas.width.toFixed(3)} × {canvas.height.toFixed(3)} µm</div>
+      </div>}
+      {activeClip && <div className="wf-summary"><strong>{activeClip.name}</strong><span>{activeClip.polygonCount} 多边形</span><span><code>{activeClip.clipHash.slice(0, 12)}…</code></span><span>{activeClip.annotations.length} 标注</span></div>}
+      {activeClip && <div className="wf-template-row">
+        <input aria-label="标注文本" value={annotationText} onChange={event => setAnnotationText(event.target.value)} placeholder="标注文本" />
+        <input aria-label="标注 X" value={annotationX} onChange={event => setAnnotationX(event.target.value)} />
+        <input aria-label="标注 Y" value={annotationY} onChange={event => setAnnotationY(event.target.value)} />
+        <button className="wf-button ghost" disabled={!!busy} onClick={() => void addAnnotation()}>添加标注</button>
+      </div>}
+      {clips.length > 0 && <div className="wf-clip-list">
+        {clips.map(clip => <button key={clip.clipId} type="button" className={activeClip?.clipId === clip.clipId ? 'active' : ''} onClick={() => selectClip(clip)}>{clip.name} · {clip.polygonCount}</button>)}
+      </div>}
+      {activeClip && mode === 'draft' && <div className="wf-muted">已选择 Clip：{activeClip.name}。保存工程后，02 编译将使用该 Clip 作为几何。</div>}
+      {activeClip && mode === 'project' && <div className="wf-template-row">
+        <button className="wf-button ghost" disabled={!!busy} onClick={() => void useClipAsGeometry(activeClip, false)}>用作工程几何</button>
+        <button className="wf-button primary" disabled={!!busy || !(project?.steps?.length)}
+          title={!(project?.steps?.length) ? '流程还没有步骤，先在 02 添加步骤' : '使用该 Clip 编译当前流程'}
+          onClick={() => void useClipAsGeometry(activeClip, true)}>{busy === 'clip-use' ? '编译中…' : '用此 Clip 编译'}</button>
+      </div>}
+    </div>
+  );
+
   const currentSection = ZONES.find(item => item.id === zone) ?? ZONES[0];
   const propertyRows: Array<[string, string]> = [
-    ['Project', project?.name ?? '—'],
-    ['Dimension', project ? `${project.dimension ?? '?'}D` : '—'],
-    ['Compile', compile ? `${compile.compileId.slice(0, 18)}…` : '—'],
+    ['工程', project?.name ?? '—'],
+    ['维度', project ? `${project.dimension ?? '?'}D` : '—'],
+    ['编译', compile ? `${compile.compileId.slice(0, 18)}…` : '—'],
     ['Binding', compile?.bindingId ? `${compile.bindingId.slice(0, 18)}…` : '—'],
     ['Route', route?.route.name ?? '—'],
-    ['Segment', segment ? `${segment.status} · ${segment.segmentId.slice(0, 12)}…` : '—'],
+    ['Segment', segment ? `${statusLabel(segment.status)} · ${segment.segmentId.slice(0, 12)}…` : '—'],
     ['Run', segment?.runId ? `${segment.runId.slice(0, 16)}…` : '—'],
-    ['Measurement', measurement ? `${measurement.value === null ? '—' : measurement.value.toFixed(4)} ${measurement.unit}` : '—'],
-    ['Engine', health ? `ViennaPS ${health.viennaps ?? '—'}` : '—'],
+    ['测量', measurement ? `${measurement.value === null ? '—' : measurement.value.toFixed(4)} ${measurement.unit}` : '—'],
+    ['引擎', health ? `ViennaPS ${health.viennaps ?? '—'}` : '—'],
   ];
 
   return (
@@ -1414,8 +2158,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             {openMenu === id && <div className="spx-menu-popover" role="menu">
               {id === 'file' && <>
                 <button role="menuitem" onClick={() => { setOpenMenu(null); projectInput.current?.click(); }}>打开工程 JSON…</button>
-                <button role="menuitem" onClick={() => { setOpenMenu(null); gdsInput.current?.click(); }}>上传 GDS 版图…</button>
-                <button role="menuitem" disabled={!canAdopt} onClick={() => { setOpenMenu(null); void adopt(); }}>采纳为 Workflow</button>
+                <button role="menuitem" onClick={() => { setOpenMenu(null); setSetupMode('new'); setDraft(prev => ({ ...prev, source: 'layout' })); gdsInput.current?.click(); }}>上传 GDS 版图…</button>
+                <button role="menuitem" onClick={() => { setOpenMenu(null); setSetupMode('home'); }}>返回开始页</button>
               </>}
               {id === 'edit' && <>
                 <button role="menuitem" onClick={() => { setOpenMenu(null); setActivityLog([]); }}>清空 Output</button>
@@ -1426,10 +2170,12 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 {onOpenLegacy && <button role="menuitem" onClick={() => { setOpenMenu(null); onOpenLegacy(); }}>传统工作区</button>}
               </>}
               {id === 'project' && <>
-                <button role="menuitem" disabled={!compile} onClick={() => { setOpenMenu(null); void createRoute(); }}>创建首个 Route</button>
-                <button role="menuitem" disabled={!compile} onClick={() => { setOpenMenu(null); void saveTemplate(); }}>保存当前步骤为模板</button>
+                <button role="menuitem" disabled={!canCompile} onClick={() => { setOpenMenu(null); void compileFlow(); }}>编译流程</button>
+                <button role="menuitem" disabled={!canRoute} onClick={() => { setOpenMenu(null); void createRoute(); }}>创建 Route</button>
+                <button role="menuitem" disabled={!project} onClick={() => { setOpenMenu(null); void saveTemplate(); }}>保存当前步骤为模板</button>
+                <button role="menuitem" onClick={() => { setOpenMenu(null); openLibraryManager('process'); }}>管理库</button>
                 <button role="menuitem" disabled={!libraryName.trim()} onClick={() => { setOpenMenu(null); void exportLibrary(); }}>导出共享库</button>
-                <button role="menuitem" disabled={!compile} onClick={() => { setOpenMenu(null); setZone('flow'); }}>打开流程编辑器</button>
+                <button role="menuitem" onClick={() => { setOpenMenu(null); setZone('flow'); }}>打开流程编辑器</button>
               </>}
               {id === 'run' && <>
                 <button role="menuitem" disabled={!canRun} onClick={() => { setOpenMenu(null); void execute(); }}>执行当前 Segment</button>
@@ -1468,18 +2214,18 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       <div className="spx-body">
         <aside className="spx-left">
           <div className="spx-panel">
-            <div className="spx-panel-title"><span>Project</span></div>
+            <div className="spx-panel-title"><span>工程</span></div>
             <div className="spx-tree" role="tree" aria-label="Project tree">
-              <div className="spx-tree-root"><span>▾</span><strong>{project?.name ?? 'No project'}</strong></div>
-              <div className="spx-tree-meta">{project ? `${project.dimension ?? '?'}D · ${project.steps?.length ?? 0} steps` : 'Open a ProjectV7 JSON to begin'}</div>
+              <div className="spx-tree-root"><span>▾</span><strong>{project?.name ?? '未打开工程'}</strong></div>
+              <div className="spx-tree-meta">{project ? `${project.dimension ?? '?'}D · ${project.steps?.length ?? 0} 步 · ${projectGeometrySource.kind === 'layout' ? 'GDS Clip' : '参数化'}` : '新建工程或导入 ProjectV7'}</div>
               {[
-                { label: 'Compile', value: compile ? `${compile.stepCount} steps` : 'not compiled', target: 'flow' as const, present: !!compile },
-                { label: 'Route', value: route ? route.route.name : 'not created', target: 'run' as const, present: !!route },
-                { label: 'Run', value: segment?.runId ? segment.runId.slice(0, 12) + '…' : segment?.status ?? '—', target: 'run' as const, present: !!segment?.runId },
-                { label: 'Measurement', value: measurement ? `${measurement.value === null ? '—' : measurement.value.toFixed(4)} ${measurement.unit}` : '—', target: 'run' as const, present: !!measurement },
-                { label: 'Experiment', value: experimentDoc?.status ?? '—', target: 'experiment' as const, present: !!experimentDoc },
-                { label: 'Analysis', value: comparison ? 'candidates loaded' : '—', target: 'analyze' as const, present: !!comparison },
-                { label: 'Report', value: reportDocument ? reportDocument.reportId.slice(0, 16) : '—', target: 'report' as const, present: !!reportDocument },
+                { label: '编译', value: compile ? `${compile.stepCount} 步` : '未编译', target: 'flow' as const, present: !!compile && !compileStale, stale: compileStale && !!compile },
+                { label: 'Route', stale: false, value: route ? `${route.segments.length} Segment` : '未创建', target: 'run' as const, present: !!route },
+                { label: 'Run', stale: false, value: segment?.runId ? segment.runId.slice(0, 12) + '…' : segment ? statusLabel(segment.status) : '—', target: 'run' as const, present: !!segment?.runId },
+                { label: '测量', stale: false, value: measurement ? `${measurement.value === null ? '—' : measurement.value.toFixed(4)} ${measurement.unit}` : '—', target: 'run' as const, present: !!measurement },
+                { label: '实验', stale: false, value: experimentDoc ? statusLabel(experimentDoc.status) : '—', target: 'experiment' as const, present: !!experimentDoc },
+                { label: '分析', stale: false, value: comparison ? '已载入候选' : '—', target: 'analyze' as const, present: !!comparison },
+                { label: '报告', stale: false, value: reportDocument ? reportDocument.reportId.slice(0, 16) : '—', target: 'report' as const, present: !!reportDocument },
               ].map(item => <div
                 key={item.label}
                 role="treeitem"
@@ -1488,16 +2234,28 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 className={zone === item.target ? 'spx-tree-item active' : 'spx-tree-item'}
                 onClick={() => setZone(item.target)}
                 onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') setZone(item.target); }}
-              ><span className="spx-tree-label">{item.label}</span><span className="spx-tree-value">{item.value}</span><span className={item.present ? 'spx-tree-dot present' : 'spx-tree-dot'} /></div>)}
+              ><span className="spx-tree-label">{item.label}</span><span className="spx-tree-value">{item.stale ? '待重编译' : item.value}</span><span className={item.present ? 'spx-tree-dot present' : 'spx-tree-dot'} /></div>)}
             </div>
           </div>
           <div className="spx-panel">
-            <div className="spx-panel-title"><span>Libraries</span></div>
+            <div className="spx-panel-title"><span>库</span></div>
             <div className="spx-tree">
-              <div className="spx-tree-item"><span>Flows</span><span className="spx-count">{templates.length}</span></div>
-              <div className="spx-tree-item"><span>Layouts</span><span className="spx-count">{layouts.length}</span></div>
-              <div className="spx-tree-item"><span>Clips</span><span className="spx-count">{clips.length}</span></div>
-              <div className="spx-tree-item"><span>Bundles</span><span className="spx-count">{libraryBundles.length}</span></div>
+              {([
+                { label: '材料', count: libraryItems.filter(item => item.category === 'material').length, onClick: () => openLibraryManager('material') },
+                { label: '工艺', count: libraryItems.filter(item => item.category === 'process').length, onClick: () => openLibraryManager('process') },
+                { label: '流程', count: libraryItems.filter(item => item.category === 'flow').length, onClick: () => setZone('flow') },
+                { label: '实验', count: libraryItems.filter(item => item.category === 'experiment').length, onClick: () => openLibraryManager('experiment') },
+                { label: '版图', count: layouts.length, onClick: () => { setZone('setup'); setSetupMode('new'); setDraft(prev => ({ ...prev, source: 'layout' })) } },
+                { label: 'Clip', count: clips.length, onClick: () => { setZone('setup'); setSetupMode('new'); setDraft(prev => ({ ...prev, source: 'layout' })) } },
+                { label: 'Bundles', count: libraryBundles.length, onClick: () => { setZone('flow'); setLibraryAdvancedOpen(true); } },
+              ]).map(item => <div
+                key={item.label}
+                role="treeitem"
+                tabIndex={0}
+                className="spx-tree-item"
+                onClick={item.onClick}
+                onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') item.onClick(); }}
+              ><span>{item.label}</span><span className="spx-count">{item.count}</span></div>)}
             </div>
           </div>
           <div className="spx-left-foot">
@@ -1514,8 +2272,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               <p>{currentSection.desc}</p>
             </div>
             <div className="spx-doc-state">
-              <span className={compile ? 'spx-state-pill ok' : 'spx-state-pill'}>{compile ? 'Compiled' : 'No compile'}</span>
-              <span className={segment?.status === 'succeeded' ? 'spx-state-pill ok' : 'spx-state-pill'}>{segment ? segment.status : 'No run'}</span>
+              <span className={compile && !compileStale ? 'spx-state-pill ok' : 'spx-state-pill'}>{compile ? (compileStale ? '已编译 · 待重编译' : '已编译') : '未编译'}</span>
+              <span className={segment?.status === 'succeeded' ? 'spx-state-pill ok' : 'spx-state-pill'}>{segment ? statusLabel(segment.status) : '未运行'}</span>
             </div>
           </div>
 
@@ -1525,7 +2283,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             <button type="button" className={setupMode === 'new' ? 'spx-command active' : 'spx-command'} onClick={startNewProject}>
               <span className="spx-command-icon">＋</span>
               <strong>新建工程</strong>
-              <span>从空白属性表单创建 ProjectV7</span>
+              <span>定义名称、维度与几何来源</span>
             </button>
             <button type="button" className={setupMode === 'examples' ? 'spx-command active' : 'spx-command'} onClick={() => setSetupMode('examples')}>
               <span className="spx-command-icon">▦</span>
@@ -1540,18 +2298,18 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
           </div>
 
           {(project || gds) && <div className="spx-attached-row">
-            {project && <div className="spx-file-name filled">Project · {project.name ?? '未命名'} · {project.dimension ?? '?'}D · {project.steps?.length ?? 0} steps</div>}
-            {gds && <div className="spx-file-name filled">Layout · {gds.fileName}</div>}
+            {project && <div className="spx-file-name filled">工程 · {project.name ?? '未命名'} · {project.dimension ?? '?'}D · {project.steps?.length ?? 0} 步</div>}
+            {gds && <div className="spx-file-name filled">GDS · {gds.fileName}</div>}
           </div>}
 
           {setupMode === 'new' && <div className="spx-sheet">
-            <div className="spx-sheet-title">新建工程 / New Project</div>
+            <div className="spx-sheet-title">新建工程</div>
             <div className="spx-form-groups">
               <section className="spx-field-group">
-                <div className="spx-group-title">General</div>
+                <div className="spx-group-title">基本</div>
                 <div className="spx-field-grid">
                   <label className="spx-field span-2"><span>工程名称</span><input aria-label="新工程名称" value={draft.name} onChange={event => setDraftField('name', event.target.value)} /></label>
-                  <div className="spx-field"><span>Dimension</span>
+                  <div className="spx-field"><span>维度</span>
                     <div className="spx-segment">
                       <button type="button" className={draft.dimension === 2 ? 'active' : ''} onClick={() => setDraftDimension(2)}>2D</button>
                       <button type="button" className={draft.dimension === 3 ? 'active' : ''} onClick={() => setDraftDimension(3)}>3D</button>
@@ -1561,34 +2319,44 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               </section>
 
               <section className="spx-field-group">
-                <div className="spx-group-title">Geometry</div>
-                <div className="spx-geometry-picks">
-                  {(draft.dimension === 2 ? ['plane', 'trench'] : ['hole', 'fin']).map(kind => <button
-                    type="button" key={kind}
-                    className={draft.geometry === kind ? 'active' : ''}
-                    onClick={() => setDraftField('geometry', kind)}
-                  >{kind === 'plane' ? 'Plane' : kind === 'trench' ? 'Trench' : kind === 'hole' ? 'Hole' : 'Fin'}</button>)}
+                <div className="spx-group-title">几何来源</div>
+                <div className="spx-segment spx-source-pick">
+                  <button type="button" className={draft.source === 'parametric' ? 'active' : ''} onClick={() => chooseDraftSource('parametric')}>参数化</button>
+                  <button type="button" className={draft.source === 'layout' ? 'active' : ''} disabled={draft.dimension === 3}
+                    title={draft.dimension === 3 ? 'GDS 版图几何仅支持 2D 工程' : '从 GDS 版图 Clip 构建几何'}
+                    onClick={() => chooseDraftSource('layout')}>GDS / Layout</button>
                 </div>
-                <div className="spx-field-grid">
-                  {draft.geometry === 'plane' && <label className="spx-field"><span>Plane height (µm)</span><input aria-label="新工程高度" type="number" value={draft.height} onChange={event => setDraftField('height', Number(event.target.value))} /></label>}
-                  {draft.geometry === 'trench' && <>
-                    <label className="spx-field"><span>Trench width (µm)</span><input aria-label="新工程 Trench 宽度" type="number" value={draft.width} onChange={event => setDraftField('width', Number(event.target.value))} /></label>
-                    <label className="spx-field"><span>Trench depth (µm)</span><input aria-label="新工程 Trench 深度" type="number" value={draft.depth} onChange={event => setDraftField('depth', Number(event.target.value))} /></label>
-                  </>}
-                  {draft.geometry === 'hole' && <>
-                    <label className="spx-field"><span>Hole radius (µm)</span><input aria-label="新工程孔半径" type="number" value={draft.radius} onChange={event => setDraftField('radius', Number(event.target.value))} /></label>
-                    <label className="spx-field"><span>Hole depth (µm)</span><input aria-label="新工程孔深度" type="number" value={draft.depth} onChange={event => setDraftField('depth', Number(event.target.value))} /></label>
-                  </>}
-                  {draft.geometry === 'fin' && <>
-                    <label className="spx-field"><span>Fin width (µm)</span><input aria-label="新工程 Fin 宽度" type="number" value={draft.width} onChange={event => setDraftField('width', Number(event.target.value))} /></label>
-                    <label className="spx-field"><span>Fin height (µm)</span><input aria-label="新工程 Fin 高度" type="number" value={draft.finHeight} onChange={event => setDraftField('finHeight', Number(event.target.value))} /></label>
-                  </>}
-                  {draft.geometry !== 'plane' && <>
-                    <label className="spx-field"><span>Taper angle (deg)</span><input aria-label="新工程 taper" type="number" value={draft.taperAngle} onChange={event => setDraftField('taperAngle', Number(event.target.value))} /></label>
-                    <label className="spx-field"><span>Mask height (µm)</span><input aria-label="新工程 maskHeight" type="number" value={draft.maskHeight} onChange={event => setDraftField('maskHeight', Number(event.target.value))} /></label>
-                  </>}
-                </div>
-                <p className="spx-help">参数化几何用于新建工程；GDS / Clip 流程请在 02 流程区上传版图，或使用“导入 JSON”。</p>
+                {draft.source === 'parametric' && <>
+                  <div className="spx-geometry-picks">
+                    {(draft.dimension === 2 ? ['plane', 'trench'] : ['hole', 'fin']).map(kind => <button
+                      type="button" key={kind}
+                      className={draft.geometry === kind ? 'active' : ''}
+                      onClick={() => setDraftField('geometry', kind)}
+                    >{kind === 'plane' ? 'Plane' : kind === 'trench' ? 'Trench' : kind === 'hole' ? 'Hole' : 'Fin'}</button>)}
+                  </div>
+                  <div className="spx-field-grid">
+                    {draft.geometry === 'plane' && <label className="spx-field"><span>Plane height (µm)</span><input aria-label="新工程高度" type="number" value={draft.height} onChange={event => setDraftField('height', Number(event.target.value))} /></label>}
+                    {draft.geometry === 'trench' && <>
+                      <label className="spx-field"><span>Trench width (µm)</span><input aria-label="新工程 Trench 宽度" type="number" value={draft.width} onChange={event => setDraftField('width', Number(event.target.value))} /></label>
+                      <label className="spx-field"><span>Trench depth (µm)</span><input aria-label="新工程 Trench 深度" type="number" value={draft.depth} onChange={event => setDraftField('depth', Number(event.target.value))} /></label>
+                    </>}
+                    {draft.geometry === 'hole' && <>
+                      <label className="spx-field"><span>Hole radius (µm)</span><input aria-label="新工程孔半径" type="number" value={draft.radius} onChange={event => setDraftField('radius', Number(event.target.value))} /></label>
+                      <label className="spx-field"><span>Hole depth (µm)</span><input aria-label="新工程孔深度" type="number" value={draft.depth} onChange={event => setDraftField('depth', Number(event.target.value))} /></label>
+                    </>}
+                    {draft.geometry === 'fin' && <>
+                      <label className="spx-field"><span>Fin width (µm)</span><input aria-label="新工程 Fin 宽度" type="number" value={draft.width} onChange={event => setDraftField('width', Number(event.target.value))} /></label>
+                      <label className="spx-field"><span>Fin height (µm)</span><input aria-label="新工程 Fin 高度" type="number" value={draft.finHeight} onChange={event => setDraftField('finHeight', Number(event.target.value))} /></label>
+                    </>}
+                    {draft.geometry !== 'plane' && <>
+                      <label className="spx-field"><span>Taper angle (deg)</span><input aria-label="新工程 taper" type="number" value={draft.taperAngle} onChange={event => setDraftField('taperAngle', Number(event.target.value))} /></label>
+                      <label className="spx-field"><span>Mask height (µm)</span><input aria-label="新工程 maskHeight" type="number" value={draft.maskHeight} onChange={event => setDraftField('maskHeight', Number(event.target.value))} /></label>
+                    </>}
+                  </div>
+                </>}
+                {draft.source === 'layout' && <div className="spx-inline-section">
+                  {renderClipEditor('draft')}
+                </div>}
               </section>
 
               <section className="spx-field-group">
@@ -1618,10 +2386,11 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               </section>
             </div>
             <div className="spx-sheet-actions">
-              <button type="button" className="wf-button primary" onClick={createDraftProject}>创建工程</button>
+              <button type="button" className="wf-button primary" onClick={createDraftProject}
+                title={draft.source === 'layout' && !activeClip ? '先上传 GDS 并保存 Clip' : '保存工程草稿，步骤从 02 开始定义'}>保存工程草稿</button>
               <button type="button" className="wf-button" onClick={() => setSetupMode('home')}>取消</button>
             </div>
-            <p className="spx-help spx-form-note">创建后会自动加入一个 no-op 初始步骤，保证可立即编译；真实工艺步骤在 02 流程中编辑。</p>
+            <p className="spx-form-note">工程草稿只保存定义，步骤为空；流程步骤在 02 中从库插入或手动添加。</p>
           </div>}
 
           {setupMode === 'examples' && <div className="spx-samples">
@@ -1639,332 +2408,350 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
           {setupMode === 'project' && project && <div className="spx-sheet">
             <div className="spx-sheet-title">工程定义 / {project.name ?? '未命名工程'}</div>
             <div className="spx-summary-grid">
-              <div><span>Dimension</span><strong>{project.dimension ?? '—'}D</strong></div>
-              <div><span>Steps</span><strong>{project.steps?.length ?? 0}</strong></div>
-              <div><span>Geometry</span><strong>{project.geometry?.kind ?? '—'}</strong></div>
-              <div><span>Compile</span><strong>{compile ? `${compile.stepCount} steps` : 'not compiled'}</strong></div>
+              <div><span>维度</span><strong>{project.dimension ?? '—'}D</strong></div>
+              <div><span>几何来源</span><strong>{projectGeometrySource.kind === 'layout' ? `Clip · ${projectGeometrySource.clipName ?? '未选择'}` : '参数化'}</strong></div>
+              <div><span>步骤</span><strong>{project.steps?.length ?? 0}</strong></div>
+              <div><span>求解器</span><strong>{String((project.solver as Record<string, unknown> | undefined)?.enginePreference ?? '—')}</strong></div>
             </div>
             <div className="spx-sheet-actions">
-              <button type="button" className="wf-button primary" disabled={!canAdopt} onClick={() => void adopt()}>
-                {busy === 'adopt' ? '采纳中…' : '采纳为 Workflow'}
-              </button>
-              <button type="button" className="wf-button" onClick={() => projectInput.current?.click()}>更换 JSON</button>
-              <button type="button" className="wf-button" onClick={() => setSetupMode('home')}>重新选择</button>
+              <button type="button" className="wf-button primary" onClick={() => setZone('flow')}>去 02 定义流程</button>
+              <button type="button" className="wf-button" onClick={() => setSetupMode('home')}>返回开始页</button>
+              <button type="button" className="wf-button" onClick={() => {
+                setProject(null); setCompile(null); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);
+                setCompileStale(true); setProjectGeometrySource({ kind: 'parametric' }); setSetupMode('home');
+              }}>关闭工程</button>
             </div>
-            {compile && <div className="wf-summary success"><strong>Compile 已冻结</strong><span>{compile.stepCount} 步 · {compile.compileId.slice(0, 16)}…</span></div>}
+            {compile && <div className={compileStale ? 'wf-summary' : 'wf-summary success'}>
+              <strong>{compileStale ? '流程已修改，需要重新编译' : '流程已编译'}</strong>
+              <span>{compile.stepCount} 步 · Compile {compile.compileId.slice(0, 16)}… · Binding {compile.bindingId.slice(0, 16)}…</span>
+            </div>}
             <div className="spx-inline-section">
-              <div className="spx-form-title">版图 / Layout <span className="spx-tag optional">可选</span></div>
-              <div className="spx-file-row">
-                <div className={gds ? 'spx-file-name filled' : 'spx-file-name'}>{gds ? gds.fileName : '未选择 GDS 文件'}</div>
-                <button type="button" className="wf-button ghost spx-browse" disabled={!!busy} onClick={() => gdsInput.current?.click()}>{gds ? '更换 GDS' : '上传 GDS'}</button>
+              <div className="spx-form-title">几何来源</div>
+              <div className="spx-segment spx-source-pick">
+                <button type="button" className={projectGeometrySource.kind === 'parametric' ? 'active' : ''}
+                  onClick={() => { setProjectGeometrySource({ kind: 'parametric' }); setCompileStale(true); }}>参数化</button>
+                <button type="button" className={projectGeometrySource.kind === 'layout' ? 'active' : ''} disabled={project.dimension === 3}
+                  title={project.dimension === 3 ? 'GDS 版图几何仅支持 2D 工程' : '使用 GDS 版图 Clip 作为工程几何'}
+                  onClick={() => { setProjectGeometrySource({ kind: 'layout', clipId: activeClip?.clipId, clipName: activeClip?.name }); setCompileStale(true); }}>GDS / Layout</button>
               </div>
-              {gds && <div className="spx-form-note">asset {gds.assetId.slice(0, 20)}… · 下方可保存 Clip / 标注</div>}
+              {projectGeometrySource.kind === 'parametric'
+                ? <div className="wf-muted">几何类型：{String((project.geometry as Record<string, unknown> | undefined)?.kind ?? '—')}</div>
+                : renderClipEditor('project')}
             </div>
           </div>}
 
           <input ref={gdsInput} type="file" accept=".gds,.gdsii" hidden onChange={event => { const file = event.target.files?.[0]; if (file) void uploadGds(file); }} />
           <input ref={projectInput} type="file" accept=".json" hidden onChange={event => { const file = event.target.files?.[0]; if (file) void importProject(file); }} />
-
-          {gds && <details className="spx-advanced" open={clipToolsOpen} onToggle={event => setClipToolsOpen(event.currentTarget.open)}>
-            <summary>版图 Clip 工具（可选）</summary>
-            <div className="wf-clip-editor">
-            <div className="wf-card-subhead">版图 / Clip</div>
-            <div className="wf-template-row">
-              <button className="wf-button ghost" disabled={!!busy} onClick={() => void registerLayout()}>注册为 Layout</button>
-              <select aria-label="版图选择" value={activeLayout?.layoutId ?? ''} onChange={event => void chooseLayout(event.target.value)}>
-                <option value="">选择 Layout</option>
-                {layouts.map(item => <option key={item.layoutId} value={item.layoutId}>{item.fileName} · {item.structureCount} 结构</option>)}
-              </select>
-            </div>
-            {activeLayout && <>
-              <div className="wf-template-row">
-                <select aria-label="版图结构" value={layoutStructure} onChange={event => selectStructure(activeLayout, event.target.value)}>
-                  {activeLayout.structures.map(item => <option key={item.name} value={item.name}>{item.name}</option>)}
-                </select>
-                <input aria-label="Clip 名称" value={clipName} onChange={event => setClipName(event.target.value)} placeholder="Clip 名称" />
-              </div>
-              <div className="wf-layer-picks">
-                {(activeLayout.structures.find(item => item.name === layoutStructure)?.layerDatatypes ?? []).map(([layer, datatype]) => {
-                  const key = `${layer}:${datatype}`;
-                  return <label key={key}><input type="checkbox" checked={selectedPairs.includes(key)} onChange={event => setSelectedPairs(previous => event.target.checked ? [...previous, key] : previous.filter(item => item !== key))} /> L{layer}/{datatype}</label>;
-                })}
-              </div>
-              <div className="wf-bounds">
-                {(['x0', 'y0', 'x1', 'y1'] as const).map(key => <input key={key} aria-label={`Clip ${key}`} value={String(clipBounds[key])} onChange={event => setClipBounds(previous => ({ ...previous, [key]: Number(event.target.value) }))} />)}
-                <button className="wf-button ghost" disabled={!!busy} onClick={() => void previewClip()}>预览</button>
-                <button className="wf-button ghost" disabled={!!busy} onClick={() => void saveClip()}>保存 Clip</button>
-              </div>
-            </>}
-            {canvas && <div className="wf-canvas-wrap">
-              <svg viewBox={`0 0 ${canvas.width} ${canvas.height}`} className="wf-clip-canvas" role="img" aria-label="版图 Clip 画布">
-                {canvas.polygons.map((polygon, index) => <polygon
-                  key={`${polygon.layer}-${index}`}
-                  points={polygon.points.map(([x, y]) => `${x},${canvas.height - y}`).join(' ')}
-                  fill={LAYER_COLORS[polygon.layer % LAYER_COLORS.length]}
-                  fillOpacity="0.45"
-                  stroke={LAYER_COLORS[polygon.layer % LAYER_COLORS.length]}
-                  strokeWidth={Math.max(canvas.width, canvas.height) / 500}
-                />)}
-                {activeClip?.annotations.map(annotation => <g key={annotation.annotationId}>
-                  <circle cx={annotation.x} cy={activeClip.height - annotation.y} r={Math.max(canvas.width, canvas.height) / 80} className="wf-annotation" />
-                  <text x={annotation.x} y={activeClip.height - annotation.y} className="wf-annotation-text">{annotation.text}</text>
-                </g>)}
-              </svg>
-              <div className="wf-muted">{canvas.polygonCount} 多边形 · {canvas.pointCount} 点 · {canvas.width.toFixed(3)} × {canvas.height.toFixed(3)} µm</div>
-            </div>}
-            {activeClip && <div className="wf-summary"><strong>{activeClip.name}</strong><span>{activeClip.polygonCount} 多边形</span><span><code>{activeClip.clipHash.slice(0, 12)}…</code></span><span>{activeClip.annotations.length} 标注</span></div>}
-            {activeClip && <div className="wf-template-row">
-              <input aria-label="标注文本" value={annotationText} onChange={event => setAnnotationText(event.target.value)} placeholder="标注文本" />
-              <input aria-label="标注 X" value={annotationX} onChange={event => setAnnotationX(event.target.value)} />
-              <input aria-label="标注 Y" value={annotationY} onChange={event => setAnnotationY(event.target.value)} />
-              <button className="wf-button ghost" disabled={!!busy} onClick={() => void addAnnotation()}>添加标注</button>
-            </div>}
-            {clips.length > 0 && <div className="wf-clip-list">
-              {clips.map(clip => <button key={clip.clipId} type="button" className={activeClip?.clipId === clip.clipId ? 'active' : ''} onClick={() => selectClip(clip)}>{clip.name} · {clip.polygonCount}</button>)}
-            </div>}
-            {activeClip && <button className="wf-button primary" disabled={!project || !!busy} onClick={() => void compileClip()}>
-              {busy === 'clip-compile' ? '编译中…' : '用此 Clip 编译'}
-            </button>}
-            </div>
-          </details>}
         </section>
 
         <section className={`wf-card wf-flow ${zone === 'flow' ? '' : 'wf-hidden'}`}>
-          <div className="wf-card-head"><span>02</span><h2>流程 / Process Flow</h2></div>
-          {!compile && <div className="wf-empty">采纳工程后显示流程步骤。</div>}
-          {compile && <>
+          <div className="wf-card-head"><span>02</span><h2>流程编辑</h2></div>
+          {!project && <div className="wf-empty">先在 01 创建或导入工程。</div>}
+          {project && <>
             <div className="spx-flow-summary">
-              <div><span>Project</span><strong>{compile.projectName}</strong></div>
-              <div><span>Dimension</span><strong>{compile.dimension}D</strong></div>
-              <div><span>Enabled steps</span><strong>{activeSteps.length}</strong></div>
-              <div><span>Compile</span><strong>{compile.compileId.slice(0, 16)}…</strong></div>
+              <div><span>工程</span><strong>{project.name ?? '未命名'}</strong></div>
+              <div><span>维度</span><strong>{project.dimension ?? '?'}D</strong></div>
+              <div><span>几何</span><strong>{projectGeometrySource.kind === 'layout' ? `Clip · ${projectGeometrySource.clipName ?? '—'}` : '参数化'}</strong></div>
+              <div><span>步骤</span><strong>{authoredSteps.length}</strong></div>
             </div>
             <div className="spx-flow-toolbar">
-              <button className="wf-button primary" disabled={!canRoute} onClick={() => void createRoute()}>{busy === 'route' ? '创建中…' : '创建首个 Route'}</button>
-              <button className="wf-button" aria-label="保存当前步骤为模板" disabled={!compile || !!busy} onClick={() => void saveTemplate()}>保存为模板</button>
-              <button className="wf-button" disabled={!compile || !!busy} onClick={() => void compareCompile()}>比较上一版</button>
-            </div>
-            <div className="spx-flow-template">
-              <label><span>模板</span>
-                <select aria-label="模板选择" value={templateId} onChange={event => setTemplateId(event.target.value)}>
-                  <option value="">选择模板</option>
-                  {templates.map(item => <option key={item.templateId} value={item.templateId}>{item.name} · {item.stepCount} 步</option>)}
-                </select>
-              </label>
-              <label><span>duration 覆盖</span><input aria-label="模板变量值" value={templateVariable} onChange={event => setTemplateVariable(event.target.value)} /></label>
-              <button className="wf-button" disabled={!project || !templateId || !!busy} onClick={() => void applyTemplate('replace')}>替换流程</button>
-              <button className="wf-button" disabled={!project || !templateId || !!busy} onClick={() => void applyTemplate('append')}>插入模板</button>
-            </div>
-            <div className="spx-flow-body">
-              <div className="spx-flow-list">
-                <table className="wf-table" aria-label="流程步骤">
-                  <thead><tr><th>#</th><th>Step</th><th>Model</th><th>Operation</th><th>Enabled</th></tr></thead>
-                  <tbody>{compile.compile.project.steps.map((step, index) => (
-                    <tr key={step.id} className={selectedFlowStepId === step.id ? 'selected' : ''} onClick={() => setSelectedFlowStepId(step.id)}>
-                      <td>{String(index + 1).padStart(2, '0')}</td>
-                      <td>{step.name}</td>
-                      <td>{STEP_LABELS[step.model] ?? step.model}</td>
-                      <td>{step.operation ?? '—'}</td>
-                      <td>{step.enabled ? 'yes' : 'no'}</td>
-                    </tr>
-                  ))}</tbody>
-                </table>
+              <button className="wf-button primary" disabled={!canCompile}
+                title={authoredSteps.length === 0 ? '流程为空：先插入或添加步骤' : '使用 /flows/from-project 编译当前步骤'}
+                onClick={() => void compileFlow()}>{busy === 'compile-flow' ? '编译中…' : '编译流程'}</button>
+              {compile && !compileStale && <button className="wf-button" disabled={!canRoute} onClick={() => void createRoute()}>{busy === 'route' ? '创建中…' : '创建 Route / 去 03'}</button>}
+              <div className="spx-flow-viewswitch" role="tablist" aria-label="流程视图">
+                <button type="button" role="tab" aria-selected={!libraryManagerOpen} className={!libraryManagerOpen ? 'active' : ''} onClick={() => setLibraryManagerOpen(false)}>流程编辑</button>
+                <button type="button" role="tab" aria-selected={libraryManagerOpen} className={libraryManagerOpen ? 'active' : ''} onClick={() => openLibraryManager(libraryCategory)}>库管理</button>
               </div>
-              <div className="spx-step-inspector">
-                <div className="spx-step-inspector-title">Step Properties</div>
-                {selectedFlowStep ? <>
-                  <div className="spx-prop"><span>Name</span><code>{selectedFlowStep.name}</code></div>
-                  <div className="spx-prop"><span>Model</span><code>{selectedFlowStep.model}</code></div>
-                  <div className="spx-prop"><span>Operation</span><code>{selectedFlowStep.operation ?? '—'}</code></div>
-                  <div className="spx-prop"><span>Duration</span><code>{String((selectedFlowStep as unknown as Record<string, unknown>).duration ?? '—')} s</code></div>
-                  <div className="spx-prop"><span>Rate</span><code>{String((selectedFlowStep as unknown as Record<string, unknown>).rateMagnitude ?? '—')}</code></div>
-                  <div className="spx-prop"><span>Authored ID</span><code>{compile.compile.sourceMap?.find(entry => entry.stepId === selectedFlowStep.id)?.authoredStepId ?? selectedFlowStep.id}</code></div>
-                  <p className="spx-help">编译后的步骤是只读快照。修改请用模板、模块化流程或重新采纳工程。</p>
-                </> : <p className="spx-help">选择左侧步骤查看参数。</p>}
+              <span className={compileStale ? 'wf-stale' : 'wf-muted'}>
+                {compile ? (compileStale ? '流程已修改，需重新编译' : '编译为最新') : '未编译'}
+              </span>
+            </div>
+            {compile && <div className={compileStale ? 'wf-summary' : 'wf-summary success'}>
+              <strong>{compileStale ? 'Compile 已过期' : '编译成功'}</strong>
+              <span>Compile ID {compile.compileId}</span>
+              <span>Binding {compile.bindingId}</span>
+              <span>{compile.stepCount} 步 · {compile.dimension}D</span>
+              {compileStale && <span>重新编译后才能创建 Route。</span>}
+            </div>}
+
+            {!libraryManagerOpen && <>
+            <div className="spx-flow-editor">
+              <div className="spx-library-browser">
+                <div className="spx-library-head">
+                  <span>库</span>
+                  <button type="button" className="spx-link" onClick={() => openLibraryManager(libraryCategory)}>管理库</button>
+                </div>
+                <div className="spx-library-tabs">
+                  {([
+                    ['material', 'Materials'],
+                    ['process', 'Processes'],
+                    ['flow', 'Flows'],
+                    ['experiment', 'Experiments'],
+                  ] as Array<[LibraryCategory, string]>).map(([category, label]) => <button
+                    key={category} type="button" className={libraryCategory === category ? 'active' : ''}
+                    onClick={() => setLibraryCategory(category)}
+                  >{label}<span className="spx-count">{libraryItems.filter(item => item.category === category).length}</span></button>)}
+                </div>
+                <div className="spx-library-category-head compact">
+                  <strong>{LIBRARY_CATEGORY_LABELS[libraryCategory]}</strong>
+                  <span className={libraryError ? 'spx-library-load-error' : 'wf-muted'}>
+                    {libraryLoading ? '加载中…' : libraryError ? '加载失败' : `${libraryItems.filter(item => item.category === libraryCategory).length} 条`}
+                  </span>
+                  {libraryError && <button type="button" className="wf-button ghost" onClick={() => void loadLibraryItems()}>重试</button>}
+                </div>
+                <div className="spx-library-list" aria-label="库条目">
+                  {libraryLoading && <div className="wf-muted spx-library-empty">加载中…</div>}
+                  {!libraryLoading && libraryError && <div className="wf-muted spx-library-empty">加载失败：{libraryError}<button type="button" className="wf-button ghost" onClick={() => void loadLibraryItems()}>重试</button></div>}
+                  {!libraryLoading && !libraryError && libraryItems.filter(item => item.category === libraryCategory).length === 0 && <div className="wf-muted spx-library-empty">该分类暂无条目，可从“管理库”新增。</div>}
+                  {!libraryLoading && !libraryError && libraryItems.filter(item => item.category === libraryCategory).map(item => <div
+                    key={item.itemId}
+                    className="spx-library-item"
+                    draggable
+                    onDragStart={event => { event.dataTransfer.setData('text/plain', item.itemId); event.dataTransfer.effectAllowed = 'copy'; }}
+                  >
+                    <div className="spx-library-item-main">
+                      <strong>{item.name}</strong>
+                      <span>{item.category === 'process' ? `${String(item.payload.operation ?? '')} · ${String(item.payload.model ?? '')}` : item.category === 'material' ? `${String(item.payload.catalog ?? '')} · ${String(item.payload.material ?? '')}` : item.category === 'flow' ? '流程引用' : '实验模板'}</span>
+                    </div>
+                    {item.category === 'experiment'
+                      ? <button type="button" className="spx-link" onClick={() => { setZone('experiment'); setActivityLog(previous => [...previous.slice(-79), `${new Date().toLocaleTimeString()}  实验模板 ${item.name} 在 04 中使用`]); }}>去 04</button>
+                      : <button type="button" className="spx-link" onClick={() => {
+                        if (item.category === 'flow') setConfirmLibraryItemId(confirmLibraryItemId === item.itemId ? '' : item.itemId);
+                        else void insertLibraryItem(item);
+                      }}>插入</button>}
+                    {confirmLibraryItemId === item.itemId && <div className="spx-library-confirm">
+                      <span>插入方式</span>
+                      <button type="button" className="wf-button ghost" disabled={!!busy} onClick={() => void insertLibraryItem(item, 'append')}>追加</button>
+                      <button type="button" className="wf-button ghost" disabled={!!busy} onClick={() => void insertLibraryItem(item, 'replace')}>替换</button>
+                      <button type="button" className="spx-link" onClick={() => setConfirmLibraryItemId('')}>取消</button>
+                    </div>}
+                  </div>)}
+                </div>
+              </div>
+
+              <div className="spx-flow-steps"
+                aria-label="流程步骤编辑区"
+                onDragOver={event => { event.preventDefault(); event.dataTransfer.dropEffect = 'copy'; }}
+                onDrop={event => {
+                  event.preventDefault();
+                  const itemId = event.dataTransfer.getData('text/plain');
+                  const item = libraryItems.find(row => row.itemId === itemId);
+                  if (item) void insertLibraryItem(item);
+                }}
+              >
+                <div className="spx-flow-steps-head">
+                  <span>流程步骤</span>
+                  <button type="button" className="wf-button ghost" onClick={addAuthoredStep}>＋ 添加步骤</button>
+                </div>
+                {authoredSteps.length === 0
+                  ? <div className="wf-empty">把左侧 Process 拖到这里，或点击“插入”。</div>
+                  : <table className="wf-table" aria-label="流程步骤">
+                    <thead><tr><th>#</th><th>步骤</th><th>模型</th><th>操作</th><th>启用</th></tr></thead>
+                    <tbody>{authoredSteps.map((step, index) => (
+                      <tr key={step.id} className={selectedFlowStepId === step.id ? 'selected' : ''} onClick={() => setSelectedFlowStepId(step.id)}>
+                        <td>{String(index + 1).padStart(2, '0')}</td>
+                        <td>{step.name}</td>
+                        <td>{STEP_LABELS[step.model] ?? step.model}</td>
+                        <td>{step.operation ?? '—'}</td>
+                        <td>{step.enabled ? '是' : '否'}</td>
+                      </tr>
+                    ))}</tbody>
+                  </table>}
+                <div className="spx-step-inspector">
+                  <div className="spx-step-inspector-title">步骤参数</div>
+                  {selectedFlowStep ? <div className="spx-step-form">
+                    <label className="spx-field"><span>名称</span><input aria-label="步骤名称" value={selectedFlowStep.name} onChange={event => updateSelectedStep({ name: event.target.value })} /></label>
+                    <label className="spx-field"><span>启用</span><input aria-label="步骤启用" type="checkbox" checked={selectedFlowStep.enabled} onChange={event => updateSelectedStep({ enabled: event.target.checked })} /></label>
+                    <label className="spx-field"><span>操作</span>
+                      <select aria-label="步骤操作" value={selectedFlowStep.operation ?? 'etch'} onChange={event => updateSelectedStep({ operation: event.target.value })}>
+                        <option value="etch">etch</option>
+                        <option value="deposit">deposit</option>
+                      </select>
+                    </label>
+                    <label className="spx-field"><span>模型</span>
+                      <select aria-label="步骤模型" value={selectedFlowStep.model} onChange={event => updateSelectedStep({ model: event.target.value })}>
+                        {[selectedFlowStep.model, 'isotropic', 'singleParticle', 'directional', 'multiParticle', 'removeMaterial', 'planarize']
+                          .filter((value, index, list) => list.indexOf(value) === index)
+                          .map(model => <option key={model} value={model}>{STEP_LABELS[model] ?? model}</option>)}
+                      </select>
+                    </label>
+                    <label className="spx-field"><span>duration (s)</span><input aria-label="步骤时长" type="number" step="0.01" value={Number(selectedFlowStep.duration ?? 0)} onChange={event => updateSelectedStep({ duration: Number(event.target.value) })} /></label>
+                    <label className="spx-field"><span>rate (µm/s)</span><input aria-label="步骤速率" type="number" step="0.01" value={Number(selectedFlowStep.rateMagnitude ?? selectedFlowStep.directionalRateMagnitude ?? 0)} onChange={event => updateSelectedStep({ rateMagnitude: Number(event.target.value) })} /></label>
+                    <label className="spx-field"><span>depositMaterial</span>
+                      <select aria-label="步骤沉积材料" value={String(selectedFlowStep.depositMaterial ?? '')} onChange={event => updateSelectedStep({ depositMaterial: event.target.value || undefined })}>
+                        <option value="">—</option>
+                        {materialCatalog.map(row => <option key={row.name} value={row.name}>{row.name}{materialPreset === row.name ? ' · 库' : ''}</option>)}
+                      </select>
+                    </label>
+                    {(selectedFlowStep.model === 'singleParticle') && <>
+                      <label className="spx-field"><span>stickingProbability</span><input aria-label="步骤 stickingProbability" type="number" step="0.01" value={Number(selectedFlowStep.stickingProbability ?? 1)} onChange={event => updateSelectedStep({ stickingProbability: Number(event.target.value) })} /></label>
+                      <label className="spx-field"><span>sourceExponent</span><input aria-label="步骤 sourceExponent" type="number" step="0.1" value={Number(selectedFlowStep.sourceExponent ?? 1)} onChange={event => updateSelectedStep({ sourceExponent: Number(event.target.value) })} /></label>
+                    </>}
+                    <div className="spx-step-form-actions">
+                      <code>{selectedFlowStep.id}</code>
+                      <button type="button" className="wf-button ghost" onClick={() => deleteAuthoredStep(selectedFlowStep.id)}>删除步骤</button>
+                    </div>
+                  </div> : <p className="spx-help">选择左侧步骤查看并编辑参数。</p>}
+                </div>
               </div>
             </div>
-            {compileDiff && <div className="wf-summary"><strong>Compile diff</strong><span>+{compileDiff.addedStepIds.length} / -{compileDiff.removedStepIds.length} / moved {compileDiff.movedStepIds.length} / changed {compileDiff.changedStepIds.length}</span><span>affected: {compileDiff.affectedStepIds.map(id => id.slice(0, 8)).join(', ') || '—'}</span>{compileDiff.details?.slice(0, 3).map(item => <span key={item.stepId}>{item.stepId.slice(0, 8)}: {String(item.before.duration ?? '—')} → {String(item.after.duration ?? '—')}</span>)}</div>}
+
+            <details className="spx-advanced" open>
+              <summary>模板（可选）</summary>
+              <div className="spx-advanced-body">
+                <div className="spx-flow-template">
+                  <label><span>模板</span>
+                    <select aria-label="模板选择" value={templateId} onChange={event => setTemplateId(event.target.value)}>
+                      <option value="">选择模板</option>
+                      {templates.map(item => <option key={item.templateId} value={item.templateId}>{item.name} · {item.stepCount} 步</option>)}
+                    </select>
+                  </label>
+                  <label><span>duration 覆盖</span><input aria-label="模板变量值" value={templateVariable} onChange={event => setTemplateVariable(event.target.value)} /></label>
+                  <button className="wf-button" aria-label="保存当前步骤为模板" disabled={!project || !!busy} onClick={() => void saveTemplate()}>保存为模板</button>
+                  <button className="wf-button" disabled={!project || !templateId || !!busy} onClick={() => void applyTemplate('replace')}>替换流程</button>
+                  <button className="wf-button" disabled={!project || !templateId || !!busy} onClick={() => void applyTemplate('append')}>插入模板</button>
+                  <button className="wf-button" disabled={!compile || !previousCompile || !!busy} onClick={() => void compareCompile()}>比较上一版</button>
+                </div>
+                {compileDiff && <div className="wf-summary"><strong>Compile diff</strong><span>+{compileDiff.addedStepIds.length} / -{compileDiff.removedStepIds.length} / moved {compileDiff.movedStepIds.length} / changed {compileDiff.changedStepIds.length}</span><span>affected: {compileDiff.affectedStepIds.map(id => id.slice(0, 8)).join(', ') || '—'}</span>{compileDiff.details?.slice(0, 3).map(item => <span key={item.stepId}>{item.stepId.slice(0, 8)}: {String(item.before.duration ?? '—')} → {String(item.after.duration ?? '—')}</span>)}</div>}
+              </div>
+            </details>
+
+            <details className="spx-advanced" open={flowAdvancedOpen} onToggle={event => setFlowAdvancedOpen(event.currentTarget.open)}>
+              <summary>高级：模块化流程定义（JSON）</summary>
+              <div className="spx-advanced-body">
+                <div className="wf-card-subhead">模块化流程</div>
+                <p className="wf-muted">保存模块与流程定义后展开预览；编译复用现有 Compile 与 SourceMap，不另起执行路径。</p>
+                <textarea aria-label="模块 JSON" value={moduleJson} onChange={event => setModuleJson(event.target.value)} placeholder="模块 JSON" />
+                <div className="wf-template-row">
+                  <button className="wf-button ghost" disabled={!!busy} onClick={() => void saveModule()}>{busy === 'module' ? '保存中…' : '保存模块'}</button>
+                  <span className="wf-muted">moduleId 唯一；内容变更会递增模块修订</span>
+                </div>
+                <textarea aria-label="流程定义 JSON" value={definitionJson} onChange={event => setDefinitionJson(event.target.value)} placeholder="流程定义 JSON" />
+                <div className="wf-template-row">
+                  <input aria-label="流程变量 JSON" value={definitionVariables} onChange={event => setDefinitionVariables(event.target.value)} placeholder='{"rate": 0.2}' />
+                  <button className="wf-button ghost" disabled={!!busy} onClick={() => void saveDefinition()}>{busy === 'definition' ? '保存中…' : '保存定义'}</button>
+                  <button className="wf-button ghost" disabled={!activeDefinitionId || !!busy} onClick={() => void expandDefinition()}>{busy === 'expand' ? '展开中…' : '展开预览'}</button>
+                  <button className="wf-button primary" disabled={!activeDefinitionId || !project || !!busy} onClick={() => void compileDefinition()}>{busy === 'definition-compile' ? '编译中…' : '编译模块化流程'}</button>
+                </div>
+                {moduleStatus && <div className="wf-summary"><strong>{moduleStatus}</strong><span>definition {activeDefinitionId || '—'}</span></div>}
+                {expansion && <>
+                  <div className="wf-summary">
+                    <strong>展开预览</strong>
+                    <span>{expansion.stepCount} 步 · 深度 {expansion.maxDepth}</span>
+                    <span>{expansion.moduleInstances.length} 模块实例 · {expansion.iterations.length} 循环迭代</span>
+                  </div>
+                  {expansion.variables.length > 0 && <div className="wf-muted">变量: {expansion.variables.map(item => `${item.name}=${String(item.value)}${item.unit ? ` ${item.unit}` : ''} (${item.source})`).join(' · ')}</div>}
+                  {expansion.iterations.length > 0 && <div className="wf-muted">循环: {expansion.iterations.map(item => `${item.path} · ${item.variable}[${item.index}]=${String(item.value)}`).join(' · ')}</div>}
+                  {expansion.moduleInstances.length > 0 && <div className="wf-muted">模块实例: {expansion.moduleInstances.map(item => `${item.instancePath} → ${item.moduleId}`).join(' · ')}</div>}
+                  <table className="wf-table">
+                    <thead><tr><th>Authored ID</th><th>Module / path</th><th>参数</th></tr></thead>
+                    <tbody>
+                      {expansion.steps.map(step => <tr key={step.authoredStepId}>
+                        <td><code>{step.authoredStepId}</code></td>
+                        <td><code>{step.moduleId ? `${step.moduleId} @ ${step.moduleInstanceIdPath}` : step.flowPath}</code></td>
+                        <td>{Object.entries(step.parameterProvenance).map(([key, item]) => `${key}=${JSON.stringify(item.resolvedValue)}`).join(' · ')}</td>
+                      </tr>)}
+                    </tbody>
+                  </table>
+                </>}
+              </div>
+            </details>
+
+            <details className="spx-advanced" open={libraryAdvancedOpen} onToggle={event => setLibraryAdvancedOpen(event.currentTarget.open)}>
+              <summary>高级：共享流程库</summary>
+              <div className="spx-advanced-body">
+                <p className="wf-muted">导出全部模块、流程定义、模板与当前实验的可复用条件；导入时明确 reject/clone 冲突策略。实验只保留条件、重复数与 seed，不带运行状态。</p>
+                <div className="wf-template-row">
+                  <input aria-label="共享库名称" value={libraryName} onChange={event => setLibraryName(event.target.value)} placeholder="共享库名称" />
+                  <input aria-label="共享库描述" value={libraryDescription} onChange={event => setLibraryDescription(event.target.value)} placeholder="描述（可选）" />
+                  <button className="wf-button ghost" aria-label="导出共享库" disabled={!!busy} onClick={() => void exportLibrary()}>{busy === 'library' ? '处理中…' : '导出共享库'}</button>
+                </div>
+                <div className="wf-template-row">
+                  <select aria-label="共享库 bundle 选择" value={libraryBundleId} onChange={event => setLibraryBundleId(event.target.value)}>
+                    <option value="">选择 bundle</option>
+                    {libraryBundles.map(item => <option key={item.bundleId} value={item.bundleId}>{item.name} · {item.bundleId.slice(0, 12)}…</option>)}
+                  </select>
+                  <select aria-label="共享库导入策略" value={libraryPolicy} onChange={event => setLibraryPolicy(event.target.value as 'reject' | 'clone')}>
+                    <option value="reject">reject · 冲突即失败</option>
+                    <option value="clone">clone · 生成新 ID</option>
+                  </select>
+                  <button className="wf-button primary" aria-label="导入共享库" disabled={!libraryBundleId || !!busy} onClick={() => void importLibraryBundle()}>{busy === 'library' ? '处理中…' : '导入共享库'}</button>
+                </div>
+                {libraryStatus && <div className="wf-summary" role="status"><strong>{libraryStatus}</strong><span>{libraryBundles.length} 个本地 bundle</span></div>}
+                {libraryBundles.length > 0 && <table className="wf-table" aria-label="共享库列表">
+                  <thead><tr><th>Bundle</th><th>内容</th><th>创建时间</th></tr></thead>
+                  <tbody>
+                    {libraryBundles.slice(0, 8).map(item => <tr key={item.bundleId}>
+                      <td><code>{item.bundleId}</code><div className="wf-muted">{item.name}</div></td>
+                      <td>{item.moduleCount} 模块修订 · {item.definitionCount} 定义 · {item.templateCount} 模板 · {item.experimentTemplateCount} 实验模板</td>
+                      <td>{item.createdAt}</td>
+                    </tr>)}
+                  </tbody>
+                </table>}
+                <details className="spx-advanced">
+                  <summary>高级：粘贴 bundle JSON</summary>
+                  <div className="spx-advanced-body">
+                    <textarea aria-label="共享库 JSON" value={libraryBundleJson} onChange={event => setLibraryBundleJson(event.target.value)} placeholder="粘贴 bundle JSON 以便跨机器交换" />
+                    <div className="wf-template-row">
+                      <button className="wf-button ghost" aria-label="从 JSON 导入共享库" disabled={!libraryBundleJson.trim() || !!busy} onClick={() => void importLibraryJson()}>{busy === 'library' ? '处理中…' : '从 JSON 导入'}</button>
+                      <span className="wf-muted">bundleId 由内容 hash 生成；reject 保留原 ID，clone 为定义/模板/实验生成新 ID。</span>
+                    </div>
+                  </div>
+                </details>
+                {libraryResult && <div className="wf-summary" aria-label="共享库导入结果">
+                  <strong>{libraryResult.bundleId}</strong>
+                  <span>定义: {libraryResult.definitionIds.join(', ') || '—'}</span>
+                  <span>模板: {libraryResult.templateIds.join(', ') || '—'}</span>
+                  <span>实验: {libraryResult.experimentIds.join(', ') || '—'}</span>
+                  {libraryResult.renames.length > 0 && <span>新 ID: {libraryResult.renames.map(item => `${item.previousId} → ${item.importedId}`).join(' · ')}</span>}
+                  {libraryResult.skipped.length > 0 && <span>跳过: {libraryResult.skipped.join(' · ')}</span>}
+                  {libraryResult.conflicts.length > 0 && <span>冲突: {libraryResult.conflicts.join(' · ')}</span>}
+                </div>}
+              </div>
+            </details>
+            </>}
+            {libraryManagerOpen && renderLibraryManager()}
           </>}
-          {route && <div className="wf-summary"><strong>{route.route.name}</strong><span>{route.segments.length} Segment · {route.stepOrder.length} Step · head {route.route.headAttemptId.slice(0, 10)}…</span></div>}
-          <details className="spx-advanced">
-            <summary>高级：模块化流程定义（JSON）</summary>
-            <div className="spx-advanced-body">
-          <div className="wf-card-subhead">模块化流程</div>
-          <p className="wf-muted">保存模块与流程定义后展开预览；编译复用现有 Compile 与 SourceMap，不另起执行路径。</p>
-          <textarea aria-label="模块 JSON" value={moduleJson} onChange={event => setModuleJson(event.target.value)} placeholder="模块 JSON" />
-          <div className="wf-template-row">
-            <button className="wf-button ghost" disabled={!!busy} onClick={() => void saveModule()}>{busy === 'module' ? '保存中…' : '保存模块'}</button>
-            <span className="wf-muted">moduleId 唯一；内容变更会递增模块修订</span>
-          </div>
-          <textarea aria-label="流程定义 JSON" value={definitionJson} onChange={event => setDefinitionJson(event.target.value)} placeholder="流程定义 JSON" />
-          <div className="wf-template-row">
-            <input aria-label="流程变量 JSON" value={definitionVariables} onChange={event => setDefinitionVariables(event.target.value)} placeholder='{"rate": 0.2}' />
-            <button className="wf-button ghost" disabled={!!busy} onClick={() => void saveDefinition()}>{busy === 'definition' ? '保存中…' : '保存定义'}</button>
-            <button className="wf-button ghost" disabled={!activeDefinitionId || !!busy} onClick={() => void expandDefinition()}>{busy === 'expand' ? '展开中…' : '展开预览'}</button>
-            <button className="wf-button primary" disabled={!activeDefinitionId || !project || !!busy} onClick={() => void compileDefinition()}>{busy === 'definition-compile' ? '编译中…' : '编译模块化流程'}</button>
-          </div>
-          {moduleStatus && <div className="wf-summary"><strong>{moduleStatus}</strong><span>definition {activeDefinitionId || '—'}</span></div>}
-          {expansion && <>
-            <div className="wf-summary">
-              <strong>展开预览</strong>
-              <span>{expansion.stepCount} 步 · 深度 {expansion.maxDepth}</span>
-              <span>{expansion.moduleInstances.length} 模块实例 · {expansion.iterations.length} 循环迭代</span>
-            </div>
-            {expansion.variables.length > 0 && <div className="wf-muted">变量: {expansion.variables.map(item => `${item.name}=${String(item.value)}${item.unit ? ` ${item.unit}` : ''} (${item.source})`).join(' · ')}</div>}
-            {expansion.iterations.length > 0 && <div className="wf-muted">循环: {expansion.iterations.map(item => `${item.path} · ${item.variable}[${item.index}]=${String(item.value)}`).join(' · ')}</div>}
-            {expansion.moduleInstances.length > 0 && <div className="wf-muted">模块实例: {expansion.moduleInstances.map(item => `${item.instancePath} → ${item.moduleId}`).join(' · ')}</div>}
-            <table className="wf-table">
-              <thead><tr><th>Authored ID</th><th>Module / path</th><th>参数</th></tr></thead>
-              <tbody>
-                {expansion.steps.map(step => <tr key={step.authoredStepId}>
-                  <td><code>{step.authoredStepId}</code></td>
-                  <td><code>{step.moduleId ? `${step.moduleId} @ ${step.moduleInstanceIdPath}` : step.flowPath}</code></td>
-                  <td>{Object.entries(step.parameterProvenance).map(([key, item]) => `${key}=${JSON.stringify(item.resolvedValue)}`).join(' · ')}</td>
-                </tr>)}
-              </tbody>
-            </table>
-          </>}
-            </div>
-          </details>
-          <div className="wf-card-subhead">共享流程库</div>
-          <p className="wf-muted">导出全部模块、流程定义、模板与当前实验的可复用条件；导入时明确 reject/clone 冲突策略。实验只保留条件、重复数与 seed，不带运行状态。</p>
-          <div className="wf-template-row">
-            <input aria-label="共享库名称" value={libraryName} onChange={event => setLibraryName(event.target.value)} placeholder="共享库名称" />
-            <input aria-label="共享库描述" value={libraryDescription} onChange={event => setLibraryDescription(event.target.value)} placeholder="描述（可选）" />
-            <button className="wf-button ghost" aria-label="导出共享库" disabled={!!busy} onClick={() => void exportLibrary()}>{busy === 'library' ? '处理中…' : '导出共享库'}</button>
-          </div>
-          <div className="wf-template-row">
-            <select aria-label="共享库 bundle 选择" value={libraryBundleId} onChange={event => setLibraryBundleId(event.target.value)}>
-              <option value="">选择 bundle</option>
-              {libraryBundles.map(item => <option key={item.bundleId} value={item.bundleId}>{item.name} · {item.bundleId.slice(0, 12)}…</option>)}
-            </select>
-            <select aria-label="共享库导入策略" value={libraryPolicy} onChange={event => setLibraryPolicy(event.target.value as 'reject' | 'clone')}>
-              <option value="reject">reject · 冲突即失败</option>
-              <option value="clone">clone · 生成新 ID</option>
-            </select>
-            <button className="wf-button primary" aria-label="导入共享库" disabled={!libraryBundleId || !!busy} onClick={() => void importLibraryBundle()}>{busy === 'library' ? '处理中…' : '导入共享库'}</button>
-          </div>
-          {libraryStatus && <div className="wf-summary" role="status"><strong>{libraryStatus}</strong><span>{libraryBundles.length} 个本地 bundle</span></div>}
-          {libraryBundles.length > 0 && <table className="wf-table" aria-label="共享库列表">
-            <thead><tr><th>Bundle</th><th>内容</th><th>创建时间</th></tr></thead>
-            <tbody>
-              {libraryBundles.slice(0, 8).map(item => <tr key={item.bundleId}>
-                <td><code>{item.bundleId}</code><div className="wf-muted">{item.name}</div></td>
-                <td>{item.moduleCount} 模块修订 · {item.definitionCount} 定义 · {item.templateCount} 模板 · {item.experimentTemplateCount} 实验模板</td>
-                <td>{item.createdAt}</td>
-              </tr>)}
-            </tbody>
-          </table>}
-          <details className="spx-advanced">
-            <summary>高级：粘贴 bundle JSON</summary>
-            <div className="spx-advanced-body">
-              <textarea aria-label="共享库 JSON" value={libraryBundleJson} onChange={event => setLibraryBundleJson(event.target.value)} placeholder="粘贴 bundle JSON 以便跨机器交换" />
-              <div className="wf-template-row">
-                <button className="wf-button ghost" aria-label="从 JSON 导入共享库" disabled={!libraryBundleJson.trim() || !!busy} onClick={() => void importLibraryJson()}>{busy === 'library' ? '处理中…' : '从 JSON 导入'}</button>
-                <span className="wf-muted">bundleId 由内容 hash 生成；reject 保留原 ID，clone 为定义/模板/实验生成新 ID。</span>
-              </div>
-            </div>
-          </details>
-          {libraryResult && <div className="wf-summary" aria-label="共享库导入结果">
-            <strong>{libraryResult.bundleId}</strong>
-            <span>定义: {libraryResult.definitionIds.join(', ') || '—'}</span>
-            <span>模板: {libraryResult.templateIds.join(', ') || '—'}</span>
-            <span>实验: {libraryResult.experimentIds.join(', ') || '—'}</span>
-            {libraryResult.renames.length > 0 && <span>新 ID: {libraryResult.renames.map(item => `${item.previousId} → ${item.importedId}`).join(' · ')}</span>}
-            {libraryResult.skipped.length > 0 && <span>跳过: {libraryResult.skipped.join(' · ')}</span>}
-            {libraryResult.conflicts.length > 0 && <span>冲突: {libraryResult.conflicts.join(' · ')}</span>}
-          </div>}
         </section>
 
         <section className={`wf-card wf-run ${zone === 'run' ? '' : 'wf-hidden'}`}>
-          <div className="wf-card-head"><span>03</span><h2>运行 / 测量</h2></div>
-          {!segment && <div className="wf-empty">创建 Route 后可执行 Segment。</div>}
+          <div className="wf-card-head"><span>03</span><h2>运行与测量</h2></div>
+          {!route && <div className="wf-empty">在 02 编译流程并创建 Route 后，这里执行 Segment 与测量。</div>}
+          {route && <div className="wf-summary success">
+            <strong>Route 已创建</strong>
+            <span>{route.route.name} · {route.segments.length} Segment · {route.stepOrder.length} Step</span>
+            {routeStale && <span className="wf-rerun">流程已变更，现有 Segment 待重跑</span>}
+          </div>}
           {segment && <>
-            <div className="wf-status-row"><span className={`wf-status ${segment.status}`}>{segment.status}</span><code>{segment.runId ?? 'no run yet'}</code></div>
+            <div className="wf-status-row">
+              <span className={`wf-status ${segment.status}`}>{statusLabel(segment.status)}</span>
+              <code>{segment.runId ?? '尚未运行'}</code>
+            </div>
             {route && <div className="wf-route-tree">
               {route.attempts.map(attempt => <div key={attempt.attemptId} className="wf-attempt">
-                <div className="wf-attempt-title"><strong>{attempt.attemptId.slice(0, 10)}…</strong><span>{attempt.status}</span></div>
-                {route.reuse.filter(item => item.attemptId === attempt.attemptId).map(item => <div key={item.reuseId} className="wf-segment-row"><span className="wf-status verified">reuse</span><code>{item.reusedFromSegmentId.slice(0, 8)} · {item.fromStepId.slice(0, 6)} → {item.toStepId.slice(0, 6)}</code></div>)}
-                {route.segments.filter(item => item.attemptId === attempt.attemptId).map(item => <div key={item.segmentId} className="wf-segment-row"><span className={`wf-status ${item.status}`}>{item.status}</span><code>{item.startAfterStepId ? 'after ' + item.startAfterStepId.slice(0, 8) : 'start'} → {item.throughStepId.slice(0, 8)}</code>{item.status === 'planned' && <span className="wf-stale">待重跑</span>}</div>)}
+                <div className="wf-attempt-title"><strong>{attempt.attemptId.slice(0, 10)}…</strong><span>{attempt.status === 'planned' ? '尝试' : statusLabel(attempt.status)}</span></div>
+                {route.reuse.filter(item => item.attemptId === attempt.attemptId).map(item => <div key={item.reuseId} className="wf-segment-row"><span className="wf-status verified">复用</span><code>{item.reusedFromSegmentId.slice(0, 8)} · {item.fromStepId.slice(0, 6)} → {item.toStepId.slice(0, 6)}</code></div>)}
+                {route.segments.filter(item => item.attemptId === attempt.attemptId).map(item => <div key={item.segmentId} className="wf-segment-row">
+                  <span className={`wf-status ${item.status}`}>{statusLabel(item.status)}</span>
+                  <code>{item.startAfterStepId ? 'after ' + item.startAfterStepId.slice(0, 8) : 'start'} → {item.throughStepId.slice(0, 8)}</code>
+                  {item.status === 'planned' && !routeStale && <span className="wf-muted">待执行</span>}
+                  {(item.status === 'planned' && routeStale) || (item.status === 'succeeded' && routeStale) ? <span className="wf-rerun">待重跑</span> : null}
+                </div>)}
               </div>)}
             </div>}
-            <div className="wf-muted">steps {segment.startAfterStepId ?? 'start'} → {segment.throughStepId}</div>
-            <button className="wf-button primary" disabled={!canRun} onClick={() => void execute()}>
-              {busy === 'execute' ? '启动中…' : '执行 Segment'}
-            </button>
-            <button className="wf-button ghost" disabled={!route || !!busy} onClick={() => void executeAll()}>执行全部 Segment</button>
-            <div className="wf-branch-row">
-              <input aria-label="尾步时长" value={branchDuration} onChange={event => setBranchDuration(event.target.value)} />
-              <button className="wf-button ghost" disabled={!route || !!busy} onClick={() => void branchLastStep()}>修改尾步并分支</button>
-            </div>
-            <div className="wf-decision">
-              <div className="wf-recipe-title">测量驱动分支</div>
-              <select
-                aria-label="决策前缀 Segment"
-                value={decisionPrefixId}
-                onChange={event => setDecisionPrefixId(event.target.value)}
-                disabled={!branchablePrefixes.length}
-              >
-                {!branchablePrefixes.length && <option value="">无可用前缀（先执行保留后续步骤的 Segment）</option>}
-                {branchablePrefixes.map(item => (
-                  <option key={item.segmentId} value={item.throughStepId}>
-                    {item.segmentId.slice(0, 12)} · through {authoredByCompiled.get(item.throughStepId) ?? item.throughStepId.slice(0, 10)}
-                  </option>
-                ))}
-              </select>
-              <select
-                aria-label="决策分支止于"
-                value={decisionThroughId}
-                onChange={event => setDecisionThroughId(event.target.value)}
-                disabled={!decisionSuffix.length}
-              >
-                {!decisionSuffix.length && <option value="">无后续步骤</option>}
-                {decisionSuffix.map(stepId => (
-                  <option key={stepId} value={stepId}>{authoredByCompiled.get(stepId) ?? stepId.slice(0, 10)}</option>
-                ))}
-              </select>
-              <div className="wf-muted">
-                可用前缀：{branchablePrefixes.length ? branchablePrefixes.map(item => authoredByCompiled.get(item.throughStepId) ?? item.throughStepId.slice(0, 10)).join(' / ') : '无（先执行前缀 Segment）'}
-                {' · '}当前 recipe：{activeRecipeId ? `${activeRecipeId} v${activeRecipeVersion}` : '未固定（将按上方配方创建）'}
-              </div>
-              <div className="wf-decision-row">
-                <select aria-label="决策比较符" value={decisionOperator} onChange={event => setDecisionOperator(event.target.value as typeof decisionOperator)}>
-                  <option value="gt">&gt;</option>
-                  <option value="gte">≥</option>
-                  <option value="lt">&lt;</option>
-                  <option value="lte">≤</option>
-                  <option value="eq">=</option>
-                </select>
-                <input aria-label="决策阈值" value={decisionThreshold} onChange={event => setDecisionThreshold(event.target.value)} placeholder="threshold" />
-              </div>
-              <textarea aria-label="true 分支参数 JSON" value={decisionTrueParameters} onChange={event => setDecisionTrueParameters(event.target.value)} placeholder='true 分支：{"step_02":{"duration":0.02}}' />
-              <textarea aria-label="false 分支参数 JSON" value={decisionFalseParameters} onChange={event => setDecisionFalseParameters(event.target.value)} placeholder='false 分支：{"step_02":{"duration":0.05}}' />
-              <button className="wf-button primary" aria-label="测量并生成分支" disabled={!route || !branchablePrefixes.length || !decisionThroughId || !!busy} onClick={() => void decideMeasurementBranch()}>
-                {busy === 'decision' ? '测量并决策中…' : '测量并生成分支'}
+            <div className="spx-run-actions">
+              <button className="wf-button primary" disabled={!canRun} onClick={() => void execute()}>
+                {busy === 'execute' ? '启动中…' : '执行当前 Segment'}
               </button>
-              <div className="wf-muted">决策只改动「分支止于」之前的步骤；止于中间步骤时，可在其运行结束后继续测量决策，形成同一 workflow run 的序列。</div>
+              <button className="wf-button" disabled={!route || !!busy} onClick={() => void executeAll()}>执行全部 Segment</button>
+              <button className="wf-button" disabled={!canMeasure} onClick={() => void measure()}>
+                {busy === 'measure' ? '测量中…' : '测量'}
+              </button>
             </div>
-            {decisions.length > 0 && <div className="wf-muted">
-              工作流 run：{Array.from(new Set(decisions.map(item => item.workflowRunId))).map(runId => {
-                const rows = decisions.filter(item => item.workflowRunId === runId);
-                return `${runId}（${rows.length} 决策 / ${rows.filter(item => item.replayOf).length} 重放）`;
-              }).join('；')}
-            </div>}
-            {decisions.length > 0 && <table className="wf-table" aria-label="测量决策列表">
-              <thead><tr><th>测量</th><th>条件</th><th>结果</th><th>分支 / 解析参数</th><th>Workflow run</th><th /></tr></thead>
-              <tbody>{decisions.map(item => <tr key={item.decisionId}>
-                <td>{item.measuredValue.toFixed(4)} {item.unit}<br /><code className="wf-mono">{item.measurementId.slice(0, 12)}</code><br /><span className="wf-muted">binding {item.measurementBindingStatus}</span></td>
-                <td><code className="wf-mono">{item.operator} {item.threshold}</code><br /><span className="wf-muted">{item.recipeId} v{item.recipeVersion}</span></td>
-                <td><span className={`wf-status ${item.result ? 'succeeded' : 'failed'}`}>{item.result ? 'true' : 'false'}</span><br />{item.chosenBranch}</td>
-                <td><code className="wf-mono">{JSON.stringify(item.resolvedParameters)}</code><br /><span className="wf-muted">止于 {authoredByCompiled.get(item.branchThroughStepId ?? '') ?? item.branchThroughStepId?.slice(0, 10) ?? '—'}</span>{item.replayOf && <><br /><span className="wf-muted">replay of {item.replayOf.slice(0, 12)}</span></>}</td>
-                <td><code className="wf-mono">{item.workflowRunId}</code><br /><span className="wf-muted">{item.targetCompileId.slice(0, 12)}</span></td>
-                <td><button className="wf-link" aria-label={`重放决策 ${item.decisionId}`} disabled={!!busy} onClick={() => void replayDecision(item)}>重放决策</button></td>
-              </tr>)}</tbody>
-            </table>}
-            {segment.status === 'running' && <div className="wf-progress"><i /></div>}
-            <div className="wf-recipe">
+            <div className="wf-recipe spx-recipe-inline">
               <div className="wf-recipe-title">测量配方</div>
-              <select value={recipeMethod} onChange={event => setRecipeMethod(event.target.value as typeof recipeMethod)}>
+              <select aria-label="测量方法" value={recipeMethod} onChange={event => setRecipeMethod(event.target.value as typeof recipeMethod)}>
                 <option value="etch_depth">深度</option>
                 <option value="cd_at_height">指定高度 CD</option>
               </select>
@@ -1976,48 +2763,120 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                   <input aria-label="参考高度" value={recipeRef} onChange={event => setRecipeRef(event.target.value)} placeholder="参考高度 µm" />
                 </>}
             </div>
-            <button className="wf-button ghost" disabled={!canMeasure} onClick={() => void measure()}>
-              {busy === 'measure' ? '测量中…' : '按配方测量并绑定'}
-            </button>
-            {segment.status === 'succeeded' && <div className="wf-muted">运行完成后可测量；2D 支持 CD/深度，3D 支持材料顶高深度。</div>}
+            {segment.status === 'running' && <div className="wf-progress"><i /></div>}
+            {measurement && <div className="wf-summary">
+              <strong>测量 · {statusLabel(measurement.status)}</strong>
+              <span>{measurement.value === null ? measurement.reason ?? '无值' : `${measurement.value.toFixed(4)} ${measurement.unit}`}</span>
+              <span>binding: {measurement.bindingStatus} · equivalence: {measurement.equivalenceStatus}</span>
+            </div>}
+            {metrics.length > 0 && <table className="wf-table"><thead><tr><th>状态</th><th>数值</th><th>配方 / 步骤</th><th>Binding</th><th /></tr></thead><tbody>{metrics.map(item => <tr key={item.measurementId}><td>{statusLabel(item.status)}</td><td>{item.value === null ? item.reason : `${item.value.toFixed(4)} ${item.unit}`}</td><td>{item.recipeId} v{item.recipeVersion} · {item.method} · {item.material} · {item.sourceStepId?.slice(0, 8)}</td><td>{item.bindingStatus} / {item.equivalenceStatus}</td><td><button className="wf-link" aria-label={`查看 ${item.measurementId} 证据`} onClick={() => void showMetricDetail(item)}>详情</button></td></tr>)}</tbody></table>}
+            {metricDetail && <div className="wf-evidence">
+              <div className="wf-evidence-head"><strong>{metricDetail.measurement.measurementId}</strong><span className={`wf-status ${metricDetail.measurement.status}`}>{statusLabel(metricDetail.measurement.status)}</span></div>
+              <div className="wf-evidence-grid">
+                <span>方法</span><code>{metricDetail.recipe.method}</code>
+                <span>材料</span><code>{metricDetail.recipe.material}</code>
+                <span>配方</span><code>{metricDetail.recipe.recipeId} v{metricDetail.recipe.version}</code>
+                <span>参数</span><code>{JSON.stringify(metricDetail.recipe.parameters)}</code>
+                <span>快照</span><code>{metricDetail.measurement.sourceSnapshotHash.slice(0, 16)}…</code>
+                <span>交点</span><code>{metricDetail.measurement.intersections.join(', ') || '—'}</code>
+                <span>不确定度</span><code>{metricDetail.measurement.uncertainty ?? '—'} ({metricDetail.measurement.uncertaintyStatus})</code>
+                <span>Binding</span><code>{metricDetail.measurement.bindingStatus}{metricDetail.measurement.bindingEvidence ? ` · ${metricDetail.measurement.bindingEvidence.methodVersion}` : ''}</code>
+                <span>等价性</span><code>{metricDetail.measurement.equivalenceStatus}</code>
+                <span>证据记录</span><code>{metricDetail.provenance.verifications.map(row => `${row.status}/${row.evidence.methodVersion}`).join(', ') || '—'}</code>
+              </div>
+            </div>}
+            {provenance && <div className="wf-provenance">
+              <div className="wf-muted">验证记录: {provenance.verifications.length}</div>
+              {provenance.verifications.map(item => <div className="wf-verify" key={item.verificationId}><span className={`wf-status ${item.status}`}>{statusLabel(item.status)}</span><code>{item.verificationId.slice(0, 10)}…</code><span>{item.evidence.methodVersion}</span></div>)}
+            </div>}
+
+            <details className="spx-advanced">
+              <summary>高级：分支与测量决策</summary>
+              <div className="spx-advanced-body">
+                <div className="wf-branch-row">
+                  <input aria-label="尾步时长" value={branchDuration} onChange={event => setBranchDuration(event.target.value)} />
+                  <button className="wf-button ghost" disabled={!route || !!busy} onClick={() => void branchLastStep()}>修改尾步并分支</button>
+                </div>
+                <div className="wf-decision">
+                  <div className="wf-recipe-title">测量驱动分支</div>
+                  <select
+                    aria-label="决策前缀 Segment"
+                    value={decisionPrefixId}
+                    onChange={event => setDecisionPrefixId(event.target.value)}
+                    disabled={!branchablePrefixes.length}
+                  >
+                    {!branchablePrefixes.length && <option value="">无可用前缀（先执行保留后续步骤的 Segment）</option>}
+                    {branchablePrefixes.map(item => (
+                      <option key={item.segmentId} value={item.throughStepId}>
+                        {item.segmentId.slice(0, 12)} · through {authoredByCompiled.get(item.throughStepId) ?? item.throughStepId.slice(0, 10)}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    aria-label="决策分支止于"
+                    value={decisionThroughId}
+                    onChange={event => setDecisionThroughId(event.target.value)}
+                    disabled={!decisionSuffix.length}
+                  >
+                    {!decisionSuffix.length && <option value="">无后续步骤</option>}
+                    {decisionSuffix.map(stepId => (
+                      <option key={stepId} value={stepId}>{authoredByCompiled.get(stepId) ?? stepId.slice(0, 10)}</option>
+                    ))}
+                  </select>
+                  <div className="wf-muted">
+                    可用前缀：{branchablePrefixes.length ? branchablePrefixes.map(item => authoredByCompiled.get(item.throughStepId) ?? item.throughStepId.slice(0, 10)).join(' / ') : '无（先执行前缀 Segment）'}
+                    {' · '}当前配方：{activeRecipeId ? `${activeRecipeId} v${activeRecipeVersion}` : '未固定（将按上方配方创建）'}
+                  </div>
+                  <div className="wf-decision-row">
+                    <select aria-label="决策比较符" value={decisionOperator} onChange={event => setDecisionOperator(event.target.value as typeof decisionOperator)}>
+                      <option value="gt">&gt;</option>
+                      <option value="gte">≥</option>
+                      <option value="lt">&lt;</option>
+                      <option value="lte">≤</option>
+                      <option value="eq">=</option>
+                    </select>
+                    <input aria-label="决策阈值" value={decisionThreshold} onChange={event => setDecisionThreshold(event.target.value)} placeholder="threshold" />
+                  </div>
+                  <textarea aria-label="true 分支参数 JSON" value={decisionTrueParameters} onChange={event => setDecisionTrueParameters(event.target.value)} placeholder='true 分支：{"step_02":{"duration":0.02}}' />
+                  <textarea aria-label="false 分支参数 JSON" value={decisionFalseParameters} onChange={event => setDecisionFalseParameters(event.target.value)} placeholder='false 分支：{"step_02":{"duration":0.05}}' />
+                  <button className="wf-button primary" aria-label="测量并生成分支" disabled={!route || !branchablePrefixes.length || !decisionThroughId || !!busy} onClick={() => void decideMeasurementBranch()}>
+                    {busy === 'decision' ? '测量并决策中…' : '测量并生成分支'}
+                  </button>
+                  <div className="wf-muted">决策只改动「分支止于」之前的步骤；止于中间步骤时，可在其运行结束后继续测量决策，形成同一 workflow run 的序列。</div>
+                </div>
+                {decisions.length > 0 && <div className="wf-muted">
+                  工作流 run：{Array.from(new Set(decisions.map(item => item.workflowRunId))).map(runId => {
+                    const rows = decisions.filter(item => item.workflowRunId === runId);
+                    return `${runId}（${rows.length} 决策 / ${rows.filter(item => item.replayOf).length} 重放）`;
+                  }).join('；')}
+                </div>}
+                {decisions.length > 0 && <table className="wf-table" aria-label="测量决策列表">
+                  <thead><tr><th>测量</th><th>条件</th><th>结果</th><th>分支 / 解析参数</th><th>Workflow run</th><th /></tr></thead>
+                  <tbody>{decisions.map(item => <tr key={item.decisionId}>
+                    <td>{item.measuredValue.toFixed(4)} {item.unit}<br /><code className="wf-mono">{item.measurementId.slice(0, 12)}</code><br /><span className="wf-muted">binding {item.measurementBindingStatus}</span></td>
+                    <td><code className="wf-mono">{item.operator} {item.threshold}</code><br /><span className="wf-muted">{item.recipeId} v{item.recipeVersion}</span></td>
+                    <td><span className={`wf-status ${item.result ? 'succeeded' : 'failed'}`}>{item.result ? 'true' : 'false'}</span><br />{item.chosenBranch}</td>
+                    <td><code className="wf-mono">{JSON.stringify(item.resolvedParameters)}</code><br /><span className="wf-muted">止于 {authoredByCompiled.get(item.branchThroughStepId ?? '') ?? item.branchThroughStepId?.slice(0, 10) ?? '—'}</span>{item.replayOf && <><br /><span className="wf-muted">replay of {item.replayOf.slice(0, 12)}</span></>}</td>
+                    <td><code className="wf-mono">{item.workflowRunId}</code><br /><span className="wf-muted">{item.targetCompileId.slice(0, 12)}</span></td>
+                    <td><button className="wf-link" aria-label={`重放决策 ${item.decisionId}`} disabled={!!busy} onClick={() => void replayDecision(item)}>重放决策</button></td>
+                  </tr>)}</tbody>
+                </table>}
+              </div>
+            </details>
           </>}
-          {measurement && <div className="wf-summary">
-            <strong>Measurement · {measurement.status}</strong>
-            <span>{measurement.value === null ? measurement.reason ?? '无值' : `${measurement.value.toFixed(4)} ${measurement.unit}`}</span>
-            <span>binding: {measurement.bindingStatus} · equivalence: {measurement.equivalenceStatus}</span>
-          </div>}
-          {metrics.length > 0 && <table className="wf-table"><thead><tr><th>Status</th><th>Value</th><th>Recipe / Step</th><th>Binding</th><th /></tr></thead><tbody>{metrics.map(item => <tr key={item.measurementId}><td>{item.status}</td><td>{item.value === null ? item.reason : `${item.value.toFixed(4)} ${item.unit}`}</td><td>{item.recipeId} v{item.recipeVersion} · {item.method} · {item.material} · {item.sourceStepId?.slice(0, 8)}</td><td>{item.bindingStatus} / {item.equivalenceStatus}</td><td><button className="wf-link" aria-label={`查看 ${item.measurementId} 证据`} onClick={() => void showMetricDetail(item)}>详情</button></td></tr>)}</tbody></table>}
-          {metricDetail && <div className="wf-evidence">
-            <div className="wf-evidence-head"><strong>{metricDetail.measurement.measurementId}</strong><span className={`wf-status ${metricDetail.measurement.status}`}>{metricDetail.measurement.status}</span></div>
-            <div className="wf-evidence-grid">
-              <span>method</span><code>{metricDetail.recipe.method}</code>
-              <span>material</span><code>{metricDetail.recipe.material}</code>
-              <span>recipe</span><code>{metricDetail.recipe.recipeId} v{metricDetail.recipe.version}</code>
-              <span>parameters</span><code>{JSON.stringify(metricDetail.recipe.parameters)}</code>
-              <span>snapshot</span><code>{metricDetail.measurement.sourceSnapshotHash.slice(0, 16)}…</code>
-              <span>intersections</span><code>{metricDetail.measurement.intersections.join(', ') || '—'}</code>
-              <span>uncertainty</span><code>{metricDetail.measurement.uncertainty ?? '—'} ({metricDetail.measurement.uncertaintyStatus})</code>
-              <span>binding</span><code>{metricDetail.measurement.bindingStatus}{metricDetail.measurement.bindingEvidence ? ` · ${metricDetail.measurement.bindingEvidence.methodVersion}` : ''}</code>
-              <span>equivalence</span><code>{metricDetail.measurement.equivalenceStatus}</code>
-              <span>evidence records</span><code>{metricDetail.provenance.verifications.map(row => `${row.status}/${row.evidence.methodVersion}`).join(', ') || '—'}</code>
-            </div>
-          </div>}
-          {provenance && <div className="wf-provenance">
-            <div className="wf-muted">verification records: {provenance.verifications.length}</div>
-            {provenance.verifications.map(item => <div className="wf-verify" key={item.verificationId}><span className={`wf-status ${item.status}`}>{item.status}</span><code>{item.verificationId.slice(0, 10)}…</code><span>{item.evidence.methodVersion}</span></div>)}
-          </div>}
         </section>
+
         {zone === 'experiment' && <section className="wf-card wf-wide">
-          <div className="wf-card-head"><span>04</span><h2>Experiment</h2></div>
-          <p className="wf-muted">P1 手工实验：保存 10 个可分别设置尾步时长的 Variant，可设重复数与种子，串行执行并使用当前配方测量。</p>
+          <div className="wf-card-head"><span>04</span><h2>实验设计</h2></div>
+          <p className="wf-muted">保存 10 个可分别设置变体参数的实验，可设重复数与种子，串行执行并使用当前配方测量。</p>
           <button className="wf-button primary" disabled={!compile || !activeRecipeId || !!busy} onClick={() => void createPersistentExperiment()}>创建 10 变体实验</button>
           <button className="wf-button ghost" disabled={!experimentDoc || !!busy} onClick={() => void runPersistentExperiment()}>{busy === 'experiment' ? '实验运行中…' : '运行持久化实验'}</button>
-          <table className="wf-table"><thead><tr><th>#</th><th>Duration</th><th>Reps</th><th>Seed</th></tr></thead><tbody>{experimentRows.map((row, index) => <tr key={index}><td>{index + 1}</td><td><input aria-label={`变体 ${index + 1} duration`} value={row.duration} onChange={event => setExperimentRows(previous => previous.map((item, itemIndex) => itemIndex === index ? { ...item, duration: event.target.value } : item))} /></td><td><input aria-label={`变体 ${index + 1} replicates`} type="number" min={1} max={8} value={row.replicates} onChange={event => setExperimentRows(previous => previous.map((item, itemIndex) => itemIndex === index ? { ...item, replicates: Number(event.target.value) || 1 } : item))} /></td><td><input aria-label={`变体 ${index + 1} seed`} type="number" value={row.seed} onChange={event => setExperimentRows(previous => previous.map((item, itemIndex) => itemIndex === index ? { ...item, seed: Number(event.target.value) || 0 } : item))} /></td></tr>)}</tbody></table>
-          {experimentDoc && <div className="wf-muted">Experiment status: {experimentDoc.status}{experimentDoc.kind === 'doe' ? ' · DOE' : ''}</div>}
-          {experimentDoc?.queue && <div className="wf-summary"><strong>Queue</strong><span>{experimentDoc.queue.succeeded}/{experimentDoc.queue.total} succeeded · pending {experimentDoc.queue.pending} · running {experimentDoc.queue.running}</span><span>ETA {experimentDoc.queue.estimatedSecondsRemaining}s</span><span>cost ${experimentDoc.queue.estimatedCostUsd.toFixed(4)}</span><span>retries {experimentDoc.queue.retries}</span></div>}
-          {experimentDoc && <table className="wf-table"><thead><tr><th>#</th><th>Status</th><th>Value</th><th>Run</th></tr></thead><tbody>{experimentDoc.variants.map(variant => <tr key={variant.ordinal}><td>{variant.ordinal}</td><td>{variant.replicates[0]?.status}</td><td>{variant.replicates[0]?.value ?? '—'} {variant.replicates[0]?.unit ?? ''}</td><td><code>{variant.replicates[0]?.runId?.slice(0, 8) ?? '—'}</code></td></tr>)}</tbody></table>}
+          <table className="wf-table"><thead><tr><th>#</th><th>时长</th><th>重复</th><th>Seed</th></tr></thead><tbody>{experimentRows.map((row, index) => <tr key={index}><td>{index + 1}</td><td><input aria-label={`变体 ${index + 1} duration`} value={row.duration} onChange={event => setExperimentRows(previous => previous.map((item, itemIndex) => itemIndex === index ? { ...item, duration: event.target.value } : item))} /></td><td><input aria-label={`变体 ${index + 1} replicates`} type="number" min={1} max={8} value={row.replicates} onChange={event => setExperimentRows(previous => previous.map((item, itemIndex) => itemIndex === index ? { ...item, replicates: Number(event.target.value) || 1 } : item))} /></td><td><input aria-label={`变体 ${index + 1} seed`} type="number" value={row.seed} onChange={event => setExperimentRows(previous => previous.map((item, itemIndex) => itemIndex === index ? { ...item, seed: Number(event.target.value) || 0 } : item))} /></td></tr>)}</tbody></table>
+          {experimentDoc && <div className="wf-muted">实验状态：{statusLabel(experimentDoc.status)}{experimentDoc.kind === 'doe' ? ' · DOE' : ''}</div>}
+          {experimentDoc?.queue && <div className="wf-summary"><strong>队列</strong><span>{experimentDoc.queue.succeeded}/{experimentDoc.queue.total} 已成功 · 待处理 {experimentDoc.queue.pending} · 运行中 {experimentDoc.queue.running}</span><span>预计剩余 {experimentDoc.queue.estimatedSecondsRemaining}s</span><span>成本 ${experimentDoc.queue.estimatedCostUsd.toFixed(4)}</span><span>重试 {experimentDoc.queue.retries}</span></div>}
+          {experimentDoc && <table className="wf-table"><thead><tr><th>#</th><th>状态</th><th>数值</th><th>Run</th></tr></thead><tbody>{experimentDoc.variants.map(variant => <tr key={variant.ordinal}><td>{variant.ordinal}</td><td>{variant.replicates[0]?.status}</td><td>{variant.replicates[0]?.value ?? '—'} {variant.replicates[0]?.unit ?? ''}</td><td><code>{variant.replicates[0]?.runId?.slice(0, 8) ?? '—'}</code></td></tr>)}</tbody></table>}
           <div className="wf-card-subhead">DOE 全因子</div>
-          {(project?.steps ?? []).filter(step => step.enabled).length === 0 && <div className="wf-muted">导入并采纳工程后可配置因子。</div>}
+          {(project?.steps ?? []).filter(step => step.enabled).length === 0 && <div className="wf-muted">先在 02 编译流程后可配置因子。</div>}
           {doeFactors.map((row, index) => <div className="wf-doe-row" key={index}>
             <select aria-label={`因子 ${index + 1} 步骤`} value={row.stepId} onChange={event => setDoeFactors(previous => previous.map((item, itemIndex) => itemIndex === index ? { ...item, stepId: event.target.value } : item))}>
               <option value="">步骤</option>
@@ -2049,18 +2908,22 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             <button className="wf-button ghost" disabled={!!busy} onClick={() => void loadExperimentTable()}>筛选 / 排序</button>
             <a className="wf-button ghost" href={`/api/v1/workflow/experiments/${experimentDoc.experimentId}/export.csv`} download>导出 CSV</a>
           </div>}
-          {experimentTable && <table className="wf-table"><thead><tr><th>#</th><th>n</th><th>Mean</th><th>Std</th><th>CI95</th><th>Status</th></tr></thead><tbody>{experimentTable.rows.map(row => <tr key={row.ordinal}><td>{row.ordinal}</td><td>{row.n}</td><td>{row.mean === null ? '—' : row.mean.toFixed(6)}</td><td>{row.std === null ? '—' : row.std.toFixed(6)}</td><td>{row.ci95 === null ? '—' : row.ci95.toFixed(6)}</td><td>{row.statisticalStatus}</td></tr>)}</tbody></table>}
-          {experimentDoc && <div className="wf-card-subhead">保留策略</div>}
-          {experimentDoc && <div className="wf-template-row">
-            <button className="wf-button ghost" disabled={!!busy} onClick={() => void previewRetention()}>预览释放</button>
-            <button className="wf-button ghost" disabled={!!busy} onClick={() => void applyRetention('release-runs')}>应用 release-runs</button>
-            <button className="wf-button ghost" disabled={!!busy} onClick={() => void applyRetention('keep-all')}>恢复 keep-all</button>
-            <span className="wf-muted">当前 {experimentDoc.retention?.mode ?? 'keep-all'}</span>
-          </div>}
-          {retentionInfo && <div className="wf-summary"><strong>Retention</strong><span>可释放 {retentionInfo.releasable.length} run</span><span>受保护 {retentionInfo.protected.length} run</span></div>}
+          {experimentTable && <table className="wf-table"><thead><tr><th>#</th><th>n</th><th>均值</th><th>标准差</th><th>CI95</th><th>状态</th></tr></thead><tbody>{experimentTable.rows.map(row => <tr key={row.ordinal}><td>{row.ordinal}</td><td>{row.n}</td><td>{row.mean === null ? '—' : row.mean.toFixed(6)}</td><td>{row.std === null ? '—' : row.std.toFixed(6)}</td><td>{row.ci95 === null ? '—' : row.ci95.toFixed(6)}</td><td>{row.statisticalStatus}</td></tr>)}</tbody></table>}
+          {experimentDoc && <details className="spx-advanced">
+            <summary>高级：保留策略</summary>
+            <div className="spx-advanced-body">
+              <div className="wf-template-row">
+                <button className="wf-button ghost" disabled={!!busy} onClick={() => void previewRetention()}>预览释放</button>
+                <button className="wf-button ghost" disabled={!!busy} onClick={() => void applyRetention('release-runs')}>应用 release-runs</button>
+                <button className="wf-button ghost" disabled={!!busy} onClick={() => void applyRetention('keep-all')}>恢复 keep-all</button>
+                <span className="wf-muted">当前 {experimentDoc.retention?.mode ?? 'keep-all'}</span>
+              </div>
+              {retentionInfo && <div className="wf-summary"><strong>Retention</strong><span>可释放 {retentionInfo.releasable.length} run</span><span>受保护 {retentionInfo.protected.length} run</span></div>}
+            </div>
+          </details>}
         </section>}
         {zone === 'analyze' && <section className="wf-card wf-wide">
-          <div className="wf-card-head"><span>05</span><h2>Analyze</h2></div>
+          <div className="wf-card-head"><span>05</span><h2>分析</h2></div>
           <p className="wf-muted">候选快照对比、结构 diff、process window 与基础标定；数值等价独立于绑定状态。</p>
           {measurement ? <div className="wf-summary"><strong>{measurement.status}</strong><span>{measurement.value === null ? measurement.reason : `${measurement.value.toFixed(4)} ${measurement.unit}`}</span><span>binding {measurement.bindingStatus} · equivalence {measurement.equivalenceStatus}</span></div> : <div className="wf-empty">完成一次运行与测量后显示指标。</div>}
           <div className="wf-card-subhead">候选 / 多视图</div>
@@ -2139,7 +3002,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
           </>}
         </section>}
         {zone === 'report' && <section className="wf-card wf-wide">
-          <div className="wf-card-head"><span>06</span><h2>Report</h2></div>
+          <div className="wf-card-head"><span>06</span><h2>报告</h2></div>
           <p className="wf-muted">服务端 HTML 报告包含 Flow/Compile、Clip、变量、引擎版本、种子、指标、视图、process window 与结论；浏览器打印可保存 PDF。</p>
           <div className="wf-template-row">
             <input aria-label="报告标题" value={reportTitle} onChange={event => setReportTitle(event.target.value)} />
@@ -2149,28 +3012,48 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
           </div>
           <textarea aria-label="报告结论" value={reportConclusions} onChange={event => setReportConclusions(event.target.value)} placeholder="结论 / 候选选择说明" />
           {reportDocument && <div className="wf-summary"><strong>{reportDocument.reportId}</strong><span>{reportDocument.createdAt}</span><span><code>{reportDocument.sha256.slice(0, 16)}…</code></span></div>}
-          <div className="wf-summary"><strong>Workflow summary</strong><span>Flow {compile?.flowId ?? '—'}</span><span>Compile {compile?.compileId ?? '—'}</span><span>Run {segment?.runId ?? '—'}</span><span>Measurement {measurement?.measurementId ?? '—'}</span><span>Binding {measurement?.bindingStatus ?? '—'}</span></div>
+          <div className="wf-summary"><strong>工作流摘要</strong><span>Flow {compile?.flowId ?? '—'}</span><span>Compile {compile?.compileId ?? '—'}</span><span>Run {segment?.runId ?? '—'}</span><span>Measurement {measurement?.measurementId ?? '—'}</span><span>Binding {measurement?.bindingStatus ?? '—'}</span></div>
         </section>}
           </main>
 
           <div className="spx-output">
-            <div className="spx-output-tabs"><span className="active">Output</span><span>Problems</span><span>Provenance</span></div>
+            <div className="spx-output-tabs">
+              {([
+                ['output', 'Output'],
+                ['problems', 'Problems'],
+                ['provenance', 'Provenance'],
+              ] as Array<[typeof outputTab, string]>).map(([id, label]) => <button
+                key={id} type="button" className={outputTab === id ? 'active' : ''}
+                onClick={() => setOutputTab(id)}
+              >{label}</button>)}
+            </div>
             <div className="spx-output-body">
-              {activityLog.length === 0 && <div className="spx-log muted">Ready. Open a project or upload a layout to begin.</div>}
-              {activityLog.slice(-8).map((line, index) => <div className="spx-log" key={`${index}-${line}`}>{line}</div>)}
-              {error && <div className="spx-log error">{error}</div>}
+              {outputTab === 'output' && <>
+                {activityLog.length === 0 && <div className="spx-log muted">就绪。新建工程或上传版图开始。</div>}
+                {activityLog.slice(-8).map((line, index) => <div className="spx-log" key={`${index}-${line}`}>{line}</div>)}
+                {error && <div className="spx-log error">{error}</div>}
+              </>}
+              {outputTab === 'problems' && (error
+                ? <div className="spx-log error">{error}</div>
+                : <div className="spx-log muted">当前没有阻塞问题。</div>)}
+              {outputTab === 'provenance' && (provenance
+                ? <>
+                  {provenance.verifications.length === 0 && <div className="spx-log muted">该测量尚无验证记录。</div>}
+                  {provenance.verifications.map(item => <div className="spx-log" key={item.verificationId}>{item.verificationId} · {statusLabel(item.status)} · {item.evidence.methodVersion} · {item.createdAt}</div>)}
+                </>
+                : <div className="spx-log muted">完成测量后显示 provenance 记录。</div>)}
             </div>
           </div>
         </section>
 
         <aside className="spx-right">
-          <div className="spx-panel-title"><span>Properties</span></div>
+          <div className="spx-panel-title"><span>属性</span></div>
           <div className="spx-props">
             {propertyRows.map(([label, value]) => <div className="spx-prop" key={label}><span>{label}</span><code>{value}</code></div>)}
           </div>
-          <div className="spx-panel-title"><span>Workflow</span></div>
+          <div className="spx-panel-title"><span>工作流</span></div>
           <div className="spx-props">
-            <div className="spx-prop"><span>Active run</span><code>{health?.activeRunId ? `${health.activeRunId.slice(0, 14)}…` : '—'}</code></div>
+            <div className="spx-prop"><span>活动运行</span><code>{health?.activeRunId ? `${health.activeRunId.slice(0, 14)}…` : '—'}</code></div>
             <div className="spx-prop"><span>ViennaPS</span><code>{health?.viennaps ?? '—'}</code></div>
             <div className="spx-prop"><span>ViennaLS</span><code>{health?.viennals ?? '—'}</code></div>
           </div>

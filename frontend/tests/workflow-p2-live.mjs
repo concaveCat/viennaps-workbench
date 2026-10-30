@@ -28,9 +28,7 @@ try {
   await page.locator('input[type=file]').nth(0).setInputFiles(layoutPath);
   await page.locator('.spx-file-name').filter({ hasText: 'two-structure-two-layer.gds' }).waitFor();
   await page.locator('input[type=file]').nth(1).setInputFiles(projectPath);
-  await page.getByRole('button', { name: '采纳为 Workflow' }).click();
-  await page.getByText('Compile 已冻结').waitFor();
-
+  await page.getByRole('button', { name: 'GDS / Layout' }).click();
   await page.getByRole('button', { name: '注册为 Layout' }).click();
   await page.getByLabel('版图结构').waitFor();
   await page.getByRole('button', { name: '预览' }).click();
@@ -75,17 +73,16 @@ try {
     const body = await response.json();
     assert.equal(body.binding.geometrySource.clipId, clips.find(item => item.name === name).clipId);
     hashes.push(body.compile.compileRecord.geometryBindingHash);
-    await page.getByText('Compile 已冻结').waitFor();
+    await page.getByText(/流程已编译/).first().waitFor();
   }
   assert.equal(new Set(hashes).size, 3, 'three clips must produce three geometry bindings');
 
   // Run the last clip compile and take a measurement so the DOE has an active recipe.
   await page.getByRole('button', { name: '02 流程' }).click();
-  await page.getByRole('button', { name: '创建首个 Route' }).click();
-  await page.getByRole('button', { name: '03 运行' }).click();
+  await page.getByRole('button', { name: '创建 Route / 去 03' }).click();
   await page.getByRole('button', { name: '执行全部 Segment' }).click();
   await page.locator('.wf-status.succeeded').first().waitFor({ timeout: 60000 });
-  await page.getByRole('button', { name: '按配方测量并绑定' }).click();
+  await page.getByRole('button', { name: '测量', exact: true }).click();
   await page.getByText(/binding: verified/).first().waitFor();
 
   await page.getByRole('button', { name: '04 实验' }).click();
@@ -97,8 +94,8 @@ try {
   await page.getByRole('button', { name: '设计 DOE' }).click();
   await page.getByText(/8 条件 × 1 重复 = 8 逻辑执行/).waitFor();
   await page.getByRole('button', { name: '运行持久化实验' }).click();
-  await page.getByText('Experiment status: completed').waitFor({ timeout: 180000 });
-  assert.match(await page.locator('.wf-summary').filter({ hasText: 'Queue' }).innerText(), /8\/8 succeeded/);
+  await page.getByText('实验状态：已完成').waitFor({ timeout: 180000 });
+  assert.match(await page.locator('.wf-summary').filter({ hasText: '队列' }).innerText(), /8\/8 已成功/);
   await page.getByRole('button', { name: '筛选 / 排序' }).click();
   await page.locator('.wf-table').last().locator('tbody tr').first().waitFor();
   assert.equal(await page.locator('.wf-table').last().locator('tbody tr').count(), 8);
@@ -106,6 +103,7 @@ try {
   assert.match(csv ?? '', /\/experiments\/exp_[a-f0-9]+\/export\.csv$/);
 
   // Retention preview/release/restore must complete without a 405 error.
+  await page.getByText('高级：保留策略').click();
   await page.getByRole('button', { name: '预览释放' }).click();
   await page.getByText(/可释放 8 run/).waitFor();
   await page.getByRole('button', { name: '应用 release-runs' }).click();

@@ -79,12 +79,12 @@ export const SAMPLE_2D_TRENCH: Record<string, unknown> = {
   "steps": [
     {
       "id": "fixture_step_01",
-      "name": "no-op",
+      "name": "etch",
       "enabled": true,
       "operation": "etch",
       "model": "isotropic",
-      "rateMagnitude": 0.0,
-      "duration": 0.01,
+      "rateMagnitude": 0.02,
+      "duration": 0.02,
       "rateMode": "uniform"
     }
   ],

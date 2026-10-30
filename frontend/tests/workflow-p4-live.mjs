@@ -50,6 +50,12 @@ const definitionJson = JSON.stringify({
   },
 }, null, 2);
 
+const getJson = async endpoint => {
+  const response = await fetch(`${baseUrl}${endpoint}`);
+  assert.ok(response.ok, `${endpoint} -> ${response.status}`);
+  return response.json();
+};
+
 const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
 const page = await browser.newPage({ viewport: { width: 1600, height: 1500 } });
 page.setDefaultTimeout(60000);
@@ -60,11 +66,11 @@ try {
   await page.goto(`${baseUrl}/`);
   await page.getByText('ViennaPS Workbench').first().waitFor();
   await page.locator('input[type=file]').nth(1).setInputFiles(projectPath);
-  await page.getByRole('button', { name: '采纳为 Workflow' }).click();
-  await page.getByText('Compile 已冻结').waitFor();
+  await page.getByRole('button', { name: '去 02 定义流程' }).click();
+  await page.getByRole('button', { name: '编译流程' }).click();
+  await page.getByText(/编译成功/).waitFor();
 
   // P4-1: module + definition + loop expansion + compile.
-  await page.getByRole('button', { name: '02 流程' }).click();
   await page.getByText('高级：模块化流程定义（JSON）').click();
   await page.getByLabel('模块 JSON').fill(moduleJson);
   await page.getByRole('button', { name: '保存模块' }).click();
@@ -77,19 +83,19 @@ try {
   await page.getByText(/模块化流程已编译 · 4 步/).waitFor();
 
   // P4-2: split route, execute prefix, measure, decide, execute branch, replay.
-  await page.getByRole('button', { name: '创建首个 Route' }).click();
-  await page.getByRole('button', { name: '03 运行' }).click();
-  await page.getByRole('button', { name: '执行 Segment' }).click();
+  await page.getByRole('button', { name: '创建 Route / 去 03' }).click();
+  await page.getByRole('button', { name: '执行当前 Segment' }).click();
   await page.locator('.wf-status.succeeded').first().waitFor({ timeout: 60000 });
-  await page.getByRole('button', { name: '按配方测量并绑定' }).click();
+  await page.getByRole('button', { name: '测量', exact: true }).click();
   await page.getByText(/binding: verified/).first().waitFor();
+  await page.getByText('高级：分支与测量决策').click();
   await page.getByLabel('决策阈值').fill('0.5');
   await page.getByRole('button', { name: '测量并生成分支' }).click();
   await page.locator('table[aria-label="测量决策列表"] tbody tr').first().waitFor();
   const decisionRow = page.locator('table[aria-label="测量决策列表"] tbody tr').first();
   assert.match(await decisionRow.innerText(), /wfr_/);
   assert.match(await decisionRow.innerText(), /false/);
-  await page.getByRole('button', { name: '执行 Segment' }).click();
+  await page.getByRole('button', { name: '执行当前 Segment' }).click();
   await page.locator('.wf-status.succeeded').first().waitFor({ timeout: 60000 });
   await page.getByRole('button', { name: /重放决策/ }).first().click();
   await page.locator('table[aria-label="测量决策列表"] tbody tr').nth(1).waitFor();
@@ -97,6 +103,7 @@ try {
 
   // P4-3: export a bundle, then clone-import it.
   await page.getByRole('button', { name: '02 流程' }).click();
+  await page.getByText('高级：共享流程库').click();
   await page.getByLabel('共享库名称').fill('P4 UI bundle');
   await page.getByRole('button', { name: '导出共享库' }).click();
   await page.locator('table[aria-label="共享库列表"] tbody tr').first().waitFor();
@@ -107,6 +114,69 @@ try {
   await page.getByRole('button', { name: '导入共享库', exact: true }).click();
   await page.getByLabel('共享库导入结果').waitFor();
   assert.match(await page.getByLabel('共享库导入结果').innerText(), /定义: def_p4_ui_/);
+
+  // P4-4: the library manager occupies the main workspace (no modal) and
+  // stores material presets by catalog + material from /api/materials.
+  await page.getByRole('tab', { name: '库管理' }).click();
+  await page.getByLabel('库管理').waitFor();
+  assert.equal(await page.locator('.spx-library-manager-body').count(), 1);
+  assert.equal(await page.locator('.spx-library-manager-list').count(), 1);
+  assert.equal(await page.locator('.spx-library-manager-actions').count(), 1);
+  assert.equal(await page.locator('.spx-modal-backdrop').count(), 0, 'library manager must live in the main workspace');
+
+  // Switching categories must replace the main-workspace heading and form.
+  const categoryChecks = [
+    ['Materials', 'Materials · 材料', '库材料 Catalog', '库材料名称'],
+    ['Processes', 'Processes · 工艺', '库工艺操作', '库工艺模型'],
+    ['Flows', 'Flows · 流程', '库流程引用', null],
+    ['Experiments', 'Experiments · 实验', '库实验配方', null],
+  ];
+  for (const [tab, heading, field, extra] of categoryChecks) {
+    await page.getByRole('button', { name: tab, exact: true }).click();
+    await page.locator('.spx-library-category-head strong').filter({ hasText: heading }).waitFor();
+    assert.equal(await page.getByLabel(field).count(), 1, `${tab} must show ${field}`);
+    if (extra) assert.equal(await page.getByLabel(extra).count(), 1, `${tab} must show ${extra}`);
+  }
+  await page.getByRole('button', { name: 'Materials', exact: true }).click();
+  await page.locator('.spx-library-category-head strong').filter({ hasText: 'Materials · 材料' }).waitFor();
+  assert.equal(await page.getByLabel('库材料 Catalog').count(), 1);
+  await page.getByRole('button', { name: '新增库条目' }).click();
+  await page.getByLabel('库条目名称').fill('P4 SiO2 preset');
+  await page.getByLabel('库材料 Catalog').selectOption('OxideNitride');
+  await page.getByLabel('库材料名称').selectOption('SiO2');
+  await page.getByRole('textbox', { name: '库材料颜色', exact: true }).fill('blue');
+  assert.equal(await page.locator('.spx-color-swatch.invalid').count(), 1);
+  await page.getByRole('textbox', { name: '库材料颜色', exact: true }).fill('#123456');
+  assert.equal(await page.locator('.spx-color-swatch.invalid').count(), 0);
+  assert.match(await page.locator('.spx-color-swatch').getAttribute('style') ?? '', /rgb\(18, 52, 86\)/);
+  await page.getByRole('button', { name: 'Save' }).click();
+  await page.getByText('已新增 P4 SiO2 preset').waitFor();
+  await page.locator('.spx-library-manager-list button').filter({ hasText: 'P4 SiO2 preset' }).click();
+  assert.equal(await page.getByLabel('库条目名称').inputValue(), 'P4 SiO2 preset');
+  await page.getByRole('button', { name: 'Processes', exact: true }).click();
+  await page.locator('.spx-library-category-head strong').filter({ hasText: 'Processes · 工艺' }).waitFor();
+  await page.getByRole('button', { name: 'Materials', exact: true }).click();
+  await page.locator('.spx-library-manager-list button').filter({ hasText: 'P4 SiO2 preset' }).click();
+  assert.equal(await page.getByLabel('库条目名称').inputValue(), 'P4 SiO2 preset');
+  await page.getByRole('button', { name: '返回流程编辑' }).click();
+  await page.getByRole('tab', { name: '流程编辑' }).waitFor();
+
+  // The left project tree's library categories must switch the main workspace
+  // even when another zone is active.
+  await page.getByRole('button', { name: '01 工程' }).click();
+  await page.locator('.spx-tree-item').filter({ hasText: '材料' }).first().click();
+  await page.locator('.spx-doc-header h1').filter({ hasText: '流程编辑' }).waitFor();
+  await page.locator('.spx-library-category-head strong').filter({ hasText: 'Materials · 材料' }).waitFor();
+  await page.locator('.spx-tree-item').filter({ hasText: '工艺' }).first().click();
+  await page.locator('.spx-library-category-head strong').filter({ hasText: 'Processes · 工艺' }).waitFor();
+  await page.getByRole('button', { name: '返回流程编辑' }).click();
+
+  const stored = (await getJson('/api/v1/workflow/library/items?category=material')).items;
+  const preset = stored.find(item => item.name === 'P4 SiO2 preset');
+  assert.ok(preset, JSON.stringify(stored));
+  assert.equal(preset.payload.catalog, 'OxideNitride');
+  assert.equal(preset.payload.material, 'SiO2');
+  assert.equal(preset.payload.color, '#123456');
 
   await page.screenshot({ path: screenshot, fullPage: true });
   assert.deepEqual(errors, []);

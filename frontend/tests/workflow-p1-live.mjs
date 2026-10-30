@@ -79,24 +79,22 @@ try {
   await page.goto(`${baseUrl}/`);
   await page.getByText('ViennaPS Workbench').first().waitFor();
   await page.locator('input[type=file]').nth(1).setInputFiles(projectPath);
-  await page.getByRole('button', { name: '采纳为 Workflow' }).click();
-  await page.getByText('Compile 已冻结').waitFor();
-
-  await page.getByRole('button', { name: '02 流程' }).click();
-  await page.getByRole('button', { name: '创建首个 Route' }).click();
-  await page.getByRole('button', { name: '03 运行' }).click();
+  await page.getByRole('button', { name: '去 02 定义流程' }).click();
+  await page.getByRole('button', { name: '编译流程' }).click();
+  await page.getByText(/编译成功/).waitFor();
+  await page.getByRole('button', { name: '创建 Route / 去 03' }).click();
   await page.getByRole('button', { name: '执行全部 Segment' }).click();
   await page.locator('.wf-status.succeeded').first().waitFor({ timeout: 60000 });
 
   // Two recipe versions: v1 default, v2 after changing the reference height.
-  await page.getByRole('button', { name: '按配方测量并绑定' }).click();
+  await page.getByRole('button', { name: '测量', exact: true }).click();
   await page.getByText(/binding: verified/).first().waitFor();
   await page.getByLabel('参考高度').fill('0.1');
-  await page.getByRole('button', { name: '按配方测量并绑定' }).click();
+  await page.getByRole('button', { name: '测量', exact: true }).click();
   const versionTwoRow = page.locator('.wf-table tbody tr').filter({ hasText: / v2 · / });
   await versionTwoRow.waitFor();
   await versionTwoRow.getByRole('button', { name: /查看 .* 证据/ }).click();
-  await page.getByText('parameters', { exact: true }).waitFor();
+  await page.getByText('参数', { exact: true }).waitFor();
   await page.getByText(/"referenceHeight":0\.1/).waitFor();
   const evidence = await page.locator('.wf-evidence-grid').innerText();
   assert.ok(evidence.includes('etch_depth'));
@@ -134,8 +132,7 @@ try {
   await page.getByRole('button', { name: '比较上一版' }).click();
   await page.getByText(/\+2 \/ -0 \/ moved 0 \/ changed 0/).waitFor();
 
-  await page.getByRole('button', { name: '创建首个 Route' }).click();
-  await page.getByRole('button', { name: '03 运行' }).click();
+  await page.getByRole('button', { name: '创建 Route / 去 03' }).click();
   await page.getByRole('button', { name: '执行全部 Segment' }).click();
   await page.locator('.wf-status.succeeded').first().waitFor({ timeout: 60000 });
 
@@ -161,9 +158,10 @@ try {
   assert.equal(authoredByStep.get(tailStepId), insertedIds[1]);
 
   // Branch the tail step and execute it from the real prefix checkpoint.
+  await page.getByText('高级：分支与测量决策').click();
   await page.getByLabel('尾步时长').fill('0.04');
   await page.getByRole('button', { name: '修改尾步并分支' }).click();
-  await page.getByText('reuse').waitFor({ timeout: 30000 });
+  await page.locator('.wf-status.verified').first().waitFor({ timeout: 30000 });
 
   const branchedPlan = (await getJson(`/api/v1/workflow/routes/${routeId}`)).plan;
   assert.equal(branchedPlan.attempts.length, 2, 'branch must append a second attempt');
@@ -180,7 +178,7 @@ try {
     'branch must not recompute the prefix',
   );
 
-  await page.getByRole('button', { name: '执行 Segment' }).click();
+  await page.getByRole('button', { name: '执行当前 Segment' }).click();
   const finishedTail = await waitForSegment(tailSegment.segmentId);
   assert.match(finishedTail.resultDigest ?? '', SHA256, 'branch tail resultDigest must be materialized');
   assert.notEqual(finishedTail.runId, prefixBefore.runId);
@@ -196,9 +194,9 @@ try {
   // Persistent experiment must use the current recipe version and replicate seeds.
   await page.getByRole('button', { name: '04 实验' }).click();
   await page.getByRole('button', { name: '创建 10 变体实验' }).click();
-  await page.getByText('Experiment status: planned').waitFor();
+  await page.getByText('实验状态：待执行').waitFor();
   await page.getByRole('button', { name: '运行持久化实验' }).click();
-  await page.getByText('Experiment status: completed').waitFor({ timeout: 180000 });
+  await page.getByText('实验状态：已完成').waitFor({ timeout: 180000 });
 
   const experimentSummaries = (await getJson('/api/v1/workflow/experiments')).experiments;
   const experiment = await getJson(`/api/v1/workflow/experiments/${experimentSummaries[0].experimentId}`);
