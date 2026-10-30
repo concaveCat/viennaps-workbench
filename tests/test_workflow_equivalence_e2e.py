@@ -11,9 +11,10 @@ os.environ.setdefault("WORKBENCH_PORT", "8767")
 
 from backend.main import app  # noqa: E402
 from backend.workflow.hashing import full_project_hash  # noqa: E402
-from backend.workflow.routes import AttemptV1, RoutePlanV1, RouteV1, SegmentV1  # noqa: E402
+from backend.workflow.routes import AttemptV1, RoutePlanV1, RouteV1, SegmentReuseV1, SegmentV1  # noqa: E402
+from backend.workflow.verification import prefix_compatibility  # noqa: E402
 from tests.test_api_integration import asgi_request, json_body  # noqa: E402
-from tests.workflow_fixtures import binding_plan_2d, compiled_2d_zero_five  # noqa: E402
+from tests.workflow_fixtures import binding_plan_2d, compiled_2d_particle, compiled_2d_zero_five  # noqa: E402
 
 
 class EquivalenceEndToEndTests(unittest.IsolatedAsyncioTestCase):
@@ -143,6 +144,92 @@ class EquivalenceEndToEndTests(unittest.IsolatedAsyncioTestCase):
             step_ids[-1], step_ids[-1],
         )
         self.assertEqual(replay["status"], "established", replay)
+
+
+
+    async def test_branch_modifies_step5_reuses_prefix_and_compares_full(self):
+        suffix = uuid.uuid4().hex[:6]
+        base = compiled_2d_particle(0.01)
+        branch = compiled_2d_particle(0.02)
+        for compiled in (base, branch):
+            registered = await asgi_request(
+                "/api/v1/workflow/compiles", method="POST",
+                payload=compiled.model_dump(mode="json", exclude_none=True),
+            )
+            self.assertEqual(registered[0], 201, registered[2])
+        step_ids = [step.id for step in base.project.steps]
+        prefix = prefix_compatibility(branch, step_ids[:4], 12345)
+        source_prefix = prefix_compatibility(base, step_ids[:4], 12345)
+        a1 = AttemptV1(
+            attemptId=f"bA{suffix}1", routeId=f"bR{suffix}", compileId=base.compileRecord.compileId,
+            submissionKey=f"bS{suffix}1", startAfterStepId=None, throughStepId=step_ids[3],
+            seedPolicy="shared-run-seed", runSeed=12345, flowDigest=base.compileRecord.fullProjectHash,
+            status="planned",
+        )
+        a2 = AttemptV1(
+            attemptId=f"bA{suffix}2", routeId=f"bR{suffix}", parentAttemptId=None,
+            compileId=branch.compileRecord.compileId, submissionKey=f"bS{suffix}2",
+            startAfterStepId=step_ids[3], throughStepId=step_ids[4], changedStepIds=[step_ids[4]],
+            prefixCompatibility=prefix, seedPolicy="shared-run-seed", runSeed=12345,
+            flowDigest=branch.compileRecord.fullProjectHash, status="planned",
+        )
+        s1 = SegmentV1(
+            segmentId=f"bS{suffix}1", attemptId=a1.attemptId, sourceCompileId=base.compileRecord.compileId,
+            segmentProjectHash=full_project_hash(base.project), startAfterStepId=None,
+            throughStepId=step_ids[3], startCheckpointRef=None, endCheckpointRef=None,
+            runId=f"bRun{suffix}1", provenanceInputHash="0" * 64,
+            flowDigest=base.compileRecord.fullProjectHash, executionHash="0" * 64, status="planned",
+        )
+        s2 = SegmentV1(
+            segmentId=f"bS{suffix}2", attemptId=a2.attemptId, sourceCompileId=branch.compileRecord.compileId,
+            segmentProjectHash=full_project_hash(branch.project), startAfterStepId=step_ids[3],
+            throughStepId=step_ids[4], startCheckpointRef=None, endCheckpointRef=None,
+            runId=f"bRun{suffix}2", provenanceInputHash="0" * 64,
+            flowDigest=branch.compileRecord.fullProjectHash, executionHash="0" * 64, status="planned",
+        )
+        initial = RoutePlanV1(
+            route=RouteV1(routeId=f"bR{suffix}", flowId="flow_particle_2d", name="branch", headAttemptId=a1.attemptId),
+            stepOrder=step_ids, attempts=[a1], segments=[s1], reuse=[],
+        )
+        created = await asgi_request("/api/v1/workflow/routes", method="POST", payload=initial.model_dump(mode="json", exclude_none=True))
+        self.assertEqual(created[0], 201, created[2])
+        first = await self._execute(s1.segmentId)
+        self.assertEqual(first["status"], "succeeded", first)
+        before = json_body(await asgi_request(f"/api/v1/workflow/routes/{initial.route.routeId}"))["plan"]
+        prefix_digest = next(item for item in before["segments"] if item["segmentId"] == s1.segmentId)["resultDigest"]
+        from backend.workflow.routes import CheckpointRefV1
+        checkpoint = CheckpointRefV1.model_validate(first["endCheckpointRef"])
+        a2 = a2.model_copy(update={"baseCheckpointRef": checkpoint})
+        s2 = s2.model_copy(update={"startCheckpointRef": checkpoint})
+        append = await asgi_request(f"/api/v1/workflow/routes/{initial.route.routeId}/attempts", method="POST", payload={
+            "attempt": a2.model_dump(mode="json", exclude_none=True),
+            "segments": [s2.model_dump(mode="json", exclude_none=True)],
+            "reuse": [SegmentReuseV1(reuseId=f"bRU{suffix}", attemptId=a2.attemptId,
+                                     reusedFromSegmentId=s1.segmentId, fromStepId=step_ids[0],
+                                     toStepId=step_ids[3], compatibility=source_prefix).model_dump(mode="json", exclude_none=True)],
+        })
+        self.assertEqual(append[0], 200, append[2])
+        second = await self._execute(s2.segmentId)
+        self.assertEqual(second["status"], "succeeded", second)
+
+        full = binding_plan_2d(branch, suffix=f"f{suffix}", run_id="0" * 24, state_hash="0" * 64)
+        payload = full.model_dump(mode="json", exclude_none=True)
+        payload["attempts"][0]["status"] = "planned"
+        payload["segments"][0]["status"] = "planned"
+        created_full = await asgi_request("/api/v1/workflow/routes", method="POST", payload=payload)
+        self.assertEqual(created_full[0], 201, created_full[2])
+        full_plan = json_body(created_full)["plan"]
+        full_done = await self._execute(full_plan["segments"][0]["segmentId"])
+        branch_snapshot = await self._snapshot(second["runId"], step_ids[-1])
+        full_snapshot = await self._snapshot(full_done["runId"], step_ids[-1])
+        report = await self._report(
+            "continuous_vs_segmented", f"proto_branch_{suffix}", branch_snapshot, full_snapshot,
+            second["runId"], full_done["runId"], s2.segmentId, full_plan["segments"][0]["segmentId"],
+            step_ids[-1], step_ids[-1],
+        )
+        self.assertEqual(report["status"], "established", report)
+        after = json_body(await asgi_request(f"/api/v1/workflow/routes/{initial.route.routeId}"))["plan"]
+        self.assertEqual(next(item for item in after["segments"] if item["segmentId"] == s1.segmentId)["resultDigest"], prefix_digest)
 
 
 if __name__ == "__main__":

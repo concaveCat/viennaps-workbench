@@ -121,6 +121,26 @@ def compiled_2d_zero_five() -> CompiledWorkflowV1:
     return _compiled_zero(5)
 
 
+def compiled_2d_particle(step5_duration: float) -> CompiledWorkflowV1:
+    steps = [
+        {"id": "step_p01", "name": "prep", "enabled": True, "operation": "etch", "model": "isotropic", "rateMagnitude": 0.005, "duration": 0.02, "rateMode": "uniform"},
+        {"id": "step_p02", "name": "particle", "enabled": True, "operation": "etch", "model": "singleParticle", "rateMagnitude": 0.01, "duration": 0.01, "stickingProbability": 0.1, "sourceExponent": 1.0, "rateMode": "uniform"},
+        {"id": "step_p03", "name": "clean", "enabled": True, "operation": "deposit", "model": "isotropic", "rateMagnitude": 0.002, "duration": 0.02, "depositMaterial": "SiO2", "rateMode": "uniform"},
+        {"id": "step_p04", "name": "cap", "enabled": True, "operation": "deposit", "model": "isotropic", "rateMagnitude": 0.002, "duration": 0.02, "depositMaterial": "SiO2", "rateMode": "uniform"},
+        {"id": "step_p05", "name": "tail particle", "enabled": True, "operation": "etch", "model": "singleParticle", "rateMagnitude": 0.01, "duration": step5_duration, "stickingProbability": 0.1, "sourceExponent": 1.0, "rateMode": "uniform"},
+    ]
+    return compile_flow(
+        FlowRevisionV1(
+            schemaVersion=1, flowId="flow_particle_2d", revision=1,
+            name="particle branch flow", steps=steps,
+            solver=SolverV7(timeStepRatio=0.25, raysPerPoint=16, cpuThreads=1,
+                            random=FixedRandom(mode="fixed", seed=12345),
+                            enginePreference="cpu", timeoutSeconds=60),
+        ),
+        _binding_2d(),
+    )
+
+
 def _compiled_zero(count: int) -> CompiledWorkflowV1:
     steps = [{
         "id": f"step_zero_{index:02d}",
