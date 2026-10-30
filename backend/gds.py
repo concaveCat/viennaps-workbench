@@ -16,6 +16,45 @@ from typing import Iterable
 
 MAX_GDS_BYTES = 64 * 1024 * 1024
 MAX_GDS_RECORDS = 2_000_000
+# The installed native blur keeps one refined exposure grid per sigma and
+# allocates all of them at once. This is the product limit on
+# fineX * fineY * sigmaCount that validation and the worker enforce before the
+# native rasterizer runs.
+MAX_GDS_BLUR_CELLS = 8_000_000
+
+
+def blur_exposure_cell_count(bounds_um: tuple[float, float, float, float], *,
+                             grid_delta: float, exposure_delta: float,
+                             grid_refine: int, sigma_count: int) -> int:
+    """Return the native fine-grid cell count for one padded GDS layout.
+
+    ``bounds_um`` is ``(min_x, min_y, max_x, max_y)`` *after* the native
+    boundary padding the worker applies. The installed blur creates a refined
+    exposure grid whose per-axis size is
+    ``(ceil(width / exposure_delta) + 1) * deltaRatio`` with
+    ``deltaRatio = ceil(gridRefine * exposure_delta / gridDelta)``, and keeps
+    one such grid per sigma.
+    """
+    try:
+        grid_delta = float(grid_delta)
+        exposure_delta = float(exposure_delta)
+        ratio = max(1, math.ceil(int(grid_refine) * exposure_delta / grid_delta))
+    except (OverflowError, ValueError, ZeroDivisionError):
+        return MAX_GDS_BLUR_CELLS + 1
+    if (not math.isfinite(grid_delta) or grid_delta <= 0
+            or not math.isfinite(exposure_delta) or exposure_delta <= 0):
+        return MAX_GDS_BLUR_CELLS + 1
+    fine = []
+    for minimum, maximum in ((bounds_um[0], bounds_um[2]),
+                             (bounds_um[1], bounds_um[3])):
+        width = float(maximum) - float(minimum)
+        if not math.isfinite(width) or width <= 0:
+            return MAX_GDS_BLUR_CELLS + 1
+        coarse_exact = width / exposure_delta
+        if not math.isfinite(coarse_exact) or coarse_exact > MAX_GDS_BLUR_CELLS:
+            return MAX_GDS_BLUR_CELLS + 1
+        fine.append((math.ceil(coarse_exact) + 1) * ratio)
+    return fine[0] * fine[1] * max(1, int(sigma_count))
 
 
 class GdsFormatError(ValueError):

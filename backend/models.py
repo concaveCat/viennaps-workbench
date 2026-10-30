@@ -539,8 +539,15 @@ class GDSBlurV7(StrictModel):
             raise ValueError("GDS blur requires nonempty sigmas and weights")
         if len(self.sigmas) != len(self.weights):
             raise ValueError("GDS blur sigmas and weights must have the same length")
-        if not math.isfinite(math.fsum(self.weights)) or math.fsum(self.weights) <= 0:
-            raise ValueError("GDS blur weights must have a positive finite sum")
+        total = 0.0
+        for weight in self.weights:
+            if not math.isfinite(weight):
+                raise ValueError("GDS blur weights must be finite")
+            total += weight
+            if not math.isfinite(total):
+                raise ValueError("GDS blur weights sum exceeds the finite range")
+        if total <= 0:
+            raise ValueError("GDS blur weights must have a positive sum")
         return self
 
 
@@ -1340,25 +1347,18 @@ class ProjectV7(ProjectV6):
         elif geometry["kind"] == "gds":
             blur = geometry.get("blur")
             if blur is not None and blur.get("enabled", True):
-                sigmas = blur.get("sigmas") or []
-                grid_refine = int(blur.get("gridRefine", 4))
                 exposure_delta = (float(blur.get("delta"))
                                   if blur.get("delta") is not None else float(delta))
+                if not math.isfinite(exposure_delta) or exposure_delta <= 0:
+                    raise ValueError("geometry.blur.delta must be finite and positive")
                 if exposure_delta > float(delta) + 1e-12:
                     raise ValueError(
                         "geometry.blur.delta is the exposure grid spacing and cannot be coarser than gridDelta")
-                # The installed native blur allocates a refined exposure grid per
-                # sigma and keeps every intermediate grid alive. Bound the
-                # allocation from the requested domain before it reaches the
-                # worker, instead of letting a request exhaust the bounded child.
-                ratio = max(1, math.ceil(grid_refine * exposure_delta / float(delta)))
-                span = max(float(self.domain.xExtent),
-                           float(getattr(self.domain, "yExtent", self.domain.xExtent)))
-                cells = (math.ceil(span / exposure_delta) * ratio + 8) ** 2
-                if cells * max(1, len(sigmas)) > 8_000_000:
-                    raise ValueError(
-                        "geometry.blur exposure grid is too large for the bounded worker; "
-                        "increase delta, reduce gridRefine or reduce the domain extent")
+                int(blur.get("gridRefine", 4))
+                # The real exposure-grid budget depends on the GDS layout and
+                # is enforced by backend.validation, which can read the asset.
+                # Do not estimate it from the simulation domain here: a 2D
+                # layout can be much taller than xExtent.
             if self.dimension == 2:
                 if abs(geometry["position"][2]) > 1e-12:
                     raise ValueError("2D GDS position must use [x,h,0]")

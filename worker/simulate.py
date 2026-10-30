@@ -33,6 +33,7 @@ from backend.runtime_limits import MAX_CELL_SET_CELLS, artifact_limit_bytes, art
 from backend.preflight import CELL_SET_JSON_BYTES, CELL_SET_VTU_BYTES_PER_CELL
 from backend.validation import fin_construction_decision
 from backend.gpu_devices import cuda_devices, resolve_gpu_device
+from backend.gds import MAX_GDS_BLUR_CELLS, blur_exposure_cell_count
 from worker.gds_mask import CONSTRUCTION as GDS_MASK_CONSTRUCTION
 from worker.gds_mask import (NATIVE_CONSTRUCTION, NATIVE_REGRID_CONSTRUCTION,
                              apply_gds_blur, build_aligned_gds_layer,
@@ -1602,6 +1603,19 @@ def _gds_planar_layers(ps: Any, path: Path, delta: float, lateral: Any,
         # The native blurred mask itself always uses the GDS boundary pair, so a
         # reflective second boundary is the compatible choice whenever blur is on.
         second_boundary=(lateral if (three_d_source or blur is not None) else None))
+    if blur is not None:
+        # Validation already enforces this from the asset; repeat it here so a
+        # hand-written worker config cannot reach the native allocator.
+        bounds = [float(value) for value in geometry.getBounds()]
+        cells = blur_exposure_cell_count(
+            (bounds[0], bounds[2], bounds[1], bounds[3]),
+            grid_delta=float(delta), exposure_delta=float(blur["delta"]),
+            grid_refine=int(blur["gridRefine"]), sigma_count=len(blur["sigmas"]))
+        if cells > MAX_GDS_BLUR_CELLS:
+            raise RuntimeError(
+                f"GDS blur exposure grid would allocate {cells} cells; the limit is "
+                f"{MAX_GDS_BLUR_CELLS}. Increase delta, reduce gridRefine/sigmas, "
+                "or shrink the layout")
     planars = {int(layer): geometry.layerToLevelSet(int(layer), True) for layer in layers}
     return geometry, planars
 

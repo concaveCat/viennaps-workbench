@@ -10,18 +10,20 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import struct
 import tempfile
 import unittest
 from pathlib import Path
 
 from backend import snapshots as snapshot_store
 from backend import storage
+from backend.gds import MAX_GDS_BLUR_CELLS, blur_exposure_cell_count, parse_gds
 from backend.hashing import requested_input, requested_input_hash
 from backend.main import app
 from backend.models import parse_project
 from backend.validation import ProjectInputError, validate_project
 from tests.test_api_integration import asgi_request, json_body
-from tests.test_directional import project as base_project
+from tests.test_directional import directional_step, project as base_project
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "docs" / "gds-mask-diagnosis" / "fixtures" / "multi-layer.gds"
@@ -31,10 +33,84 @@ MATERIAL_SI = 10
 BASELINE_HASH = "932cbc7b0c72736f64a676a0b20c5e0483943f3ea78962e437ad924b58810595"
 
 
+def _gds_record(kind: int, data_type: int, payload: bytes = b"") -> bytes:
+    if data_type == 0x06 and len(payload) % 2:
+        payload += b"\0"
+    return struct.pack(">HBB", len(payload) + 4, kind, data_type) + payload
+
+
+def _gds_real8(value: float) -> bytes:
+    sign = 0x80 if value < 0 else 0
+    normalized = abs(value)
+    exponent = 0
+    while normalized < 1 / 16:
+        normalized *= 16
+        exponent -= 1
+    while normalized >= 1:
+        normalized /= 16
+        exponent += 1
+    mantissa = int(normalized * (1 << 56))
+    return bytes([sign | ((exponent + 64) & 0x7F)]) + mantissa.to_bytes(7, "big")
+
+
+def _gds_rectangle(layer: int, x0: int, y0: int, x1: int, y1: int) -> bytes:
+    return b"".join([
+        _gds_record(0x08, 0x00),
+        _gds_record(0x0D, 0x02, struct.pack(">h", layer)),
+        _gds_record(0x0E, 0x02, struct.pack(">h", 0)),
+        _gds_record(0x10, 0x03, struct.pack(">10i", x0, y0, x1, y0, x1, y1, x0, y1, x0, y0)),
+        _gds_record(0x11, 0x00),
+    ])
+
+
+def _gds_prefix(structure: str) -> bytes:
+    timestamp = struct.pack(">12h", 2026, 1, 1, 0, 0, 0, 2026, 1, 1, 0, 0, 0)
+    return b"".join([
+        _gds_record(0x00, 0x02, struct.pack(">h", 600)),
+        _gds_record(0x01, 0x02, timestamp),
+        _gds_record(0x02, 0x06, b"BLURBUDGET"),
+        _gds_record(0x03, 0x05, _gds_real8(1e-3) + _gds_real8(1e-9)),
+        _gds_record(0x05, 0x02, timestamp),
+        _gds_record(0x06, 0x06, structure.encode("ascii")),
+    ])
+
+
+def gds_rectangle_bytes(width_nm: int, height_nm: int, *, layer: int = 1,
+                        structure: str = "RECT") -> bytes:
+    """One centered rectangle in nanometres (1 database unit = 1 nm)."""
+    return b"".join([
+        _gds_prefix(structure),
+        _gds_rectangle(layer, -width_nm // 2, -height_nm // 2,
+                       width_nm // 2, height_nm // 2),
+        _gds_record(0x07, 0x00),
+        _gds_record(0x04, 0x00),
+    ])
+
+
+def gds_reference_bytes() -> bytes:
+    """TOP references LEAF, so Python cannot prove the native XY bounds."""
+    timestamp = struct.pack(">12h", 2026, 1, 1, 0, 0, 0, 2026, 1, 1, 0, 0, 0)
+    leaf = b"".join([
+        _gds_prefix("LEAF"), _gds_rectangle(1, -500, -500, 500, 500),
+        _gds_record(0x07, 0x00),
+    ])
+    top = b"".join([
+        _gds_record(0x05, 0x02, timestamp),
+        _gds_record(0x06, 0x06, b"TOP"),
+        _gds_record(0x0A, 0x00),
+        _gds_record(0x12, 0x06, b"LEAF"),
+        _gds_record(0x10, 0x03, struct.pack(">2i", 0, 0)),
+        _gds_record(0x11, 0x00),
+        _gds_record(0x07, 0x00),
+    ])
+    return leaf + top + _gds_record(0x04, 0x00)
+
+
 def gds_project(dimension: int = 3, asset_id: str = "a" * 64, *,
                 extent: float = 6.0, layers: list[dict] | None = None,
                 blur: dict | None = None, delta: float = 0.1,
-                steps: list[dict] | None = None) -> dict:
+                steps: list[dict] | None = None,
+                structure: str = "MULTI") -> dict:
     value = base_project(dimension)
     value["schemaVersion"] = 7
     value["name"] = "GDS native bridge"
@@ -44,7 +120,7 @@ def gds_project(dimension: int = 3, asset_id: str = "a" * 64, *,
                         "boundaryXY": "reflective"})
     value["geometry"] = {
         "kind": "gds", "assetId": asset_id, "fileName": FIXTURE.name,
-        "structure": "MULTI", "unitScale": 1.0, "position": [0.0, 0.0, 0.0],
+        "structure": structure, "unitScale": 1.0, "position": [0.0, 0.0, 0.0],
         "layers": layers if layers is not None else
         ([{"layer": 1, "material": "Si"}]
          if dimension == 2 else
@@ -170,6 +246,13 @@ class GdsNativeBridgeRuns(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response[0], 201, response[2].decode("utf-8", errors="replace"))
         self.asset_id = json_body(response)["assetId"]
 
+    async def upload_gds(self, file_name: str, data: bytes) -> str:
+        response = await asgi_request(
+            f"/api/gds-assets?file_name={file_name}", method="POST", payload=data,
+            headers=[(b"content-type", b"application/octet-stream")])
+        self.assertEqual(response[0], 201, response[2].decode("utf-8", errors="replace"))
+        return json_body(response)["assetId"]
+
     async def asyncTearDown(self):
         await self.life.__aexit__(None, None, None)
 
@@ -210,6 +293,92 @@ class GdsNativeBridgeRuns(unittest.IsolatedAsyncioTestCase):
         two_d = gds_project(2, self.asset_id, extent=2.0)
         with self.assertRaises(ProjectInputError):
             validate_project(two_d, kind="preview")
+
+    async def test_blur_budget_uses_both_actual_gds_axes(self):
+        # 4 x 4,000 um layout: the old xExtent-only estimate passed, while the
+        # native padded layout allocates ~28.8 M fine cells.
+        tall_asset = await self.upload_gds(
+            "blur-tall.gds", gds_rectangle_bytes(4_000, 4_000_000))
+        project = gds_project(2, tall_asset, extent=40.0, blur=blur_block(),
+                              structure="RECT")
+
+        with self.assertRaises(ProjectInputError) as caught:
+            validate_project(project, kind="preview")
+        self.assertIn("exposure grid", str(caught.exception))
+
+        for path in ("/api/projects/validate",):
+            response = await asgi_request(path, method="POST", payload=project)
+            self.assertEqual(response[0], 422, response[2])
+            detail = json.loads(response[2])["detail"]
+            self.assertIn("geometry.blur", {row["path"] for row in detail})
+
+        response = await asgi_request("/api/runs", method="POST",
+                                      payload={"kind": "preview", "project": project})
+        self.assertEqual(response[0], 422, response[2])
+
+        project["steps"] = [directional_step(direction=[0.0, -1.0, 0.0])]
+        response = await asgi_request("/api/runs", method="POST",
+                                      payload={"kind": "simulate", "project": project})
+        self.assertEqual(response[0], 422, response[2])
+        self.assertIn("exposure grid", response[2].decode("utf-8", errors="replace"))
+
+    async def test_blur_budget_accepts_wide_short_2d_layout(self):
+        # 30 x 4 um layout in a 40 um domain: both actual axes fit the budget,
+        # even though using xExtent for both axes would reject this request.
+        wide_asset = await self.upload_gds(
+            "blur-wide.gds", gds_rectangle_bytes(30_000, 4_000))
+        project = gds_project(2, wide_asset, extent=40.0,
+                              blur=blur_block(sigmas=[5.0] * 4,
+                                              weights=[0.25] * 4, gridRefine=8),
+                              structure="RECT")
+        bounds = parse_gds(gds_rectangle_bytes(30_000, 4_000)).selected_layout_bounds_um("RECT")
+        self.assertEqual(bounds, (-15.0, -2.0, 15.0, 2.0))
+        cells = blur_exposure_cell_count(
+            (bounds[0] - 0.2, bounds[1] - 0.2, bounds[2] + 0.2, bounds[3] + 0.2),
+            grid_delta=0.1, exposure_delta=0.1, grid_refine=8, sigma_count=4)
+        self.assertLess(cells, MAX_GDS_BLUR_CELLS)
+        response = await asgi_request("/api/projects/validate", method="POST",
+                                      payload=project)
+        self.assertEqual(response[0], 200, response[2])
+        self.assertTrue(json_body(response)["valid"])
+
+    async def test_blur_budget_fails_safe_when_layout_bounds_are_unknown(self):
+        reference_asset = await self.upload_gds("blur-reference.gds",
+                                                gds_reference_bytes())
+        project = gds_project(2, reference_asset, extent=40.0, blur=blur_block(),
+                              structure="TOP")
+        response = await asgi_request("/api/projects/validate", method="POST",
+                                      payload=project)
+        self.assertEqual(response[0], 422, response[2])
+        detail = json.loads(response[2])["detail"]
+        self.assertIn("geometry.blur", {row["path"] for row in detail})
+        self.assertIn("SREF/AREF", response[2].decode("utf-8", errors="replace"))
+
+    async def test_blur_overflow_and_underflow_are_422_not_500(self):
+        overflow = gds_project(2, self.asset_id, extent=40.0,
+                               blur=blur_block(sigmas=[5.0, 5.0],
+                                               weights=[1e308, 1e308]))
+        response = await asgi_request("/api/projects/validate", method="POST",
+                                      payload=overflow)
+        self.assertEqual(response[0], 422, response[2])
+        self.assertIn("finite range", response[2].decode("utf-8", errors="replace"))
+
+        underflow = gds_project(2, self.asset_id, extent=40.0,
+                                blur=blur_block(delta=5e-324))
+        response = await asgi_request("/api/projects/validate", method="POST",
+                                      payload=underflow)
+        self.assertEqual(response[0], 422, response[2])
+        body = response[2].decode("utf-8", errors="replace")
+        # A subnormal exposure delta may be rejected as non-positive by the
+        # schema or as an over-budget exposure grid; either is a normal 422.
+        self.assertTrue("exposure grid" in body or "greater than 0" in body, body)
+
+        tiny = gds_project(2, self.asset_id, extent=40.0,
+                           blur=blur_block(delta=1e-300))
+        response = await asgi_request("/api/projects/validate", method="POST",
+                                      payload=tiny)
+        self.assertEqual(response[0], 422, response[2])
+        self.assertIn("exposure grid", response[2].decode("utf-8", errors="replace"))
 
     async def test_2d_blur_threshold_effect_and_determinism(self):
         base = gds_project(2, self.asset_id)

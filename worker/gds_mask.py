@@ -84,8 +84,13 @@ def resolve_blur(blur: Any, grid_delta: float) -> dict[str, Any] | None:
         raise RuntimeError("geometry.blur sigmas must be finite and positive")
     if any(not math.isfinite(value) or value < 0 for value in weight_values):
         raise RuntimeError("geometry.blur weights must be finite and non-negative")
-    if not math.isfinite(math.fsum(weight_values)) or math.fsum(weight_values) <= 0:
-        raise RuntimeError("geometry.blur weights must have a positive finite sum")
+    total_weight = 0.0
+    for weight in weight_values:
+        total_weight += weight
+        if not math.isfinite(total_weight):
+            raise RuntimeError("geometry.blur weights sum exceeds the finite range")
+    if total_weight <= 0:
+        raise RuntimeError("geometry.blur weights must have a positive sum")
     threshold = float(blur.get("threshold", 0.5))
     if not math.isfinite(threshold) or not 0.0 < threshold < 1.0:
         raise RuntimeError("geometry.blur threshold must be strictly between 0 and 1")
