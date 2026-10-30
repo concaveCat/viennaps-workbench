@@ -1086,3 +1086,6 @@ body {
 .spx-project-row { grid-template-columns: minmax(0, 1fr) auto auto; }
 .spx-flow-save { margin-right: 2px; }
 .spx-sync-hint { color: var(--spx-muted); font: 9px "Consolas", monospace; align-self: center; }
+/* `hidden` must win over the .spx-field-grid display rule (GDS projects hide
+   the parametric material fields). */
+.spx-field-grid[hidden] { display: none; }

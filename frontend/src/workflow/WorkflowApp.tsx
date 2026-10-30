@@ -1264,6 +1264,11 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     lastStateJson.current = '';
     setStateNotice('');
     setRestoreNotice('');
+    setActiveClip(null);
+    setCanvas(null);
+    setActiveLayout(null);
+    setClips([]);
+    setClipNotice('');
     setSetupMode('project');
   };
 
@@ -1521,8 +1526,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const openProject = (record: ProjectRecord) => run('project-open', async () => {
     const document = await api<ProjectDoc>(`/api/v1/workflow/projects/${record.projectId}`);
     applyLoadedProject(document, record);
-    const binding = await resolveClipBinding(document);
-    if (binding) setProjectGeometrySource(binding);
+    await activateClipBinding(await resolveClipBinding(document));
     window.localStorage.setItem(PROJECT_STORAGE_KEY, record.projectId);
     setActivityLog(previous => [...previous.slice(-79), `${clockTime()}  已打开工程 ${record.name}`]);
     await restoreWorkflowState(record.projectId);
@@ -1625,8 +1629,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
           dimension: document.dimension ?? 2, stepCount: document.steps?.length ?? 0,
           createdAt: '', updatedAt: '',
         });
-        const binding = await resolveClipBinding(document);
-        if (binding) setProjectGeometrySource(binding);
+        await activateClipBinding(await resolveClipBinding(document));
         window.localStorage.setItem(PROJECT_STORAGE_KEY, stored);
         await restoreWorkflowState(stored);
       } catch {
@@ -1991,8 +1994,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       setProjectGeometrySource(geometry.kind === 'gds'
         ? { kind: 'layout', clipName: typeof geometry.fileName === 'string' ? geometry.fileName : 'GDS Clip' }
         : { kind: 'parametric' });
-      const binding = await resolveClipBinding(parsed);
-      if (binding) setProjectGeometrySource(binding);
+      await activateClipBinding(await resolveClipBinding(parsed));
       setCompileStale(true);
       setProjectState(emptyWorkflowState());
       lastStateJson.current = '';
@@ -2611,6 +2613,17 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     if (project?.dimension === 3) return;
     setProjectGeometrySource({ kind: 'layout', clipId: clip.clipId, clipName: clip.name, layoutId: clip.layoutId, clipHash: clip.clipHash });
     setCompileStale(true);
+  };
+
+  /** Reopened GDS project: show the bound clip as the active one, not just its name. */
+  const activateClipBinding = async (binding: ProjectGeometrySource | null) => {
+    if (!binding) return;
+    setProjectGeometrySource(binding);
+    if (!binding.clipId) return;
+    try {
+      const clip = await api<Clip>(`/api/v1/workflow/clips/${binding.clipId}`);
+      selectClip(clip);
+    } catch { /* the header still shows the bound clip name */ }
   };
 
   // The 01 GDS tab must list saved layouts/clips without requiring a fresh upload.
