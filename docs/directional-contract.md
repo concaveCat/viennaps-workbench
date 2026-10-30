@@ -62,10 +62,79 @@
 约束与拒绝条件：
 
 - `rateSets` 长度为 1–8；空列表被拒绝（原生虽接受空列表，但那样不会构建任何速度场）。
-- 每个 `direction` 非零；2D 第三分量必须为 0（逐集合检查）。
+- 每个 `direction` 非零；2D 第三分量必须为 0（按单位化后的方向逐集合/标量检查：归一化后 `|z| > 1e-12` 即拒绝，不再只看原始分量的绝对值）。
 - 每个材料名必须在材料目录中；重复名称、未知名称、超出范围的速率都会被拒绝。
 - 不接受自定义 callable 或任何额外字段（pydantic `extra="forbid"`）。
 - `maskMaterials` 显式省略了几何掩膜材料时，`/api/projects/validate` 返回警告：该集合会移动这些材料。掩膜从不被静默丢弃，默认值与逐集合记录都会写入运行历史。
+
+### API 消费方（rateSets 模式必须分支）
+
+`rateSets` 模式下步骤的标量字段 `direction`、`directionalRateMagnitude`、
+`isotropicRateMagnitude` **不存在**（`model_dump(exclude_none=True)` 会省略 `null`，
+`/api/projects/validate` 返回的 `normalizedProject` 与保存后的项目同样如此）。
+它们不是 0，也不应被补成 0：
+
+- 消费方必须先判断 `step.get("rateSets") is not None`，再决定渲染/回写哪一组字段；
+- rateSets 分支只能回写 `rateSets`（以及与模式无关的 `id`、`name`、`enabled`、
+  `operation`、`model`、`duration`、`depositMaterial`），不得写入标量字段；
+- 步骤级 `calculateVisibility` 在 `rateSets` 步骤的标准化输出中仍以默认值 `true` 出现，
+  回写 `true` 是允许的（与默认等价），但不得回写 `false`（会 422）；可见性按集合放在
+  `rateSets[]` 内。
+
+最小正确请求（回写时保持这个形状）：
+
+```json
+{
+  "id": "step_dual_beam",
+  "name": "双方向束",
+  "enabled": true,
+  "operation": "etch",
+  "model": "directional",
+  "rateSets": [
+    {"direction": [0.0, 1.0, 0.0], "directionalVelocity": 0.15},
+    {"direction": [0.6, -0.8, 0.0], "directionalVelocity": 0.1}
+  ],
+  "duration": 0.4
+}
+```
+
+错误示例：旧消费方把缺失的标量字段补成 0 后回写。
+
+```json
+{
+  "id": "step_dual_beam",
+  "name": "双方向束",
+  "enabled": true,
+  "operation": "etch",
+  "model": "directional",
+  "rateSets": [{"direction": [0.0, 1.0, 0.0], "directionalVelocity": 0.15}],
+  "direction": [0.0, 0.0, 0.0],
+  "directionalRateMagnitude": 0.0,
+  "isotropicRateMagnitude": 0.0,
+  "duration": 0.4
+}
+```
+
+`POST /api/runs`、`POST /api/runs/replay`、`POST /api/projects` 与
+`POST /api/projects/validate` 都会返回 422。路径前缀取决于端点：`/api/projects` 与
+`/api/projects/validate` 直接校验 JSON，路径为 `steps[0].directional`；`/api/runs` 的
+请求体先经 `ProjectAny` 判别联合，实际是 `project[5].steps[0].directional`；
+`/api/runs/replay` 的整个信封也是判别联合，实际是
+`[5].normalizedProject.steps[0].directional`。`message` 相同：
+
+```json
+{
+  "detail": [
+    {
+      "path": "project[5].steps[0].directional",
+      "message": "Value error, rateSets is mutually exclusive with direction, directionalRateMagnitude and isotropicRateMagnitude: omit all three fields in rateSets mode; send them only for scalar directional steps, never as 0 placeholders"
+    }
+  ]
+}
+```
+
+该互斥是刻意保留的服务端约束：服务端不会静默丢弃回写的 0，也不会猜测消费方想切换到标量模式。
+把三个字段同时删除（而不是置 0）即可通过；若确实要标量模式，删除 `rateSets` 并只发送标量字段。
 
 ## ViennaPS 调用
 
