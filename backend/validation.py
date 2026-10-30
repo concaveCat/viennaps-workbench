@@ -1625,14 +1625,28 @@ def slice_axis_bounds(project: dict[str, Any], slice_request: dict[str, Any]) ->
         return {"axis": axis, "axisName": "x", "outputExtent": y_extent,
                 "min": 0.0 if half_x else -x_extent / 2,
                 "max": x_extent / 2, "halfDomain": half_x,
+                "restriction": "half-domain" if half_x else None,
                 "lateralAxis": "y", "verticalAxis": "z", "normal": [1.0, 0.0, 0.0]}
     if axis == 1:
+        if geometry.get("kind") == "fin" and geometry.get("extrusion") is not None:
+            # An extruded 3D fin occupies only the requested y extrusion
+            # range, regardless of whether the worker uses the d2-Extrude
+            # route or the direct 3D box-stencil route.
+            y_min, y_max = (float(value) for value in geometry["extrusion"]["extent"])
+            restriction = "extrusion"
+        elif half_y:
+            y_min, y_max = 0.0, y_extent / 2
+            restriction = "half-domain"
+        else:
+            y_min, y_max = -y_extent / 2, y_extent / 2
+            restriction = None
         return {"axis": axis, "axisName": "y", "outputExtent": x_extent,
-                "min": 0.0 if half_y else -y_extent / 2,
-                "max": y_extent / 2, "halfDomain": half_y,
+                "min": y_min, "max": y_max,
+                "halfDomain": half_y,
+                "restriction": restriction,
                 "lateralAxis": "x", "verticalAxis": "z", "normal": [0.0, 1.0, 0.0]}
     return {"axis": axis, "axisName": "z", "outputExtent": x_extent,
-            "min": None, "max": None, "halfDomain": False,
+            "min": None, "max": None, "halfDomain": False, "restriction": None,
             "lateralAxis": "x", "verticalAxis": "y", "normal": [0.0, 0.0, 1.0]}
 
 
@@ -1649,7 +1663,7 @@ def slice_position_issue(project: dict[str, Any], slice_request: dict[str, Any])
         return None
     if bounds["min"] - 1e-12 <= position <= bounds["max"] + 1e-12:
         return None
-    half_note = " (half-domain limit)" if bounds["halfDomain"] else ""
+    half_note = f" ({bounds['restriction']} limit)" if bounds.get("restriction") else ""
     return (f"native Slice {bounds['axisName']} position {position:g} lies outside the source "
             f"{bounds['axisName']} range [{bounds['min']:g}, {bounds['max']:g}]{half_note}")
 

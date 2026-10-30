@@ -454,43 +454,112 @@ class NativeCapabilityRelease(unittest.IsolatedAsyncioTestCase):
                                                "sliceRequest": {"sliceAxis": "y", "position": -0.25}})
         self.assertEqual(response[0], 422, response[2].decode("utf-8", errors="replace"))
 
+    async def test_slice_extruded_fin_uses_actual_y_range(self):
+        def fin_project(construction: str) -> dict:
+            project = project_v7(3, {
+                "kind": "fin", "width": 0.4, "height": 0.8, "taperAngle": 0.0,
+                "maskHeight": 0.4, "maskTaperAngle": 0.0, "halfFin": True,
+                "construction": construction,
+                "extrusion": {"extent": [-1.0, 1.0], "axis": 1},
+                "substrateMaterial": "Si", "maskMaterial": "Mask"},
+                name=f"extruded half fin {construction}")
+            project["domain"].update({"xExtent": 2.0, "yExtent": 4.0, "gridDelta": 0.2})
+            return project
+
+        from backend.validation import slice_axis_bounds
+        for construction in ("native", "boolean"):
+            project = fin_project(construction)
+            bounds_y = slice_axis_bounds(project, {"sliceAxis": "y", "position": 0.5})
+            self.assertEqual([bounds_y["min"], bounds_y["max"]], [-1.0, 1.0])
+            with self.subTest(construction=construction, position=1.5):
+                response = await asgi_request("/api/runs/slice", method="POST",
+                                              payload={"project": project,
+                                                       "sliceRequest": {"sliceAxis": "y",
+                                                                        "position": 1.5}})
+                self.assertEqual(response[0], 422, response[2].decode("utf-8", errors="replace"))
+                detail = json.loads(response[2])["detail"]
+                self.assertIn("extrusion limit", detail["message"])
+            with self.subTest(construction=construction, position=0.5):
+                response = await asgi_request("/api/runs/slice", method="POST",
+                                              payload={"project": project,
+                                                       "sliceRequest": {"sliceAxis": "y",
+                                                                        "position": 0.5}})
+                self.assertEqual(response[0], 202, response[2].decode("utf-8", errors="replace"))
+                result = await self.wait_run(json_body(response)["runId"])
+                self.assertEqual(result["status"], "succeeded", result.get("failureReason"))
+
     async def test_slice_metadata_uses_native_half_away_from_zero_rounding(self):
-        project = project_v7(3, {"kind": "plane", "height": 0.0, "substrateMaterial": "Si"},
-                             name="rounding slice")
-        project["domain"].update({"xExtent": 2.0, "yExtent": 4.0, "gridDelta": 0.2})
-        response = await asgi_request("/api/runs/slice", method="POST",
-                                      payload={"project": project,
-                                               "sliceRequest": {"sliceAxis": "y", "position": 0.1}})
-        self.assertEqual(response[0], 202, response[2].decode("utf-8", errors="replace"))
-        run_id = json_body(response)["runId"]
-        result = await self.wait_run(run_id)
-        self.assertEqual(result["status"], "succeeded", result.get("failureReason"))
-        snapshot = await self.snapshot(run_id, "true-slice")
-        readback = snapshot["sliceReadback"]
-        self.assertAlmostEqual(readback["requestedPosition"], 0.1)
-        self.assertAlmostEqual(readback["position"], 0.2)
-        self.assertTrue(readback["positionAdjustedToGrid"])
+        project = project_v7(3, {"kind": "hole", "radius": 0.8, "depth": 0.4,
+                                 "taperAngle": 0.0, "maskHeight": 0.4,
+                                 "maskTaperAngle": 0.0, "substrateMaterial": "Si",
+                                 "maskMaterial": "Mask"}, name="rounding slice")
+        project["domain"].update({"xExtent": 4.0, "yExtent": 4.0, "gridDelta": 0.2})
+        references: dict[float, dict] = {}
+
+        async def slice_at(position: float) -> dict:
+            response = await asgi_request("/api/runs/slice", method="POST",
+                                          payload={"project": project,
+                                                   "sliceRequest": {"sliceAxis": "y",
+                                                                    "position": position}})
+            self.assertEqual(response[0], 202, response[2].decode("utf-8", errors="replace"))
+            run_id = json_body(response)["runId"]
+            result = await self.wait_run(run_id)
+            self.assertEqual(result["status"], "succeeded", result.get("failureReason"))
+            return await self.snapshot(run_id, "true-slice")
+
+        cases = [(0.09999999999999999, 0.0), (0.1, 0.2),
+                 (0.0999999999999999, 0.0), (0.10000000000000003, 0.2),
+                 (-0.1, -0.2), (-0.09999999999999999, -0.0)]
+        for requested, expected in cases:
+            with self.subTest(requested=requested, expected=expected):
+                snapshot = await slice_at(requested)
+                readback = snapshot["sliceReadback"]
+                self.assertAlmostEqual(readback["requestedPosition"], requested, places=15)
+                self.assertAlmostEqual(readback["position"], expected, places=15)
+                self.assertTrue(readback["positionAdjustedToGrid"])
+                if expected not in references:
+                    references[expected] = await slice_at(expected)
+                self.assertEqual(signature(snapshot), signature(references[expected]))
 
     async def test_preview_replay_document_keeps_a_valid_gpu_engine_pair(self):
         for engine in ("GPU_DISK", "GPU_TRIANGLE"):
-            with self.subTest(engine=engine):
-                project = self.gpu_triangle_project(2)
-                project["steps"] = []
-                project["solver"]["gpuEngine"] = engine
-                response = await asgi_request("/api/runs", method="POST",
-                                              payload={"kind": "preview", "project": project})
-                self.assertEqual(response[0], 202, response[2].decode("utf-8", errors="replace"))
-                run_id = json_body(response)["runId"]
-                result = await self.wait_run(run_id)
-                self.assertEqual(result["status"], "succeeded", result.get("failureReason"))
-                replay = json_body(await asgi_request(f"/api/runs/{run_id}/replay-project"))
-                self.assertEqual(replay["normalizedProject"]["solver"]["enginePreference"], "gpu")
-                self.assertEqual(replay["normalizedProject"]["solver"]["gpuEngine"], engine)
-                replay_response = await asgi_request("/api/runs/replay", method="POST", payload=replay)
-                self.assertEqual(replay_response[0], 202,
-                                 replay_response[2].decode("utf-8", errors="replace"))
-                replay_result = await self.wait_run(json_body(replay_response)["runId"])
-                self.assertEqual(replay_result["status"], "succeeded", replay_result.get("failureReason"))
+            for with_steps in (False, True):
+                with self.subTest(engine=engine, enabledSteps=with_steps):
+                    project = self.gpu_triangle_project(2)
+                    project["solver"]["gpuEngine"] = engine
+                    if not with_steps:
+                        project["steps"] = []
+                    response = await asgi_request("/api/runs", method="POST",
+                                                  payload={"kind": "preview", "project": project})
+                    self.assertEqual(response[0], 202, response[2].decode("utf-8", errors="replace"))
+                    run_id = json_body(response)["runId"]
+                    result = await self.wait_run(run_id)
+                    self.assertEqual(result["status"], "succeeded", result.get("failureReason"))
+                    replay = json_body(await asgi_request(f"/api/runs/{run_id}/replay-project"))
+                    self.assertEqual(replay["normalizedProject"]["solver"]["enginePreference"], "gpu")
+                    self.assertEqual(replay["normalizedProject"]["solver"]["gpuEngine"], engine)
+                    requirements = replay["executionRequirements"]["steps"]
+                    if with_steps:
+                        self.assertEqual(len(requirements), 1)
+                        self.assertEqual(requirements[0]["engine"], engine)
+                        self.assertEqual(requirements[0]["seed"],
+                                         replay["normalizedProject"]["solver"]["random"]["seed"])
+                    else:
+                        self.assertEqual(requirements, [])
+                    with patch("backend.supervisor.cuda_devices", return_value=GPU_INVENTORY):
+                        replay_response = await asgi_request("/api/runs/replay", method="POST", payload=replay)
+                        self.assertEqual(replay_response[0], 202,
+                                         replay_response[2].decode("utf-8", errors="replace"))
+                        replay_id = json_body(replay_response)["runId"]
+                        replay_result = await self.wait_run(replay_id)
+                    if replay_result["status"] != "succeeded":
+                        reason = str(replay_result.get("failureReason") or "")
+                        if with_steps and any(token in reason for token in ("CUDA", "cuda", "GPU", "device")):
+                            self.skipTest(f"GPU unavailable in this sandbox: {reason.strip()}")
+                        self.fail(reason)
+                    if with_steps:
+                        manifest = storage.read_json(storage.run_path(replay_id) / "manifest.json")
+                        self.assertEqual(manifest["actualExecution"][-1]["actualEngine"], engine)
 
     # ------------------------------------------------------------- Hole/fin/trench
     def test_omitted_native_shape_flags_keep_historical_hashes(self):

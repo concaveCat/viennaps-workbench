@@ -68,9 +68,12 @@ omitted `stepEngines` entry inherits `solver.gpuEngine` instead of defaulting to
 Passing an unproven normalized project directly to the worker therefore fails
 before any native GPU process is built.
 
-A preview (no particle steps) has no executed engine to pin. Its replay
+A preview with no particle steps has no executed engine to pin. Its replay
 document keeps the requested `gpu`/`gpuEngine` pair instead of forcing `cpu`
-and leaving an invalid combination.
+and leaving an invalid combination. A preview with enabled process steps emits
+the same concrete engine/strategy requirements a simulate would use, so its
+replay document parses and executes instead of failing with empty
+requirements.
 
 ## 2. Any-axis Slice
 
@@ -111,10 +114,16 @@ moves along the **normal** axis, so x-normal positions are bounded by the
 source x range, y-normal positions by the y range, and z-normal positions by
 the measured source surface z range. Half-domain geometries (`holeShape`
 HALF/QUARTER, `halfTrench`, `halfFin`) only retain the positive half of the
-halved axes, so a HALF hole rejects `sliceAxis=x` positions below 0. The worker
-rounds the position with the native half-away-from-zero rule and records both
-`requestedPosition` and the actual `position`. A slice plane with no defined
-points raises instead of exporting an empty mesh.
+halved axes, so a HALF hole rejects `sliceAxis=x` positions below 0. An
+extruded 3D fin is bounded y-wise by its actual `extrusion.extent` range, not
+by the nominal project y extent; the same bound applies to the d2-Extrude and
+direct-stencil construction routes. The worker computes the native position
+with `std::round` semantics (`position/gridDelta` rounded half away from zero,
+comparing the fractional part rather than `floor(q+0.5)`) and records both
+`requestedPosition` and the actual `position`; this matches the plane native
+Slice selects at values such as `0.09999999999999999` (rounds to 0) and `0.1`
+(rounds to 0.2) at grid 0.2. A slice plane with no defined points raises
+instead of exporting an empty mesh.
 
 `sliceReadback` records `axis`, `axisName`, `planeNormal`,
 `outputCoordinateMapping`, `reflectX`, requested/actual position,
@@ -165,14 +174,15 @@ There is no silent full-shape fallback.
   if the sandbox cannot reach CUDA.
 - x/y/z slices on a 3D geometry against an independent native Slice, plane
   normals, output coordinate extents, reflect-X mirroring, default hash
-  stability, normal-axis bounds (including half-domain limits), native
-  half-away-from-zero position rounding, 2D rejection, invalid axes and
-  replay.
+  stability, normal-axis bounds (half-domain and extruded-fin limits), native
+  half-away-from-zero position rounding at the exact boundary cases, 2D
+  rejection, invalid axes and replay.
 - Direct worker input: the GPU_TRIANGLE evidence gate, omitted-`stepEngines`
   inheritance of `solver.gpuEngine`, and rejection of a pinned engine that
   contradicts it.
-- Preview replay documents for both `GPU_DISK` and `GPU_TRIANGLE`, parsed and
-  replayed through the API.
+- Preview replay documents for both `GPU_DISK` and `GPU_TRIANGLE`, with and
+  without enabled process steps; the documents are parsed and replayed through
+  the API.
 - HALF/QUARTER/halfFin/halfTrench product/direct comparisons in 2D and 3D,
   x/y bounds, QUARTER symmetry, omitted-hash stability, invalid combinations
   and replay.

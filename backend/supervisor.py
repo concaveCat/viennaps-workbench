@@ -493,9 +493,35 @@ class Supervisor:
             replay_actual_seed = run_seed
             if replay_actual_seed is None:
                 random_config = project["solver"]["random"]
-                replay_actual_seed = int(random_config.get("seed", 0))
+                seed_value = random_config.get("seed")
+                replay_actual_seed = int(seed_value) if seed_value is not None else 0
             replay_project["solver"]["random"] = {"mode": "fixed", "seed": replay_actual_seed}
-            replay_engine = next((item["engine"] for item in actual_steps if item["engine"] in {"CPU_DISK", "GPU_DISK", "CPU_TRIANGLE", "GPU_TRIANGLE"}), None)
+            # A preview does not execute its enabled steps, but its replay
+            # document must still describe what would run. Resolve the same
+            # concrete engine/strategy the simulate path would use.
+            preview_requirements: list[dict[str, Any]] = []
+            preview_native_strategy = False
+            if kind == "preview":
+                for step in project["steps"]:
+                    if not step.get("enabled") or not uses_flux(step):
+                        continue
+                    engine = select_engine(project, step)
+                    if engine not in {"CPU_DISK", "GPU_DISK", "CPU_TRIANGLE", "GPU_TRIANGLE"}:
+                        raise ReplayMismatch(
+                            f"preview replay cannot pin an engine for step {step['id']}: {engine}")
+                    execution_strategy = None
+                    if (project.get("schemaVersion") == 7 and step.get("model") == "multiParticle"
+                            and sum(row.get("kind") == "ion" for row in step.get("species", [])) > 1
+                            and engine == "GPU_DISK"):
+                        execution_strategy = GPU_MULTIPARTICLE_NATIVE_STRATEGY
+                        preview_native_strategy = True
+                    preview_requirements.append({
+                        "stepId": step["id"], "engine": engine, "seed": replay_actual_seed,
+                        **({"executionStrategy": execution_strategy} if execution_strategy else {}),
+                    })
+            replay_items = actual_steps if actual_steps else preview_requirements
+            replay_engine = next((item["engine"] for item in replay_items
+                                  if item["engine"] in {"CPU_DISK", "GPU_DISK", "CPU_TRIANGLE", "GPU_TRIANGLE"}), None)
             if replay_engine is not None:
                 replay_project["solver"]["enginePreference"] = "gpu" if replay_engine.startswith("GPU_") else "cpu"
             elif replay_project["solver"].get("gpuEngine") is not None:
@@ -512,13 +538,20 @@ class Supervisor:
                 {"stepId": item["stepId"], "engine": item["engine"], "seed": replay_actual_seed,
                  **({"executionStrategy": item["executionStrategy"]} if item.get("executionStrategy") else {}),
                  **({"fluxStrategy": item["fluxStrategy"]} if item.get("fluxStrategy") else {})}
-                for item in actual_steps if item["engine"] in {"CPU_DISK", "GPU_DISK", "CPU_TRIANGLE", "GPU_TRIANGLE"}
+                for item in replay_items if item["engine"] in {"CPU_DISK", "GPU_DISK", "CPU_TRIANGLE", "GPU_TRIANGLE"}
             ]
+            preview_native_fingerprint = None
+            if preview_native_strategy:
+                try:
+                    _, preview_native_fingerprint = configured_runtime(None)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    raise ReplayMismatch(str(exc)) from exc
+            replay_native_fingerprint = native_engine_fingerprint or preview_native_fingerprint
             replay_document = {
                 "format": "viennaps-replay", "schemaVersion": project["schemaVersion"], "normalizedProject": replay_project,
                 "executionRequirements": {"viennapsVersion": ps_version, "viennalsVersion": ls_version,
                                           "cpuThreads": project["solver"]["cpuThreads"], "steps": replay_requirements,
-                                          **({"nativeEngineFingerprint": native_engine_fingerprint} if native_engine_fingerprint else {})},
+                                          **({"nativeEngineFingerprint": replay_native_fingerprint} if replay_native_fingerprint else {})},
             }
             if project["schemaVersion"] == 6:
                 replay_document["replayMode"] = "from-domain-state" if state_ref is not None else "from-initial"

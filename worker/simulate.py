@@ -101,6 +101,26 @@ def verify_worker_engine_evidence(project: dict[str, Any], step: dict[str, Any],
             "the request instead of falling back to GPU_DISK or CPU_DISK")
 
 
+def native_slice_position(position: float, grid_delta: float) -> float:
+    """Reproduce ViennaLS Slice's std::round(position/gridDelta)*gridDelta.
+
+    C++ std::round rounds exact halves away from zero. Comparing the
+    fractional part avoids ``floor(q + 0.5)`` accidentally rounding
+    0.49999999999999994 up to 1.0 when the addition itself is rounded.
+    """
+    quotient = position / grid_delta
+    if quotient >= 0.0:
+        lower = math.floor(quotient)
+        index = lower + 1.0 if quotient - lower >= 0.5 else lower
+    else:
+        upper = math.ceil(quotient)
+        index = upper - 1.0 if upper - quotient >= 0.5 else upper
+    result = index * grid_delta
+    if index == 0.0 and math.copysign(1.0, quotient) < 0.0:
+        return -0.0
+    return result
+
+
 def configure_native_materials(ps: Any, custom_rows: list[dict[str, Any]]) -> None:
     """Recreate the persisted 4.6.2 registry prefix in every isolated worker."""
     global MATERIAL_ROWS, MATERIAL_NAMES, MATERIAL_IDS, MATERIAL_COLORS
@@ -3337,10 +3357,10 @@ def execute(input_path: Path, run_dir: Path) -> None:
         # by that axis' (possibly halved) domain extent.
         if axis_bounds["min"] is not None:
             if not (axis_bounds["min"] - 1e-12 <= slice_position <= axis_bounds["max"] + 1e-12):
-                half_note = " (half-domain limit)" if axis_bounds["halfDomain"] else ""
+                note = f" ({axis_bounds['restriction']} limit)" if axis_bounds.get("restriction") else ""
                 raise RuntimeError(
                     f"native Slice {axis_label} position {slice_position:g} lies outside the source "
-                    f"{axis_label} range [{axis_bounds['min']:g}, {axis_bounds['max']:g}]{half_note}")
+                    f"{axis_label} range [{axis_bounds['min']:g}, {axis_bounds['max']:g}]{note}")
         else:
             # The z computational boundary is infinite; use the measured
             # source surface range instead of a lateral extent.
@@ -3352,11 +3372,10 @@ def execute(input_path: Path, run_dir: Path) -> None:
                         f"native Slice z position {slice_position:g} lies outside the source surface "
                         f"z range [{axis_min:g}, {axis_max:g}]")
         # Native ViennaLS uses std::round(): half away from zero. Python's
-        # round() is ties-to-even, which would record a different position for
-        # requests such as 0.1 um at gridDelta=0.2 um.
-        grid_index = slice_position / delta
-        native_index = math.floor(grid_index + 0.5) if grid_index >= 0 else math.ceil(grid_index - 0.5)
-        native_position = native_index * delta
+        # round() is ties-to-even and floor(q + 0.5) loses precision at
+        # 0.49999999999999994, which would record a different position than
+        # the plane native Slice actually selects.
+        native_position = native_slice_position(slice_position, delta)
         ps.setDimension(2)
         slice_boundary = ps.BoundaryType.REFLECTIVE_BOUNDARY if project["domain"]["boundaryXY"] == "reflective" else ps.BoundaryType.PERIODIC_BOUNDARY
         sliced_domain = ps.d2.Domain(delta, output_extent, slice_boundary)
