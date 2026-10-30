@@ -11,6 +11,7 @@ from typing import Any
 
 from .. import snapshots, storage
 from .metrology import snapshot_content_hash
+from .store import WorkflowValidation
 
 MAX_VIEW_POINTS = 20_000
 MAX_VIEW_LINES = 30_000
@@ -302,41 +303,462 @@ def _escape(value: Any) -> str:
     return html.escape("" if value is None else str(value))
 
 
-def _svg_for_snapshot(snapshot: dict[str, Any], width: int = 520, height: int = 320) -> str:
+# Status codes are part of the data contract; the report shows Chinese labels and
+# keeps the raw code available in the technical-details blocks.
+STATUS_LABELS = {
+    "succeeded": "成功",
+    "failed": "失败",
+    "running": "运行中",
+    "planned": "待执行",
+    "queued": "排队中",
+    "cancelled": "已取消",
+    "interrupted": "已中断",
+    "completed": "已完成",
+    "WITHIN_TOLERANCE": "在公差内",
+    "OUTSIDE_TOLERANCE": "超出公差",
+    "NOT_EVALUATED": "未评估",
+    "within_tolerance": "在公差内",
+    "outside_tolerance": "超出公差",
+    "not_evaluated": "未评估",
+    "identical": "一致",
+    "different": "不同",
+    "measured": "已测量",
+    "evaluated": "已评估",
+    "pass": "通过",
+    "fail": "超出",
+    "uncertain": "不确定",
+    "unbound": "未绑定",
+    "verified": "已验证",
+    "established": "已建立",
+    "inconclusive": "不确定",
+}
+
+_PARAMETER_UNITS = {
+    "duration": " s",
+    "rateMagnitude": " µm/s",
+    "stickingProbability": "",
+    "sourceExponent": "",
+}
+
+_MATERIAL_PALETTE = (
+    "#4e79a7", "#f28e2b", "#59a14f", "#e15759", "#76b7b2",
+    "#edc948", "#b07aa1", "#9c755f", "#bab0ac", "#ff9da7",
+)
+
+
+def _status_label(value: Any) -> str:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return "未记录"
+    text = str(value)
+    return STATUS_LABELS.get(text, text)
+
+
+def _display(value: Any, empty: str = "未记录") -> str:
+    """Render a readable cell value, never a blank or ``None``."""
+
+    if value is None:
+        return empty
+    if isinstance(value, str) and not value.strip():
+        return empty
+    if isinstance(value, (list, tuple, dict, set)) and not value:
+        return empty
+    return _escape(value)
+
+
+def _fmt_number(value: Any) -> str:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return "未记录"
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        number = float(value)
+        if number.is_integer() and abs(number) < 1e15:
+            return str(int(number))
+        return f"{number:.6g}"
+    return _escape(value)
+
+
+def _code(value: Any, empty: str = "未记录") -> str:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return empty
+    return f"<code>{_escape(value)}</code>"
+
+
+def _details(rows: list[tuple[str, str]], summary: str = "技术详情") -> str:
+    if not rows:
+        return ""
+    body = "".join(f"<tr><th>{_escape(label)}</th><td>{value}</td></tr>" for label, value in rows)
+    return f'<details class="tech"><summary>{_escape(summary)}</summary><table>{body}</table></details>'
+
+
+def _kv_table(rows: list[tuple[str, str]]) -> str:
+    body = "".join(f"<tr><th>{_escape(label)}</th><td>{value}</td></tr>" for label, value in rows)
+    return f"<table>{body}</table>"
+
+
+def _table(headers: list[str], rows: list[list[str]]) -> str:
+    head = "".join(f"<th>{_escape(header)}</th>" for header in headers)
+    body = "".join("<tr>%s</tr>" % "".join(f"<td>{cell}</td>" for cell in row) for row in rows)
+    return f"<table><tr>{head}</tr>{body}</table>"
+
+
+def _step_names(compile: Any, manifest: dict[str, Any] | None) -> dict[str, str]:
+    names: dict[str, str] = {}
+    project = getattr(compile, "project", None) if compile is not None else None
+    for step in getattr(project, "steps", None) or []:
+        if getattr(step, "id", None) and getattr(step, "name", None):
+            names[str(step.id)] = str(step.name)
+    if manifest:
+        for snapshot in manifest.get("snapshots") or []:
+            step_id, name = snapshot.get("stepId"), snapshot.get("name")
+            if step_id and name:
+                names.setdefault(str(step_id), str(name))
+    return names
+
+
+def _step_label(step_id: Any, names: dict[str, str]) -> str:
+    if step_id is None or (isinstance(step_id, str) and not step_id.strip()):
+        return "未记录"
+    return names.get(str(step_id)) or str(step_id)
+
+
+def _condition_values(parameters: dict[str, Any]) -> list[str]:
+    values: list[str] = []
+    for overrides in (parameters or {}).values():
+        if not isinstance(overrides, dict):
+            continue
+        for key, value in sorted(overrides.items()):
+            unit = _PARAMETER_UNITS.get(str(key), "")
+            values.append(f"{_fmt_number(value)}{unit}")
+    return values
+
+
+def _variant_conditions(variant: dict[str, Any]) -> str:
+    return " · ".join(_condition_values(variant.get("parameters") or {}))
+
+
+def _variant_seed(variant: dict[str, Any]) -> Any:
+    replicates = variant.get("replicates") or []
+    for replicate in replicates:
+        if replicate.get("seed") is not None:
+            return replicate["seed"]
+    return None
+
+
+def _variant_title(variant: dict[str, Any], index: int) -> str:
+    parts = [f"候选 {index + 1}", f"V{_fmt_number(variant.get('ordinal') or index + 1)}"]
+    conditions = _variant_conditions(variant)
+    if conditions:
+        parts.append(conditions)
+    seed = _variant_seed(variant)
+    if seed is not None:
+        parts.append(f"seed {_fmt_number(seed)}")
+    return " · ".join(parts)
+
+
+def _variant_status(variant: dict[str, Any]) -> str:
+    statuses = [str((replicate or {}).get("status") or "planned") for replicate in variant.get("replicates") or []]
+    if not statuses:
+        return "未记录"
+    if any(status == "running" for status in statuses):
+        return "运行中"
+    if any(status == "failed" for status in statuses):
+        return "失败"
+    if all(status == "succeeded" for status in statuses):
+        return "成功"
+    if all(status in {"planned", "queued"} for status in statuses):
+        return "待执行"
+    return _status_label(statuses[-1])
+
+
+def _material_name(view: dict[str, Any], material_id: Any) -> str:
+    name = (view.get("materialNames") or {}).get(str(material_id))
+    if name:
+        return str(name)
+    entry = (view.get("materials") or {}).get(str(material_id)) or {}
+    if entry.get("name"):
+        return str(entry["name"])
+    return f"材料 {material_id}"
+
+
+def _material_color(view: dict[str, Any], material_id: Any) -> str:
+    entry = (view.get("materials") or {}).get(str(material_id)) or {}
+    color = entry.get("color")
+    if isinstance(color, str) and color.strip():
+        return color
+    try:
+        index = abs(int(material_id)) % len(_MATERIAL_PALETTE)
+    except (TypeError, ValueError):
+        index = 0
+    return _MATERIAL_PALETTE[index]
+
+
+def _axis_indices(view: dict[str, Any], points: list[Any]) -> tuple[int, int]:
+    """Resolve horizontal/vertical point indices from the snapshot axis map.
+
+    ViennaPS 2D cross sections are authored on x/z, but some writers store the
+    height in the ``h`` slot. Prefer ``axisMap.z`` as requested and fall back to
+    ``axisMap.h`` when the z slot is degenerate, so a 2D view is never collapsed
+    into a single horizontal line by an axis mismatch.
+    """
+
+    axis_map = view.get("axisMap") or {}
+    try:
+        x_index = int(axis_map.get("x", 0))
+    except (TypeError, ValueError):
+        x_index = 0
+    try:
+        z_index = int(axis_map.get("z", 2))
+    except (TypeError, ValueError):
+        z_index = 2
+    try:
+        h_index = int(axis_map.get("h", 1))
+    except (TypeError, ValueError):
+        h_index = 1
+
+    def span(index: int) -> float:
+        values = [float(point[index]) for point in points if len(point) > index]
+        return (max(values) - min(values)) if values else 0.0
+
+    vertical = z_index
+    if view.get("dimension") != 3 and span(z_index) <= 1e-12 and span(h_index) > 1e-12:
+        vertical = h_index
+    if span(vertical) <= 1e-12 and span(h_index) > 1e-12:
+        vertical = h_index
+    return x_index, vertical
+
+
+def _nice_step(span: float, target: int = 4) -> float:
+    if not math.isfinite(span) or span <= 0:
+        return 1.0
+    raw = span / max(1, target)
+    power = 10 ** math.floor(math.log10(raw))
+    for multiplier in (1, 2, 2.5, 5, 10):
+        if raw <= multiplier * power:
+            return multiplier * power
+    return 10 * power
+
+
+def _tick_text(value: float, step: float) -> str:
+    if step >= 1:
+        return f"{value:.0f}"
+    decimals = min(6, max(0, int(math.ceil(-math.log10(step)))))
+    return f"{value:.{decimals}f}"
+
+
+def _trace_polygons(lines: list[Any], limit: int = 4000) -> list[list[int]]:
+    """Trace closed loops out of a line soup so material regions can be filled."""
+
+    adjacency: dict[int, list[tuple[int, int]]] = {}
+    for index, line in enumerate(lines):
+        try:
+            a, b = int(line[0]), int(line[1])
+        except (IndexError, TypeError, ValueError):
+            continue
+        adjacency.setdefault(a, []).append((b, index))
+        adjacency.setdefault(b, []).append((a, index))
+    used: set[int] = set()
+    polygons: list[list[int]] = []
+    for start in adjacency:
+        for neighbor, edge in adjacency[start]:
+            if edge in used:
+                continue
+            used.add(edge)
+            loop = [start, neighbor]
+            current = neighbor
+            while current != start and len(loop) <= limit:
+                step = None
+                for candidate, candidate_edge in adjacency.get(current, []):
+                    if candidate_edge not in used:
+                        step = (candidate, candidate_edge)
+                        break
+                if step is None:
+                    break
+                used.add(step[1])
+                current = step[0]
+                loop.append(current)
+            if current == start and len(loop) >= 4:
+                polygons.append(loop[:-1])
+            if len(polygons) >= 200:
+                return polygons
+    return polygons
+
+
+def _polygon_area(points: list[Any], loop: list[int], x_index: int = 0, y_index: int = 1) -> float:
+    area = 0.0
+    for index, current in enumerate(loop):
+        nxt = loop[(index + 1) % len(loop)]
+        try:
+            x1, y1 = float(points[current][x_index]), float(points[current][y_index])
+            x2, y2 = float(points[nxt][x_index]), float(points[nxt][y_index])
+        except (IndexError, TypeError, ValueError):
+            return 0.0
+        area += x1 * y2 - x2 * y1
+    return abs(area) / 2.0
+
+
+def _svg_for_snapshot(snapshot: dict[str, Any], width: int = 560, height: int = 360) -> str:
     view = candidate_view(snapshot)
     points = view["points"]
     if not points:
-        return '<p class="muted">snapshot has no points</p>'
-    xs = [point[0] for point in points]
-    ys = [point[1] for point in points]
-    if view["dimension"] == 3 and points and len(points[0]) > 2:
-        ys = [point[2] for point in points]
+        return '<p class="muted">快照没有可绘制的点。</p>'
+    dimension = int(view.get("dimension") or 0)
+    x_index, y_index = _axis_indices(view, points)
+    xs = [float(point[x_index]) for point in points if len(point) > x_index]
+    ys = [float(point[y_index]) for point in points if len(point) > y_index]
+    if not xs or not ys:
+        return '<p class="muted">快照没有可绘制的坐标。</p>'
     x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
-    x_span = x1 - x0 or 1.0
-    y_span = y1 - y0 or 1.0
-    scale = min((width - 30) / x_span, (height - 30) / y_span)
-    def px(x: float) -> float: return 15 + (x - x0) * scale
-    def py(y: float) -> float: return height - 15 - (y - y0) * scale
-    parts = [f'<svg viewBox="0 0 {width} {height}" class="report-svg" role="img" aria-label="candidate view">']
-    if view["dimension"] == 2:
-        for index, line in enumerate(view["lines"]):
-            try:
-                a, b = points[int(line[0])], points[int(line[1])]
-            except (IndexError, TypeError, ValueError):
-                continue
-            material = view["lineMaterialIds"][index] if index < len(view["lineMaterialIds"]) else -1
-            color = (view["materials"].get(str(material)) or {}).get("color") or "#7cc7ff"
-            parts.append(f'<line x1="{px(a[0]):.3f}" y1="{py(a[1]):.3f}" x2="{px(b[0]):.3f}" y2="{py(b[1]):.3f}" stroke="{_escape(color)}" stroke-width="1.5"/>')
+    x_span = (x1 - x0) or 1.0
+    y_span = (y1 - y0) or 1.0
+    left, right, top, bottom = 62, 18, 18, 52
+    plot_width = max(1.0, width - left - right)
+    plot_height = max(1.0, height - top - bottom)
+    scale = min(plot_width / x_span, plot_height / y_span)
+    offset_x = left + (plot_width - x_span * scale) / 2.0
+    offset_y = top + (plot_height - y_span * scale) / 2.0
+
+    def px(value: float) -> float:
+        return offset_x + (value - x0) * scale
+
+    def py(value: float) -> float:
+        return offset_y + (y1 - value) * scale
+
+    unit = str(view.get("coordinateUnit") or "um")
+    unit_label = "µm" if unit in {"um", "µm"} else unit
+    vertical_label = "z" if y_index == 2 and dimension == 3 else ("z" if y_index == 2 else "高度")
+    aria = f"{dimension}D 结构视图：横轴 x，纵轴 {vertical_label}，单位 {unit_label}"
+    parts = [
+        f'<svg viewBox="0 0 {width} {height}" class="report-svg" role="img" aria-label="{_escape(aria)}">',
+        f'<rect x="0" y="0" width="{width}" height="{height}" fill="#fbfdff"/>',
+        f'<rect x="{left}" y="{top}" width="{plot_width:.3f}" height="{plot_height:.3f}" fill="#ffffff" stroke="#d8dee6"/>',
+    ]
+
+    step = _nice_step(max(x_span, y_span) / 4)
+    # Light grid plus numeric ticks on both axes.
+    tick = math.ceil(x0 / step) * step
+    while tick <= x1 + step * 1e-9:
+        gx = px(tick)
+        parts.append(f'<line x1="{gx:.3f}" y1="{top}" x2="{gx:.3f}" y2="{top + plot_height:.3f}" stroke="#eef2f7" stroke-width="1"/>')
+        parts.append(f'<text x="{gx:.3f}" y="{top + plot_height + 14:.3f}" font-size="9" fill="#6b7785" text-anchor="middle">{_tick_text(tick, step)}</text>')
+        tick += step
+    tick = math.ceil(y0 / step) * step
+    while tick <= y1 + step * 1e-9:
+        gy = py(tick)
+        parts.append(f'<line x1="{left}" y1="{gy:.3f}" x2="{left + plot_width:.3f}" y2="{gy:.3f}" stroke="#eef2f7" stroke-width="1"/>')
+        parts.append(f'<text x="{left - 6:.3f}" y="{gy + 3:.3f}" font-size="9" fill="#6b7785" text-anchor="end">{_tick_text(tick, step)}</text>')
+        tick += step
+
+    # Axis lines and titles.
+    parts.append(f'<line x1="{left}" y1="{top + plot_height:.3f}" x2="{left + plot_width:.3f}" y2="{top + plot_height:.3f}" stroke="#94a3b8" stroke-width="1.2"/>')
+    parts.append(f'<line x1="{left}" y1="{top}" x2="{left}" y2="{top + plot_height:.3f}" stroke="#94a3b8" stroke-width="1.2"/>')
+    parts.append(f'<text x="{left + plot_width / 2:.3f}" y="{height - 10:.3f}" font-size="10" fill="#334155" text-anchor="middle">x ({_escape(unit_label)})</text>')
+    parts.append(f'<text x="14" y="{top + plot_height / 2:.3f}" font-size="10" fill="#334155" text-anchor="middle" transform="rotate(-90 14 {top + plot_height / 2:.3f})">{_escape(vertical_label)} ({_escape(unit_label)})</text>')
+
+    if dimension == 2:
+        material_ids = view.get("lineMaterialIds") or []
+        by_material: dict[int, list[list[int]]] = {}
+        for index, line in enumerate(view.get("lines") or []):
+            material = int(material_ids[index]) if index < len(material_ids) else -1
+            by_material.setdefault(material, []).append(line)
+        for material, material_lines in by_material.items():
+            color = _material_color(view, material)
+            loops = [loop for loop in _trace_polygons(material_lines) if _polygon_area(points, loop, x_index, y_index) > 1e-18]
+            for loop in loops[:120]:
+                coords = " ".join(f"{px(float(points[index][x_index])):.3f},{py(float(points[index][y_index])):.3f}" for index in loop)
+                parts.append(f'<polygon points="{coords}" fill="{_escape(color)}" fill-opacity="0.32" stroke="{_escape(color)}" stroke-width="1"/>')
+            if not loops:
+                # A branched contour (shared boundary with another material) has no
+                # single closed loop; paint a translucent band so the material
+                # region is still visible instead of a bare outline.
+                for line in material_lines:
+                    try:
+                        a, b = points[int(line[0])], points[int(line[1])]
+                    except (IndexError, TypeError, ValueError):
+                        continue
+                    parts.append(
+                        f'<line x1="{px(float(a[x_index])):.3f}" y1="{py(float(a[y_index])):.3f}" '
+                        f'x2="{px(float(b[x_index])):.3f}" y2="{py(float(b[y_index])):.3f}" '
+                        f'stroke="{_escape(color)}" stroke-width="6" stroke-opacity="0.22" stroke-linecap="round"/>'
+                    )
+            # Keep the raw contour visible even when no closed loop could be traced.
+            for line in material_lines:
+                try:
+                    a, b = points[int(line[0])], points[int(line[1])]
+                except (IndexError, TypeError, ValueError):
+                    continue
+                parts.append(
+                    f'<line x1="{px(float(a[x_index])):.3f}" y1="{py(float(a[y_index])):.3f}" '
+                    f'x2="{px(float(b[x_index])):.3f}" y2="{py(float(b[y_index])):.3f}" '
+                    f'stroke="{_escape(color)}" stroke-width="1.1" stroke-opacity="0.9"/>'
+                )
     else:
         for index, point in enumerate(points):
             material = view["materialIds"][index] if index < len(view["materialIds"]) else -1
-            color = (view["materials"].get(str(material)) or {}).get("color") or "#7cc7ff"
-            parts.append(f'<circle cx="{px(point[0]):.3f}" cy="{py(point[2]):.3f}" r="1.2" fill="{_escape(color)}"/>')
+            color = _material_color(view, material)
+            parts.append(f'<circle cx="{px(float(point[x_index])):.3f}" cy="{py(float(point[y_index])):.3f}" r="1.1" fill="{_escape(color)}" fill-opacity="0.85"/>')
+
+    # Scale bar: a round length close to a quarter of the horizontal span.
+    bar_value = _nice_step(x_span / 4, 1)
+    if bar_value * scale > plot_width * 0.6:
+        bar_value = _nice_step(bar_value / 2, 1)
+    bar_px = max(1.0, bar_value * scale)
+    bar_x = left + plot_width - bar_px - 14
+    bar_y = top + plot_height - 12
+    parts.append(f'<line x1="{bar_x:.3f}" y1="{bar_y:.3f}" x2="{bar_x + bar_px:.3f}" y2="{bar_y:.3f}" stroke="#17212b" stroke-width="3"/>')
+    parts.append(f'<line x1="{bar_x:.3f}" y1="{bar_y - 4:.3f}" x2="{bar_x:.3f}" y2="{bar_y + 4:.3f}" stroke="#17212b" stroke-width="1.2"/>')
+    parts.append(f'<line x1="{bar_x + bar_px:.3f}" y1="{bar_y - 4:.3f}" x2="{bar_x + bar_px:.3f}" y2="{bar_y + 4:.3f}" stroke="#17212b" stroke-width="1.2"/>')
+    parts.append(f'<text x="{bar_x + bar_px / 2:.3f}" y="{bar_y - 7:.3f}" font-size="9" fill="#17212b" text-anchor="middle">{_fmt_number(bar_value)} {_escape(unit_label)}</text>')
+
+    # Material legend with colour swatches and readable names.
+    legend_materials: list[Any] = []
+    seen: set[Any] = set()
+    for material in (view.get("lineMaterialIds") if dimension == 2 else view.get("materialIds")) or []:
+        if material in seen:
+            continue
+        seen.add(material)
+        legend_materials.append(material)
+    for key in (view.get("materials") or {}):
+        try:
+            material = int(key)
+        except (TypeError, ValueError):
+            continue
+        if material not in seen:
+            seen.add(material)
+            legend_materials.append(material)
+    legend_materials = legend_materials[:8]
+    if legend_materials:
+        legend_width = 146
+        legend_height = 18 + 16 * len(legend_materials)
+        legend_x = left + plot_width - legend_width - 8
+        legend_y = top + 8
+        parts.append(f'<rect x="{legend_x:.3f}" y="{legend_y:.3f}" width="{legend_width}" height="{legend_height}" fill="#ffffff" fill-opacity="0.92" stroke="#d8dee6"/>')
+        parts.append(f'<text x="{legend_x + 8:.3f}" y="{legend_y + 13:.3f}" font-size="9" fill="#334155" font-weight="600">材料图例</text>')
+        for row, material in enumerate(legend_materials):
+            item_y = legend_y + 22 + row * 16
+            color = _material_color(view, material)
+            parts.append(f'<rect x="{legend_x + 8:.3f}" y="{item_y - 8:.3f}" width="10" height="10" fill="{_escape(color)}" stroke="#94a3b8" stroke-width="0.5"/>')
+            parts.append(f'<text x="{legend_x + 24:.3f}" y="{item_y + 1:.3f}" font-size="9" fill="#17212b">{_escape(_material_name(view, material))}</text>')
+
     parts.append("</svg>")
     return "".join(parts)
 
 
+def _parameters_text(parameters: dict[str, Any], names: dict[str, str]) -> str:
+    parts: list[str] = []
+    for step_id, overrides in sorted((parameters or {}).items()):
+        if not isinstance(overrides, dict):
+            continue
+        label = _step_label(step_id, names)
+        for key, value in sorted(overrides.items()):
+            unit = _PARAMETER_UNITS.get(str(key), "")
+            parts.append(f"{label} {key}={_fmt_number(value)}{unit}")
+    return " · ".join(parts) if parts else "未提供"
+
+
 def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
+    if not any(request.get(key) for key in ("runId", "measurementId", "experimentId")):
+        raise WorkflowValidation("报告需要至少一次运行、测量或实验")
     title = str(request.get("title") or "Workflow report")
     experiment = None
     if request.get("experimentId"):
@@ -421,128 +843,282 @@ def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
             binding = store.get_binding(compile.compileRecord.geometryBindingId).model_dump(mode="json", exclude_none=True)
         except Exception:
             binding = None
-    sections = []
-    sections.append("<h2>流程 / Compile</h2>")
+
+    step_names = _step_names(compile, manifest)
+    sections: list[str] = []
+
+    # -- 流程与编译 ---------------------------------------------------------
+    sections.append("<h2>流程与编译</h2>")
     if compile:
         record = compile.compileRecord.model_dump(mode="json", exclude_none=True)
-        sections.append("<table><tr><th>compileId</th><td><code>%s</code></td></tr>" % _escape(record.get("compileId")))
-        sections.append("<tr><th>flowId / revision</th><td>%s / <code>%s</code></td></tr>" % (_escape(record.get("flowId")), _escape(record.get("flowRevisionId"))))
-        sections.append("<tr><th>flow hash</th><td><code>%s</code></td></tr>" % _escape(record.get("flowRevisionHash")))
-        sections.append("<tr><th>variables</th><td><code>%s</code></td></tr>" % _escape(json.dumps(record.get("variableSet") or [], sort_keys=True)))
-        sections.append("<tr><th>seed policy</th><td>%s</td></tr>" % _escape(record.get("seedPolicy")))
-        sections.append("</table>")
-        factors = (experiment or {}).get("design", {}).get("factors") or []
+        sections.append(_kv_table([
+            ("编译 ID", _code(record.get("compileId"))),
+            ("流程 / 修订", "%s / %s" % (_display(record.get("flowId")), _code(record.get("flowRevisionId")))),
+            ("流程哈希", _code(record.get("flowRevisionHash"))),
+            ("变量", _code(json.dumps(record.get("variableSet") or [], sort_keys=True))),
+            ("种子策略", _display(record.get("seedPolicy"))),
+        ]))
+        factors = ((experiment or {}).get("design") or {}).get("factors") or []
         if factors:
-            sections.append("<h3>Experiment factors</h3><table><tr><th>step</th><th>parameter</th><th>values</th></tr>")
-            for factor in factors:
-                sections.append("<tr><td><code>%s</code></td><td>%s</td><td>%s</td></tr>" % (
-                    _escape(factor.get("stepId")), _escape(factor.get("parameter")),
-                    _escape(json.dumps(factor.get("values") or []))))
-            sections.append("</table>")
-        sections.append("<h3>Steps</h3><table><tr><th>#</th><th>stepId</th><th>authored</th><th>path</th></tr>")
-        for index, entry in enumerate(compile.sourceMap):
-            sections.append("<tr><td>%s</td><td><code>%s</code></td><td>%s</td><td>%s</td></tr>" % (
-                index + 1, _escape(entry.stepId), _escape(entry.authoredStepId), _escape(entry.flowPath)))
-        sections.append("</table>")
+            sections.append("<h3>实验因子</h3>")
+            sections.append(_table(
+                ["步骤", "参数", "取值"],
+                [[_escape(_step_label(factor.get("stepId"), step_names)), _escape(factor.get("parameter")),
+                  _escape(json.dumps(factor.get("values") or []))] for factor in factors],
+            ))
+        sections.append("<h3>步骤</h3>")
+        sections.append(_table(
+            ["编号", "步骤", "作者步骤", "路径"],
+            [[str(index + 1), "%s<br>%s" % (_escape(_step_label(entry.stepId, step_names)), _code(entry.stepId)),
+              _code(entry.authoredStepId), _escape(entry.flowPath)]
+             for index, entry in enumerate(compile.sourceMap)],
+        ))
+        sections.append(_details([
+            ("编译版本", _display(record.get("compilerVersion"))),
+            ("几何绑定哈希", _code(record.get("geometryBindingHash"))),
+            ("完整工程哈希", _code(record.get("fullProjectHash"))),
+            ("来源映射哈希", _code(record.get("sourceMapHash"))),
+            ("步骤 ID 策略", _display(record.get("stepIdPolicy"))),
+            ("材料定义哈希", _code(record.get("materialDefinitionsHash"))),
+            ("引擎版本", _display(json.dumps(record.get("engineVersions") or {}, sort_keys=True))),
+        ]))
     else:
-        sections.append('<p class="muted">No compile envelope selected.</p>')
+        sections.append('<p class="muted">未选择编译记录。</p>')
+
+    # -- 几何 / Clip --------------------------------------------------------
+    sections.append("<h2>几何 / Clip</h2>")
     if binding:
         source = binding.get("geometrySource") or {}
-        sections.append("<h2>几何 / Clip</h2><table>")
-        sections.append("<tr><th>binding</th><td><code>%s</code></td></tr>" % _escape(binding.get("bindingId")))
-        sections.append("<tr><th>geometry kind</th><td>%s</td></tr>" % _escape((binding.get("geometry") or {}).get("kind")))
-        sections.append("<tr><th>source</th><td>%s</td></tr>" % _escape(json.dumps(source, sort_keys=True) if source else "parametric"))
-        sections.append("</table>")
-    sections.append("<h2>引擎 / 种子</h2>")
+        geometry = binding.get("geometry") or {}
+        source_text = json.dumps(source, sort_keys=True) if source else "参数化几何"
+        sections.append(_kv_table([
+            ("绑定", _code(binding.get("bindingId"))),
+            ("几何类型", _display(geometry.get("kind"))),
+            ("来源", _escape(source_text)),
+        ]))
+        sections.append(_details([
+            ("来源结构", _display(source.get("structure"), "未提供")),
+            ("多边形数量", _fmt_number(source.get("polygonCount"))),
+            ("点数", _fmt_number(source.get("pointCount"))),
+            ("域", _display(json.dumps(binding.get("domain") or {}, sort_keys=True))),
+            ("网格", _display(json.dumps(binding.get("grid") or {}, sort_keys=True))),
+        ]))
+    else:
+        sections.append('<p class="muted">未提供几何绑定。</p>')
+
+    # -- 引擎与种子 --------------------------------------------------------
+    sections.append("<h2>引擎与种子</h2>")
     if manifest:
         versions = manifest.get("versions") or {}
         solver = manifest.get("requestedSolver") or {}
-        sections.append("<table>")
-        sections.append("<tr><th>ViennaPS</th><td>%s</td></tr>" % _escape(versions.get("viennaps")))
-        sections.append("<tr><th>ViennaLS</th><td>%s</td></tr>" % _escape(versions.get("viennals")))
-        sections.append("<tr><th>requested engine</th><td>%s</td></tr>" % _escape(solver.get("enginePreference")))
-        sections.append("<tr><th>actual seed</th><td>%s</td></tr>" % _escape(manifest.get("actualSeed")))
-        sections.append("<tr><th>requested input hash</th><td><code>%s</code></td></tr>" % _escape(manifest.get("requestedInputHash")))
-        sections.append("<tr><th>execution hash</th><td><code>%s</code></td></tr>" % _escape(manifest.get("executionHash")))
-        sections.append("</table>")
+        engine_text = "ViennaPS %s · ViennaLS %s" % (
+            _display(versions.get("viennaps"), "未记录"), _display(versions.get("viennals"), "未记录"))
+        sections.append(_kv_table([
+            ("引擎", engine_text),
+            ("请求引擎", _display(solver.get("enginePreference"))),
+            ("实际种子", _display(manifest.get("actualSeed"))),
+            ("请求输入哈希", _code(manifest.get("requestedInputHash"))),
+            ("执行哈希", _code(manifest.get("executionHash"))),
+        ]))
         actual = manifest.get("actualExecution") or []
         if actual:
-            sections.append("<h3>Step engine selection</h3><table><tr><th>step</th><th>actual engine</th><th>reason</th></tr>")
-            for row in actual[:40]:
-                sections.append("<tr><td><code>%s</code></td><td>%s</td><td>%s</td></tr>" % (
-                    _escape(row.get("stepId")), _escape(row.get("actualEngine")), _escape(row.get("engineSelectionReason"))))
-            sections.append("</table>")
+            sections.append("<h3>步骤引擎选择</h3>")
+            sections.append(_table(
+                ["步骤", "步骤引擎", "原因"],
+                [[_escape(_step_label(row.get("stepId"), step_names)), _display(row.get("actualEngine")),
+                  _display(row.get("engineSelectionReason"))] for row in actual[:40]],
+            ))
+        sections.append(_details([
+            ("运行模式", _display(manifest.get("runMode"))),
+            ("维度", _fmt_number(manifest.get("dimension"))),
+            ("应用版本", _display(versions.get("application"))),
+            ("Python", _display(versions.get("python"))),
+            ("计划执行哈希", _code(manifest.get("plannedExecutionHash"))),
+            ("耗时（秒）", _fmt_number(manifest.get("elapsedSeconds"))),
+        ]))
     else:
-        sections.append('<p class="muted">No run manifest selected.</p>')
-    sections.append("<h2>运行 / 测量</h2>")
-    if run_id:
-        sections.append("<p>run <code>%s</code> · step <code>%s</code></p>" % (_escape(run_id), _escape(step_id)))
-    if measurement:
-        sections.append("<table><tr><th>measurement</th><td><code>%s</code></td></tr>" % _escape(getattr(measurement, "measurementId", "")))
-        sections.append("<tr><th>metric</th><td>%s</td></tr>" % _escape(getattr(measurement, "metricId", "")))
-        sections.append("<tr><th>recipe</th><td>%s v%s</td></tr>" % (_escape(getattr(measurement, "recipeId", "")), _escape(getattr(measurement, "recipeVersion", ""))))
-        sections.append("<tr><th>method</th><td>%s · %s</td></tr>" % (_escape(getattr(measurement, "method", "")), _escape(getattr(measurement, "material", ""))))
-        sections.append("<tr><th>value</th><td>%s %s</td></tr>" % (_escape(getattr(measurement, "value", None)), _escape(getattr(measurement, "unit", ""))))
-        sections.append("<tr><th>source snapshot</th><td><code>%s</code></td></tr>" % _escape(getattr(measurement, "sourceSnapshotHash", "")))
-        sections.append("<tr><th>binding</th><td>%s</td></tr>" % _escape(getattr(measurement, "bindingStatus", "")))
-        sections.append("<tr><th>equivalence</th><td>%s</td></tr>" % _escape(getattr(measurement, "equivalenceStatus", "")))
-        sections.append("</table>")
+        sections.append('<p class="muted">未记录运行清单。</p>')
+
+    # -- 运行与测量 --------------------------------------------------------
+    sections.append("<h2>运行与测量</h2>")
+    run_status = _status_label(manifest.get("status") if manifest else (getattr(segment, "status", None) if segment else None))
+    run_route = route.route.name if route is not None and getattr(route, "route", None) is not None else None
+    run_parts = ["运行 %s" % run_status]
+    if manifest and (manifest.get("startedAt") or manifest.get("finishedAt")):
+        run_parts.append("%s → %s" % (_display(manifest.get("startedAt")), _display(manifest.get("finishedAt"))))
+    if run_route:
+        run_parts.append("路由 %s" % _escape(run_route))
+    if step_id:
+        run_parts.append("步骤 %s" % _escape(_step_label(step_id, step_names)))
+    sections.append("<p>%s</p>" % " · ".join(run_parts))
+    sections.append(_details([
+        ("运行 ID", _code(run_id)),
+        ("步骤 ID", _code(step_id)),
+        ("路由 ID", _code(getattr(getattr(route, "route", None), "routeId", None))),
+        ("尝试 ID", _code(getattr(segment, "attemptId", None))),
+        ("段状态", _status_label(getattr(segment, "status", None))),
+        ("输入哈希", _code(getattr(segment, "provenanceInputHash", None))),
+        ("执行哈希", _code(getattr(segment, "executionHash", None))),
+        ("结果哈希", _code(getattr(segment, "resultDigest", None))),
+    ]))
+    if measurement is not None:
+        metric_name = None
+        try:
+            metric_name = store.get_metric(measurement.metricId).name
+        except Exception:
+            metric_name = None
+        metric_label = metric_name or measurement.metricId
+        sections.append("<p>测量 %s · 数值 %s %s · %s</p>" % (
+            _escape(metric_label), _fmt_number(measurement.value), _display(measurement.unit, ""),
+            _status_label(measurement.status)))
+        sections.append(_kv_table([
+            ("测量", _code(measurement.measurementId)),
+            ("指标", _escape(metric_label)),
+            ("配方", "%s v%s" % (_escape(measurement.recipeId), _display(measurement.recipeVersion, ""))),
+            ("方法", "%s · %s" % (_display(measurement.method), _display(measurement.material))),
+            ("数值", "%s %s" % (_fmt_number(measurement.value), _display(measurement.unit, ""))),
+            ("来源快照", _code(measurement.sourceSnapshotHash)),
+            ("绑定状态", _status_label(measurement.bindingStatus)),
+            ("等价状态", _status_label(measurement.equivalenceStatus)),
+            ("状态", _status_label(measurement.status)),
+        ]))
+        sections.append(_details([
+            ("算法版本", _display(measurement.algorithmVersion)),
+            ("来源运行 ID", _code(measurement.sourceRunId)),
+            ("来源步骤 ID", _code(measurement.sourceStepId)),
+            ("来源状态 ID", _code(measurement.sourceStateId)),
+            ("不确定度", _fmt_number(measurement.uncertainty)),
+            ("不确定度状态", _status_label(measurement.uncertaintyStatus)),
+            ("坐标系统", _display(measurement.coordinateSystem)),
+            ("原因", _display(measurement.reason, "未提供")),
+        ]))
         if provenance:
-            sections.append("<h3>Evidence / Provenance</h3><table><tr><th>verification</th><th>status</th><th>method</th></tr>")
-            for row in provenance:
-                sections.append("<tr><td><code>%s</code></td><td>%s</td><td>%s</td></tr>" % (
-                    _escape(row.verificationId), _escape(row.status), _escape(row.methodVersion)))
-            sections.append("</table>")
+            sections.append("<h3>证据</h3>")
+            sections.append(_table(
+                ["证据", "状态", "方法版本"],
+                [[_code(row.verificationId), _status_label(row.status), _display(row.methodVersion)] for row in provenance],
+            ))
     else:
-        sections.append('<p class="muted">No measurement selected.</p>')
+        sections.append('<p class="muted">未记录测量结果。</p>')
+
+    # -- 实验与统计 --------------------------------------------------------
     if experiment:
-        sections.append("<h2>实验 / 统计</h2>")
-        sections.append("<p>%s · %s · %s conditions</p>" % (
-            _escape(experiment.get("name")), _escape(experiment.get("status")),
-            _escape((experiment.get("design") or {}).get("conditionCount", len(experiment.get("variants") or [])))))
+        sections.append("<h2>实验与统计</h2>")
+        condition_count = (experiment.get("design") or {}).get("conditionCount", len(experiment.get("variants") or []))
+        sections.append(_kv_table([
+            ("实验", _display(experiment.get("name"))),
+            ("条件数", _fmt_number(condition_count)),
+            ("状态", _status_label(experiment.get("status"))),
+        ]))
+        variants = experiment.get("variants") or []
+        if variants:
+            sections.append("<h3>候选</h3>")
+            sections.append(_table(
+                ["候选", "条件", "状态", "运行数"],
+                [[_escape(_variant_title(variant, index)), _display(_variant_conditions(variant), "未提供"),
+                  _escape(_variant_status(variant)), _fmt_number(len(variant.get("replicates") or []))]
+                 for index, variant in enumerate(variants)],
+            ))
         aggregation = experiment.get("aggregation") or {}
         rows = aggregation.get("rows") or []
         if rows:
-            sections.append("<table><tr><th>#</th><th>parameters</th><th>n</th><th>mean</th><th>std</th><th>CI95</th><th>status</th></tr>")
-            for row in rows:
-                sections.append("<tr><td>%s</td><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
-                    _escape(row.get("ordinal")), _escape(json.dumps(row.get("parameters") or {}, sort_keys=True)),
-                    _escape(row.get("n")), _escape(row.get("mean")),
-                    _escape(row.get("std")), _escape(row.get("ci95")), _escape(row.get("statisticalStatus"))))
-            sections.append("</table>")
-            sections.append("<p class='muted'>CI method: %s</p>" % _escape(aggregation.get("ciMethod")))
+            sections.append("<h3>统计汇总</h3>")
+            sections.append(_table(
+                ["编号", "参数", "样本数", "均值", "标准差", "95% 置信区间", "统计状态"],
+                [[_fmt_number(row.get("ordinal")), _escape(_parameters_text(row.get("parameters") or {}, step_names)),
+                  _fmt_number(row.get("n")), _fmt_number(row.get("mean")), _fmt_number(row.get("std")),
+                  _fmt_number(row.get("ci95")), _status_label(row.get("statisticalStatus"))] for row in rows],
+            ))
+            sections.append(_details([
+                ("CI 方法", _display(aggregation.get("ciMethod"))),
+                ("单位", _display(aggregation.get("unit"))),
+                ("假设", _display(json.dumps(aggregation.get("assumptions") or [], ensure_ascii=False))),
+                ("样本来源", _display(aggregation.get("sampleSource"))),
+            ]))
         if request.get("lower") is not None and request.get("upper") is not None:
             window = process_window(experiment, float(request["lower"]), float(request["upper"]))
-            sections.append("<h3>Process window</h3><p>%s</p>" % _escape(json.dumps(window["summary"], sort_keys=True)))
-    sections.append("<h2>视图</h2>")
-    view_snapshots = []
+            unit = window.get("unit") or ""
+            sections.append("<h3>工艺窗口</h3>")
+            sections.append(_kv_table([
+                ("工艺窗口", "%s – %s %s" % (_fmt_number(window.get("lower")), _fmt_number(window.get("upper")), _display(unit, ""))),
+                ("候选", "%s 个" % _fmt_number(len(window.get("candidates") or []))),
+            ]))
+            sections.append("<p>通过 %s · 超出 %s · 不确定 %s · 未评估 %s</p>" % (
+                _fmt_number(window["summary"]["pass"]), _fmt_number(window["summary"]["fail"]),
+                _fmt_number(window["summary"]["uncertain"]), _fmt_number(window["summary"]["notEvaluated"])))
+            if window.get("candidates"):
+                sections.append(_table(
+                    ["候选", "参数", "均值", "95% 置信区间", "样本数", "状态"],
+                    [[_fmt_number(row.get("ordinal")), _escape(_parameters_text(row.get("parameters") or {}, step_names)),
+                      _fmt_number(row.get("mean")), _fmt_number(row.get("ci95")), _fmt_number(row.get("n")),
+                      _status_label(row.get("status"))] for row in window["candidates"]],
+                ))
+            sections.append(_details([
+                ("因子窗口", _display(json.dumps(window.get("factorWindows") or [], ensure_ascii=False))),
+                ("统计明细", _display(json.dumps(window.get("rows") or [], ensure_ascii=False))),
+            ]))
+
+    # -- 结构视图 ----------------------------------------------------------
+    sections.append("<h2>结构视图</h2>")
+    view_snapshots: list[tuple[dict[str, Any], str]] = []
     if experiment:
-        for variant in (experiment.get("variants") or [])[:3]:
+        for index, variant in enumerate((experiment.get("variants") or [])[:3]):
             replicate = (variant.get("replicates") or [{}])[0]
-            if replicate.get("runId") and step_id:
-                try:
-                    view_snapshots.append(load_snapshot(replicate["runId"], step_id))
-                except Exception:
-                    pass
+            if not replicate.get("runId") or not step_id:
+                continue
+            try:
+                snapshot = load_snapshot(replicate["runId"], step_id)
+            except Exception:
+                continue
+            caption_parts = [_step_label(step_id, step_names)]
+            conditions = _variant_conditions(variant)
+            if conditions:
+                caption_parts.append(conditions)
+            seed = _variant_seed(variant)
+            if seed is not None:
+                caption_parts.append(f"seed {_fmt_number(seed)}")
+            view_snapshots.append((snapshot, " · ".join(caption_parts)))
     elif run_id and step_id:
         try:
-            view_snapshots.append(load_snapshot(run_id, step_id))
+            view_snapshots.append((load_snapshot(run_id, step_id), _step_label(step_id, step_names)))
         except Exception:
             pass
     if view_snapshots:
         sections.append('<div class="views">')
-        for index, snapshot in enumerate(view_snapshots):
-            sections.append("<figure><figcaption>candidate %s</figcaption>%s</figure>" % (index + 1, _svg_for_snapshot(snapshot)))
+        for snapshot, caption in view_snapshots:
+            sections.append("<figure><figcaption>%s</figcaption>%s</figure>" % (_escape(caption), _svg_for_snapshot(snapshot)))
         sections.append("</div>")
     else:
-        sections.append('<p class="muted">No snapshot view is available.</p>')
+        sections.append('<p class="muted">未记录可用的结构快照。</p>')
+
+    # -- 结论 --------------------------------------------------------------
     conclusions = request.get("conclusions") or ""
-    sections.append("<h2>结论</h2><p>%s</p>" % (_escape(conclusions) if conclusions else '<span class="muted">not recorded</span>'))
+    sections.append("<h2>结论</h2>")
+    if conclusions:
+        sections.append("<p>%s</p>" % _escape(conclusions))
+    else:
+        sections.append('<p><span class="muted">未填写</span></p>')
+
     body = "".join(sections)
     timestamp = _now()
+    body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    summary_parts = []
+    if run_id:
+        summary_parts.append("1 次运行")
+    if measurement is not None:
+        summary_parts.append("1 次测量")
+    if experiment:
+        summary_parts.append("1 个实验 · %s 个候选" % _fmt_number(len(experiment.get("variants") or [])))
+    summary = " · ".join(summary_parts) or "无数据"
     document = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>{_escape(title)}</title>
-<style>body{{font-family:system-ui,sans-serif;margin:32px;line-height:1.5;color:#17212b}}h1{{margin-bottom:0}}h2{{margin-top:26px;border-bottom:1px solid #d8dee6;padding-bottom:4px}}table{{border-collapse:collapse;width:100%;margin:8px 0}}th,td{{border:1px solid #d8dee6;padding:5px 8px;text-align:left;font-size:12px}}th{{background:#f4f7fa}}code{{font-size:11px}}.muted{{color:#6b7785}}.views{{display:flex;gap:12px;flex-wrap:wrap}}figure{{margin:0;flex:1 1 300px}}figcaption{{font-size:11px;color:#6b7785}}.report-svg{{width:100%;height:auto;border:1px solid #d8dee6;background:#fbfdff}}@media print{{body{{margin:0}}button{{display:none}}}}
-</style></head><body><h1>{_escape(title)}</h1><p class="muted">generated {_escape(timestamp)} · report hash {_escape(hashlib.sha256(body.encode('utf-8')).hexdigest())}</p>
+<style>body{{font-family:system-ui,sans-serif;margin:32px;line-height:1.5;color:#17212b}}h1{{margin-bottom:0}}.meta{{color:#6b7785;margin-top:4px}}h2{{margin-top:26px;border-bottom:1px solid #d8dee6;padding-bottom:4px}}h3{{margin-top:18px;font-size:15px}}table{{border-collapse:collapse;width:100%;margin:8px 0}}th,td{{border:1px solid #d8dee6;padding:5px 8px;text-align:left;font-size:12px;vertical-align:top}}th{{background:#f4f7fa}}code{{font-size:11px}}.muted{{color:#6b7785}}.views{{display:flex;gap:12px;flex-wrap:wrap}}figure{{margin:0;flex:1 1 320px}}figcaption{{font-size:11px;color:#6b7785}}.report-svg{{width:100%;height:auto;border:1px solid #d8dee6;background:#fbfdff}}details.tech{{margin:8px 0;font-size:12px}}details.tech summary{{cursor:pointer;color:#475569}}details.tech table{{margin-top:6px}}@media print{{body{{margin:0}}button{{display:none}}details.tech{{display:none}}}}
+</style></head><body><h1>{_escape(title)}</h1>
+<p class="meta">生成时间 {_escape(timestamp)} · 报告摘要 {_escape(summary)}</p>
+<details class="tech"><summary>技术详情</summary><table>
+<tr><th>报告哈希</th><td><code>{_escape(body_hash)}</code></td></tr>
+<tr><th>生成时间</th><td>{_escape(timestamp)}</td></tr>
+<tr><th>格式版本</th><td>1</td></tr>
+</table></details>
 <button onclick="window.print()">打印 / 保存为 PDF</button>{body}</body></html>"""
     digest = hashlib.sha256(document.encode("utf-8")).hexdigest()
     return {"reportId": f"report_{digest[:16]}", "title": title, "html": document, "sha256": digest, "createdAt": timestamp}
