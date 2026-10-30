@@ -49,7 +49,7 @@ what the docstring implies. Empty `dimensions` means the class never sees a doma
 | `TEOSDeposition` | `specialized/teosDeposition` | 2/3 | pinned SiO₂ output |
 | `TEOSPECVD` | `specialized/teospecvd` | 2/3 | pinned SiO₂ output |
 | `SingleParticleALD` | `specialized/ald` | 2/3 | + `AtomicLayerProcessParameters`, selectable material |
-| `Oxidation` | `specialized/oxidation` | 2/3 | 13 of ~40 setter values (see B5) |
+| `Oxidation` | `specialized/oxidation` | 2/3 | 17 of 45 `set*` methods + all four orientations (see B5) |
 | `OxideRegrowth` | `specialized/oxideRegrowth` | 2/3 | derives its own `DenseCellSet` |
 | `SelectiveEpitaxy` | `specialized/selectiveEpitaxy` | 2/3 | native `Material` enum only, no `nvFactors` |
 | `NeutralTransport` | `specialized/neutralTransport` | 2/3 | all 12 parameters |
@@ -125,8 +125,9 @@ custom material catalog.
 | `CoverageParameters` | `tolerance = 1e-3` (hard-coded) | `tolerance`, `maxIterations`, `initialized` | Convergence cannot be tightened or loosened |
 | `RateSet` | `model: directional` `rateSets[]`: 1–8 sets, per-set direction, velocities, masks and visibility | `print()` (debug helper) | Multiple simultaneous directions and per-set masks are now declarative |
 | `DenseCellSet` | OxideRegrowth by-product JSON only | generic per-step generation, height/cover/periodic options, filling fractions, user scalars, VTU export, continuation | No project can request a volumetric field of its own |
-| `Oxidation` advanced setters | 13 of ~40 | CFL, coupling/mechanics/Stokes/pressure iterations+tolerances, solve bounds, `maxGridPoints`, simple relaxation, mask contact/traction mechanics, `GpuMode`/`GpuPreconditioner`, model-level `saveSurfaceMesh`/`saveVolumeMesh` helpers (the workbench writes the same meshes through `Domain`), `estimatePlanarOxideThickness` | Separate solver surface; unproven on this host |
-| `SiliconOrientation.Si110` | 3 of 4 | `Si110` | Exists in 4.6.2, missing only because it was never evidenced |
+| `Oxidation` advanced setters | 17 of 45: the 13 historical values + `setCFLFactor`, `setMechanicsTolerance`, `setCouplingTolerance`, `setSimplePressureRelaxation` via `steps[].advancedOxidation` | iteration caps, pressure/stokes tolerances, `setSimpleVelocityRelaxation`, `setMaxGridPoints`, `setSolveBounds`, mask mechanics, `GpuMode`/`GpuPreconditioner`, model-level `saveSurfaceMesh`/`saveVolumeMesh` helpers | Each accepted setter has a native surface-hash probe; the excluded ones are inert, unsafe, GPU-only, or have no verified LOCOS output. See [`oxidation-advanced-contract.md`](oxidation-advanced-contract.md) |
+| `SiliconOrientation.Si110` | 4 of 4 (`Si100`, `Si110`, `Si111`, `PolySi`) | — | Native enum value 1; changes the Deal-Grove planar readback and produces distinct 2D/3D surface hashes |
+| `OxidationParameters`, `psOxidation`, `psProcessContext` | not bound | entire legacy C++ parameter surface (`oxidantFlux`, `reactionRate`, `volumeExpansion`, `stabilityFactor`, `redoStabilityCheck`, `calculateError`, `maxCellTravelDistance`, `useFluxSolver`, `fluxMultiplier`, `solverStabilityFactor`, `trapLayer`, `diffusionCellSet`, `finiteVolume`, `fluxAtBoundary`) | The installed 4.6.2 Python module does not expose these names; the Workbench rejects them as unknown keys |
 
 ### 3.3 Deliberately never exposed (batch C)
 
@@ -255,11 +256,24 @@ worker runs match an independent native reference exactly.
   schema and hash; oversized cell sets fail preflight before writing; cell counts and field arrays
   replay byte-identically; VTU export stays off until its artifact budget is proven.
 
-### Batch B5 — Oxidation advanced setters and `Si110`
+### Batch B5 — Oxidation advanced setters and `Si110` (exposed, backend/API)
 
-- Acceptance: `Si110` added only after a dry/wet run reproduces a native reference; advanced setters
-  grouped and opt-in with unchanged defaults; mask-mechanics fields require a mask level set (422
-  otherwise); GPU oxidation stays out until host GPU evidence exists.
+- `orientation: "Si110"` is accepted. The native enum has value 1; it changes the Deal-Grove planar
+  readback (`0.020625` → `0.027757` µm at 1000 °C dry/0.5 h) and produces a distinct surface hash in
+  both 2D and 3D.
+- The strict optional `steps[].advancedOxidation` object exposes exactly four solver setters proven to
+  change the native surface: `cflFactor`, `mechanicsTolerance`, `couplingTolerance` and
+  `simplePressureRelaxation`. Defaults are the installed 4.6.2 defaults; an omitted block keeps all
+  historical request hashes and artifacts, and materialising the defaults is a behaviour no-op.
+- Excluded with probe evidence: GPU mode/preconditioner, `maxGridPoints`, `solveBounds`, iteration
+  caps, pressure/stokes tolerances, `simpleVelocityRelaxation`, all mask-mechanics setters, the
+  model-level save helpers, and every legacy `OxidationParameters` name. The installed module does not
+  bind `OxidationParameters`, `psOxidation` or `psProcessContext`.
+- Acceptance: omitted block hashes unchanged; 2D and 3D native orientation runs are distinct and
+  deterministic; at least two advanced setters change the surface deterministically; unknown keys,
+  out-of-range values, unsupported orientation, inert candidates and non-oxidation placement are 422;
+  the API manifest and snapshot record requested/effective/defaults/native-readback.
+- Mask mechanics and GPU oxidation remain unexposed because no verified host run exists.
 
 ### Batch C1 — guard rails for the never-exposed surface
 

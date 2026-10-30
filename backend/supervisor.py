@@ -594,7 +594,7 @@ class Supervisor:
                 manifest["currentStepId"] = item.get("stepId")
                 manifest["currentStepName"] = item.get("name")
             elif event_type == "snapshot":
-                entry = {key: item[key] for key in ("stepId", "name", "stepIndex", "snapshot", "vtk", "pointCount", "lineCount", "triangleCount", "topology", "dimension", "materialIds", "materialIdsByLevelSetIndex", "noOp", "measuredGeometry", "geometryReadback", "sliceReadback", "nativeState", "outputs") if key in item}
+                entry = {key: item[key] for key in ("stepId", "name", "stepIndex", "snapshot", "vtk", "pointCount", "lineCount", "triangleCount", "topology", "dimension", "materialIds", "materialIdsByLevelSetIndex", "noOp", "measuredGeometry", "geometryReadback", "sliceReadback", "nativeState", "oxidation", "outputs") if key in item}
                 if not any(existing.get("stepId") == entry.get("stepId") for existing in manifest["snapshots"]):
                     manifest["snapshots"].append(entry)
                 if entry.get("stepId") != "initial" and entry.get("stepId") not in manifest["completedStepIds"]:

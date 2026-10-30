@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from backend.specialized_models import advanced_spec, model_spec
+from backend.specialized_models import advanced_spec, model_spec, oxidation_advanced_spec
 
 
 def _set_native_path(target: Any, path: str, value: Any) -> None:
@@ -364,6 +364,60 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
         if p["maskMaterial"]:
             model.setMaskMaterial(material_handle(p["maskMaterial"]))
         resolved["nativeParameters"] = {**p, "processDurationDerivation": "timeHours * 3600 seconds"}
+        advanced = step.get("advancedOxidation")
+        if advanced is not None:
+            # This is the only place the advanced object reaches the native
+            # model. The schema already proved the values are finite and
+            # in-range; repeat the type/domain checks here so a request that
+            # bypassed Pydantic (e.g. a hand-edited normalized project) cannot
+            # reach a native setter with a bad value.
+            spec = oxidation_advanced_spec()
+            fields = {field["key"]: field for field in spec["fields"]}
+            if not isinstance(advanced, dict):
+                raise RuntimeError("advancedOxidation must be a JSON object")
+            if unknown := sorted(set(advanced) - set(fields)):
+                raise RuntimeError(f"advancedOxidation contains unknown keys {unknown}")
+            effective: dict[str, float] = {}
+            for key, field in fields.items():
+                value = advanced.get(key, field["default"])
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise RuntimeError(f"advancedOxidation.{key} must be a finite number")
+                number = float(value)
+                if not math.isfinite(number):
+                    raise RuntimeError(f"advancedOxidation.{key} must be a finite number")
+                if not float(field["minimum"]) <= number <= float(field["maximum"]):
+                    raise RuntimeError(
+                        f"advancedOxidation.{key} must be between "
+                        f"{field['minimum']} and {field['maximum']}")
+                effective[key] = number
+            if effective["couplingTolerance"] < effective["mechanicsTolerance"]:
+                raise RuntimeError(
+                    "advancedOxidation.couplingTolerance must be at least mechanicsTolerance")
+            model.setCFLFactor(effective["cflFactor"])
+            model.setMechanicsTolerance(effective["mechanicsTolerance"])
+            model.setCouplingTolerance(effective["couplingTolerance"])
+            model.setSimplePressureRelaxation(effective["simplePressureRelaxation"])
+            # ``Oxidation`` has no getters for these solver controls. The only
+            # native readback available on the installed binding is the
+            # Deal-Grove planar estimate, which also re-reads the orientation.
+            readback = {
+                "orientation": str(p["orientation"]),
+                "planarOxideThicknessUm": float(model.estimatePlanarOxideThickness(
+                    float(p["initialOxideThicknessUm"]))),
+                "solverControls": "no native getters in viennaps 4.6.2; requested == effective after schema validation",
+                "nativeGetters": "not exposed",
+            }
+            resolved["advancedOxidation"] = {
+                "schemaVersion": 1,
+                "location": spec["location"],
+                "nativeClass": spec["nativeClass"],
+                "requested": dict(advanced),
+                "defaults": {key: field["default"] for key, field in fields.items()},
+                "effective": effective,
+                "nativeSetters": {key: field["nativeSetter"] for key, field in fields.items()},
+                "nativeReadback": readback,
+                "defaultsSource": spec["defaultsSource"],
+            }
     elif model_id == "oxideRegrowth":
         surface = domain.getSurfaceMesh(addInterfaces=True, sharpCorners=False, minNodeDistanceFactor=0.01)
         vertical_axis = 1 if int(project["dimension"]) == 2 else 2
