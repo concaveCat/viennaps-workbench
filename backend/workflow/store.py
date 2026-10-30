@@ -184,6 +184,11 @@ class WorkflowStore:
                 CREATE INDEX IF NOT EXISTS attempts_route_idx ON attempts(route_id);
                 CREATE INDEX IF NOT EXISTS segments_attempt_idx ON segments(attempt_id);
                 CREATE INDEX IF NOT EXISTS reuse_attempt_idx ON reuse(attempt_id);
+                CREATE TABLE IF NOT EXISTS experiments (
+                    experiment_id TEXT PRIMARY KEY,
+                    document_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS flow_templates (
                     template_id TEXT PRIMARY KEY,
                     template_json TEXT NOT NULL,
@@ -1299,6 +1304,32 @@ class WorkflowStore:
     def materialize(self, route_id: str, attempt_id: str) -> list[SegmentRefV1]:
         plan = self.get_plan(route_id)
         return materialize_attempt(plan, attempt_id)
+
+    def save_experiment(self, experiment_id: str, document: dict[str, Any]) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO experiments (experiment_id, document_json, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(experiment_id) DO UPDATE SET document_json = excluded.document_json, updated_at = excluded.updated_at",
+                (experiment_id, self._dump(document), self._now()),
+            )
+        return document
+
+    def get_experiment(self, experiment_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute("SELECT document_json FROM experiments WHERE experiment_id = ?", (experiment_id,)).fetchone()
+        if row is None:
+            raise WorkflowNotFound(f"experiment {experiment_id!r} does not exist")
+        return json.loads(row["document_json"])
+
+    def list_experiments(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute("SELECT document_json, updated_at FROM experiments ORDER BY updated_at DESC").fetchall()
+        return [
+            {"experimentId": json.loads(row["document_json"])["experimentId"],
+             "name": json.loads(row["document_json"]).get("name"),
+             "updatedAt": row["updated_at"]}
+            for row in rows
+        ]
 
     def register_template(self, template) -> Any:
         payload = template.model_dump(mode="json", exclude_none=True)

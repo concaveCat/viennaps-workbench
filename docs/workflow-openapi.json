@@ -576,6 +576,32 @@
         "title": "BooleanStepV5",
         "type": "object"
       },
+      "BranchRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "changedStepIds": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Changedstepids",
+            "type": "array"
+          },
+          "compileId": {
+            "title": "Compileid",
+            "type": "string"
+          },
+          "startAfterStepId": {
+            "title": "Startafterstepid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "compileId",
+          "startAfterStepId"
+        ],
+        "title": "BranchRequest",
+        "type": "object"
+      },
       "CDAtHeightParametersV1": {
         "additionalProperties": false,
         "properties": {
@@ -1066,6 +1092,49 @@
           "compileRecord"
         ],
         "title": "CompiledWorkflowV1",
+        "type": "object"
+      },
+      "CreateExperimentRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "flowId": {
+            "title": "Flowid",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "project": {
+            "$ref": "#/components/schemas/ProjectV7"
+          },
+          "recipeId": {
+            "title": "Recipeid",
+            "type": "string"
+          },
+          "recipeVersion": {
+            "title": "Recipeversion",
+            "type": "integer"
+          },
+          "variants": {
+            "items": {
+              "$ref": "#/components/schemas/ExperimentVariantSpecV1"
+            },
+            "maxItems": 20,
+            "minItems": 1,
+            "title": "Variants",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "project",
+          "flowId",
+          "recipeId",
+          "recipeVersion",
+          "variants"
+        ],
+        "title": "CreateExperimentRequest",
         "type": "object"
       },
       "DirectionalStepV5": {
@@ -1836,6 +1905,33 @@
           "status"
         ],
         "title": "ExecutionEvidenceV1",
+        "type": "object"
+      },
+      "ExperimentVariantSpecV1": {
+        "additionalProperties": false,
+        "properties": {
+          "parameters": {
+            "additionalProperties": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Parameters",
+            "type": "object"
+          },
+          "replicates": {
+            "default": 1,
+            "maximum": 8.0,
+            "minimum": 1.0,
+            "title": "Replicates",
+            "type": "integer"
+          },
+          "seed": {
+            "default": 20261029,
+            "title": "Seed",
+            "type": "integer"
+          }
+        },
+        "title": "ExperimentVariantSpecV1",
         "type": "object"
       },
       "FixedRandom": {
@@ -3493,6 +3589,17 @@
               }
             ],
             "title": "Name"
+          },
+          "splitAfterStepId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Splitafterstepid"
           }
         },
         "required": [
@@ -6939,6 +7046,158 @@
         ]
       }
     },
+    "/api/v1/workflow/experiments": {
+      "get": {
+        "operationId": "list_experiments_api_v1_workflow_experiments_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Experiments Api V1 Workflow Experiments Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Experiments",
+        "tags": [
+          "workflow"
+        ]
+      },
+      "post": {
+        "operationId": "create_experiment_api_v1_workflow_experiments_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateExperimentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Experiment Api V1 Workflow Experiments Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Experiment",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/experiments/{experiment_id}": {
+      "get": {
+        "operationId": "get_experiment_api_v1_workflow_experiments__experiment_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "experiment_id",
+            "required": true,
+            "schema": {
+              "title": "Experiment Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Experiment Api V1 Workflow Experiments  Experiment Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Experiment",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/experiments/{experiment_id}/run": {
+      "post": {
+        "operationId": "run_experiment_api_v1_workflow_experiments__experiment_id__run_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "experiment_id",
+            "required": true,
+            "schema": {
+              "title": "Experiment Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Run Experiment Api V1 Workflow Experiments  Experiment Id  Run Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Run Experiment",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
     "/api/v1/workflow/flows/from-project": {
       "post": {
         "operationId": "adopt_project_endpoint_api_v1_workflow_flows_from_project_post",
@@ -7824,6 +8083,58 @@
           }
         },
         "summary": "Materialize Route",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/routes/{route_id}/branches": {
+      "post": {
+        "operationId": "branch_route_api_v1_workflow_routes__route_id__branches_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "route_id",
+            "required": true,
+            "schema": {
+              "title": "Route Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BranchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RoutePlanResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Branch Route",
         "tags": [
           "workflow"
         ]

@@ -3,7 +3,7 @@ import './workflow.css';
 
 type Health = { status: string; viennaps?: string; viennals?: string; activeRunId?: string | null };
 type GdsAsset = { assetId: string; fileName: string };
-type ProjectStep = { id: string; name: string; model: string; operation?: string; enabled: boolean };
+type ProjectStep = { id: string; name: string; model: string; operation?: string; enabled: boolean; duration?: number };
 type CompileInfo = {
   flowId: string;
   bindingId: string;
@@ -11,7 +11,7 @@ type CompileInfo = {
   projectName: string;
   dimension: number;
   stepCount: number;
-  compile: { project: { name: string; dimension: number; steps: ProjectStep[] } };
+  compile: { project: { name: string; dimension: number; steps: ProjectStep[] }; sourceMap?: Array<{ stepId: string; authoredStepId: string }> };
 };
 type RoutePlan = {
   route: { routeId: string; name: string; headAttemptId: string };
@@ -96,6 +96,15 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [experiments, setExperiments] = useState<Array<{ index: number; routeId: string; segmentId: string; status: string; runId: string | null }>>([]);
   const [templates, setTemplates] = useState<TemplateSummary[]>([]);
   const [templateId, setTemplateId] = useState('');
+  const [recipeMethod, setRecipeMethod] = useState<'cd_at_height' | 'etch_depth'>('etch_depth');
+  const [recipeMaterial, setRecipeMaterial] = useState('Si');
+  const [recipeHeight, setRecipeHeight] = useState('0');
+  const [recipeX, setRecipeX] = useState('0');
+  const [recipeRef, setRecipeRef] = useState('0');
+  const [metrics, setMetrics] = useState<Measurement[]>([]);
+  const [branchDuration, setBranchDuration] = useState('0.02');
+  const [activeRecipeId, setActiveRecipeId] = useState('');
+  const [experimentDoc, setExperimentDoc] = useState<{ experimentId: string; name: string; status: string; variants: Array<{ ordinal: number; replicates: Array<{ status: string; value?: number | null; unit?: string; runId?: string }> }> } | null>(null);
   const [provenance, setProvenance] = useState<Provenance | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [zone, setZone] = useState<'setup' | 'flow' | 'run' | 'experiment' | 'analyze' | 'report'>('setup');
@@ -199,9 +208,12 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
 
   const createRoute = () => run('route', async () => {
     if (!compile) throw new Error('先采纳工程');
+    const enabledSteps = compile.compile.project.steps.filter(step => step.enabled);
+    const splitAfterStepId = enabledSteps.length > 1 ? enabledSteps[enabledSteps.length - 2].id : undefined;
     const result = await postJson<{ plan: RoutePlan }>('/api/v1/workflow/routes/from-compile', {
       compileId: compile.compileId,
-      name: `${compile.projectName} · P0 route`,
+      name: `${compile.projectName} · P1 route`,
+      splitAfterStepId,
     });
     setRoute(result.plan);
     setSegment(result.plan.segments[0] ?? null);
@@ -220,17 +232,20 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
 
   const measure = () => run('measure', async () => {
     if (!segment?.runId) throw new Error('先完成运行');
-    const stamp = Date.now().toString(36);
-    const metricId = `metric_cd_${stamp}`;
-    const recipeId = `recipe_cd_${stamp}`;
+    if (!compile) throw new Error('先采纳工程');
+    const metricId = `metric_${compile.flowId}_${recipeMethod}`;
+    const recipeId = `recipe_${compile.flowId}_${recipeMethod}`;
+    const metricUnit = 'um';
     await postJson('/api/v1/workflow/metrics', {
-      schemaVersion: 1, metricId, name: 'P0 CD / depth', unit: 'um', description: 'workflow UI default recipe',
+      schemaVersion: 1, metricId, name: `${recipeMethod} metric`, unit: metricUnit, description: 'P1 configurable recipe',
     });
-    const dimension = compile?.dimension ?? 2;
+    const parameters = recipeMethod === 'cd_at_height'
+      ? { kind: 'cd_at_height', height: Number(recipeHeight) || 0, pairSelection: 'outermost' }
+      : { kind: 'etch_depth', x: Number(recipeX) || 0, referenceHeight: Number(recipeRef) || 0 };
     await postJson('/api/v1/workflow/metrology-recipes', {
-      schemaVersion: 1, recipeId, version: 1, metricId, name: 'P0 depth', dimension,
-      method: 'etch_depth', parameters: { kind: 'etch_depth', x: 0, referenceHeight: dimension === 3 ? 0.1 : 0 },
-      material: 'Si',
+      schemaVersion: 1, recipeId, version: 1, metricId,
+      name: `${recipeMethod} @ ${recipeMaterial}`, dimension: compile.dimension,
+      method: recipeMethod, parameters, material: recipeMaterial,
     });
     const result = await postJson<Measurement>('/api/v1/workflow/measurements/from-run', {
       recipeId, recipeVersion: 1, runId: segment.runId, stepId: segment.throughStepId,
@@ -241,6 +256,71 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     });
     setMeasurement(bound);
     setProvenance(await api<Provenance>(`/api/v1/workflow/measurements/${result.measurementId}/provenance`));
+    const listed = await api<{ measurements: Measurement[] }>(`/api/v1/workflow/measurements?run_id=${segment.runId}`);
+    setMetrics(listed.measurements);
+    setActiveRecipeId(recipeId);
+  });
+
+
+  const executeAll = () => run('execute', async () => {
+    if (!route) throw new Error('先创建 Route');
+    for (const item of route.segments.filter(segmentItem => segmentItem.status === 'planned')) {
+      const started = await postJson<{ segment: RoutePlan['segments'][number]; runId: string }>(
+        `/api/v1/workflow/segments/${item.segmentId}/execute`, {},
+      );
+      setSegment(started.segment);
+      setRoute(previous => previous ? { ...previous, segments: previous.segments.map(row => row.segmentId === started.segment.segmentId ? started.segment : row) } : previous);
+      await waitSegment(item.segmentId);
+    }
+  });
+
+  const branchLastStep = () => run('branch', async () => {
+    if (!project || !compile || !route) throw new Error('先完成前缀 Route');
+    const enabledSteps = compile.compile.project.steps.filter(step => step.enabled);
+    if (enabledSteps.length < 2) throw new Error('至少需要两步');
+    const tail = enabledSteps[enabledSteps.length - 1];
+    const prefix = enabledSteps[enabledSteps.length - 2];
+    const authoredTail = compile.compile.sourceMap?.find(entry => entry.stepId === tail.id)?.authoredStepId ?? tail.id;
+    const cloned = JSON.parse(JSON.stringify(project)) as typeof project & { steps?: Array<Record<string, unknown>> };
+    const target = cloned.steps?.find(step => step.id === authoredTail);
+    if (!target) throw new Error('找不到尾步骤');
+    target.duration = Number(branchDuration) || 0.02;
+    const adopted = await postJson<CompileInfo>('/api/v1/workflow/flows/from-project', { project: cloned, flowId: compile.flowId });
+    setCompile(adopted);
+    const result = await postJson<{ plan: RoutePlan }>(`/api/v1/workflow/routes/${route.route.routeId}/branches`, {
+      compileId: adopted.compileId, startAfterStepId: prefix.id, changedStepIds: [tail.id],
+    });
+    setRoute(result.plan);
+    const tailSegment = result.plan.segments[result.plan.segments.length - 1];
+    setSegment(tailSegment);
+    setMeasurement(null); setProvenance(null); setMetrics([]);
+  });
+
+  const createPersistentExperiment = () => run('experiment', async () => {
+    if (!project || !compile || !activeRecipeId) throw new Error('先完成一次测量以固定配方');
+    const tail = compile.compile.project.steps.filter(step => step.enabled).slice(-1)[0];
+    const authored = compile.compile.sourceMap?.find(entry => entry.stepId === tail.id)?.authoredStepId ?? tail.id;
+    const variants = Array.from({ length: 10 }, (_, index) => ({
+      parameters: { [authored]: { duration: 0.01 + index * 0.001 } },
+      replicates: 1,
+      seed: 20261029 + index,
+    }));
+    const doc = await postJson<typeof experimentDoc>('/api/v1/workflow/experiments', {
+      name: `${compile.projectName} · 10 variants`, project, flowId: compile.flowId,
+      recipeId: activeRecipeId, recipeVersion: 1, variants,
+    });
+    setExperimentDoc(doc);
+  });
+
+  const runPersistentExperiment = () => run('experiment', async () => {
+    if (!experimentDoc) throw new Error('先创建实验');
+    await postJson(`/api/v1/workflow/experiments/${experimentDoc.experimentId}/run`, {});
+    for (let index = 0; index < 600; index += 1) {
+      const doc = await api<typeof experimentDoc>(`/api/v1/workflow/experiments/${experimentDoc.experimentId}`);
+      setExperimentDoc(doc);
+      if (doc && ['completed', 'failed'].includes(doc.status)) return;
+      await new Promise(resolve => window.setTimeout(resolve, 500));
+    }
   });
 
   const sleep = (ms: number) => new Promise(resolve => window.setTimeout(resolve, ms));
@@ -254,25 +334,6 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     }
     throw new Error('experiment segment did not finish');
   };
-
-  const runExperiment = () => run('experiment', async () => {
-    if (!compile) throw new Error('先采纳工程');
-    const rows: Array<{ index: number; routeId: string; segmentId: string; status: string; runId: string | null }> = [];
-    for (let index = 1; index <= 3; index += 1) {
-      const created = await postJson<{ plan: RoutePlan }>('/api/v1/workflow/routes/from-compile', {
-        compileId: compile.compileId, name: `${compile.projectName} · variant ${index}`,
-      });
-      const item = created.plan.segments[0];
-      rows.push({ index, routeId: created.plan.route.routeId, segmentId: item.segmentId, status: 'planned', runId: null });
-      setExperiments([...rows]);
-      const started = await postJson<{ segment: RoutePlan['segments'][number]; runId: string }>(
-        `/api/v1/workflow/segments/${item.segmentId}/execute`, {},
-      );
-      rows[rows.length - 1] = { ...rows[rows.length - 1], status: started.segment.status, runId: started.runId };
-      setExperiments([...rows]);
-      await waitSegment(item.segmentId);
-    }
-  });
 
   const downloadReport = () => {
     const lines = [
@@ -382,9 +443,28 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             <button className="wf-button primary" disabled={!canRun} onClick={() => void execute()}>
               {busy === 'execute' ? '启动中…' : '执行 Segment'}
             </button>
+            <button className="wf-button ghost" disabled={!route || !!busy} onClick={() => void executeAll()}>执行全部 Segment</button>
+            <div className="wf-branch-row">
+              <input aria-label="尾步时长" value={branchDuration} onChange={event => setBranchDuration(event.target.value)} />
+              <button className="wf-button ghost" disabled={!route || !!busy} onClick={() => void branchLastStep()}>修改尾步并分支</button>
+            </div>
             {segment.status === 'running' && <div className="wf-progress"><i /></div>}
+            <div className="wf-recipe">
+              <div className="wf-recipe-title">测量配方</div>
+              <select value={recipeMethod} onChange={event => setRecipeMethod(event.target.value as typeof recipeMethod)}>
+                <option value="etch_depth">深度</option>
+                <option value="cd_at_height">指定高度 CD</option>
+              </select>
+              <input aria-label="测量材料" value={recipeMaterial} onChange={event => setRecipeMaterial(event.target.value)} placeholder="材料" />
+              {recipeMethod === 'cd_at_height'
+                ? <input aria-label="CD 高度" value={recipeHeight} onChange={event => setRecipeHeight(event.target.value)} placeholder="高度 µm" />
+                : <>
+                  <input aria-label="深度 X" value={recipeX} onChange={event => setRecipeX(event.target.value)} placeholder="X µm" />
+                  <input aria-label="参考高度" value={recipeRef} onChange={event => setRecipeRef(event.target.value)} placeholder="参考高度 µm" />
+                </>}
+            </div>
             <button className="wf-button ghost" disabled={!canMeasure} onClick={() => void measure()}>
-              {busy === 'measure' ? '测量中…' : '测量并绑定 Provenance'}
+              {busy === 'measure' ? '测量中…' : '按配方测量并绑定'}
             </button>
             {segment.status === 'succeeded' && <div className="wf-muted">运行完成后可测量；2D 支持 CD/深度，3D 支持材料顶高深度。</div>}
           </>}
@@ -393,6 +473,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             <span>{measurement.value === null ? measurement.reason ?? '无值' : `${measurement.value.toFixed(4)} ${measurement.unit}`}</span>
             <span>binding: {measurement.bindingStatus} · equivalence: {measurement.equivalenceStatus}</span>
           </div>}
+          {metrics.length > 0 && <table className="wf-table"><thead><tr><th>Metric</th><th>Value</th><th>Binding</th></tr></thead><tbody>{metrics.map(item => <tr key={item.measurementId}><td>{item.status}</td><td>{item.value === null ? item.reason : `${item.value.toFixed(4)} ${item.unit}`}</td><td>{item.bindingStatus} / {item.equivalenceStatus}</td></tr>)}</tbody></table>}
           {provenance && <div className="wf-provenance">
             <div className="wf-muted">verification records: {provenance.verifications.length}</div>
             {provenance.verifications.map(item => <div className="wf-verify" key={item.verificationId}><span className={`wf-status ${item.status}`}>{item.status}</span><code>{item.verificationId.slice(0, 10)}…</code><span>{item.evidence.methodVersion}</span></div>)}
@@ -400,9 +481,10 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         </section>
         {zone === 'experiment' && <section className="wf-card wf-wide">
           <div className="wf-card-head"><span>04</span><h2>Experiment</h2></div>
-          <p className="wf-muted">P0 手工实验：对同一 Compile 顺序运行 3 个变体，验证重复执行与状态汇总。DOE 设计器仍属于后续阶段。</p>
-          <button className="wf-button primary" disabled={!compile || !!busy} onClick={() => void runExperiment()}>{busy === 'experiment' ? '实验运行中…' : '运行 3 个变体'}</button>
-          <table className="wf-table"><thead><tr><th>#</th><th>Status</th><th>Run</th></tr></thead><tbody>{experiments.map(item => <tr key={item.segmentId}><td>{item.index}</td><td>{item.status}</td><td><code>{item.runId ?? '—'}</code></td></tr>)}</tbody></table>
+          <p className="wf-muted">P1 手工实验：保存 10 个可分别设置尾步时长的 Variant，可设重复数与种子，串行执行并使用当前配方测量。</p>
+          <button className="wf-button primary" disabled={!compile || !activeRecipeId || !!busy} onClick={() => void createPersistentExperiment()}>创建 10 变体实验</button>
+          <button className="wf-button ghost" disabled={!experimentDoc || !!busy} onClick={() => void runPersistentExperiment()}>{busy === 'experiment' ? '实验运行中…' : '运行持久化实验'}</button>
+          {experimentDoc && <table className="wf-table"><thead><tr><th>#</th><th>Status</th><th>Value</th><th>Run</th></tr></thead><tbody>{experimentDoc.variants.map(variant => <tr key={variant.ordinal}><td>{variant.ordinal}</td><td>{variant.replicates[0]?.status}</td><td>{variant.replicates[0]?.value ?? '—'} {variant.replicates[0]?.unit ?? ''}</td><td><code>{variant.replicates[0]?.runId?.slice(0, 8) ?? '—'}</code></td></tr>)}</tbody></table>}
         </section>}
         {zone === 'analyze' && <section className="wf-card wf-wide">
           <div className="wf-card-head"><span>05</span><h2>Analyze</h2></div>

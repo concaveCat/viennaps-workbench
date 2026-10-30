@@ -50,7 +50,7 @@ def adopt_project(
     return flow, binding, compiled
 
 
-def first_route(compiled: Any, *, name: str | None = None) -> RoutePlanV1:
+def first_route(compiled: Any, *, name: str | None = None, split_after_step_id: str | None = None) -> RoutePlanV1:
     suffix = uuid.uuid4().hex[:10]
     step_ids = [step.id for step in compiled.project.steps if step.enabled]
     if not step_ids:
@@ -67,22 +67,27 @@ def first_route(compiled: Any, *, name: str | None = None) -> RoutePlanV1:
         flowDigest=compiled.compileRecord.fullProjectHash,
         status="planned",
     )
-    segment = SegmentV1(
-        segmentId=f"segment_{suffix}",
-        attemptId=attempt.attemptId,
-        sourceCompileId=compiled.compileRecord.compileId,
-        segmentProjectHash=full_project_hash(compiled.project),
-        startAfterStepId=None,
-        throughStepId=step_ids[-1],
-        startCheckpointRef=None,
-        endCheckpointRef=None,
-        runId=f"pending_{suffix}",
-        provenanceInputHash="0" * 64,
-        flowDigest=compiled.compileRecord.fullProjectHash,
-        executionHash="0" * 64,
-        resultDigest=None,
-        status="planned",
-    )
+    splits: list[SegmentV1] = []
+    range_specs = [(None, step_ids[-1])]
+    if split_after_step_id and split_after_step_id in step_ids and step_ids.index(split_after_step_id) < len(step_ids) - 1:
+        range_specs = [(None, split_after_step_id), (split_after_step_id, step_ids[-1])]
+    for index, (start_after, through) in enumerate(range_specs):
+        splits.append(SegmentV1(
+            segmentId=f"segment_{suffix}_{index}",
+            attemptId=attempt.attemptId,
+            sourceCompileId=compiled.compileRecord.compileId,
+            segmentProjectHash=full_project_hash(compiled.project),
+            startAfterStepId=start_after,
+            throughStepId=through,
+            startCheckpointRef=None,
+            endCheckpointRef=None,
+            runId=f"pending_{suffix}_{index}",
+            provenanceInputHash="0" * 64,
+            flowDigest=compiled.compileRecord.fullProjectHash,
+            executionHash="0" * 64,
+            resultDigest=None,
+            status="planned",
+        ))
     return RoutePlanV1(
         route=RouteV1(
             routeId=attempt.routeId,
@@ -92,6 +97,6 @@ def first_route(compiled: Any, *, name: str | None = None) -> RoutePlanV1:
         ),
         stepOrder=step_ids,
         attempts=[attempt],
-        segments=[segment],
+        segments=splits,
         reuse=[],
     )

@@ -28,9 +28,9 @@ try {
   await page.getByRole('button', { name: '执行 Segment' }).click();
   await page.locator('.wf-status.succeeded').first().waitFor({ timeout: 30000 });
 
-  await page.getByRole('button', { name: '测量并绑定 Provenance' }).click();
+  await page.getByRole('button', { name: '按配方测量并绑定' }).click();
   await page.getByText('Measurement · measured').waitFor({ timeout: 30000 });
-  await page.getByText(/2\.0000 um/).waitFor({ timeout: 30000 });
+  await page.getByText(/2\.0000 um/).first().waitFor({ timeout: 30000 });
   await page.getByText(/binding: verified/).waitFor({ timeout: 30000 });
   await page.screenshot({ path: screenshot, fullPage: true });
 

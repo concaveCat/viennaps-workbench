@@ -13,8 +13,10 @@ from .. import snapshots, storage
 from ..models import ProjectV7, StrictModel
 from .metrology import MeasurementResultV1, MetrologyRecipeV1, MetricDefinitionV1, SnapshotPayloadV1, snapshot_content_hash
 from .adoption import adopt_project, first_route
+from .branches import create_branch
 from .equivalence import ComparisonProtocolV1, EquivalenceResultV1, compare_snapshots
 from .execution import execute_segment
+from .experiments import create_experiment_document, start_experiment
 from .models import CompileDiffV1, CompiledWorkflowV1
 from .provenance import ProvenanceVerificationV1, VerificationRecordV1
 from .routes import AttemptV1, RoutePlanV1, SegmentRefV1, SegmentReuseV1, SegmentV1
@@ -140,6 +142,7 @@ class AdoptProjectResponse(StrictModel):
 class RouteFromCompileRequest(StrictModel):
     compileId: str
     name: str | None = None
+    splitAfterStepId: str | None = None
 
 
 class EquivalenceCheckRequest(StrictModel):
@@ -154,6 +157,21 @@ class EquivalenceCheckRequest(StrictModel):
     rightStepId: str | None = None
 
 
+class ExperimentVariantSpecV1(StrictModel):
+    parameters: dict[str, dict] = Field(default_factory=dict)
+    replicates: Annotated[int, Field(ge=1, le=8)] = 1
+    seed: int = 20261029
+
+
+class CreateExperimentRequest(StrictModel):
+    name: str
+    project: ProjectV7
+    flowId: str
+    recipeId: str
+    recipeVersion: int
+    variants: Annotated[list[ExperimentVariantSpecV1], Field(min_length=1, max_length=20)]
+
+
 class TemplateSummaryV1(StrictModel):
     templateId: str
     name: str
@@ -163,6 +181,12 @@ class TemplateSummaryV1(StrictModel):
 
 class TemplateListResponse(StrictModel):
     templates: list[TemplateSummaryV1]
+
+
+class BranchRequest(StrictModel):
+    compileId: str
+    startAfterStepId: str
+    changedStepIds: list[str] = Field(default_factory=list)
 
 
 class FromTemplateRequest(StrictModel):
@@ -515,10 +539,45 @@ async def adopt_project_endpoint(request: AdoptProjectRequest) -> AdoptProjectRe
 async def route_from_compile(request: RouteFromCompileRequest) -> RoutePlanResponse:
     def operation():
         compiled = get_store().get_compile(request.compileId)
-        plan = first_route(compiled, name=request.name)
+        plan = first_route(compiled, name=request.name, split_after_step_id=request.splitAfterStepId)
         get_store().create_plan(plan)
         return RoutePlanResponse(plan=plan)
     return _call(operation)
+
+
+@router.post("/experiments", response_model=dict, status_code=201)
+async def create_experiment(request: CreateExperimentRequest) -> dict:
+    def operation():
+        store = get_store()
+        store.get_recipe(request.recipeId, request.recipeVersion)
+        document = create_experiment_document(
+            name=request.name,
+            project=request.project.model_dump(mode="json", exclude_none=True),
+            flow_id=request.flowId,
+            recipe_id=request.recipeId,
+            recipe_version=request.recipeVersion,
+            variants=[item.model_dump(mode="json") for item in request.variants],
+        )
+        return store.save_experiment(document["experimentId"], document)
+    return _call(operation)
+
+
+@router.get("/experiments", response_model=dict)
+async def list_experiments() -> dict:
+    return {"experiments": _call(get_store().list_experiments)}
+
+
+@router.get("/experiments/{experiment_id}", response_model=dict)
+async def get_experiment(experiment_id: str) -> dict:
+    return _call(lambda: get_store().get_experiment(experiment_id))
+
+
+@router.post("/experiments/{experiment_id}/run", response_model=dict)
+async def run_experiment(experiment_id: str, request: Request) -> dict:
+    supervisor = getattr(request.app.state, "supervisor", None)
+    if supervisor is None:
+        raise HTTPException(status_code=503, detail="supervisor is unavailable")
+    return _call(lambda: start_experiment(get_store(), supervisor, experiment_id))
 
 
 @router.post("/templates", response_model=FlowTemplateV1, status_code=201)
@@ -573,6 +632,14 @@ async def compile_diff(left_id: str, right_id: str) -> CompileDiffV1:
             affectedStepIds=changed, changedVariables=[],
         )
     return _call(operation)
+
+
+@router.post("/routes/{route_id}/branches", response_model=RoutePlanResponse, status_code=201)
+async def branch_route(route_id: str, request: BranchRequest) -> RoutePlanResponse:
+    plan = _call(lambda: create_branch(
+        get_store(), route_id, request.compileId, request.startAfterStepId, request.changedStepIds,
+    ))
+    return RoutePlanResponse(plan=plan)
 
 
 @router.post("/routes", response_model=RoutePlanResponse, status_code=201)
