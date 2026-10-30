@@ -224,9 +224,11 @@ advanced.gamma_O             map {default 1, byMaterial {material: value}}  0 ..
 advanced.gamma_O_passivated  map {default 1, byMaterial {material: value}}  0 .. 1
 ```
 
-`gamma_*` maps are read by the native etchant/oxygen/polymer particles only
-when `fluxIncludeSticking=true`; the fields remain exposed because they are
-active in that mode. `CF4O2ParametersSiGe.k_sigma_SiGe(x)` is a method, not a
+`gamma_*` maps are read by the native etchant/oxygen/polymer
+`surfaceReflection` callbacks on every run; they change the reflected fraction
+even when `fluxIncludeSticking` is false. `fluxIncludeSticking=true`
+additionally applies the coverage-dependent sticking factor in
+`surfaceCollision`. `CF4O2ParametersSiGe.k_sigma_SiGe(x)` is a method, not a
 field, so it is not exposed.
 
 ## 4. How defaults are derived
@@ -326,7 +328,8 @@ can leave `Ions.thetaRMax` uninitialized, so that overload is not used.
 `sf6o2`/`hbro2` create the passivation particle only when
 `passivationFlux > 0`; the `passivation` block and `beta_P` affect physics in
 that mode. `polymer` affects only geometry containing `Material::Polymer`.
-`gamma_*` affects sticking only when `fluxIncludeSticking=true`.
+`gamma_*` affects the reflected fraction unconditionally; `fluxIncludeSticking`
+adds the coverage-dependent sticking factor in `surfaceCollision`.
 
 ## 7. Run metadata
 
