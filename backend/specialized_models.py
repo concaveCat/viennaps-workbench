@@ -1,6 +1,7 @@
 """Installed ViennaPS 4.6.2 specialized process allowlist and UI metadata."""
 from __future__ import annotations
 
+import math
 from copy import deepcopy
 from typing import Any
 
@@ -44,20 +45,171 @@ def ibe_fields() -> list[dict[str, Any]]:
             rates("materialPlaneWaferRateByMaterial", 0.0, label="材料平面晶圆速率表")]
 
 
+def advanced_number(key: str, default: float, *, minimum: float = 0.0, maximum: float = 1_000_000.0,
+                    step: float = 0.01, unit: str | None = None) -> dict[str, Any]:
+    return {"key": key, "kind": "number", "default": default, "minimum": minimum,
+            "maximum": maximum, "step": step, "nativeUnit": unit}
+
+
+def advanced_boolean(key: str, default: bool) -> dict[str, Any]:
+    return {"key": key, "kind": "boolean", "default": default}
+
+
+# Payload keys are lower-case aliases; ``native`` is the exact installed member
+# path. Defaults and ranges come from introspecting ViennaPS 4.6.2
+# (PlasmaEtchingParameters*/CF4O2Parameters*) and the flat overloads, not from
+# prose documentation. ``tests/test_plasma_advanced.py`` fails if the installed
+# binding stops matching this table.
+_PLASMA_ADVANCED_TEMPLATE: dict[str, Any] = {
+    "parameterClass": "PlasmaEtchingParameters",
+    "constructorOverload": "parameters",
+    "blocks": {
+        "ions": {"native": "Ions", "fields": [
+            advanced_number("meanEnergy", 100.0), advanced_number("sigmaEnergy", 10.0),
+            advanced_number("exponent", 500.0), advanced_number("n_l", 10.0),
+            advanced_number("minAngle", 1.3962634, maximum=math.pi, unit="rad"),
+            advanced_number("inflectAngle", 1.55334303, maximum=math.pi, unit="rad"),
+            advanced_number("thetaRMin", 1.2217304763960306, maximum=math.pi, unit="rad"),
+            advanced_number("thetaRMax", 1.5707963267948966, maximum=math.pi, unit="rad"),
+        ]},
+        "mask": {"native": "Mask", "fields": [
+            advanced_number("A_sp", 0.0139), advanced_number("B_sp", 9.3),
+            advanced_number("Eth_sp", 20.0), advanced_number("rho", 500.0, minimum=0.000001),
+        ]},
+        "passivation": {"native": "Passivation", "fields": [
+            advanced_number("A_ie", 3.0), advanced_number("Eth_ie", 10.0),
+        ]},
+        "polymer": {"native": "Polymer", "fields": [
+            advanced_number("A_sp", 0.02), advanced_number("B_sp", 8.5),
+            advanced_number("Eth_sp", 15.0), advanced_number("rho", 5.0, minimum=0.000001),
+            advanced_number("a1", -0.26, minimum=-1_000_000.0), advanced_number("a2", 2.72, minimum=-1_000_000.0),
+            advanced_number("a3", -4.3, minimum=-1_000_000.0), advanced_number("a4", 1.95, minimum=-1_000_000.0),
+            advanced_boolean("usePolyCosThetaYield", False),
+        ]},
+        "substrate": {"native": "Substrate", "fields": [
+            advanced_number("A_ie", 7.0), advanced_number("A_sp", 0.0337),
+            advanced_number("B_ie", 0.8), advanced_number("B_sp", 9.3),
+            advanced_number("Eth_ie", 15.0), advanced_number("Eth_sp", 20.0),
+            advanced_number("beta_sigma", 0.04), advanced_number("k_sigma", 300.0),
+            advanced_number("rho", 5.02, minimum=0.000001),
+        ]},
+    },
+    "scalars": [advanced_number("passivationFlux", 100.0)],
+    "maps": [
+        {"key": "beta_E", "native": "beta_E", "default": 1.0, "minimum": 0.0, "maximum": 1_000_000.0},
+        {"key": "beta_P", "native": "beta_P", "default": 1.0, "minimum": 0.0, "maximum": 1_000_000.0},
+        {"key": "rateFactors", "native": "rateFactors", "default": 1.0, "minimum": 0.0, "maximum": 1_000_000.0},
+    ],
+}
+
+_CF4O2_ADVANCED: dict[str, Any] = {
+    "parameterClass": "CF4O2Parameters",
+    "constructorOverload": "parameters",
+    "blocks": {
+        "ions": {"native": "Ions", "fields": [
+            advanced_number("meanEnergy", 100.0), advanced_number("sigmaEnergy", 10.0),
+            advanced_number("exponent", 500.0), advanced_number("n_l", 10.0),
+            advanced_number("minAngle", 1.3962634, maximum=math.pi, unit="rad"),
+            advanced_number("inflectAngle", 1.55334303, maximum=math.pi, unit="rad"),
+        ]},
+        "mask": {"native": "Mask", "fields": [
+            advanced_number("A_sp", 0.0139), advanced_number("Eth_sp", 20.0),
+            advanced_number("rho", 500.0, minimum=0.000001),
+        ]},
+        "passivation": {"native": "Passivation", "fields": [
+            advanced_number("A_C_ie", 3.0), advanced_number("A_O_ie", 3.0),
+            advanced_number("Eth_C_ie", 10.0), advanced_number("Eth_O_ie", 10.0),
+        ]},
+        "si": {"native": "Si", "fields": [
+            advanced_number("A_ie", 7.0), advanced_number("A_sp", 0.0337),
+            advanced_number("Eth_ie", 15.0), advanced_number("Eth_sp", 20.0),
+            advanced_number("beta_sigma", 0.04), advanced_number("k_sigma", 300.0),
+            advanced_number("rho", 5.02, minimum=0.000001),
+        ]},
+        "siGe": {"native": "SiGe", "fields": [
+            advanced_number("A_ie", 6.5), advanced_number("A_sp", 0.03),
+            advanced_number("Eth_ie", 14.0), advanced_number("Eth_sp", 18.0),
+            advanced_number("beta_sigma", 0.04), advanced_number("k_sigma", 345.168420976798),
+            advanced_number("rho", 4.84, minimum=0.000001), advanced_number("x", 0.3, maximum=1.0),
+        ]},
+    },
+    "scalars": [advanced_boolean("fluxIncludeSticking", False)],
+    "maps": [
+        {"key": name, "native": name, "default": 1.0, "minimum": 0.0, "maximum": 1.0}
+        for name in ("gamma_C", "gamma_C_oxidized", "gamma_F", "gamma_F_oxidized",
+                     "gamma_O", "gamma_O_passivated")
+    ],
+}
+
+_FLAT_MAPPING_SF6 = {
+    "ionFlux": "ionFlux", "etchantFlux": "etchantFlux", "oxygenFlux": "passivationFlux",
+    "meanIonEnergy": "Ions.meanEnergy", "sigmaIonEnergy": "Ions.sigmaEnergy",
+    "ionExponent": "Ions.exponent", "oxySputterYield": "Passivation.A_ie",
+    "etchStopDepth": "etchStopDepth",
+}
+_FLAT_MAPPING_SF6C4F8 = {
+    "ionFlux": "ionFlux", "etchantFlux": "etchantFlux",
+    "meanEnergy": "Ions.meanEnergy", "sigmaEnergy": "Ions.sigmaEnergy",
+    "ionExponent": "Ions.exponent", "etchStopDepth": "etchStopDepth",
+}
+_FLAT_MAPPING_CF4O2 = {
+    "ionFlux": "ionFlux", "etchantFlux": "etchantFlux",
+    "oxygenFlux": "oxygenFlux", "polymerFlux": "polymerFlux",
+    "meanIonEnergy": "Ions.meanEnergy", "sigmaIonEnergy": "Ions.sigmaEnergy",
+    "ionExponent": "Ions.exponent", "oxySputterYield": "Passivation.A_O_ie",
+    "polySputterYield": "Passivation.A_C_ie", "etchStopDepth": "etchStopDepth",
+}
+
+
+def _plasma_advanced(flat_mapping: dict[str, str], default_patches: dict[str, float]) -> dict[str, Any]:
+    """Clone the shared PlasmaEtchingParameters schema for one model.
+
+    The plasma models share the parameter class but not all native defaults:
+    HBrO2Etching lowers three Substrate values and SF6C4F8Etching uses a zero
+    passivation flux. The catalog defaults mirror those model-specific values so
+    an omitted advanced block reports the same number the flat overload uses.
+    """
+    advanced = deepcopy(_PLASMA_ADVANCED_TEMPLATE)
+    advanced["flatMapping"] = dict(flat_mapping)
+    by_block = {block["native"]: block for block in advanced["blocks"].values()}
+    by_scalar = {field["key"]: field for field in advanced["scalars"]}
+    for path, value in default_patches.items():
+        if "." in path:
+            block_name, field_name = path.split(".", 1)
+            next(field for field in by_block[block_name]["fields"] if field["key"] == field_name)["default"] = value
+        else:
+            by_scalar[path]["default"] = value
+    return advanced
+
+
 CATALOG: list[dict[str, Any]] = [
     {"id": "sf6o2", "label": "SF₆/O₂ 等离子体刻蚀", "nativeClass": "SF6O2Etching", "operation": "etch", "usesFlux": True,
+     "optionalKeys": ["advanced"],
+     "advanced": _plasma_advanced(_FLAT_MAPPING_SF6, {}),
      "fields": [number("ionFlux", 1), number("etchantFlux", 1), number("oxygenFlux", 0.2),
                 number("meanIonEnergy", 100), number("sigmaIonEnergy", 10), number("ionExponent", 100),
                 number("oxySputterYield", 3), number("etchStopDepth", -1_000_000, minimum=-1_000_000)]},
     {"id": "cf4o2", "label": "CF₄/O₂ 等离子体刻蚀", "nativeClass": "CF4O2Etching", "operation": "etch", "usesFlux": True,
+     "optionalKeys": ["advanced"],
+     "advanced": {**deepcopy(_CF4O2_ADVANCED), "flatMapping": dict(_FLAT_MAPPING_CF4O2)},
      "fields": [number("ionFlux", 1), number("etchantFlux", 1), number("oxygenFlux", 0.2), number("polymerFlux", 0.2),
                 number("meanIonEnergy", 100), number("sigmaIonEnergy", 10), number("ionExponent", 100),
                 number("oxySputterYield", 3), number("polySputterYield", 3), number("etchStopDepth", -1_000_000, minimum=-1_000_000)]},
     {"id": "hbro2", "label": "HBr/O₂ 等离子体刻蚀", "nativeClass": "HBrO2Etching", "operation": "etch", "usesFlux": True,
+     "optionalKeys": ["advanced"],
+     # HBrO2Etching's native defaults differ from PlasmaEtchingParameters():
+     # Substrate.A_ie/A_sp/Eth_sp are 5.0/0.5/30.0 instead of 7.0/0.0337/20.0.
+     "advanced": _plasma_advanced(_FLAT_MAPPING_SF6, {
+         "Substrate.A_ie": 5.0, "Substrate.A_sp": 0.5, "Substrate.Eth_sp": 30.0}),
      "fields": [number("ionFlux", 1), number("etchantFlux", 1), number("oxygenFlux", 0.2),
                 number("meanIonEnergy", 100), number("sigmaIonEnergy", 10), number("ionExponent", 100),
                 number("oxySputterYield", 3), number("etchStopDepth", -1_000_000, minimum=-1_000_000)]},
     {"id": "sf6c4f8", "label": "SF₆/C₄F₈ 等离子体刻蚀", "nativeClass": "SF6C4F8Etching", "operation": "etch", "usesFlux": True,
+     "optionalKeys": ["advanced"],
+     # SF6C4F8Etching defaults to Ions.exponent=300 and passivationFlux=0
+     # instead of the parameter class defaults 500 and 100.
+     "advanced": _plasma_advanced(_FLAT_MAPPING_SF6C4F8,
+                                  {"Ions.exponent": 300.0, "passivationFlux": 0.0}),
      "fields": [number("ionFlux", 1), number("etchantFlux", 1), number("meanEnergy", 100),
                 number("sigmaEnergy", 10), number("ionExponent", 300), number("etchStopDepth", -1_000_000, minimum=-1_000_000)]},
     {"id": "fluorocarbon", "label": "Fluorocarbon 等离子体刻蚀", "nativeClass": "FluorocarbonEtching", "operation": "etch", "usesFlux": True,
@@ -158,3 +310,9 @@ def specialized_catalog() -> dict[str, Any]:
 
 def model_spec(model_id: str) -> dict[str, Any] | None:
     return BY_ID.get(model_id)
+
+
+def advanced_spec(model_id: str) -> dict[str, Any] | None:
+    """Return the strict ``nativeParameters.advanced`` schema for a model."""
+    spec = BY_ID.get(model_id)
+    return spec.get("advanced") if spec else None

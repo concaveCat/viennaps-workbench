@@ -3,7 +3,145 @@ from __future__ import annotations
 
 from typing import Any
 
-from backend.specialized_models import model_spec
+from backend.specialized_models import advanced_spec, model_spec
+
+
+def _set_native_path(target: Any, path: str, value: Any) -> None:
+    parts = path.split(".")
+    for part in parts[:-1]:
+        target = getattr(target, part)
+    setattr(target, parts[-1], value)
+
+
+def _read_native_values(params: Any, spec: dict[str, Any], material_handle: Any,
+                        material_names: list[str]) -> dict[str, Any]:
+    """Read the installed parameter object back as plain JSON values."""
+    values: dict[str, Any] = {"blocks": {}, "scalars": {}, "maps": {}}
+    for name, block in spec["blocks"].items():
+        native = getattr(params, block["native"])
+        values["blocks"][name] = {field["key"]: float(getattr(native, field["key"]))
+                                  for field in block["fields"]}
+    for field in spec["scalars"]:
+        value = getattr(params, field["key"])
+        values["scalars"][field["key"]] = value if field["kind"] == "boolean" else float(value)
+    for row in spec["maps"]:
+        native = getattr(params, row["native"])
+        by_material: dict[str, float] = {}
+        unresolved: list[str] = []
+        for material_name in material_names:
+            try:
+                handle = material_handle(material_name)
+            except Exception:
+                unresolved.append(material_name)
+                continue
+            by_material[material_name] = float(native.get(handle))
+        values["maps"][row["key"]] = {"default": float(native.getDefault()),
+                                      "byMaterial": by_material}
+        if unresolved:
+            values["maps"][row["key"]]["unresolvedMaterialNames"] = unresolved
+    return values
+
+
+def _build_plasma_model(ps: Any, model_id: str, spec: dict[str, Any], parameters: dict[str, Any],
+                        flat_keys: tuple[str, ...], material_handle: Any,
+                        material_ids: dict[str, int]) -> tuple[Any, dict[str, Any] | None]:
+    """Construct one of the four plasma models through the installed overloads.
+
+    Without ``advanced`` this is exactly the pre-existing flat float overload.
+    With ``advanced`` the flat model is built first, its model-owned
+    ``getParameters()`` object is used as the base (preserving each model's
+    native defaults such as HBrO2's Substrate values and SF6C4F8's zero
+    passivation flux), the flat values are applied explicitly, then the
+    validated advanced overrides, and the parameter-object overload is called.
+    """
+    native_class = getattr(ps, spec["nativeClass"])
+    flat_args = tuple(float(parameters[key]) for key in flat_keys)
+    if "advanced" not in parameters:
+        return native_class(*flat_args), None
+    advanced_schema = advanced_spec(model_id)
+    if advanced_schema is None:
+        raise RuntimeError(f"{model_id} has no advanced native parameter schema")
+    advanced = parameters["advanced"]
+    if not isinstance(advanced, dict):
+        raise RuntimeError(f"{model_id} advanced native parameters must be a JSON object")
+
+    allowed_blocks = advanced_schema["blocks"]
+    allowed_scalars = {field["key"]: field for field in advanced_schema["scalars"]}
+    allowed_maps = {row["key"]: row for row in advanced_schema["maps"]}
+    unknown = sorted(set(advanced) - set(allowed_blocks) - set(allowed_scalars) - set(allowed_maps))
+    if unknown:
+        raise RuntimeError(f"{model_id} advanced native parameters contain unknown keys {unknown}")
+
+    # ``getParameters()`` returns a reference into the model. Keep the flat
+    # model alive until the final constructor has copied the parameter object.
+    flat_model = native_class(*flat_args)
+    params = flat_model.getParameters()
+    for key, value in zip(flat_keys, flat_args):
+        _set_native_path(params, advanced_schema["flatMapping"][key], value)
+
+    explicit_names: set[str] = set()
+    for row in allowed_maps.values():
+        map_value = advanced.get(row["key"])
+        if isinstance(map_value, dict) and isinstance(map_value.get("byMaterial"), dict):
+            explicit_names.update(str(name) for name in map_value["byMaterial"])
+    names = sorted({str(name) for name in material_ids} | explicit_names)
+    defaults = _read_native_values(params, advanced_schema, material_handle, names)
+
+    for name, value in advanced.items():
+        if name in allowed_blocks:
+            if not isinstance(value, dict):
+                raise RuntimeError(f"{model_id} advanced.{name} must be a JSON object")
+            fields = {field["key"]: field for field in allowed_blocks[name]["fields"]}
+            if unknown := sorted(set(value) - set(fields)):
+                raise RuntimeError(f"{model_id} advanced.{name} contains unknown keys {unknown}")
+            native = getattr(params, allowed_blocks[name]["native"])
+            for key, entry in value.items():
+                if fields[key]["kind"] == "boolean":
+                    if type(entry) is not bool:
+                        raise RuntimeError(f"{model_id} advanced.{name}.{key} must be a boolean")
+                    setattr(native, key, entry)
+                else:
+                    if isinstance(entry, bool):
+                        raise RuntimeError(f"{model_id} advanced.{name}.{key} must be a number")
+                    setattr(native, key, float(entry))
+        elif name in allowed_scalars:
+            field = allowed_scalars[name]
+            if field["kind"] == "boolean":
+                if type(value) is not bool:
+                    raise RuntimeError(f"{model_id} advanced.{name} must be a boolean")
+                setattr(params, field["key"], value)
+            else:
+                if isinstance(value, bool):
+                    raise RuntimeError(f"{model_id} advanced.{name} must be a number")
+                setattr(params, field["key"], float(value))
+        else:
+            row = allowed_maps[name]
+            if not isinstance(value, dict) or not value:
+                raise RuntimeError(f"{model_id} advanced.{name} must be a nonempty JSON object")
+            if unknown := sorted(set(value) - {"default", "byMaterial"}):
+                raise RuntimeError(f"{model_id} advanced.{name} contains unknown keys {unknown}")
+            native = getattr(params, row["native"])
+            if "default" in value:
+                native.setDefault(float(value["default"]))
+            rows = value.get("byMaterial", {})
+            if not isinstance(rows, dict):
+                raise RuntimeError(f"{model_id} advanced.{name}.byMaterial must be a JSON object")
+            for material_name, entry in rows.items():
+                native.set(material_handle(str(material_name)), float(entry))
+
+    effective = _read_native_values(params, advanced_schema, material_handle, names)
+    model = native_class(params)
+    metadata = {
+        "parameterClass": advanced_schema["parameterClass"],
+        "constructor": spec["nativeClass"],
+        "constructorOverload": "parameter-object; flat values applied first, then advanced overrides",
+        "flatMapping": dict(advanced_schema["flatMapping"]),
+        "requested": advanced,
+        "defaults": defaults,
+        "effective": effective,
+        "defaultsSource": "installed flat overload parameters before advanced overrides",
+    }
+    return model, metadata
 
 
 def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step: dict[str, Any],
@@ -26,29 +164,45 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
                                 "nativeProcessEngine": "CPU_DISK pinned by the worker; no silent fallback"}
 
     if model_id == "sf6o2":
-        model = ps.SF6O2Etching(*(float(p[key]) for key in (
-            "ionFlux", "etchantFlux", "oxygenFlux", "meanIonEnergy", "sigmaIonEnergy",
-            "ionExponent", "oxySputterYield", "etchStopDepth")))
+        model, advanced_metadata = _build_plasma_model(
+            ps, model_id, spec, p,
+            ("ionFlux", "etchantFlux", "oxygenFlux", "meanIonEnergy", "sigmaIonEnergy",
+             "ionExponent", "oxySputterYield", "etchStopDepth"),
+            material_handle, material_ids)
+        if advanced_metadata is not None:
+            resolved["nativeAdvancedParameters"] = advanced_metadata
         coverage = ps.CoverageParameters()
         coverage.tolerance = 1e-3
         extra.append(coverage)
     elif model_id == "cf4o2":
-        model = ps.CF4O2Etching(*(float(p[key]) for key in (
-            "ionFlux", "etchantFlux", "oxygenFlux", "polymerFlux", "meanIonEnergy",
-            "sigmaIonEnergy", "ionExponent", "oxySputterYield", "polySputterYield", "etchStopDepth")))
+        model, advanced_metadata = _build_plasma_model(
+            ps, model_id, spec, p,
+            ("ionFlux", "etchantFlux", "oxygenFlux", "polymerFlux", "meanIonEnergy",
+             "sigmaIonEnergy", "ionExponent", "oxySputterYield", "polySputterYield", "etchStopDepth"),
+            material_handle, material_ids)
+        if advanced_metadata is not None:
+            resolved["nativeAdvancedParameters"] = advanced_metadata
         coverage = ps.CoverageParameters()
         coverage.tolerance = 1e-3
         extra.append(coverage)
     elif model_id == "hbro2":
-        model = ps.HBrO2Etching(*(float(p[key]) for key in (
-            "ionFlux", "etchantFlux", "oxygenFlux", "meanIonEnergy", "sigmaIonEnergy",
-            "ionExponent", "oxySputterYield", "etchStopDepth")))
+        model, advanced_metadata = _build_plasma_model(
+            ps, model_id, spec, p,
+            ("ionFlux", "etchantFlux", "oxygenFlux", "meanIonEnergy", "sigmaIonEnergy",
+             "ionExponent", "oxySputterYield", "etchStopDepth"),
+            material_handle, material_ids)
+        if advanced_metadata is not None:
+            resolved["nativeAdvancedParameters"] = advanced_metadata
         coverage = ps.CoverageParameters()
         coverage.tolerance = 1e-3
         extra.append(coverage)
     elif model_id == "sf6c4f8":
-        model = ps.SF6C4F8Etching(*(float(p[key]) for key in (
-            "ionFlux", "etchantFlux", "meanEnergy", "sigmaEnergy", "ionExponent", "etchStopDepth")))
+        model, advanced_metadata = _build_plasma_model(
+            ps, model_id, spec, p,
+            ("ionFlux", "etchantFlux", "meanEnergy", "sigmaEnergy", "ionExponent", "etchStopDepth"),
+            material_handle, material_ids)
+        if advanced_metadata is not None:
+            resolved["nativeAdvancedParameters"] = advanced_metadata
         coverage = ps.CoverageParameters()
         coverage.tolerance = 1e-3
         extra.append(coverage)

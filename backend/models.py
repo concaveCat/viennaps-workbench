@@ -816,8 +816,10 @@ class SpecializedStepV7(StrictModel):
         if spec.get("operation") != "deposit" and "depositMaterial" in self.model_fields_set:
             raise ValueError("depositMaterial applies only to a native deposition model")
         expected_parameters = {row["key"] for row in spec["fields"]}
-        if set(self.nativeParameters) != expected_parameters:
-            raise ValueError(f"{self.nativeModel} nativeParameters must contain exactly {sorted(expected_parameters)}")
+        optional_parameters = set(spec.get("optionalKeys", ()))
+        if set(self.nativeParameters) - optional_parameters != expected_parameters:
+            raise ValueError(f"{self.nativeModel} nativeParameters must contain exactly {sorted(expected_parameters)}"
+                             + (f" (optional: {sorted(optional_parameters)})" if optional_parameters else ""))
         return self
 
 

@@ -14,7 +14,7 @@ from pydantic import ValidationError
 from .models import Domain3D, Project, ProjectV3, ProjectV4, ProjectV5, ProjectV6, ProjectV7, parse_project
 from .materials import attach_and_reconcile_project_materials
 from .rates import has_motion, is_geometry_step, uses_flux, value as step_value
-from .specialized_models import FLUOROCARBON_MATERIAL_DEFAULTS, model_spec
+from .specialized_models import FLUOROCARBON_MATERIAL_DEFAULTS, advanced_spec, model_spec
 from .runtime_limits import available_cpu_threads
 
 
@@ -660,6 +660,94 @@ def _initial_vertical_extent(project: Any) -> float:
                                                 for row in geometry.get("layers", [])))
     return 0.0
 
+
+def _advanced_number_issue(path: str, field: dict[str, Any], value: Any) -> FieldIssue | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        return FieldIssue(path, "must be a finite JSON number")
+    if not float(field["minimum"]) <= float(value) <= float(field["maximum"]):
+        return FieldIssue(path, f"must be between {field['minimum']} and {field['maximum']}")
+    return None
+
+
+def _validate_advanced_parameters(prefix: str, spec: dict[str, Any], advanced: Any,
+                                  material_names: set[str]) -> list[FieldIssue]:
+    """Strict, per-model allowlist for ``nativeParameters.advanced``.
+
+    The schema is generated from introspected ViennaPS members, so an unknown
+    key means the request cannot be represented by the installed parameter
+    object. Reject it rather than silently dropping a physics change.
+    """
+    path = f"{prefix}.advanced"
+    if not isinstance(advanced, dict):
+        return [FieldIssue(path, "must be a JSON object")]
+    blocks = spec["blocks"]
+    scalars = {field["key"]: field for field in spec["scalars"]}
+    maps = {row["key"]: row for row in spec["maps"]}
+    allowed = set(blocks) | set(scalars) | set(maps)
+    issues: list[FieldIssue] = []
+    if unknown := sorted(set(advanced) - allowed):
+        issues.append(FieldIssue(path, f"unknown advanced keys {unknown}; allowed keys are {sorted(allowed)}"))
+    for name, value in advanced.items():
+        if name in blocks:
+            block_path = f"{path}.{name}"
+            if not isinstance(value, dict):
+                issues.append(FieldIssue(block_path, "must be a JSON object"))
+                continue
+            fields = {field["key"]: field for field in blocks[name]["fields"]}
+            if unknown := sorted(set(value) - set(fields)):
+                issues.append(FieldIssue(block_path, f"unknown {name} keys {unknown}; allowed keys are {sorted(fields)}"))
+            for key, entry in value.items():
+                if key not in fields:
+                    continue
+                if fields[key]["kind"] == "boolean":
+                    if type(entry) is not bool:
+                        issues.append(FieldIssue(f"{block_path}.{key}", "must be a JSON boolean"))
+                elif issue := _advanced_number_issue(f"{block_path}.{key}", fields[key], entry):
+                    issues.append(issue)
+            if {"thetaRMin", "thetaRMax"} <= set(fields):
+                theta_min = value.get("thetaRMin", next(f["default"] for f in fields.values() if f["key"] == "thetaRMin"))
+                theta_max = value.get("thetaRMax", next(f["default"] for f in fields.values() if f["key"] == "thetaRMax"))
+                if isinstance(theta_min, (int, float)) and not isinstance(theta_min, bool) and isinstance(theta_max, (int, float)) and not isinstance(theta_max, bool) and theta_min > theta_max:
+                    issues.append(FieldIssue(f"{block_path}.thetaRMin",
+                                             "must be less than or equal to thetaRMax"))
+            if {"minAngle", "inflectAngle"} <= set(fields):
+                min_angle = value.get("minAngle", next(f["default"] for f in fields.values() if f["key"] == "minAngle"))
+                inflect = value.get("inflectAngle", next(f["default"] for f in fields.values() if f["key"] == "inflectAngle"))
+                if isinstance(min_angle, (int, float)) and not isinstance(min_angle, bool) and isinstance(inflect, (int, float)) and not isinstance(inflect, bool) and min_angle > inflect:
+                    issues.append(FieldIssue(f"{block_path}.minAngle",
+                                             "must be less than or equal to inflectAngle"))
+        elif name in scalars:
+            field = scalars[name]
+            if field["kind"] == "boolean":
+                if type(value) is not bool:
+                    issues.append(FieldIssue(f"{path}.{name}", "must be a JSON boolean"))
+            elif issue := _advanced_number_issue(f"{path}.{name}", field, value):
+                issues.append(issue)
+        elif name in maps:
+            map_path = f"{path}.{name}"
+            if not isinstance(value, dict) or not value:
+                issues.append(FieldIssue(map_path, "must be an object with default and/or byMaterial"))
+                continue
+            if unknown := sorted(set(value) - {"default", "byMaterial"}):
+                issues.append(FieldIssue(map_path, f"unknown map keys {unknown}; allowed keys are ['byMaterial', 'default']"))
+            if "default" in value:
+                if issue := _advanced_number_issue(f"{map_path}.default", maps[name], value["default"]):
+                    issues.append(issue)
+            if "byMaterial" in value:
+                rows = value["byMaterial"]
+                if not isinstance(rows, dict):
+                    issues.append(FieldIssue(f"{map_path}.byMaterial", "must be a material-keyed object"))
+                else:
+                    for material, entry in rows.items():
+                        if material not in material_names:
+                            issues.append(FieldIssue(
+                                f"{map_path}.byMaterial.{material}",
+                                f"unknown installed material {material!r}"))
+                        if issue := _advanced_number_issue(f"{map_path}.byMaterial.{material}", maps[name], entry):
+                            issues.append(issue)
+    return issues
+
+
 def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
     issues: list[FieldIssue] = []
     material_names = {row["name"] for row in _catalog_names()}
@@ -792,6 +880,17 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
                         for subkey, subvalue in entry.items():
                             if isinstance(subvalue, bool) or not isinstance(subvalue, (int, float)) or not math.isfinite(float(subvalue)) or not field["minimum"] <= float(subvalue) <= field["maximum"]:
                                 issues.append(FieldIssue(f"{path}.{name}.{subkey}", "must be a finite number within the displayed range"))
+
+        if "advanced" in params:
+            spec_advanced = spec.get("advanced")
+            if spec_advanced is None:
+                issues.append(FieldIssue(f"{prefix}.advanced",
+                                         f"{step.nativeModel} does not expose advanced native parameters"))
+            else:
+                # The built-in plasma models have no verified custom-material
+                # parameter rows; keep advanced maps on the installed catalog.
+                issues.extend(_validate_advanced_parameters(
+                    prefix, spec_advanced, params["advanced"], material_names - custom_names))
 
         if step.nativeModel in {"wetEtch", "selectiveEpitaxy"}:
             table = params.get("materialRates", {})
