@@ -117,6 +117,10 @@ def compiled_2d_zero_two() -> CompiledWorkflowV1:
     return _compiled_zero(2)
 
 
+def compiled_2d_zero_five() -> CompiledWorkflowV1:
+    return _compiled_zero(5)
+
+
 def _compiled_zero(count: int) -> CompiledWorkflowV1:
     steps = [{
         "id": f"step_zero_{index:02d}",

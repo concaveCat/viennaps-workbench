@@ -36,6 +36,10 @@ class WorkflowGcTests(unittest.TestCase):
         self.assertIn(artifact, {item["artifactId"] for item in dry["candidates"]})
         self.assertEqual(store.list_artifact_refs(artifact), [])
 
+        store.register_artifact_ref(artifact, "route", "route_a", "continue")
+        dry = store.gc_dry_run()
+        self.assertNotIn(artifact, {item["artifactId"] for item in dry["candidates"]})
+
 
 if __name__ == "__main__":
     unittest.main()

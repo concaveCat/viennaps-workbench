@@ -1427,15 +1427,14 @@ class WorkflowStore:
                         deps.add((run_id, "attempt", row["attempt_id"], "continue"))
                 except (ValueError, TypeError):
                     pass
-            for row in connection.execute("SELECT artifact_id, owner_type, owner_id, required_for FROM artifact_refs"):
-                deps.add((row["artifact_id"], row["owner_type"], row["owner_id"], row["required_for"]))
+            explicit_refs = {row["artifact_id"] for row in connection.execute("SELECT artifact_id FROM artifact_refs")}
             pins = {row["artifact_id"] for row in connection.execute("SELECT artifact_id FROM artifact_pins")}
             abandoned = {
                 (row["artifact_id"], row["owner_type"], row["owner_id"], row["capability"])
                 for row in connection.execute("SELECT artifact_id, owner_type, owner_id, capability FROM deletion_records")
             }
         active = deps - abandoned
-        referenced = {item[0] for item in active} | pins
+        referenced = {item[0] for item in active} | explicit_refs | pins
         candidates = []
         for path in sorted(storage.RUNS.iterdir()) if storage.RUNS.is_dir() else []:
             if not path.is_dir() or path.name in referenced:

@@ -350,13 +350,17 @@ async def equivalence_check(request: EquivalenceCheckRequest) -> EquivalenceResu
                     else:
                         if left_segment.segmentId == right_segment.segmentId:
                             reasons.append(f"{request.protocol.checkType} requires distinct Segments")
-                        if left_segment.runId != request.leftRunId or right_segment.runId != request.rightRunId:
-                            reasons.append("one or both runs are not owned by their Segments")
                         if request.protocol.checkType == "prefix_reuse":
                             if right_segment.startAfterStepId is None or right_segment.startCheckpointRef is None:
                                 reasons.append("prefix_reuse right Segment has no checkpoint boundary")
-                            elif right_segment.startCheckpointRef.runId != request.leftRunId:
-                                reasons.append("prefix_reuse right Segment does not start from the left run")
+                            elif right_segment.startCheckpointRef.runId != request.rightRunId:
+                                reasons.append("prefix_reuse right Segment does not start from the right run")
+                            elif left_segment.throughStepId != right_segment.startAfterStepId:
+                                reasons.append("prefix_reuse left Segment does not end at the right Segment boundary")
+                            if left_segment.runId != request.leftRunId:
+                                reasons.append("left run is not owned by the left Segment")
+                        elif left_segment.runId != request.leftRunId or right_segment.runId != request.rightRunId:
+                            reasons.append("one or both runs are not owned by their Segments")
         if reasons:
             result = result.model_copy(update={"status": "failed" if failed else "inconclusive", "reasons": reasons})
         return store.record_equivalence(result)
