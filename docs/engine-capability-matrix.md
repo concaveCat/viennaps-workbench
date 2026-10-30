@@ -272,7 +272,8 @@ worker runs match an independent native reference exactly.
 - Acceptance: omitted block hashes unchanged; 2D and 3D native orientation runs are distinct and
   deterministic; at least two advanced setters change the surface deterministically; unknown keys,
   out-of-range values, unsupported orientation, inert candidates and non-oxidation placement are 422;
-  the API manifest and snapshot record requested/effective/defaults/native-readback.
+  the API manifest and snapshot record normalized-input/effective/defaults/native-readback
+  (`normalizedInput`, not raw submitted keys: schema defaults are materialized before the worker).
 - Mask mechanics and GPU oxidation remain unexposed because no verified host run exists.
 
 ### Batch C1 — guard rails for the never-exposed surface

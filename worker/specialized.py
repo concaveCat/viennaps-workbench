@@ -411,7 +411,12 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
                 "schemaVersion": 1,
                 "location": spec["location"],
                 "nativeClass": spec["nativeClass"],
-                "requested": dict(advanced),
+                # The worker only sees the normalized project; Pydantic has
+                # already materialised every default, so the raw submitted key
+                # subset is not recoverable without changing the request hash
+                # or inventing replay-only state. Name the value honestly.
+                "normalizedInput": dict(advanced),
+                "inputSource": "normalized project; schema defaults are materialised before the worker",
                 "defaults": {key: field["default"] for key, field in fields.items()},
                 "effective": effective,
                 "nativeSetters": {key: field["nativeSetter"] for key, field in fields.items()},

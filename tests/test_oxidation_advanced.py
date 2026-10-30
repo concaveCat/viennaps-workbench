@@ -20,8 +20,8 @@ The contract pinned here is deliberately narrow:
   caps, tolerance combinations without evidence, mask mechanics, the old
   ``OxidationParameters`` names) is rejected by the strict schema rather than
   silently ignored;
-* API run, snapshot manifest and save/reopen preserve the requested/effective/
-  native-readback record.
+* API run, snapshot manifest and save/reopen preserve the normalized-input/
+  effective/native-readback record.
 """
 from __future__ import annotations
 
@@ -168,6 +168,9 @@ def run_workbench(project: dict) -> tuple[dict, str, int]:
     model, extra, actual, duration = build_specialized_model(
         ps, domain, parsed, step, lambda name: getattr(ps.Material, name), {})
     process = ps.Process(domain, model, duration)
+    # Match worker/simulate.py: pin CPU_DISK before apply() so the native
+    # Process does not attempt CUDA autodetection on a CPU-only evidence run.
+    process.setFluxEngineType(ps.FluxEngineType.CPU_DISK)
     advection = ps.AdvectionParameters()
     advection.timeStepRatio = 0.25
     process.setParameters(advection)
@@ -255,22 +258,39 @@ class OxidationCatalogAndSchema(unittest.TestCase):
         # A default value is only a real default if passing it explicitly
         # reproduces the omitted-block surface. This is the native-default
         # check that the missing getters cannot provide directly.
-        for dimension, delta, time_hours in ((2, 0.02, 0.1), (3, 0.05, 0.02)):
-            with self.subTest(dimension=dimension):
-                plain = oxidation_project(dimension, delta=delta,
-                                          time_hours=time_hours,
-                                          time_step_hours=0.03)
-                materialized = oxidation_project(
-                    dimension, delta=delta, time_hours=time_hours,
-                    time_step_hours=0.03,
-                    advanced=dict(ADVANCED_DEFAULTS))
-                _plain_actual, plain_hash, _ = run_workbench(plain)
-                actual, explicit_hash, _ = run_workbench(materialized)
-                self.assertEqual(plain_hash, explicit_hash)
-                metadata = actual["advancedOxidation"]
-                self.assertEqual(metadata["requested"], ADVANCED_DEFAULTS)
-                self.assertEqual(metadata["effective"], ADVANCED_DEFAULTS)
-                self.assertEqual(metadata["defaults"], ADVANCED_DEFAULTS)
+        plain = oxidation_project(2, delta=0.02, time_hours=0.1,
+                                  time_step_hours=0.03)
+        materialized = oxidation_project(
+            2, delta=0.02, time_hours=0.1, time_step_hours=0.03,
+            advanced=dict(ADVANCED_DEFAULTS))
+        _plain_actual, plain_hash, _ = run_workbench(plain)
+        actual, explicit_hash, _ = run_workbench(materialized)
+        self.assertEqual(plain_hash, explicit_hash)
+        metadata = actual["advancedOxidation"]
+        self.assertEqual(metadata["normalizedInput"], ADVANCED_DEFAULTS)
+        self.assertEqual(metadata["effective"], ADVANCED_DEFAULTS)
+        self.assertEqual(metadata["defaults"], ADVANCED_DEFAULTS)
+
+        # ViennaPS 4.6.2 keeps dimension state process-wide. Run both 3D cases
+        # in fresh interpreters and validate topology/counts, not just hash
+        # equality, so a stale 2D→3D surface cannot masquerade as a no-op.
+        plain_3d = run_3d_subprocess(delta=0.05, oxide=0.15,
+                                     time_hours=0.02, time_step_hours=0.02,
+                                     orientation="Si100")
+        materialized_3d = run_3d_subprocess(
+            delta=0.05, oxide=0.15, time_hours=0.02, time_step_hours=0.02,
+            orientation="Si100", advanced=dict(ADVANCED_DEFAULTS))
+        for result in (plain_3d, materialized_3d):
+            self.assertEqual(result["dimension"], 3)
+            self.assertEqual(result["topology"], "triangles")
+            self.assertGreater(result["pointCount"], 0)
+            self.assertGreater(result["cellCount"], 0)
+        self.assertEqual(plain_3d["surfaceHash"],
+                         materialized_3d["surfaceHash"])
+        self.assertEqual(materialized_3d["advancedOxidation"]["effective"],
+                         ADVANCED_DEFAULTS)
+        self.assertEqual(materialized_3d["advancedOxidation"]["normalizedInput"],
+                         ADVANCED_DEFAULTS)
 
     def test_native_readback_orientation_is_recorded(self):
         actual, _digest, _ = run_workbench(
@@ -503,10 +523,10 @@ class OxidationAdvancedApi(unittest.IsolatedAsyncioTestCase):
         record = next(row for row in info["actualExecution"]
                       if row.get("stepId") == "stage8_oxidation")
         metadata = record["actualParameters"]["nativeModel"]["advancedOxidation"]
-        self.assertEqual(metadata["requested"], {
+        self.assertEqual(metadata["normalizedInput"], {
             "cflFactor": 0.05, "mechanicsTolerance": 0.05,
             "couplingTolerance": 0.1, "simplePressureRelaxation": 0.1})
-        self.assertEqual(metadata["effective"], metadata["requested"])
+        self.assertEqual(metadata["effective"], metadata["normalizedInput"])
         self.assertEqual(metadata["defaults"], ADVANCED_DEFAULTS)
         self.assertEqual(metadata["nativeReadback"]["orientation"], "Si110")
         self.assertGreater(metadata["nativeReadback"]["planarOxideThicknessUm"], 0.0)
@@ -520,7 +540,8 @@ class OxidationAdvancedApi(unittest.IsolatedAsyncioTestCase):
                          metadata["nativeReadback"])
         listed = next(row for row in info["snapshots"]
                       if row.get("stepId") == "stage8_oxidation")
-        self.assertEqual(listed["oxidation"]["requested"], metadata["requested"])
+        self.assertEqual(listed["oxidation"]["normalizedInput"],
+                         metadata["normalizedInput"])
 
     async def test_omitted_block_adds_no_snapshot_or_manifest_section(self):
         project = self.project()
