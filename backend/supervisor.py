@@ -222,10 +222,16 @@ class Supervisor:
             state_path: Path | None = None
             if state_ref is not None:
                 if state_ref.get("viennapsVersion") != ps_version or state_ref.get("viennalsVersion") != ls_version:
-                    raise ReplayMismatch("native Domain state requires a different ViennaPS/ViennaLS version")
+                    raise ReplayMismatch(
+                    f"native Domain state requires ViennaPS {state_ref['viennapsVersion']} / "
+                    f"ViennaLS {state_ref['viennalsVersion']}; installed is {ps_version} / {ls_version}. "
+                    f"Saved state is never reinterpreted under a different runtime.")
                 state_path = storage.resolve_domain_state(state_ref)
             if replay and (replay["viennapsVersion"] != ps_version or replay["viennalsVersion"] != ls_version):
-                raise ReplayMismatch(f"replay requires ViennaPS {replay['viennapsVersion']} / ViennaLS {replay['viennalsVersion']}; installed is {ps_version} / {ls_version}")
+                raise ReplayMismatch(
+                    f"replay requires ViennaPS {replay['viennapsVersion']} / "
+                    f"ViennaLS {replay['viennalsVersion']}; installed is {ps_version} / {ls_version}. "
+                    f"Old runs are never reinterpreted under a different runtime; start the matching runtime.")
             actual_steps = []
             analysis_mode = "flux" if kind == "flux" else "process"
             for step in enabled_steps:

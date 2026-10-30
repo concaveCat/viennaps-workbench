@@ -163,7 +163,10 @@ def make_model(step: dict[str, Any], domain: Any, project: dict[str, Any]):
             extra.append(native)
     elif kind == "oxidation":
         model = ps.Oxidation()
-        model.setOxidant(getattr(ps.OxidantType, p["oxidant"])); model.setOrientation(getattr(ps.SiliconOrientation, p["orientation"]))
+        oxidant = getattr(ps.OxidantType, p["oxidant"], None)
+        if oxidant is None:
+            oxidant = getattr(ps.OxidantType, str(p["oxidant"]).upper())
+        model.setOxidant(oxidant); model.setOrientation(getattr(ps.SiliconOrientation, p["orientation"]))
         model.setTemperature(p["temperatureC"]); model.setPressure(p["pressureAtm"]); model.setTime(p["timeHours"]); model.setTimeStep(p["timeStepHours"])
         model.setTransferCoefficient(p["transferCoefficientUmHr"]); model.setInitialOxideThickness(p["initialOxideThicknessUm"])
         model.setReactionActivationVolume(p["reactionActivationVolumeM3"]); model.setDiffusionActivationVolume(p["diffusionActivationVolumeM3"])

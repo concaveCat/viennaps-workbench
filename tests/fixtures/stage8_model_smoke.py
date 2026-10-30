@@ -124,7 +124,10 @@ def make_model(name):
         return model
     if name == "oxidation":
         model = ps.Oxidation()
-        model.setOxidant(getattr(ps.OxidantType, "Dry", getattr(ps.OxidantType, "DRY")))
+        oxidant = getattr(ps.OxidantType, "Dry", None)
+        if oxidant is None:
+            oxidant = getattr(ps.OxidantType, "DRY")
+        model.setOxidant(oxidant)
         model.setOrientation(ps.SiliconOrientation.Si100)
         model.setTemperature(1000.0)
         model.setPressure(1.0)

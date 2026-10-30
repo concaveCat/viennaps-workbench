@@ -14,8 +14,12 @@ from pydantic import ValidationError
 from .models import Domain3D, Project, ProjectV3, ProjectV4, ProjectV5, ProjectV6, ProjectV7, parse_project
 from .materials import attach_and_reconcile_project_materials, geometry_mask_material_names
 from .rates import has_motion, is_geometry_step, uses_flux, value as step_value
-from .specialized_models import FLUOROCARBON_MATERIAL_DEFAULTS, model_spec
+from .specialized_models import (FLUOROCARBON_MATERIAL_DEFAULTS, model_spec,
+                                 oxidation_advanced_spec)
 from .runtime_limits import available_cpu_threads
+from .engine import (EVIDENCE_ENGINE_VERSION, OXIDATION_ADVANCED_RESTRICTED,
+                     ald_surface_diffusion_supported, engine_version,
+                     oxidation_advanced_supported)
 
 
 # These ViennaPS 4.6.2 combinations either SIGSEGV or produce different final
@@ -288,7 +292,7 @@ def validate_project(payload: Any, *, kind: str = "project") -> tuple[Project, l
 def _planarize_warnings(project: Any) -> list[str]:
     """Explain what a material-aware planarize can and cannot do.
 
-    The installed ViennaPS 4.6.2 Planarize accepts a height only. A
+    The installed ViennaPS Planarize accepts a height only. A
     ``stopMaterial`` step therefore derives one global cutoff from the
     area-weighted 90th percentile of that material's up-facing surface; it is
     not a CMP selectivity model. Surface the limitation in the same place the
@@ -303,7 +307,7 @@ def _planarize_warnings(project: Any) -> list[str]:
             continue
         warnings.append(
             f"steps[{index}]: material-aware CMP derives one global cutoff from the area-weighted 90th "
-            f"percentile of {stop_material}'s up-facing surface, minus overPolish. ViennaPS 4.6.2 Planarize "
+            f"percentile of {stop_material}'s up-facing surface, minus overPolish. ViennaPS {engine_version()} Planarize "
             f"still cuts every material above that height and models no lateral selectivity, so a stop material "
             f"whose upper plateau covers 10% of its exposed area or less, or that is genuinely multi-level "
             f"without one dominant upper plateau, can be over- or under-cut. The measured stop height, the "
@@ -336,23 +340,24 @@ def _specialized_model_warnings(project: Any) -> list[str]:
             boundary = getattr(domain, "boundaryXY", None) or getattr(domain, "xBoundary", None)
             if boundary != "periodic":
                 warnings.append(
-                    f"steps[{index}].nativeModel: ViennaPS 4.6.2 FaradayCageEtching builds a periodic cage source "
+                    f"steps[{index}].nativeModel: ViennaPS {engine_version()} FaradayCageEtching builds a periodic cage source "
                     f"and requires periodic lateral boundaries; this project uses {boundary!r}. The native run "
                     f"still executes but does not represent a periodic Faraday cage.")
         if model_id == "geometricTrenchDeposition":
             warnings.append(
                 f"steps[{index}].nativeModel: GeometricTrenchDeposition is a ViennaLS geometric-advection "
                 f"distribution, not a flux or velocity-field deposition. It grows the step's depositMaterial "
-                f"top level set without a native mask; 4.6.2 ignores trenchWidth, the process duration does not "
+                f"top level set without a native mask; {engine_version()} ignores trenchWidth, the process duration does not "
                 f"scale the thickness, and the local radius a*(1-|z|/trenchDepth)^n+b is evaluated from absolute "
                 f"z with the trench top assumed at z=0.")
         surface_diffusion = step_value(step, "surfaceDiffusion")
         if (model_id == "ald" and surface_diffusion is not None
-                and step_value(surface_diffusion, "enabled", True)):
+                and step_value(surface_diffusion, "enabled", True)
+                and ald_surface_diffusion_supported()):
             warnings.append(
-                f"steps[{index}].surfaceDiffusion: ViennaPS 4.6.2 builds this Laplacian stencil only inside "
-                f"the ALP strategy and only while coverageDiffusionCoefficient > 0. It smooths the native "
-                f"Coverage scalar that drives the ALD growth rate; it does not smooth the level-set surface.")
+                f"steps[{index}].surfaceDiffusion: ViennaPS {engine_version()} builds this Laplacian stencil "
+                f"only inside the ALP strategy and only while coverageDiffusionCoefficient > 0. It smooths the "
+                f"native Coverage scalar that drives the ALD growth rate; it does not smooth the level-set surface.")
     return warnings
 
 
@@ -824,6 +829,32 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
         spec = model_spec(step.nativeModel)
         if spec is None:
             continue
+        engine = engine_version()
+        surface_diffusion = step.surfaceDiffusion
+        if (step.enabled and step.nativeModel == "ald" and surface_diffusion is not None
+                and surface_diffusion.enabled
+                and not ald_surface_diffusion_supported(engine)):
+            issues.append(FieldIssue(
+                f"steps[{index}].surfaceDiffusion",
+                f"ViennaPS {engine} has a confirmed native hang in the ALD "
+                f"SurfaceDiffusionParameters stencil; the worker process would never return. "
+                f"Use the ViennaPS 4.6.2 runtime, or remove or disable this block."))
+        advanced = step.advancedOxidation
+        if step.enabled and step.nativeModel == "oxidation" and advanced is not None:
+            fields = {field["key"]: field for field in oxidation_advanced_spec()["fields"]}
+            for key, reason in OXIDATION_ADVANCED_RESTRICTED.items():
+                if oxidation_advanced_supported(key, engine):
+                    continue
+                default = fields[key]["default"]
+                if getattr(advanced, key) == default:
+                    # Materialised defaults are behaviour no-ops and must stay
+                    # replayable. Only an attempt to change the control is
+                    # rejected; the worker never sends the removed setter.
+                    continue
+                issues.append(FieldIssue(
+                    f"steps[{index}].advancedOxidation.{key}",
+                    f"ViennaPS {engine}: {reason}. The worker would silently ignore "
+                    f"{key}={getattr(advanced, key)!r}; use the ViennaPS 4.6.2 runtime or omit this override."))
         allowed_dimensions = spec.get("dimensions")
         if allowed_dimensions and project.dimension not in allowed_dimensions:
             available = ", ".join(f"{value}D" for value in allowed_dimensions)
@@ -974,7 +1005,10 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
             issues.append(FieldIssue(f"steps[{index}].nativeModel", "OxideRegrowth requires native SiO2 and Si3N4 materials in the geometry"))
         if step.nativeModel == "oxideRegrowth" and (project.geometry.get("kind") != "stack" or
                 project.geometry.get("pattern", {}).get("kind") != "none"):
-            issues.append(FieldIssue(f"steps[{index}].nativeModel", "installed OxideRegrowth is verified only on a flat stack with top-layer pattern set to none; patterned or non-stack domains can crash ViennaPS 4.6.2"))
+            issues.append(FieldIssue(
+                f"steps[{index}].nativeModel",
+                f"installed OxideRegrowth is verified only on a flat stack with top-layer pattern set to none; "
+                f"patterned or non-stack domains can crash ViennaPS {engine_version()}"))
         if step.nativeModel == "selectiveEpitaxy" and custom_names & geometry_names:
             issues.append(FieldIssue(f"steps[{index}].nativeModel", "SelectiveEpitaxy has only been verified with installed native epitaxy materials"))
         surface_diffusion = getattr(step, "surfaceDiffusion", None)
@@ -1147,7 +1181,7 @@ def _gpu_material_scope_matches(scope: dict[str, Any], materials: list[str] | No
                                geometry_kind: str | None, operation: str,
                                boundary: str) -> bool:
     if (scope.get("kind") != "viennaps-native-material-registry-v1"
-            or scope.get("engineVersion") != "4.6.2"
+            or scope.get("engineVersion") != EVIDENCE_ENGINE_VERSION
             or boundary not in scope.get("boundaries", [])):
         return False
     if materials is None or material_roles is None or material_bindings is None or geometry_kind is None:
@@ -1345,7 +1379,7 @@ def _gpu_combination_verified(dimension: int, model: str, operation: str, bounda
                 if geometry_kind == "gds":
                     scope = row.get("gdsScope", {})
                     if (scope.get("kind") != "viennaps-gds-process-v1"
-                            or scope.get("engineVersion") != "4.6.2"
+                            or scope.get("engineVersion") != EVIDENCE_ENGINE_VERSION
                             or dimension not in scope.get("dimensions", [])
                             or gds_mapping_count is None
                             or gds_mapping_count < 1

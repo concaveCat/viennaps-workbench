@@ -32,6 +32,7 @@ import json
 import subprocess
 import sys
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,6 +41,7 @@ sys.path.insert(0, str(ROOT / "tests" / "fixtures"))
 import viennaps as ps  # noqa: E402
 
 from backend import storage  # noqa: E402
+from backend.engine import oxidation_advanced_supported
 from backend.hashing import requested_input_hash  # noqa: E402
 from backend.main import app  # noqa: E402
 from backend.specialized_models import (  # noqa: E402
@@ -211,7 +213,10 @@ def run_3d_subprocess(*, delta: float, oxide: float, orientation: str,
 def planar_estimate(orientation: str, *, temperature: float = 1000.0,
                     time_hours: float = 0.5, dry: bool = True) -> float:
     model = ps.Oxidation()
-    model.setOxidant(getattr(ps.OxidantType, "Dry", getattr(ps.OxidantType, "DRY")) if dry else getattr(ps.OxidantType, "Wet", getattr(ps.OxidantType, "WET")))
+    oxidant = getattr(ps.OxidantType, "Dry" if dry else "Wet", None)
+    if oxidant is None:
+        oxidant = getattr(ps.OxidantType, "DRY" if dry else "WET")
+    model.setOxidant(oxidant)
     model.setOrientation(getattr(ps.SiliconOrientation, orientation))
     model.setTemperature(temperature)
     model.setPressure(1.0)
@@ -235,9 +240,17 @@ class OxidationCatalogAndSchema(unittest.TestCase):
         self.assertEqual({field["key"]: field["default"]
                           for field in advanced["fields"]},
                          ADVANCED_DEFAULTS)
-        # All four are real bound setters on the installed module.
+        # Every field is a real bound setter on the installed module, except
+        # the controls the installed runtime documents as removed/inert.
         for field in OXIDATION_ADVANCED_FIELDS:
-            self.assertTrue(hasattr(ps.Oxidation, field["nativeSetter"].split(".")[-1]))
+            native = field["nativeSetter"].split(".")[-1]
+            if oxidation_advanced_supported(field["key"]):
+                self.assertTrue(hasattr(ps.Oxidation, native), native)
+            else:
+                self.assertIn(field["key"], advanced["runtimeGate"])
+                if field["key"] == "simplePressureRelaxation":
+                    # Removed in 4.7.0, not merely inert.
+                    self.assertFalse(hasattr(ps.Oxidation, native), native)
 
     def test_omitting_the_block_keeps_the_base_request_hashes(self):
         for dimension, expected in BASE_REQUEST_HASHES.items():
@@ -361,12 +374,29 @@ class OxidationAdvancedNative(unittest.TestCase):
         self.assert_setter_changes_2d({"cflFactor": 0.05})
 
     def test_mechanics_tolerance_changes_the_2d_surface(self):
+        if not oxidation_advanced_supported("mechanicsTolerance"):
+            self.assert_gated_2d("mechanicsTolerance", 0.05)
+            return
         self.assert_setter_changes_2d({"mechanicsTolerance": 0.05})
+
+    def assert_gated_2d(self, key: str, value: float) -> None:
+        project = oxidation_project(2, delta=0.01, time_hours=0.166,
+                                    time_step_hours=0.03,
+                                    advanced={key: value})
+        with self.assertRaises(ProjectInputError) as raised:
+            validate_project(project, kind="simulate")
+        message = str(raised.exception)
+        self.assertIn(f"steps[0].advancedOxidation.{key}", message)
+        self.assertIn(str(value), message)
 
     def test_coupling_tolerance_and_pressure_relaxation_change_the_2d_surface(self):
         # At the finer 0.01 um grid the coupling tolerance is inert for this
         # planar case; 0.02 um is the controlled probe configuration where the
         # native coupling loop changes the returned surface.
+        if not oxidation_advanced_supported("couplingTolerance"):
+            self.assert_gated_2d("couplingTolerance", 0.2)
+            self.assert_gated_2d("simplePressureRelaxation", 0.1)
+            return
         self.assert_setter_changes_2d({"couplingTolerance": 0.2}, delta=0.02)
         self.assert_setter_changes_2d({"simplePressureRelaxation": 0.1})
 
@@ -375,20 +405,22 @@ class OxidationAdvancedNative(unittest.TestCase):
         # the numerical setters at this coarse grid; the 2D probes above are
         # the behavioural evidence. This run proves the 3D binding accepts the
         # setters and that the recorded effective values survive the worker.
+        advanced = {"cflFactor": 0.2}
+        if oxidation_advanced_supported("mechanicsTolerance"):
+            advanced = {"mechanicsTolerance": 0.05, "couplingTolerance": 0.05}
         result = run_3d_subprocess(
             delta=0.05, oxide=0.15, time_hours=0.02, time_step_hours=0.02,
-            orientation="Si100",
-            advanced={"mechanicsTolerance": 0.05, "couplingTolerance": 0.05})
+            orientation="Si100", advanced=advanced)
         self.assertGreater(result["pointCount"], 0)
         self.assertEqual(result["advancedOxidation"]["effective"],
-                         {**ADVANCED_DEFAULTS, "mechanicsTolerance": 0.05,
-                          "couplingTolerance": 0.05})
+                         {**ADVANCED_DEFAULTS, **advanced})
 
     def test_repeated_advanced_runs_are_byte_identical(self):
+        advanced = {"cflFactor": 0.05}
+        if oxidation_advanced_supported("mechanicsTolerance"):
+            advanced["mechanicsTolerance"] = 0.05
         project = oxidation_project(2, delta=0.01, time_hours=0.166,
-                                    time_step_hours=0.03,
-                                    advanced={"cflFactor": 0.05,
-                                              "mechanicsTolerance": 0.05})
+                                    time_step_hours=0.03, advanced=advanced)
         first_actual, first_hash, _ = run_workbench(project)
         second_actual, second_hash, _ = run_workbench(project)
         self.assertEqual(first_hash, second_hash)
@@ -425,6 +457,28 @@ class OxidationAdvancedRejections(unittest.TestCase):
         project = oxidation_project(advanced={"mechanicsTolerance": 0.2,
                                               "couplingTolerance": 0.05})
         self.assert_rejected(project, "couplingTolerance")
+
+    def test_runtime_qualified_advanced_controls(self):
+        cases = (("mechanicsTolerance", 0.05, 0.01),
+                 ("couplingTolerance", 0.2, 0.02),
+                 ("simplePressureRelaxation", 0.1, 0.01))
+        for key, value, delta in cases:
+            with self.subTest(key=key):
+                project = oxidation_project(2, delta=delta, time_hours=0.166,
+                                            time_step_hours=0.03,
+                                            advanced={key: value})
+                with patch("backend.validation.engine_version", return_value="4.6.2"):
+                    parsed, _warnings = validate_project(project)
+                self.assertEqual(getattr(parsed.steps[0].advancedOxidation, key), value)
+                if oxidation_advanced_supported(key):
+                    continue
+                with patch("backend.validation.engine_version", return_value="4.7.0"):
+                    with self.assertRaises(ProjectInputError) as raised:
+                        validate_project(project)
+                message = str(raised.exception)
+                self.assertIn(f"steps[0].advancedOxidation.{key}", message)
+                self.assertIn("4.7.0", message)
+                self.assertIn("omit this override", message)
 
     def test_unsupported_orientation_is_rejected(self):
         project = oxidation_project(orientation="Si101")
@@ -490,13 +544,19 @@ class OxidationAdvancedApi(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.05)
         self.fail("oxidation run did not finish")
 
+    def advanced(self) -> dict:
+        if not oxidation_advanced_supported("mechanicsTolerance"):
+            return {"cflFactor": 0.05}
+        return {"cflFactor": 0.05, "mechanicsTolerance": 0.05,
+                "couplingTolerance": 0.1, "simplePressureRelaxation": 0.1}
+
+    def expected_effective(self) -> dict:
+        return {**ADVANCED_DEFAULTS, **self.advanced()}
+
     def project(self) -> dict:
         project = oxidation_project(
             2, delta=0.02, time_hours=0.15, time_step_hours=0.03,
-            orientation="Si110",
-            advanced={"cflFactor": 0.05, "mechanicsTolerance": 0.05,
-                      "couplingTolerance": 0.1,
-                      "simplePressureRelaxation": 0.1})
+            orientation="Si110", advanced=self.advanced())
         project["name"] = "Oxidation advanced API checkpoint"
         project["steps"][0]["id"] = "stage8_oxidation"
         project["solver"]["timeoutSeconds"] = 120
@@ -523,9 +583,7 @@ class OxidationAdvancedApi(unittest.IsolatedAsyncioTestCase):
         record = next(row for row in info["actualExecution"]
                       if row.get("stepId") == "stage8_oxidation")
         metadata = record["actualParameters"]["nativeModel"]["advancedOxidation"]
-        self.assertEqual(metadata["normalizedInput"], {
-            "cflFactor": 0.05, "mechanicsTolerance": 0.05,
-            "couplingTolerance": 0.1, "simplePressureRelaxation": 0.1})
+        self.assertEqual(metadata["normalizedInput"], self.expected_effective())
         self.assertEqual(metadata["effective"], metadata["normalizedInput"])
         self.assertEqual(metadata["defaults"], ADVANCED_DEFAULTS)
         self.assertEqual(metadata["nativeReadback"]["orientation"], "Si110")
@@ -584,8 +642,7 @@ class OxidationAdvancedApi(unittest.IsolatedAsyncioTestCase):
                              if row.get("stepId") == "stage8_oxidation")
         self.assertEqual(
             replay_record["actualParameters"]["nativeModel"]["advancedOxidation"]["effective"],
-            {"cflFactor": 0.05, "mechanicsTolerance": 0.05,
-             "couplingTolerance": 0.1, "simplePressureRelaxation": 0.1})
+            self.expected_effective())
 
 
 if __name__ == "__main__":

@@ -80,7 +80,10 @@ def api_report() -> dict:
 
 def planar_estimates() -> dict:
     model = ps.Oxidation()
-    model.setOxidant(getattr(ps.OxidantType, "Dry", getattr(ps.OxidantType, "DRY")))
+    oxidant = getattr(ps.OxidantType, "Dry", None)
+    if oxidant is None:
+        oxidant = getattr(ps.OxidantType, "DRY")
+    model.setOxidant(oxidant)
     model.setTemperature(1000.0)
     model.setPressure(1.0)
     model.setTime(0.5)

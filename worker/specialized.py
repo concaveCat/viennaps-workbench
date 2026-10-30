@@ -5,6 +5,7 @@ import math
 from typing import Any
 
 from backend.specialized_models import advanced_spec, model_spec, oxidation_advanced_spec
+from backend.engine import engine_version, oxidation_advanced_supported
 
 
 def _set_native_path(target: Any, path: str, value: Any) -> None:
@@ -399,6 +400,14 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
             if effective["couplingTolerance"] < effective["mechanicsTolerance"]:
                 raise RuntimeError(
                     "advancedOxidation.couplingTolerance must be at least mechanicsTolerance")
+            for restricted in ("simplePressureRelaxation", "mechanicsTolerance",
+                               "couplingTolerance"):
+                if (effective[restricted] != fields[restricted]["default"]
+                        and not oxidation_advanced_supported(restricted)):
+                    raise RuntimeError(
+                        f"ViennaPS {engine_version()} does not honour "
+                        f"advancedOxidation.{restricted}; use the ViennaPS 4.6.2 runtime "
+                        f"or omit this override")
             model.setCFLFactor(effective["cflFactor"])
             model.setMechanicsTolerance(effective["mechanicsTolerance"])
             model.setCouplingTolerance(effective["couplingTolerance"])
@@ -435,6 +444,7 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
                 "nativeSetters": {key: field["nativeSetter"] for key, field in fields.items()},
                 "nativeReadback": readback,
                 "defaultsSource": spec["defaultsSource"],
+                "runtimeGate": spec.get("runtimeGate", {}),
             }
     elif model_id == "oxideRegrowth":
         surface = domain.getSurfaceMesh(addInterfaces=True, sharpCorners=False, minNodeDistanceFactor=0.01)
