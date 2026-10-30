@@ -868,7 +868,7 @@ class CsvProcessStepV7(StrictModel):
     model: Literal["csvProcess"]
     duration: Annotated[Number, Field(ge=0.01, le=600)]
     assetId: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
-    fileName: Annotated[str, Field(min_length=1, max_length=255, pattern=r"^[^/\\]+$")]
+    fileName: Annotated[str, Field(min_length=1, max_length=255, pattern=r"^[^/\\\x00-\x1f\x7f]+$")]
     direction: DirectionVector3
     offset: Vector2
     isotropicComponent: Annotated[Number, Field(ge=0, le=100)] = 0.0

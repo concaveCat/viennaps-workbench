@@ -3,9 +3,10 @@
 The worker never accepts a path from submitted JSON: the supervisor copies the
 content-addressed asset into the isolated run directory and passes that path
 through ``input.json``. This module re-verifies the copy's SHA-256, re-parses
-the table with the same bounded schema used at upload time, and only then calls
-the real native constructor. A missing or malformed table raises instead of
-letting ``RateGrid`` fall back to a zero velocity field.
+and re-canonicalizes the table with the same bounded parser used at upload time,
+and only then calls the real native constructor. A missing, non-canonical or
+malformed table raises instead of letting ``RateGrid`` fall back to a zero
+velocity field or an unsafe LINEAR parse.
 """
 from __future__ import annotations
 
@@ -14,8 +15,8 @@ import math
 from pathlib import Path
 from typing import Any
 
-from backend.csv_assets import RateCsvError, inspect_rate_csv
-from worker.specialized import _mask_material_names
+from backend.csv_assets import RateCsvError, canonicalize_rate_csv
+from worker.mask_materials import protected_material_names
 
 
 def _sha256(path: Path) -> str:
@@ -48,9 +49,14 @@ def build_csv_process(ps: Any, project: dict[str, Any], step: dict[str, Any], *,
 
     dimension = int(project["dimension"])
     try:
-        summary = inspect_rate_csv(source.read_bytes(), dimension)
+        raw = source.read_bytes()
+        canonical, summary = canonicalize_rate_csv(raw, dimension)
     except (OSError, RateCsvError) as exc:
         raise RuntimeError(f"csvProcess asset is not a valid {dimension}D rate table: {exc}") from exc
+    if canonical != raw:
+        raise RuntimeError("csvProcess asset copy is not in the canonical ASCII/LF format; re-upload the table")
+    if hashlib.sha256(canonical).hexdigest() != observed:
+        raise RuntimeError("csvProcess canonical table SHA-256 differs from the run copy")
     mode = str(step["interpolationMode"])
     if mode == "LINEAR" and not summary["linearCompatible"]:
         raise RuntimeError("csvProcess LINEAR interpolation requires a table the native RateGrid can interpolate")
@@ -63,7 +69,7 @@ def build_csv_process(ps: Any, project: dict[str, Any], step: dict[str, Any], *,
         raise RuntimeError("csvProcess direction must be a finite nonzero vector")
     native_direction = [value / length for value in raw_direction]
     offset = [float(value) for value in step["offset"]]
-    mask_names = sorted(_mask_material_names(project))
+    mask_names = sorted(protected_material_names(project))
     mask_materials = [material_handle(name) for name in mask_names]
     visibility = bool(step["calculateVisibility"])
 
@@ -85,6 +91,7 @@ def build_csv_process(ps: Any, project: dict[str, Any], step: dict[str, Any], *,
         "assetSha256": observed,
         "assetFileName": str(step["fileName"]),
         "assetCopy": source.name,
+        "canonicalFormat": summary["canonicalFormat"],
         "dimension": dimension,
         "csvSchema": summary["columns"],
         "csvRowCount": summary["rowCount"],

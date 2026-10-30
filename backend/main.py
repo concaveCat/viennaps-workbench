@@ -399,7 +399,7 @@ async def gds_asset_get(asset_id: str) -> dict[str, Any]:
 
 @app.get("/api/csv-assets/{asset_id}")
 async def csv_asset_get(asset_id: str) -> dict[str, Any]:
-    from .csv_assets import inspect_rate_csv
+    from .csv_assets import canonicalize_rate_csv
     try:
         path = storage.resolve_csv_asset(asset_id)
         metadata_path = storage.csv_asset_metadata_path(asset_id)
@@ -407,7 +407,12 @@ async def csv_asset_get(asset_id: str) -> dict[str, Any]:
         dimension = metadata.get("dimension")
         if type(dimension) is not int or dimension not in (2, 3):
             raise ValueError("CSV asset metadata does not declare a 2D or 3D rate table")
-        return {**metadata, "assetId": asset_id, **inspect_rate_csv(path.read_bytes(), dimension)}
+        raw = path.read_bytes()
+        canonical, summary = canonicalize_rate_csv(raw, dimension)
+        if canonical != raw:
+            raise ValueError("stored CSV asset is not in canonical form; re-upload it")
+        return {**metadata, **summary, "assetId": asset_id,
+                "sourceSizeBytes": metadata.get("sourceSizeBytes", summary["sourceSizeBytes"])}
     except (FileNotFoundError, OSError, ValueError) as exc:
         raise HTTPException(status_code=404, detail="CSV rate asset not found, invalid or SHA-256 mismatch") from exc
 
@@ -416,11 +421,11 @@ async def csv_asset_get(asset_id: str) -> dict[str, Any]:
 async def csv_asset_upload(request: Request,
                            file_name: str = Query(default="rates.csv", min_length=1, max_length=255),
                            dimension: int = Query(...)) -> dict[str, Any]:
-    from .csv_assets import RateCsvError, inspect_rate_csv
+    from .csv_assets import RateCsvError, canonicalize_rate_csv
     if dimension not in (2, 3):
         raise HTTPException(status_code=422, detail="CSV rate tables require dimension=2 or dimension=3")
-    if "/" in file_name or "\\" in file_name or any(ord(value) < 32 for value in file_name):
-        raise HTTPException(status_code=422, detail="CSV file name must be a simple file name")
+    if "/" in file_name or "\\" in file_name or any(ord(value) < 32 or ord(value) == 127 for value in file_name):
+        raise HTTPException(status_code=422, detail="CSV file name must be a simple file name without control characters")
     content_length = request.headers.get("content-length")
     if content_length:
         try:
@@ -442,21 +447,25 @@ async def csv_asset_upload(request: Request,
                 digest.update(chunk)
                 output.write(chunk)
         data = upload_path.read_bytes()
+        source_sha256 = digest.hexdigest()
+        if source_sha256 != hashlib.sha256(data).hexdigest():
+            raise HTTPException(status_code=500, detail="CSV upload SHA-256 changed while streaming")
         try:
-            summary = inspect_rate_csv(data, dimension)
+            canonical, summary = canonicalize_rate_csv(data, dimension)
         except (OSError, RateCsvError) as exc:
             raise HTTPException(status_code=422, detail=f"CSV rate table is invalid: {exc}") from exc
-        asset_id = digest.hexdigest()
-        if asset_id != hashlib.sha256(data).hexdigest():
-            raise HTTPException(status_code=500, detail="CSV upload SHA-256 changed while streaming")
+        asset_id = summary["canonicalSha256"]
+        if asset_id != hashlib.sha256(canonical).hexdigest():
+            raise HTTPException(status_code=500, detail="canonical CSV SHA-256 is inconsistent")
         destination = storage.csv_asset_path(asset_id)
         if destination.exists():
             if storage.file_sha256(destination) != asset_id:
                 raise HTTPException(status_code=500, detail="content-addressed CSV asset store has a SHA-256 mismatch")
         else:
-            storage.check_disk_preflight(projected_bytes=size)
+            storage.check_disk_preflight(projected_bytes=len(canonical))
+            upload_path.write_bytes(canonical)
             os.replace(upload_path, destination)
-        metadata = {"assetId": asset_id, "fileName": file_name, **summary}
+        metadata = {"assetId": asset_id, "fileName": file_name, "sourceSha256": source_sha256, **summary}
         atomic_json(storage.csv_asset_metadata_path(asset_id), metadata)
         return metadata
     finally:

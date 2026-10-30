@@ -1994,14 +1994,19 @@ export default function App() {
       return !!spec?.dimensions?.length && !spec.dimensions.includes(dimension);
     });
     const droppedSpecializedIds = new Set(droppedSpecialized.map(step => step.id));
+    const droppedCsv = source.steps.filter(step => step.model === 'csvProcess');
+    const droppedCsvIds = new Set(droppedCsv.map(step => step.id));
     const droppedNotice = [
       droppedSpecialized.length
         ? `已移除不支持的专用模型：${droppedSpecialized.map(step => step.nativeModel).join('、')}。`
         : '',
       droppedGdsBoolean ? '已移除 GDS 布尔步骤（仅支持 3D GDS 项目）。' : '',
+      droppedCsv.length
+        ? `已移除 CSV 速率表步骤：${droppedCsv.map(step => step.fileName ?? '未命名').join('、')}（速率表维度、方向与 offset 在 2D/3D 之间不兼容，请重新上传并添加）。`
+        : '',
     ].filter(Boolean).join(' ');
     const convertedSteps = source.steps
-      .filter(step => !(dimension === 2 && step.model === 'gdsBoolean') && !droppedSpecializedIds.has(step.id))
+      .filter(step => !(dimension === 2 && step.model === 'gdsBoolean') && !droppedSpecializedIds.has(step.id) && !droppedCsvIds.has(step.id))
       .map(step => {
       if (step.model === 'boolean') {
         const position = step.position ?? [0, 0, 0];
@@ -2278,6 +2283,7 @@ export default function App() {
     : '';
 
   return <div className={`app-shell ${isResizingPanels ? 'columns-resizing' : ''}`}>
+    <input ref={csvInputRef} data-testid="csv-asset-input" type="file" accept=".csv,text/csv" hidden onChange={event => { const file = event.target.files?.[0]; if (file) void uploadCsvFile(file, csvUploadMode); }} />
     <TopBar>
       <header className="topbar topbar-shell">
         <div className="brand-block"><div className="brand-mark">V<span>PS</span></div><div className="brand-copy"><strong>ViennaPS 工艺工作台</strong><span>二维 / 三维本机仿真 · µm · s</span></div></div>
@@ -2376,7 +2382,6 @@ export default function App() {
               >导入 GDS</button>
             </div>
             <input ref={gdsInputRef} type="file" accept=".gds,.gdsii,application/octet-stream" hidden onChange={event => { const file = event.target.files?.[0]; if (file) void uploadGdsFile(file); }} />
-            <input ref={csvInputRef} type="file" accept=".csv,text/csv" hidden onChange={event => { const file = event.target.files?.[0]; if (file) void uploadCsvFile(file, csvUploadMode); }} />
             {gdsImportOpen && gdsImportPosition && createPortal(
               <div
                 ref={gdsImportCardRef}
