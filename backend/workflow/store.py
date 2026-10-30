@@ -1455,6 +1455,27 @@ class WorkflowStore:
             for row in rows
         ]
 
+    def workflow_run_route_ids(self, workflow_run_id: str) -> set[str]:
+        """Return the routes that already recorded this workflow run id.
+
+        Workflow runs are a grouping of decision records, so the check scans the
+        small decision table instead of introducing a second identity store.
+        """
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT route_id, document_json FROM measurement_decisions"
+            ).fetchall()
+        routes: set[str] = set()
+        for row in rows:
+            try:
+                document = json.loads(row["document_json"])
+            except ValueError:
+                continue
+            if document.get("workflowRunId") == workflow_run_id:
+                routes.add(row["route_id"])
+        return routes
+
     def save_experiment(self, experiment_id: str, document: dict[str, Any]) -> dict[str, Any]:
         with self._connect() as connection:
             connection.execute(

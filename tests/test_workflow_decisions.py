@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sqlite3
 import unittest
@@ -12,6 +13,9 @@ os.environ.setdefault("WORKBENCH_PORT", "8767")
 
 from backend import storage  # noqa: E402
 from backend.main import app  # noqa: E402
+from backend.workflow.adoption import adopt_project  # noqa: E402
+from backend.workflow.compiler import compile_flow  # noqa: E402
+from backend.workflow.decisions import _build_target_compile  # noqa: E402
 from backend.workflow.store import SCHEMA_VERSION, WorkflowStore  # noqa: E402
 from tests.test_api_integration import asgi_request, json_body  # noqa: E402
 
@@ -109,6 +113,7 @@ class MeasurementDecisionTests(unittest.IsolatedAsyncioTestCase):
 
         first = await self._execute(self.prefix_segment["segmentId"])
         self.assertEqual(first["status"], "succeeded", first)
+        self.executed_prefix = first
 
     async def asyncTearDown(self) -> None:
         await self.lifespan.__aexit__(None, None, None)
@@ -133,10 +138,14 @@ class MeasurementDecisionTests(unittest.IsolatedAsyncioTestCase):
         return await self._wait_segment(segment_id)
 
     def _decision_payload(self, *, operator: str = "gt", threshold: float = 0.0,
-                          true_parameters: dict, false_parameters: dict) -> dict:
-        return {
-            "startAfterStepId": self.prefix_step_id,
-            "recipeId": self.recipe_id,
+                          true_parameters: dict, false_parameters: dict,
+                          start_after: str | None = None,
+                          through: str | None = None,
+                          workflow_run_id: str | None = None,
+                          recipe_id: str | None = None) -> dict:
+        payload = {
+            "startAfterStepId": self.prefix_step_id if start_after is None else start_after,
+            "recipeId": recipe_id or self.recipe_id,
             "recipeVersion": 1,
             "operator": operator,
             "threshold": threshold,
@@ -145,6 +154,11 @@ class MeasurementDecisionTests(unittest.IsolatedAsyncioTestCase):
                 "false": {"parameters": false_parameters},
             },
         }
+        if through is not None:
+            payload["branchThroughStepId"] = through
+        if workflow_run_id is not None:
+            payload["workflowRunId"] = workflow_run_id
+        return payload
 
     async def _decide(self, **kwargs) -> dict:
         response = await asgi_request(
@@ -154,6 +168,51 @@ class MeasurementDecisionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response[0], 201, response[2])
         return json_body(response)
+
+    async def _create_route(self, name: str, split_after: str | None) -> dict:
+        response = await asgi_request(
+            "/api/v1/workflow/routes/from-compile",
+            method="POST",
+            payload={
+                "compileId": self.compile_id,
+                "name": name,
+                "splitAfterStepId": split_after,
+            },
+        )
+        self.assertEqual(response[0], 201, response[2])
+        return json_body(response)["plan"]
+
+    @staticmethod
+    def _db_path():
+        return storage.VAR / "workflow" / "workflow.sqlite3"
+
+    def _read_decision(self, decision_id: str) -> dict:
+        with sqlite3.connect(self._db_path()) as connection:
+            row = connection.execute(
+                "SELECT document_json FROM measurement_decisions WHERE decision_id = ?",
+                (decision_id,),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        return json.loads(row[0])
+
+    def _set_decision_document(self, decision_id: str, document: dict) -> None:
+        with sqlite3.connect(self._db_path()) as connection:
+            connection.execute(
+                "UPDATE measurement_decisions SET document_json = ? WHERE decision_id = ?",
+                (json.dumps(document), decision_id),
+            )
+
+    def _rewrite_measurement(self, measurement_id: str, sql: str, values: tuple) -> None:
+        with sqlite3.connect(self._db_path()) as connection:
+            connection.execute(
+                f"UPDATE measurements SET {sql} WHERE measurement_id = ?",
+                (*values, measurement_id),
+            )
+
+    async def _measurement_count(self, run_id: str) -> int:
+        response = await asgi_request(f"/api/v1/workflow/measurements?run_id={run_id}")
+        self.assertEqual(response[0], 200, response[2])
+        return len(json_body(response)["measurements"])
 
     async def _target_step(self, compile_id: str, authored_step_id: str) -> dict:
         response = await asgi_request(f"/api/v1/workflow/compiles/{compile_id}")
@@ -431,6 +490,395 @@ class MeasurementDecisionTests(unittest.IsolatedAsyncioTestCase):
             payload={},
         )
         self.assertEqual(cross[0], 404, cross[2])
+
+    async def test_chained_decisions_share_one_workflow_run_and_replay(self):
+        first_step = self.step_ids["step_etch_01"]
+        middle = self.step_ids["step_etch_02"]
+        tail = self.step_ids["step_etch_03"]
+        route = await self._create_route("chained decisions", first_step)
+        route_id = route["route"]["routeId"]
+        prefix = route["segments"][0]
+        self.assertEqual(prefix["throughStepId"], first_step)
+        self.assertEqual((await self._execute(prefix["segmentId"]))["status"], "succeeded")
+
+        base = self._decision_payload(
+            start_after=first_step,
+            true_parameters={"step_etch_02": {"duration": 0.03}},
+            false_parameters={"step_etch_02": {"duration": 0.2}},
+        )
+        # The reported branch end bounds which authored steps may change.
+        after_end = await asgi_request(
+            f"/api/v1/workflow/routes/{route_id}/measurement-decisions",
+            method="POST",
+            payload={
+                **base,
+                "branchThroughStepId": middle,
+                "branches": {
+                    "true": {"parameters": {"step_etch_03": {"duration": 0.04}}},
+                    "false": {"parameters": {"step_etch_03": {"duration": 0.5}}},
+                },
+            },
+        )
+        self.assertEqual(after_end[0], 422, after_end[2])
+        self.assertIn("after the branch end", after_end[2].decode())
+        before_start = await asgi_request(
+            f"/api/v1/workflow/routes/{route_id}/measurement-decisions",
+            method="POST",
+            payload={**base, "branchThroughStepId": first_step},
+        )
+        self.assertEqual(before_start[0], 422, before_start[2])
+
+        first = await asgi_request(
+            f"/api/v1/workflow/routes/{route_id}/measurement-decisions",
+            method="POST",
+            payload={**base, "branchThroughStepId": middle},
+        )
+        self.assertEqual(first[0], 201, first[2])
+        first_body = json_body(first)
+        decision1 = first_body["decision"]
+        self.assertEqual(decision1["sourceAttemptId"], prefix["attemptId"])
+        self.assertEqual(decision1["branchThroughStepId"], middle)
+        self.assertEqual(decision1["seed"], 20261030)
+        self.assertRegex(decision1["sourcePrefixDigest"], r"^[a-f0-9]{64}$")
+        self.assertRegex(decision1["sourceCheckpointHash"], r"^[a-f0-9]{64}$")
+        self.assertRegex(decision1["sourceCompileHash"], r"^[a-f0-9]{64}$")
+        self.assertRegex(decision1["targetCompileHash"], r"^[a-f0-9]{64}$")
+        self.assertEqual(decision1["measurementBindingStatus"], "verified")
+        self.assertEqual(decision1["measurementEquivalenceStatus"], "not_evaluated")
+        self.assertEqual(
+            decision1["candidateParameters"]["false"]["parameters"],
+            {"step_etch_02": {"duration": 0.2}},
+        )
+        branch1 = next(
+            item for item in first_body["plan"]["segments"]
+            if item["segmentId"] == decision1["branchSegmentId"]
+        )
+        self.assertEqual(branch1["throughStepId"], middle)
+        self.assertEqual((await self._execute(branch1["segmentId"]))["status"], "succeeded")
+
+        second = await asgi_request(
+            f"/api/v1/workflow/routes/{route_id}/measurement-decisions",
+            method="POST",
+            payload=self._decision_payload(
+                start_after=middle,
+                true_parameters={"step_etch_03": {"duration": 0.04}},
+                false_parameters={"step_etch_03": {"duration": 0.5}},
+            ),
+        )
+        self.assertEqual(second[0], 201, second[2])
+        second_body = json_body(second)
+        decision2 = second_body["decision"]
+        self.assertEqual(decision2["workflowRunId"], decision1["workflowRunId"])
+        self.assertEqual(decision2["sourceSegmentId"], decision1["branchSegmentId"])
+        self.assertEqual(decision2["branchThroughStepId"], tail)
+        reuses = [
+            item for item in second_body["plan"]["reuse"]
+            if item["attemptId"] == decision2["branchAttemptId"]
+        ]
+        self.assertEqual(
+            [(item["fromStepId"], item["toStepId"]) for item in reuses],
+            [(first_step, first_step), (middle, middle)],
+        )
+        self.assertEqual(
+            (await self._execute(decision2["branchSegmentId"]))["status"], "succeeded"
+        )
+
+        runs = json_body(
+            await asgi_request(f"/api/v1/workflow/routes/{route_id}/workflow-runs")
+        )
+        self.assertEqual(len(runs["runs"]), 1)
+        summary = runs["runs"][0]
+        self.assertEqual(summary["workflowRunId"], decision1["workflowRunId"])
+        self.assertEqual(summary["decisionCount"], 2)
+        self.assertEqual(summary["replayCount"], 0)
+        self.assertEqual(
+            summary["decisionIds"], [decision1["decisionId"], decision2["decisionId"]]
+        )
+        detail = json_body(
+            await asgi_request(
+                f"/api/v1/workflow/routes/{route_id}/workflow-runs/"
+                f"{decision1['workflowRunId']}"
+            )
+        )
+        self.assertEqual(
+            [item["decisionId"] for item in detail["decisions"]],
+            [decision1["decisionId"], decision2["decisionId"]],
+        )
+        self.assertEqual(len(detail["attempts"]), 3)
+        self.assertEqual(len(detail["segments"]), 3)
+
+        replayed = await asgi_request(
+            f"/api/v1/workflow/routes/{route_id}/measurement-decisions/"
+            f"{decision2['decisionId']}/replay",
+            method="POST",
+            payload={},
+        )
+        self.assertEqual(replayed[0], 201, replayed[2])
+        replay_decision = json_body(replayed)["decision"]
+        self.assertEqual(replay_decision["workflowRunId"], decision1["workflowRunId"])
+        self.assertEqual(replay_decision["targetCompileId"], decision2["targetCompileId"])
+        self.assertEqual(replay_decision["branchThroughStepId"], tail)
+        self.assertEqual(replay_decision["sourceSegmentId"], decision1["branchSegmentId"])
+
+    async def test_workflow_run_id_can_start_a_new_run_but_not_cross_routes(self):
+        first = await self._decide(
+            true_parameters={"step_etch_03": {"duration": 0.03}},
+            false_parameters={"step_etch_03": {"duration": 0.2}},
+        )
+        run_a = first["decision"]["workflowRunId"]
+        requested = f"wfr_{uuid.uuid4().hex[:16]}"
+        created = await asgi_request(
+            f"/api/v1/workflow/routes/{self.route_id}/measurement-decisions",
+            method="POST",
+            payload=self._decision_payload(
+                true_parameters={"step_etch_03": {"duration": 0.03}},
+                false_parameters={"step_etch_03": {"duration": 0.2}},
+                workflow_run_id=requested,
+            ),
+        )
+        self.assertEqual(created[0], 201, created[2])
+        self.assertEqual(json_body(created)["workflowRunId"], requested)
+        self.assertNotEqual(requested, run_a)
+
+        continued = await asgi_request(
+            f"/api/v1/workflow/routes/{self.route_id}/measurement-decisions",
+            method="POST",
+            payload=self._decision_payload(
+                true_parameters={"step_etch_03": {"duration": 0.03}},
+                false_parameters={"step_etch_03": {"duration": 0.2}},
+                workflow_run_id=run_a,
+            ),
+        )
+        self.assertEqual(continued[0], 201, continued[2])
+        self.assertEqual(json_body(continued)["workflowRunId"], run_a)
+
+        other = await self._create_route("other route", self.prefix_step_id)
+        cross = await asgi_request(
+            f"/api/v1/workflow/routes/{other['route']['routeId']}/measurement-decisions",
+            method="POST",
+            payload=self._decision_payload(
+                true_parameters={"step_etch_03": {"duration": 0.03}},
+                false_parameters={"step_etch_03": {"duration": 0.2}},
+                workflow_run_id=run_a,
+            ),
+        )
+        self.assertEqual(cross[0], 409, cross[2])
+        self.assertIn("already belongs to route", cross[2].decode())
+
+    async def test_decision_requires_verified_measurement_binding(self):
+        run_id = self.executed_prefix["runId"]
+        with sqlite3.connect(self._db_path()) as connection:
+            connection.execute(
+                "UPDATE segments SET segment_project_hash = ? WHERE segment_id = ?",
+                ("0" * 64, self.prefix_segment["segmentId"]),
+            )
+        response = await asgi_request(
+            f"/api/v1/workflow/routes/{self.route_id}/measurement-decisions",
+            method="POST",
+            payload=self._decision_payload(
+                true_parameters={"step_etch_03": {"duration": 0.03}},
+                false_parameters={"step_etch_03": {"duration": 0.2}},
+            ),
+        )
+        self.assertEqual(response[0], 409, response[2])
+        self.assertIn("not bound", response[2].decode())
+
+        plan = json_body(
+            await asgi_request(f"/api/v1/workflow/routes/{self.route_id}")
+        )["plan"]
+        self.assertEqual(len(plan["attempts"]), 1)
+        self.assertEqual(len(plan["segments"]), 2)
+        decisions = json_body(
+            await asgi_request(
+                f"/api/v1/workflow/routes/{self.route_id}/measurement-decisions"
+            )
+        )
+        self.assertEqual(decisions["decisions"], [])
+        measurements = json_body(
+            await asgi_request(f"/api/v1/workflow/measurements?run_id={run_id}")
+        )["measurements"]
+        self.assertTrue(any(item["bindingStatus"] == "failed" for item in measurements))
+
+    async def test_replay_rejects_tampered_or_stale_records(self):
+        created = await self._decide(
+            true_parameters={"step_etch_03": {"duration": 0.03}},
+            false_parameters={"step_etch_03": {"duration": 0.2}},
+        )
+        decision = created["decision"]
+        decision_id = decision["decisionId"]
+        path = (
+            f"/api/v1/workflow/routes/{self.route_id}/measurement-decisions/"
+            f"{decision_id}/replay"
+        )
+        original_document = self._read_decision(decision_id)
+
+        def replay():
+            return asgi_request(path, method="POST", payload={})
+
+        def tampered(mutate) -> dict:
+            document = json.loads(json.dumps(original_document))
+            mutate(document)
+            self._set_decision_document(decision_id, document)
+            return document
+
+        tampered(lambda document: document.update(result=not document["result"]))
+        response = await replay()
+        self.assertEqual(response[0], 409, response[2])
+        self.assertIn("result does not match", response[2].decode())
+
+        tampered(lambda document: document.update(
+            chosenBranch="false" if document["chosenBranch"] == "true" else "true"
+        ))
+        response = await replay()
+        self.assertEqual(response[0], 409, response[2])
+        self.assertIn("chosen branch", response[2].decode())
+
+        tampered(lambda document: document["resolvedParameters"]["step_etch_03"].update(
+            duration=0.99
+        ))
+        response = await replay()
+        self.assertEqual(response[0], 409, response[2])
+        self.assertIn("branch parameters", response[2].decode())
+
+        tampered(lambda document: document.update(targetCompileId="c_" + "0" * 24))
+        response = await replay()
+        self.assertEqual(response[0], 409, response[2])
+
+        self._set_decision_document(decision_id, original_document)
+        self._rewrite_measurement(
+            decision["measurementId"], "value = ?", (decision["measuredValue"] + 1.0,)
+        )
+        response = await replay()
+        self.assertEqual(response[0], 409, response[2])
+        self.assertIn("measured value", response[2].decode())
+
+        self._rewrite_measurement(
+            decision["measurementId"], "value = ?", (decision["measuredValue"],)
+        )
+        self._rewrite_measurement(
+            decision["measurementId"], "binding_status = ?", ("failed",)
+        )
+        response = await replay()
+        self.assertEqual(response[0], 409, response[2])
+        self.assertIn("no longer bound", response[2].decode())
+
+        self._rewrite_measurement(
+            decision["measurementId"], "binding_status = ?", ("verified",)
+        )
+        response = await replay()
+        self.assertEqual(response[0], 201, response[2])
+
+    async def test_auto_prefix_without_suffix_and_nonfinite_threshold_are_rejected(self):
+        route = await self._create_route("single segment", None)
+        route_id = route["route"]["routeId"]
+        self.assertEqual(len(route["segments"]), 1)
+        self.assertEqual(
+            (await self._execute(route["segments"][0]["segmentId"]))["status"],
+            "succeeded",
+        )
+        payload = self._decision_payload(
+            true_parameters={"step_etch_03": {"duration": 0.03}},
+            false_parameters={"step_etch_03": {"duration": 0.2}},
+        )
+        payload.pop("startAfterStepId")
+        auto = await asgi_request(
+            f"/api/v1/workflow/routes/{route_id}/measurement-decisions",
+            method="POST",
+            payload=payload,
+        )
+        self.assertEqual(auto[0], 409, auto[2])
+        self.assertIn("no succeeded prefix with a suffix", auto[2].decode())
+
+        run_id = self.executed_prefix["runId"]
+        count = await self._measurement_count(run_id)
+        nonfinite = await asgi_request(
+            f"/api/v1/workflow/routes/{self.route_id}/measurement-decisions",
+            method="POST",
+            payload={
+                **self._decision_payload(
+                    true_parameters={"step_etch_03": {"duration": 0.03}},
+                    false_parameters={"step_etch_03": {"duration": 0.2}},
+                ),
+                "threshold": float("nan"),
+            },
+        )
+        self.assertEqual(nonfinite[0], 422, nonfinite[2])
+        self.assertEqual(await self._measurement_count(run_id), count)
+
+
+class DecisionCompileProvenanceTests(unittest.TestCase):
+    def test_target_compile_keeps_source_identity_and_chained_overrides(self):
+        suffix = uuid.uuid4().hex[:6]
+        path = storage.VAR / f"test-workflow-decisions-provenance-{suffix}.sqlite3"
+        store = WorkflowStore(path)
+        store.initialize()
+        flow_id = f"flow_prov_{suffix}"
+        project = three_step_project(flow_id)
+        flow, binding, plain = adopt_project(project, flow_id=flow_id)
+        store.register_binding(binding)
+        store.register_compile(plain)
+        variable_set = [{"name": "rate", "value": 0.1, "source": "override"}]
+        overrides = [{"name": "rate", "value": 0.1, "source": "request"}]
+        varied = compile_flow(
+            flow,
+            binding,
+            variable_set=variable_set,
+            overrides=overrides,
+            compiler_version="0.0.9",
+            engine_versions={"cpu": "test-engine"},
+        )
+        store.register_compile(varied)
+
+        resolved = {"step_etch_03": {"duration": 0.03}}
+        target = _build_target_compile(store, varied, resolved)
+        self.assertEqual(target.compileRecord.compilerVersion, "0.0.9")
+        self.assertEqual(target.compileRecord.engineVersions, {"cpu": "test-engine"})
+        self.assertIn(
+            {"name": "rate", "value": 0.1, "source": "override"},
+            target.compileRecord.variableSet,
+        )
+        self.assertIn(
+            {"name": "rate", "value": 0.1, "source": "request"},
+            target.compileRecord.overrides,
+        )
+        self.assertIn(
+            {
+                "stepId": "step_etch_03",
+                "parameter": "duration",
+                "value": 0.03,
+                "source": "measurement-decision",
+            },
+            target.compileRecord.overrides,
+        )
+
+        plain_target = _build_target_compile(store, plain, resolved)
+        self.assertEqual(plain_target.compileRecord.variableSet, [
+            {
+                "name": "step_etch_03.duration",
+                "value": 0.03,
+                "source": "measurement-decision",
+            }
+        ])
+        self.assertNotEqual(
+            target.compileRecord.compileId, plain_target.compileRecord.compileId
+        )
+
+        chained = _build_target_compile(store, target, {"step_etch_03": {"duration": 0.05}})
+        entries = [
+            entry for entry in chained.compileRecord.overrides
+            if entry.get("stepId") == "step_etch_03"
+            and entry.get("parameter") == "duration"
+        ]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["value"], 0.05)
+        self.assertIn(
+            {"name": "rate", "value": 0.1, "source": "request"},
+            chained.compileRecord.overrides,
+        )
+        reused = _build_target_compile(store, varied, resolved)
+        self.assertEqual(
+            reused.compileRecord.compileId, target.compileRecord.compileId
+        )
 
 
 class MeasurementDecisionMigrationTests(unittest.TestCase):

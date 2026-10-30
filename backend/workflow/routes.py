@@ -257,8 +257,23 @@ def _check_reuse(
         source_start, source_end = _range_for(source.startAfterStepId, source.throughStepId, index)
         if source_start != from_index or source_end != to_index:
             raise ValueError(f"reuse {entry.reuseId!r} range does not match the source segment")
-        if not plan.route.legacyUnverified and entry.compatibility != attempt.prefixCompatibility:
-            raise ValueError(f"reuse {entry.reuseId!r} compatibility does not match the attempt")
+        if not plan.route.legacyUnverified:
+            if entry.compatibility.stepIds != plan.stepOrder[from_index:to_index + 1]:
+                raise ValueError(
+                    f"reuse {entry.reuseId!r} compatibility stepIds do not match its range"
+                )
+            prefix = attempt.prefixCompatibility
+            if prefix is None:
+                raise ValueError(f"attempt {attempt.attemptId!r} reuses a prefix without compatibility")
+            if (
+                entry.compatibility.geometryBindingHash != prefix.geometryBindingHash
+                or entry.compatibility.solverDigest != prefix.solverDigest
+                or entry.compatibility.seedPolicy != prefix.seedPolicy
+                or entry.compatibility.runSeed != prefix.runSeed
+            ):
+                raise ValueError(
+                    f"reuse {entry.reuseId!r} compatibility envelope differs from the attempt prefix"
+                )
         expected = to_index + 1
     if expected != start:
         raise ValueError(f"reuse prefix for {attempt.attemptId!r} does not end at startAfterStepId")

@@ -21,6 +21,8 @@ class WorkflowOpenApiTests(unittest.TestCase):
             "/api/v1/workflow/routes/{route_id}/measurement-decisions",
             "/api/v1/workflow/routes/{route_id}/measurement-decisions/{decision_id}",
             "/api/v1/workflow/routes/{route_id}/measurement-decisions/{decision_id}/replay",
+            "/api/v1/workflow/routes/{route_id}/workflow-runs",
+            "/api/v1/workflow/routes/{route_id}/workflow-runs/{workflow_run_id}",
             "/api/v1/workflow/compiles",
             "/api/v1/workflow/measurements",
             "/api/v1/workflow/measurements/{measurement_id}/bind",
@@ -50,6 +52,9 @@ class WorkflowOpenApiTests(unittest.TestCase):
             "MeasurementDecisionRequestV1",
             "MeasurementDecisionResponse",
             "MeasurementDecisionListResponse",
+            "WorkflowRunSummaryV1",
+            "WorkflowRunListResponse",
+            "WorkflowRunDetailV1",
         ):
             self.assertIn(name, schema["components"]["schemas"])
         decision_request = schema["components"]["schemas"]["MeasurementDecisionRequestV1"]

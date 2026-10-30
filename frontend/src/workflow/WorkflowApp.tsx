@@ -3,7 +3,7 @@ import './workflow.css';
 
 type Health = { status: string; viennaps?: string; viennals?: string; activeRunId?: string | null };
 type GdsAsset = { assetId: string; fileName: string };
-type ProjectStep = { id: string; name: string; model: string; operation?: string; enabled: boolean; duration?: number };
+type ProjectStep = { id: string; name: string; model: string; operation?: string; enabled: boolean; duration?: number; thickness?: number; rateMagnitude?: number };
 type CompileInfo = {
   flowId: string;
   bindingId: string;
@@ -57,12 +57,18 @@ type MeasurementDecision = {
   workflowRunId: string;
   routeId: string;
   sourceSegmentId: string;
+  sourceAttemptId: string | null;
   sourceCompileId: string;
+  sourceCompileHash: string | null;
   sourceRunId: string;
   startAfterStepId: string;
+  sourceCheckpointHash: string | null;
+  sourcePrefixDigest: string | null;
+  seed: number | null;
   measurementId: string;
   measurementStatus: string;
   measurementBindingStatus: string;
+  measurementEquivalenceStatus: string;
   recipeId: string;
   recipeVersion: number;
   metricId: string;
@@ -73,10 +79,16 @@ type MeasurementDecision = {
   threshold: number;
   result: boolean;
   chosenBranch: 'true' | 'false';
+  candidateParameters: {
+    true: { parameters: Record<string, Record<string, unknown>> };
+    false: { parameters: Record<string, Record<string, unknown>> };
+  } | null;
   resolvedParameters: Record<string, Record<string, unknown>>;
   targetCompileId: string;
+  targetCompileHash: string | null;
   branchAttemptId: string;
   branchSegmentId: string;
+  branchThroughStepId: string | null;
   replayOf: string | null;
   createdAt: string;
 };
@@ -352,6 +364,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [activeRecipeVersion, setActiveRecipeVersion] = useState(1);
   const [decisions, setDecisions] = useState<MeasurementDecision[]>([]);
   const [decisionPrefixId, setDecisionPrefixId] = useState('');
+  const [decisionThroughId, setDecisionThroughId] = useState('');
   const [decisionOperator, setDecisionOperator] = useState<'lt' | 'lte' | 'gt' | 'gte' | 'eq'>('gt');
   const [decisionThreshold, setDecisionThreshold] = useState('0');
   const [decisionTrueParameters, setDecisionTrueParameters] = useState('{}');
@@ -446,13 +459,6 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   }, [segment]);
 
   useEffect(() => {
-    const succeeded = (route?.segments ?? []).filter(item => item.status === 'succeeded');
-    setDecisionPrefixId(previous => succeeded.some(item => item.throughStepId === previous)
-      ? previous
-      : (succeeded[succeeded.length - 1]?.throughStepId ?? ''));
-  }, [route]);
-
-  useEffect(() => {
     const routeId = route?.route.routeId;
     if (!routeId) {
       setDecisions([]);
@@ -463,23 +469,67 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       .catch(() => setDecisions([]));
   }, [route?.route.routeId]);
 
+  const branchablePrefixes = useMemo(() => {
+    const last = route?.stepOrder[route.stepOrder.length - 1];
+    return (route?.segments ?? []).filter(item => item.status === 'succeeded' && item.throughStepId !== last);
+  }, [route]);
+
   useEffect(() => {
-    const sourceMap = compile?.compile.sourceMap ?? [];
-    const tail = sourceMap[sourceMap.length - 1]?.authoredStepId;
-    if (!tail) return;
+    const last = route?.stepOrder[route.stepOrder.length - 1];
+    const eligible = (route?.segments ?? []).filter(
+      item => item.status === 'succeeded' && item.throughStepId !== last,
+    );
+    setDecisionPrefixId(eligible[eligible.length - 1]?.throughStepId ?? '');
+  }, [route]);
+
+  const decisionSuffix = useMemo(() => {
+    if (!route || !decisionPrefixId) return [];
+    const index = route.stepOrder.indexOf(decisionPrefixId);
+    return index < 0 ? [] : route.stepOrder.slice(index + 1);
+  }, [route, decisionPrefixId]);
+
+  useEffect(() => {
+    setDecisionThroughId(previous => decisionSuffix.includes(previous)
+      ? previous
+      : (decisionSuffix[decisionSuffix.length - 1] ?? ''));
+  }, [decisionSuffix]);
+
+  const authoredByCompiled = useMemo(
+    () => new Map((compile?.compile.sourceMap ?? []).map(entry => [entry.stepId, entry.authoredStepId])),
+    [compile],
+  );
+
+  useEffect(() => {
+    const step = (compile?.compile.project.steps ?? []).find(item => item.id === decisionThroughId);
+    const authored = authoredByCompiled.get(decisionThroughId);
+    if (!step || !authored) return;
+    const fields: Array<[string, number | undefined]> = [
+      ['duration', step.duration],
+      ['thickness', step.thickness],
+      ['rateMagnitude', step.rateMagnitude],
+    ];
+    const field = fields.find(([, value]) => typeof value === 'number');
+    const name = field?.[0];
+    const value = field?.[1];
+    if (!name || typeof value !== 'number') return;
+    const presets: Record<string, [number, number]> = {
+      duration: [0.03, 0.2],
+      thickness: [0.02, 0.05],
+      rateMagnitude: [0.05, 0.2],
+    };
+    const [trueValue, falseValue] = presets[name] ?? [
+      Number((value * 0.5).toFixed(6)),
+      Number((value * 2).toFixed(6)),
+    ];
     setDecisionTrueParameters(previous => (!previous.trim() || previous.trim() === '{}')
-      ? JSON.stringify({ [tail]: { duration: 0.03 } })
+      ? JSON.stringify({ [authored]: { [name]: trueValue } })
       : previous);
     setDecisionFalseParameters(previous => (!previous.trim() || previous.trim() === '{}')
-      ? JSON.stringify({ [tail]: { duration: 0.2 } })
+      ? JSON.stringify({ [authored]: { [name]: falseValue } })
       : previous);
-  }, [compile?.compile.sourceMap]);
+  }, [compile, decisionThroughId, authoredByCompiled]);
 
   const activeSteps = useMemo(() => (compile?.compile.project.steps ?? []).filter(step => step.enabled), [compile]);
-  const succeededPrefixes = useMemo(
-    () => (route?.segments ?? []).filter(item => item.status === 'succeeded'),
-    [route],
-  );
   const canAdopt = !!project && !busy;
   const canRoute = !!compile && !busy;
   const canRun = !!segment && segment.status === 'planned' && !busy;
@@ -643,7 +693,12 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
 
   const decideMeasurementBranch = () => run('decision', async () => {
     if (!route) throw new Error('先创建 Route');
+    if (!branchablePrefixes.length) throw new Error('没有保留后续步骤的成功前缀 Segment');
     if (!decisionPrefixId) throw new Error('没有可用的已成功前缀 Segment');
+    if (!decisionThroughId) throw new Error('没有可用的分支结束步骤');
+    const thresholdText = decisionThreshold.trim();
+    const threshold = thresholdText ? Number(thresholdText) : 0;
+    if (!Number.isFinite(threshold)) throw new Error('决策阈值必须是有限数字');
     const recipe = activeRecipeId
       ? { recipeId: activeRecipeId, recipeVersion: activeRecipeVersion }
       : await ensureRecipe();
@@ -653,10 +708,11 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       `/api/v1/workflow/routes/${route.route.routeId}/measurement-decisions`,
       {
         startAfterStepId: decisionPrefixId,
+        branchThroughStepId: decisionThroughId,
         recipeId: recipe.recipeId,
         recipeVersion: recipe.recipeVersion,
         operator: decisionOperator,
-        threshold: Number(decisionThreshold) || 0,
+        threshold,
         branches: {
           true: { parameters: trueParameters },
           false: { parameters: falseParameters },
@@ -1290,16 +1346,32 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             </div>
             <div className="wf-decision">
               <div className="wf-recipe-title">测量驱动分支</div>
-              <select aria-label="决策前缀 Segment" value={decisionPrefixId} onChange={event => setDecisionPrefixId(event.target.value)}>
-                <option value="">自动（最后一个成功 Segment）</option>
-                {succeededPrefixes.map(item => (
+              <select
+                aria-label="决策前缀 Segment"
+                value={decisionPrefixId}
+                onChange={event => setDecisionPrefixId(event.target.value)}
+                disabled={!branchablePrefixes.length}
+              >
+                {!branchablePrefixes.length && <option value="">无可用前缀（先执行保留后续步骤的 Segment）</option>}
+                {branchablePrefixes.map(item => (
                   <option key={item.segmentId} value={item.throughStepId}>
-                    {item.segmentId.slice(0, 12)} · through {item.throughStepId.slice(0, 10)}
+                    {item.segmentId.slice(0, 12)} · through {authoredByCompiled.get(item.throughStepId) ?? item.throughStepId.slice(0, 10)}
                   </option>
                 ))}
               </select>
+              <select
+                aria-label="决策分支止于"
+                value={decisionThroughId}
+                onChange={event => setDecisionThroughId(event.target.value)}
+                disabled={!decisionSuffix.length}
+              >
+                {!decisionSuffix.length && <option value="">无后续步骤</option>}
+                {decisionSuffix.map(stepId => (
+                  <option key={stepId} value={stepId}>{authoredByCompiled.get(stepId) ?? stepId.slice(0, 10)}</option>
+                ))}
+              </select>
               <div className="wf-muted">
-                可用前缀：{succeededPrefixes.length ? succeededPrefixes.map(item => item.throughStepId.slice(0, 10)).join(' / ') : '无（先执行前缀 Segment）'}
+                可用前缀：{branchablePrefixes.length ? branchablePrefixes.map(item => authoredByCompiled.get(item.throughStepId) ?? item.throughStepId.slice(0, 10)).join(' / ') : '无（先执行前缀 Segment）'}
                 {' · '}当前 recipe：{activeRecipeId ? `${activeRecipeId} v${activeRecipeVersion}` : '未固定（将按上方配方创建）'}
               </div>
               <div className="wf-decision-row">
@@ -1314,17 +1386,24 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               </div>
               <textarea aria-label="true 分支参数 JSON" value={decisionTrueParameters} onChange={event => setDecisionTrueParameters(event.target.value)} placeholder='true 分支：{"step_02":{"duration":0.02}}' />
               <textarea aria-label="false 分支参数 JSON" value={decisionFalseParameters} onChange={event => setDecisionFalseParameters(event.target.value)} placeholder='false 分支：{"step_02":{"duration":0.05}}' />
-              <button className="wf-button primary" aria-label="测量并生成分支" disabled={!route || !decisionPrefixId || !!busy} onClick={() => void decideMeasurementBranch()}>
+              <button className="wf-button primary" aria-label="测量并生成分支" disabled={!route || !branchablePrefixes.length || !decisionThroughId || !!busy} onClick={() => void decideMeasurementBranch()}>
                 {busy === 'decision' ? '测量并决策中…' : '测量并生成分支'}
               </button>
+              <div className="wf-muted">决策只改动「分支止于」之前的步骤；止于中间步骤时，可在其运行结束后继续测量决策，形成同一 workflow run 的序列。</div>
             </div>
+            {decisions.length > 0 && <div className="wf-muted">
+              工作流 run：{Array.from(new Set(decisions.map(item => item.workflowRunId))).map(runId => {
+                const rows = decisions.filter(item => item.workflowRunId === runId);
+                return `${runId}（${rows.length} 决策 / ${rows.filter(item => item.replayOf).length} 重放）`;
+              }).join('；')}
+            </div>}
             {decisions.length > 0 && <table className="wf-table" aria-label="测量决策列表">
               <thead><tr><th>测量</th><th>条件</th><th>结果</th><th>分支 / 解析参数</th><th>Workflow run</th><th /></tr></thead>
               <tbody>{decisions.map(item => <tr key={item.decisionId}>
-                <td>{item.measuredValue.toFixed(4)} {item.unit}<br /><code className="wf-mono">{item.measurementId.slice(0, 12)}</code></td>
+                <td>{item.measuredValue.toFixed(4)} {item.unit}<br /><code className="wf-mono">{item.measurementId.slice(0, 12)}</code><br /><span className="wf-muted">binding {item.measurementBindingStatus}</span></td>
                 <td><code className="wf-mono">{item.operator} {item.threshold}</code><br /><span className="wf-muted">{item.recipeId} v{item.recipeVersion}</span></td>
                 <td><span className={`wf-status ${item.result ? 'succeeded' : 'failed'}`}>{item.result ? 'true' : 'false'}</span><br />{item.chosenBranch}</td>
-                <td><code className="wf-mono">{JSON.stringify(item.resolvedParameters)}</code>{item.replayOf && <><br /><span className="wf-muted">replay of {item.replayOf.slice(0, 12)}</span></>}</td>
+                <td><code className="wf-mono">{JSON.stringify(item.resolvedParameters)}</code><br /><span className="wf-muted">止于 {authoredByCompiled.get(item.branchThroughStepId ?? '') ?? item.branchThroughStepId?.slice(0, 10) ?? '—'}</span>{item.replayOf && <><br /><span className="wf-muted">replay of {item.replayOf.slice(0, 12)}</span></>}</td>
                 <td><code className="wf-mono">{item.workflowRunId}</code><br /><span className="wf-muted">{item.targetCompileId.slice(0, 12)}</span></td>
                 <td><button className="wf-link" aria-label={`重放决策 ${item.decisionId}`} disabled={!!busy} onClick={() => void replayDecision(item)}>重放决策</button></td>
               </tr>)}</tbody>

@@ -175,21 +175,55 @@ Route
 ```
 
 The `MeasurementDecisionV1` record is the only place where the branch condition
-is decided. It stores the source Segment/Run, Measurement, recipe/metric,
-operator/threshold, the measured value, the boolean result, the chosen branch,
-the authored-step resolved parameters, the target compile, and the new branch
-Attempt/Segment. Decisions on one Route form a sequence under one
-`workflowRunId` (`wfr_...`); the first decision creates it, later decisions may
-continue it.
+is decided. It stores the source Segment/Attempt/Compile/Run, the measurement
+status axes (binding, equivalence), the recipe/metric, operator/threshold, the
+measured value, the boolean result, the chosen branch, **both** candidate
+parameter maps, the authored-step resolved parameters, the branch end step, the
+target compile, the source prefix digest/seed/checkpoint hash, and the new
+branch Attempt/Segment.
+
+Decisions on one Route form a sequence under one `workflowRunId` (`wfr_...`).
+The first decision creates it, later decisions continue it, and an explicit
+`workflowRunId` may either continue an existing run or start a new one. A run id
+may never be shared by two routes. `GET /api/v1/workflow/routes/{id}/workflow-runs`
+and `/workflow-runs/{workflowRunId}` return the run as decisions plus the
+Attempt/Segment lineage they reference.
+
+A decision measures the **end step of the measured Segment** and requires
+`bindingStatus=verified`; a failed or unbound measurement is recorded and
+preserved but cannot pick a branch. `equivalenceStatus` stays an independent
+axis: it is copied onto the decision and is not a gate.
+
+`branchThroughStepId` may stop the branch before the last route step. The branch
+Segment then ends at a checkpoint that the next decision can measure, so several
+measurement-driven branches can chain inside one workflow run. Resolved
+parameters may only touch authored steps strictly after `startAfterStepId` and no
+later than the branch end. Envelope fields (geometry binding, solver, seed
+policy, run seed) of every reuse entry must match the attempt prefix, while each
+entry's step identity covers only its own contiguous range; this is what lets a
+chained attempt reuse an earlier attempt's prefix plus its own segment.
 
 Replay is record-driven:
 
 - The original Measurement is reused; no new Measurement is created and the
   source snapshot is not measured again.
 - `chosenBranch`, `resolvedParameters` and `measurementId` are copied unchanged.
-- The target compile is rebuilt from `resolvedParameters` and must reproduce the
-  recorded `targetCompileId`; otherwise replay is rejected.
+- The record is checked before anything is appended: operator/threshold/result
+  and the chosen branch must agree, `resolvedParameters` must equal the recorded
+  candidate branch, the Measurement value/recipe/status/unit must be unchanged
+  and still verified, and the source Attempt/seed/checkpoint/prefix digest must
+  match. A record that used an unverified Measurement is rejected.
+- The target compile is rebuilt from `resolvedParameters` using the source
+  compile's compiler version, engine versions, placements, module revisions,
+  variables and overrides. It must reproduce the recorded `targetCompileId` and
+  `targetCompileHash`; otherwise replay is rejected.
 - A new branch Attempt/Segment is appended with `replayOf=<originalDecisionId>`.
+
+Carrying the source compile's `variableSet`/`overrides` and identity inputs into
+the target compile keeps two different base compiles (for example a
+variable-driven flow and an equivalent literal flow) from collapsing into one
+target compile id, and keeps earlier decision overrides auditable through a
+chain.
 
 This preserves Route → Attempt → Segment → Run → Compile provenance. It makes
 no claim that the branch was executed inside one native process; the branch

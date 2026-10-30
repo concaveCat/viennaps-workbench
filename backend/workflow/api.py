@@ -22,7 +22,11 @@ from .branches import create_branch
 from .decisions import (
     MeasurementDecisionRequestV1,
     MeasurementDecisionV1,
+    WorkflowRunDetailV1,
+    WorkflowRunListResponse,
     create_measurement_decision,
+    get_workflow_run,
+    list_workflow_runs,
     replay_measurement_decision,
 )
 from .equivalence import ComparisonProtocolV1, EquivalenceResultV1, compare_snapshots as compare_equivalence_snapshots
@@ -444,7 +448,7 @@ class MeasurementDecisionResponse(StrictModel):
     plan: RoutePlanV1
     workflowRunId: str
     measurement: MeasurementResultV1
-    resolvedParameters: dict[str, dict]
+    resolvedParameters: dict[str, dict[str, object]]
 
 
 class MeasurementDecisionListResponse(StrictModel):
@@ -1501,6 +1505,28 @@ async def replay_measurement_decision_endpoint(
         lambda: replay_measurement_decision(get_store(), route_id, decision_id)
     )
     return MeasurementDecisionResponse.model_validate(result)
+
+
+@router.get(
+    "/routes/{route_id}/workflow-runs",
+    response_model=WorkflowRunListResponse,
+)
+async def list_workflow_runs_endpoint(route_id: str) -> WorkflowRunListResponse:
+    def operation():
+        get_store().get_plan(route_id)
+        return list_workflow_runs(get_store(), route_id)
+
+    return WorkflowRunListResponse(runs=_call(operation))
+
+
+@router.get(
+    "/routes/{route_id}/workflow-runs/{workflow_run_id}",
+    response_model=WorkflowRunDetailV1,
+)
+async def get_workflow_run_endpoint(
+    route_id: str, workflow_run_id: str
+) -> WorkflowRunDetailV1:
+    return _call(lambda: get_workflow_run(get_store(), route_id, workflow_run_id))
 
 
 @router.post("/routes", response_model=RoutePlanResponse, status_code=201)
