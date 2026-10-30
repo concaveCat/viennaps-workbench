@@ -1117,7 +1117,11 @@ function StructureCanvas({ view, frame, axis = 'xy', marker = null, note = null,
   const barX = frame.maxU - barLength - span * 0.02;
   const points = view.points.map(point => structurePoint(point, axes));
   const fills = structureFillPolygons(view, points);
+  // `bottom` is the SVG y of the plot bottom (used by axes/ticks); the fills
+  // are built in data coordinates and mapped with `-height`, so they must close
+  // at the data height of the bottom edge instead.
   const bottom = -frame.minV;
+  const fillBottom = frame.minV;
   const tickHalo = fontSize * 0.1;
   const axisTitle = `${axes.verticalLabel} (${frame.unit})`;
   const horizontalTitle = axes.is2D ? `X (${frame.unit})` : `${axis.toUpperCase().charAt(0)} (${frame.unit})`;
@@ -1131,7 +1135,7 @@ function StructureCanvas({ view, frame, axis = 'xy', marker = null, note = null,
     {fills.map((fill, index) => {
       const coords = fill.closed
         ? fill.coords
-        : [...fill.coords, [fill.coords[fill.coords.length - 1][0], bottom], [fill.coords[0][0], bottom]];
+        : [...fill.coords, [fill.coords[fill.coords.length - 1][0], fillBottom], [fill.coords[0][0], fillBottom]];
       return <polygon key={`f-${index}`} className="wf-fill" data-material={fill.materialId}
         points={coords.map(([x, y]) => `${x},${-y}`).join(' ')}
         fill={colorOf(fill.materialId)} fillOpacity={0.3} stroke="none" />;

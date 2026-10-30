@@ -54,6 +54,33 @@ try {
   assert.match(structureMarkup, /表面高度|深度/, '2D structure must annotate the surface height or etched depth');
   assert.equal(await page.locator('select[aria-label="结构视图轴"]').count(), 0, '2D must not offer XY/XZ/YZ axes');
   assert.equal((await page.getByLabel('结构视图轴').innerText()).trim(), 'X – 高度');
+
+  // The material fill must hang *below* the interface line: every fill vertex
+  // is at or under the surface (larger SVG y) and the polygon reaches the
+  // bottom of the view instead of closing at the top.
+  const fillGeometry = await structureSvg.evaluate(svg => {
+    const box = svg.viewBox.baseVal;
+    const line = svg.querySelector('.wf-interface');
+    const surfaceY = line
+      ? Math.max(Number(line.getAttribute('y1')), Number(line.getAttribute('y2')))
+      : null;
+    const polygons = Array.from(svg.querySelectorAll('polygon.wf-fill')).map(node =>
+      (node.getAttribute('points') ?? '').trim().split(/\s+/).map(pair => pair.split(',').map(Number)));
+    return { top: box.y, height: box.height, surfaceY, polygons };
+  });
+  assert.ok(fillGeometry.polygons.length >= 1, '2D fill polygon must exist');
+  assert.ok(fillGeometry.surfaceY !== null, '2D interface line must exist');
+  const fillBottomY = fillGeometry.top + fillGeometry.height;
+  for (const polygon of fillGeometry.polygons) {
+    const ys = polygon.map(([, y]) => y);
+    assert.ok(Math.min(...ys) >= fillGeometry.surfaceY - 1e-6,
+      `fill must start at the surface line (min y ${Math.min(...ys)} < surface ${fillGeometry.surfaceY})`);
+    assert.ok(Math.min(...ys) > fillGeometry.top + fillGeometry.height * 0.1,
+      'fill must not be drawn above the surface');
+    assert.ok(Math.max(...ys) >= fillBottomY - fillGeometry.height * 0.02,
+      'fill must reach the bottom of the view');
+    assert.ok(Math.max(...ys) <= fillBottomY + 1e-6, 'fill must not extend past the view bottom');
+  }
   await page.screenshot({
     path: process.env.WORKFLOW_STRUCTURE_SCREENSHOT ?? '/tmp/workflow-p3-structure.png',
     fullPage: true,

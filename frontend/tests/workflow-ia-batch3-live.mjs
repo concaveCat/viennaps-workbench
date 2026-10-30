@@ -148,6 +148,30 @@ try {
   const compareText = await page.locator('[aria-label="候选对比表"]').innerText();
   assert.doesNotMatch(compareText, /WITHIN_TOLERANCE|OUTSIDE_TOLERANCE|NOT_EVALUATED/);
   assert.ok((await page.locator('.wf-compare-canvas .wf-axes text').count()) > 0, 'each candidate view must draw axes/scale');
+  // 05 uses the same StructureCanvas: the fill must hang below the surface in
+  // every candidate view, not above it.
+  const candidateFillGeometry = await page.locator('.wf-compare-canvas').evaluateAll(svgs => svgs.map(svg => {
+    const box = svg.viewBox.baseVal;
+    const line = svg.querySelector('.wf-interface');
+    const surfaceY = line
+      ? Math.max(Number(line.getAttribute('y1')), Number(line.getAttribute('y2')))
+      : null;
+    const polygons = Array.from(svg.querySelectorAll('polygon.wf-fill')).map(node =>
+      (node.getAttribute('points') ?? '').trim().split(/\s+/).map(pair => pair.split(',').map(Number)));
+    return { top: box.y, height: box.height, surfaceY, polygons };
+  }));
+  assert.equal(candidateFillGeometry.length, 3);
+  for (const check of candidateFillGeometry) {
+    assert.ok(check.polygons.length >= 1, 'candidate view must fill the material');
+    assert.ok(check.surfaceY !== null, 'candidate view must draw the interface line');
+    const candidateBottom = check.top + check.height;
+    for (const polygon of check.polygons) {
+      const ys = polygon.map(([, y]) => y);
+      assert.ok(Math.min(...ys) >= check.surfaceY - 1e-6, 'candidate fill must start at the surface line');
+      assert.ok(Math.max(...ys) >= candidateBottom - check.height * 0.02, 'candidate fill must reach the view bottom');
+      assert.ok(Math.max(...ys) <= candidateBottom + 1e-6, 'candidate fill must not pass the view bottom');
+    }
+  }
   const legend = await page.locator('.wf-compare-legend').first().innerText();
   assert.match(legend, /Si|材料/);
 
