@@ -181,7 +181,7 @@ class SurfaceDiffusionSchema(unittest.TestCase):
         self.assertNotEqual(requested_input_hash(validate_project(plain)[0]),
                             requested_input_hash(validate_project(with_diffusion)[0]))
 
-    def test_only_ald_with_a_positive_native_coefficient_is_accepted(self):
+    def test_placement_is_ald_only_and_enabled_requires_positive_coefficient(self):
         good = ald_project(2, surface_diffusion={"radius": 0.1})
         validate_project(good)
 
@@ -194,6 +194,14 @@ class SurfaceDiffusionSchema(unittest.TestCase):
         other["steps"][0]["surfaceDiffusion"] = {"radius": 0.1}
         with self.assertRaises(ProjectInputError) as context:
             validate_project(other)
+        self.assertIn("specialized:ald", str(context.exception))
+
+        # A disabled token is still ALD-only: placement is a schema fact, not
+        # something the enabled flag can bypass.
+        other_disabled = make_project("teosDeposition", 2)
+        other_disabled["steps"][0]["surfaceDiffusion"] = {"enabled": False}
+        with self.assertRaises(ProjectInputError) as context:
+            validate_project(other_disabled)
         self.assertIn("specialized:ald", str(context.exception))
 
         disabled = ald_project(2, coefficient=0.0, surface_diffusion={"enabled": False})
@@ -287,6 +295,15 @@ class SurfaceDiffusionNative(unittest.TestCase):
                 self.assertEqual(omitted["heights"], explicit["heights"])
                 self.assertEqual(omitted["materials"], explicit["materials"])
                 self.assertIn("surfaceDiffusion", explicit["record"])
+
+    def test_disabled_token_on_zero_coefficient_ald_is_an_inert_noop(self):
+        without = run_worker(normalized(ald_project(2, coefficient=0.0)))
+        disabled = run_worker(normalized(ald_project(
+            2, coefficient=0.0, surface_diffusion={"enabled": False})))
+        self.assertEqual(without["heights"], disabled["heights"])
+        self.assertEqual(without["materials"], disabled["materials"])
+        self.assertNotIn("surfaceDiffusion", disabled["record"])
+        self.assertNotIn("SurfaceDiffusionParameters", disabled["processParameters"])
 
     def test_worker_rejects_an_inert_configuration(self):
         project = normalized(ald_project(2, coefficient=0.0,

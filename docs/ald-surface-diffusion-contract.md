@@ -14,8 +14,8 @@ and the ViennaPS 4.6.2 sources show something narrower:
 | `include/viennaps/process/psProcess.hpp` | `Process.setParameters(const SurfaceDiffusionParameters &)` stores the struct in the process context (bound in both `viennaps.d2.Process` and `viennaps.d3.Process`) |
 | `include/viennaps/process/psProcessContext.hpp` | `flags.hasSurfaceDiffusion` is set only when the process model's surface model returns `getDiffusionCoefficients()` |
 | `include/viennaps/models/psSingleParticleALD.hpp` | In 4.6.2 the only implementation returns `{"Coverage": coverageDiffusionCoefficient}` and only when that coefficient is `> 0` |
-| `include/viennaps/process/psALPStrategy.hpp` | The ALP strategy builds the stencil from the current disk mesh and applies it to the `ParticleFlux`/`Coverage` scalars during pulse and purge |
-| `include/viennaps/process/psSurfaceDiffusion.hpp` | The "diffusion" is one explicit-Euler Laplacian step on a scalar field over surface points, with a kNN/radius stencil weighted by distance and normal agreement |
+| `include/viennaps/process/psALPStrategy.hpp` | The ALP strategy builds the stencil from the current disk mesh. Per pulse/purge substep it calls the diffusion helper on the flux data and then on the coverage data; the flux call finds no scalar named `Coverage` and returns without changing anything, so only `Coverage` is actually diffused |
+| `include/viennaps/process/psSurfaceDiffusion.hpp` | The diffusion is a sequence of explicit-Euler Laplacian substeps on the scalar field, with a kNN/radius stencil weighted by distance and normal agreement. The native loop repeats steps of `dt = min(stabilityFactor·h²/(4D), timeStep)` until the interval is covered; the final substep can overshoot |
 
 Consequences that shape the API:
 
@@ -27,7 +27,12 @@ Consequences that shape the API:
   models return no diffusion coefficients.
 - **It is inert on ALD when `coverageDiffusionCoefficient <= 0`**, because the
   ALP flag is never set. The worker and schema therefore reject that
-  combination instead of exposing a dead knob.
+  combination when the object is enabled instead of exposing a dead knob. A
+  disabled object on ALD is still limited to the default fields and does not
+  call the native setter.
+- **Placement is ALD-only even when disabled.** The object is rejected on every
+  other specialized model regardless of `enabled`, because no other 4.6.2
+  process has a native surface-diffusion flag.
 
 ## 2. Schema
 
@@ -54,7 +59,7 @@ Consequences that shape the API:
 
 | Key | Native member | Default | Bounds | Unit / meaning |
 | --- | --- | --- | --- | --- |
-| `enabled` | — | `true` | boolean | `false` is accepted only for an all-default object; it makes the worker skip the setter |
+| `enabled` | — | `true` | boolean | ALD-only placement applies either way; `false` is accepted only for an all-default object and makes the worker skip the setter (no positive coefficient required) |
 | `radius` | `radius` | `0.0` | `0 … 2` and `≤ 8 × gridDelta` | µm; `0` selects `kNeighbors` mode. Points farther than this are not neighbours. The extra grid cap keeps the sparse stencil local |
 | `kNeighbors` | `kNeighbors` | `16` | `1 … 64` | count; used when `radius == 0` |
 | `normalCutoff` | `normalCutoff` | `0.25` | `-1 … 1` | cosine; neighbours with `n_i · n_j <= cutoff` are dropped |
@@ -85,9 +90,10 @@ defaults.
   mesh; repeated runs with the same seed and parameters hash identical.
 - **Materials preserved.** Coverage diffusion redistributes a scalar; it does
   not add/remove level sets or change `MaterialMap` identities.
-- **Rejected as inert or unsafe:** non-ALD models, `coverageDiffusionCoefficient
-  <= 0`, unknown keys, non-finite values, out-of-range values, and a disabled
-  object that still overrides a field.
+- **Rejected as inert or unsafe:** non-ALD models even when `enabled` is
+  `false`; `coverageDiffusionCoefficient <= 0` when enabled; unknown keys;
+  non-finite values; out-of-range values; and a disabled object that still
+  overrides a field.
 
 ## 4. Probe evidence (bounded, 2D and 3D)
 
