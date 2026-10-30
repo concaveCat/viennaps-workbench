@@ -74,6 +74,37 @@ class MetrologyRecipeV1(StrictModel):
         return self
 
 
+class SnapshotPayloadV1(StrictModel):
+    """Typed top-level viewer snapshot payload used by measurement/equivalence."""
+
+    schemaVersion: int | None = None
+    runId: str | None = None
+    stepId: str | None = None
+    stepName: str | None = None
+    stepIndex: int | None = None
+    axisMap: dict[str, int] = Field(default_factory=lambda: {"x": 0, "h": 1, "z": 2})
+    coordinateUnit: str = "um"
+    gridDelta: float
+    dimension: Literal[2, 3]
+    points: list[list[float]] = Field(default_factory=list)
+    lines: list[list[int]] = Field(default_factory=list)
+    triangles: list[list[int]] = Field(default_factory=list)
+    cellData: dict[str, list[int]] = Field(default_factory=dict)
+    materials: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    mesh: dict[str, Any] | None = None
+    materialIdsByLevelSetIndex: list[int] = Field(default_factory=list)
+    sameMaterialInternalInterfacesHidden: bool = False
+    outputs: list[dict[str, Any]] = Field(default_factory=list)
+    noOp: bool = False
+    measuredGeometry: dict[str, Any] | None = None
+    measuredRemoval: dict[str, Any] | None = None
+    topology: str | None = None
+    surfaceBounds: list[float] | None = None
+    domainReadback: dict[str, Any] | None = None
+    materialSurfaceStatus: str | None = None
+    materialTops: dict[str, dict[str, Any]] | None = None
+
+
 MeasurementStatus = Literal[
     "measured",
     "no_intersection",

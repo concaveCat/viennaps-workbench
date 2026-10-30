@@ -212,6 +212,8 @@ class WorkflowStore:
                 CREATE TABLE IF NOT EXISTS deletion_records (
                     record_id TEXT PRIMARY KEY,
                     artifact_id TEXT NOT NULL,
+                    owner_type TEXT NOT NULL,
+                    owner_id TEXT NOT NULL,
                     capability TEXT NOT NULL,
                     reason TEXT NOT NULL,
                     created_at TEXT NOT NULL
@@ -258,6 +260,11 @@ class WorkflowStore:
             if "equivalence_evidence_json" not in measurement_columns:
                 connection.execute("ALTER TABLE measurements ADD COLUMN equivalence_evidence_json TEXT")
 
+            deletion_columns = {row[1] for row in connection.execute("PRAGMA table_info(deletion_records)")}
+            if "owner_type" not in deletion_columns:
+                connection.execute("ALTER TABLE deletion_records ADD COLUMN owner_type TEXT NOT NULL DEFAULT ''")
+            if "owner_id" not in deletion_columns:
+                connection.execute("ALTER TABLE deletion_records ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''")
             version_row = connection.execute(
                 "SELECT value FROM schema_meta WHERE key = 'schema_version'"
             ).fetchone()
@@ -1366,18 +1373,25 @@ class WorkflowStore:
             for row in rows
         ]
 
-    def abandon_capability(self, artifact_id: str, capability: str, reason: str) -> dict[str, Any]:
+    def abandon_capability(
+        self,
+        artifact_id: str,
+        owner_type: str,
+        owner_id: str,
+        capability: str,
+        reason: str,
+    ) -> dict[str, Any]:
         record_id = f"del_{uuid.uuid4().hex}"
         with self._connect() as connection:
             connection.execute(
-                "DELETE FROM artifact_refs WHERE artifact_id = ? AND required_for = ?",
-                (artifact_id, capability),
+                "DELETE FROM artifact_refs WHERE artifact_id = ? AND owner_type = ? AND owner_id = ? AND required_for = ?",
+                (artifact_id, owner_type, owner_id, capability),
             )
             connection.execute(
-                "INSERT INTO deletion_records (record_id, artifact_id, capability, reason, created_at) VALUES (?, ?, ?, ?, ?)",
-                (record_id, artifact_id, capability, reason, self._now()),
+                "INSERT INTO deletion_records (record_id, artifact_id, owner_type, owner_id, capability, reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (record_id, artifact_id, owner_type, owner_id, capability, reason, self._now()),
             )
-        return {"recordId": record_id, "artifactId": artifact_id, "capability": capability}
+        return {"recordId": record_id, "artifactId": artifact_id, "ownerType": owner_type, "ownerId": owner_id, "capability": capability}
 
     def gc_dry_run(self) -> dict[str, Any]:
         from .. import storage
@@ -1387,6 +1401,7 @@ class WorkflowStore:
             measurement_runs = {row["source_run_id"] for row in connection.execute("SELECT source_run_id FROM measurements WHERE source_run_id IS NOT NULL")}
             pins = {row["artifact_id"] for row in connection.execute("SELECT artifact_id FROM artifact_pins")}
             refs = {row["artifact_id"] for row in connection.execute("SELECT artifact_id FROM artifact_refs")}
+            abandoned = {row["artifact_id"] for row in connection.execute("SELECT DISTINCT artifact_id FROM deletion_records")}
             checkpoint_runs: set[str] = set()
             for row in connection.execute("SELECT start_checkpoint_json, end_checkpoint_json FROM segments"):
                 for raw in row:
@@ -1404,7 +1419,8 @@ class WorkflowStore:
                         checkpoint_runs.add(run_id)
                 except (ValueError, TypeError):
                     pass
-        referenced = segment_runs | measurement_runs | checkpoint_runs | pins | refs
+        auto_runs = (segment_runs | measurement_runs | checkpoint_runs) - abandoned
+        referenced = auto_runs | pins | refs
         candidates = []
         for path in sorted(storage.RUNS.iterdir()) if storage.RUNS.is_dir() else []:
             if not path.is_dir() or path.name in referenced:

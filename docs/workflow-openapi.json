@@ -12,6 +12,14 @@
             "title": "Capability",
             "type": "string"
           },
+          "ownerId": {
+            "title": "Ownerid",
+            "type": "string"
+          },
+          "ownerType": {
+            "title": "Ownertype",
+            "type": "string"
+          },
           "reason": {
             "title": "Reason",
             "type": "string"
@@ -19,6 +27,8 @@
         },
         "required": [
           "artifactId",
+          "ownerType",
+          "ownerId",
           "capability",
           "reason"
         ],
@@ -1307,17 +1317,79 @@
         "additionalProperties": false,
         "properties": {
           "left": {
-            "additionalProperties": true,
-            "title": "Left",
-            "type": "object"
+            "$ref": "#/components/schemas/SnapshotPayloadV1"
+          },
+          "leftRunId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Leftrunid"
+          },
+          "leftSegmentId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Leftsegmentid"
+          },
+          "leftStepId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Leftstepid"
           },
           "protocol": {
             "$ref": "#/components/schemas/ComparisonProtocolV1"
           },
           "right": {
-            "additionalProperties": true,
-            "title": "Right",
-            "type": "object"
+            "$ref": "#/components/schemas/SnapshotPayloadV1"
+          },
+          "rightRunId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rightrunid"
+          },
+          "rightSegmentId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rightsegmentid"
+          },
+          "rightStepId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rightstepid"
           }
         },
         "required": [
@@ -1415,10 +1487,55 @@
             "title": "Checktype",
             "type": "string"
           },
+          "leftDigest": {
+            "anyOf": [
+              {
+                "pattern": "^[a-f0-9]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Leftdigest"
+          },
           "leftHash": {
             "pattern": "^[a-f0-9]{64}$",
             "title": "Lefthash",
             "type": "string"
+          },
+          "leftRunId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Leftrunid"
+          },
+          "leftSegmentId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Leftsegmentid"
+          },
+          "leftStepId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Leftstepid"
           },
           "materialMismatch": {
             "default": false,
@@ -1455,15 +1572,66 @@
             "title": "Reasons",
             "type": "array"
           },
+          "rightDigest": {
+            "anyOf": [
+              {
+                "pattern": "^[a-f0-9]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rightdigest"
+          },
           "rightHash": {
             "pattern": "^[a-f0-9]{64}$",
             "title": "Righthash",
             "type": "string"
           },
+          "rightRunId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rightrunid"
+          },
+          "rightSegmentId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rightsegmentid"
+          },
+          "rightStepId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rightstepid"
+          },
           "schemaVersion": {
             "const": 1,
             "title": "Schemaversion",
             "type": "integer"
+          },
+          "statisticalStatus": {
+            "const": "not_evaluated",
+            "default": "not_evaluated",
+            "title": "Statisticalstatus",
+            "type": "string"
           },
           "status": {
             "enum": [
@@ -1909,9 +2077,7 @@
             "type": "integer"
           },
           "snapshot": {
-            "additionalProperties": true,
-            "title": "Snapshot",
-            "type": "object"
+            "$ref": "#/components/schemas/SnapshotPayloadV1"
           }
         },
         "required": [
@@ -3645,6 +3811,269 @@
           "executionHash"
         ],
         "title": "SegmentV1",
+        "type": "object"
+      },
+      "SnapshotPayloadV1": {
+        "additionalProperties": false,
+        "description": "Typed top-level viewer snapshot payload used by measurement/equivalence.",
+        "properties": {
+          "axisMap": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Axismap",
+            "type": "object"
+          },
+          "cellData": {
+            "additionalProperties": {
+              "items": {
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "title": "Celldata",
+            "type": "object"
+          },
+          "coordinateUnit": {
+            "default": "um",
+            "title": "Coordinateunit",
+            "type": "string"
+          },
+          "dimension": {
+            "enum": [
+              2,
+              3
+            ],
+            "title": "Dimension",
+            "type": "integer"
+          },
+          "domainReadback": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Domainreadback"
+          },
+          "gridDelta": {
+            "title": "Griddelta",
+            "type": "number"
+          },
+          "lines": {
+            "items": {
+              "items": {
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "title": "Lines",
+            "type": "array"
+          },
+          "materialIdsByLevelSetIndex": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Materialidsbylevelsetindex",
+            "type": "array"
+          },
+          "materialSurfaceStatus": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Materialsurfacestatus"
+          },
+          "materialTops": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Materialtops"
+          },
+          "materials": {
+            "additionalProperties": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Materials",
+            "type": "object"
+          },
+          "measuredGeometry": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Measuredgeometry"
+          },
+          "measuredRemoval": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Measuredremoval"
+          },
+          "mesh": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mesh"
+          },
+          "noOp": {
+            "default": false,
+            "title": "Noop",
+            "type": "boolean"
+          },
+          "outputs": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Outputs",
+            "type": "array"
+          },
+          "points": {
+            "items": {
+              "items": {
+                "type": "number"
+              },
+              "type": "array"
+            },
+            "title": "Points",
+            "type": "array"
+          },
+          "runId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runid"
+          },
+          "sameMaterialInternalInterfacesHidden": {
+            "default": false,
+            "title": "Samematerialinternalinterfaceshidden",
+            "type": "boolean"
+          },
+          "schemaVersion": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Schemaversion"
+          },
+          "stepId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stepid"
+          },
+          "stepIndex": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stepindex"
+          },
+          "stepName": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stepname"
+          },
+          "surfaceBounds": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "number"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Surfacebounds"
+          },
+          "topology": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Topology"
+          },
+          "triangles": {
+            "items": {
+              "items": {
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "title": "Triangles",
+            "type": "array"
+          }
+        },
+        "required": [
+          "gridDelta",
+          "dimension"
+        ],
+        "title": "SnapshotPayloadV1",
         "type": "object"
       },
       "SolverV7": {

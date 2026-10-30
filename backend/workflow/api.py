@@ -11,7 +11,7 @@ from pydantic import Field, ValidationError
 
 from .. import storage
 from ..models import ProjectV7, StrictModel
-from .metrology import MeasurementResultV1, MetrologyRecipeV1, MetricDefinitionV1
+from .metrology import MeasurementResultV1, MetrologyRecipeV1, MetricDefinitionV1, SnapshotPayloadV1, snapshot_content_hash
 from .adoption import adopt_project, first_route
 from .equivalence import ComparisonProtocolV1, EquivalenceResultV1, compare_snapshots
 from .execution import execute_segment
@@ -53,7 +53,7 @@ class RecipeListResponse(StrictModel):
 class MeasureSnapshotRequest(StrictModel):
     recipeId: str
     recipeVersion: Annotated[int, Field(ge=1)]
-    snapshot: dict
+    snapshot: SnapshotPayloadV1
 
 
 class MeasureRunRequest(StrictModel):
@@ -143,8 +143,14 @@ class RouteFromCompileRequest(StrictModel):
 
 class EquivalenceCheckRequest(StrictModel):
     protocol: ComparisonProtocolV1
-    left: dict
-    right: dict
+    left: SnapshotPayloadV1
+    right: SnapshotPayloadV1
+    leftRunId: str | None = None
+    rightRunId: str | None = None
+    leftSegmentId: str | None = None
+    rightSegmentId: str | None = None
+    leftStepId: str | None = None
+    rightStepId: str | None = None
 
 
 class ProtocolSummaryV1(StrictModel):
@@ -184,6 +190,8 @@ class ArtifactRefResponse(StrictModel):
 
 class AbandonRequest(StrictModel):
     artifactId: str
+    ownerType: str
+    ownerId: str
     capability: str
     reason: str
 
@@ -254,7 +262,9 @@ async def list_artifact_refs(artifact_id: str | None = None) -> ArtifactRefRespo
 
 @router.post("/gc/abandon", response_model=dict)
 async def abandon_capability(request: AbandonRequest) -> dict:
-    return _call(lambda: get_store().abandon_capability(request.artifactId, request.capability, request.reason))
+    return _call(lambda: get_store().abandon_capability(
+        request.artifactId, request.ownerType, request.ownerId, request.capability, request.reason,
+    ))
 
 
 @router.post("/gc/dry-run", response_model=GcDryRunResponse)
@@ -279,7 +289,49 @@ async def equivalence_check(request: EquivalenceCheckRequest) -> EquivalenceResu
     def operation():
         store = get_store()
         store.register_comparison_protocol(request.protocol)
-        return store.record_equivalence(compare_snapshots(request.protocol, request.left, request.right))
+        left = request.left.model_dump(mode="json", exclude_none=True)
+        right = request.right.model_dump(mode="json", exclude_none=True)
+        result = compare_snapshots(request.protocol, left, right).model_copy(update={
+            "leftRunId": request.leftRunId,
+            "rightRunId": request.rightRunId,
+            "leftSegmentId": request.leftSegmentId,
+            "rightSegmentId": request.rightSegmentId,
+            "leftStepId": request.leftStepId,
+            "rightStepId": request.rightStepId,
+        })
+        reasons = list(result.reasons)
+        if request.protocol.checkType != "snapshot":
+            required = (request.leftRunId, request.rightRunId, request.leftSegmentId,
+                        request.rightSegmentId, request.leftStepId, request.rightStepId)
+            if any(value is None for value in required):
+                reasons.append("checkType requires both run/segment/step identities")
+            else:
+                for run_id, step_id, digest in (
+                    (request.leftRunId, request.leftStepId, result.leftDigest),
+                    (request.rightRunId, request.rightStepId, result.rightDigest),
+                ):
+                    try:
+                        manifest = storage.read_json(storage.run_path(run_id) / "manifest.json")
+                        row = next((item for item in manifest.get("snapshots", []) if item.get("stepId") == step_id), None)
+                        if row is None:
+                            reasons.append(f"run {run_id!r} has no snapshot for step {step_id!r}")
+                        elif snapshot_content_hash(left if run_id == request.leftRunId else right) != digest:
+                            reasons.append("equivalence snapshot digest does not match the request payload")
+                    except (FileNotFoundError, OSError, ValueError):
+                        reasons.append(f"run {run_id!r} is unavailable")
+                if request.protocol.checkType == "same_segment_replay" and request.leftSegmentId != request.rightSegmentId:
+                    reasons.append("same_segment_replay requires the same Segment")
+                if request.protocol.checkType in {"continuous_vs_segmented", "prefix_reuse"} and request.leftSegmentId == request.rightSegmentId:
+                    reasons.append(f"{request.protocol.checkType} requires distinct Segments")
+                if request.protocol.checkType == "prefix_reuse":
+                    try:
+                        if store.get_segment(request.rightSegmentId).startAfterStepId is None:
+                            reasons.append("prefix_reuse right Segment has no reused checkpoint boundary")
+                    except Exception as exc:
+                        reasons.append(f"prefix_reuse right Segment is unavailable: {exc}")
+        if reasons:
+            result = result.model_copy(update={"status": "inconclusive", "reasons": reasons})
+        return store.record_equivalence(result)
     return _call(operation)
 
 
@@ -315,7 +367,7 @@ async def measure_snapshot(request: MeasureSnapshotRequest) -> MeasurementResult
         store = get_store()
         recipe = store.get_recipe(request.recipeId, request.recipeVersion)
         metric = store.get_metric(recipe.metricId)
-        return store.measure_and_record(recipe, metric, request.snapshot)
+        return store.measure_and_record(recipe, metric, request.snapshot.model_dump(mode="json", exclude_none=True))
     return _call(operation)
 
 

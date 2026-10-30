@@ -28,6 +28,18 @@ class WorkflowOpenApiTests(unittest.TestCase):
         static = json.loads((Path(__file__).resolve().parents[1] / "docs" / "workflow-openapi.json").read_text(encoding="utf-8"))
         self.assertEqual(static["info"]["title"], schema["info"]["title"])
         self.assertEqual(set(static["paths"]), set(paths))
+        snapshot = schema["components"]["schemas"]["SnapshotPayloadV1"]
+        self.assertFalse(snapshot.get("additionalProperties", False))
+        self.assertIn("gridDelta", snapshot["required"])
+        self.assertIn("dimension", snapshot["required"])
+        self.assertEqual(
+            schema["components"]["schemas"]["MeasureSnapshotRequest"]["properties"]["snapshot"]["$ref"],
+            "#/components/schemas/SnapshotPayloadV1",
+        )
+        self.assertEqual(
+            schema["components"]["schemas"]["EquivalenceCheckRequest"]["properties"]["left"]["$ref"],
+            "#/components/schemas/SnapshotPayloadV1",
+        )
 
 
 if __name__ == "__main__":

@@ -33,6 +33,15 @@ class EquivalenceResultV1(StrictModel):
     protocolVersion: Annotated[int, Field(ge=1)]
     leftHash: Hash64
     rightHash: Hash64
+    leftDigest: Hash64 | None = None
+    rightDigest: Hash64 | None = None
+    leftRunId: str | None = None
+    rightRunId: str | None = None
+    leftSegmentId: str | None = None
+    rightSegmentId: str | None = None
+    leftStepId: str | None = None
+    rightStepId: str | None = None
+    statisticalStatus: Literal["not_evaluated"] = "not_evaluated"
     status: Literal["established", "failed", "inconclusive"]
     maxPointDelta: float | None = None
     materialMismatch: bool = False
@@ -68,6 +77,8 @@ def compare_snapshots(protocol: ComparisonProtocolV1, left: dict[str, Any], righ
             protocolVersion=protocol.version,
             leftHash=left_hash,
             rightHash=right_hash,
+            leftDigest=left_hash,
+            rightDigest=right_hash,
             status="failed",
             materialMismatch=False,
             reasons=reasons,
@@ -94,6 +105,8 @@ def compare_snapshots(protocol: ComparisonProtocolV1, left: dict[str, Any], righ
             protocolVersion=protocol.version,
             leftHash=left_hash,
             rightHash=right_hash,
+            leftDigest=left_hash,
+            rightDigest=right_hash,
             status="inconclusive",
             maxPointDelta=None,
             materialMismatch=material_mismatch,
@@ -109,6 +122,8 @@ def compare_snapshots(protocol: ComparisonProtocolV1, left: dict[str, Any], righ
         protocolVersion=protocol.version,
         leftHash=left_hash,
         rightHash=right_hash,
+        leftDigest=left_hash,
+        rightDigest=right_hash,
         status=status,
         maxPointDelta=max_delta,
         materialMismatch=material_mismatch,
