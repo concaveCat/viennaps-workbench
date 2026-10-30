@@ -195,15 +195,15 @@ try {
 
   // Persistent experiment must use the current recipe version and replicate seeds.
   await page.getByRole('button', { name: '04 实验' }).click();
-  await page.getByRole('button', { name: '创建 10 变体实验' }).click();
+  await page.getByRole('button', { name: '创建实验', exact: true }).click();
   await page.getByText('实验状态：待执行').waitFor();
-  await page.getByRole('button', { name: '运行持久化实验' }).click();
+  await page.getByRole('button', { name: '运行实验', exact: true }).click();
   await page.getByText('实验状态：已完成').waitFor({ timeout: 180000 });
 
   const experimentSummaries = (await getJson('/api/v1/workflow/experiments')).experiments;
   const experiment = await getJson(`/api/v1/workflow/experiments/${experimentSummaries[0].experimentId}`);
   assert.equal(experiment.status, 'completed');
-  assert.equal(experiment.variants.length, 10);
+  assert.equal(experiment.variants.length, 3);
   assert.equal(experiment.variants[0].replicates.length, 2);
   assert.equal(experiment.recipeVersion, 2, 'experiment must pin the latest recipe version');
   assert.deepEqual(

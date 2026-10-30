@@ -927,3 +927,65 @@ body {
 .spx-layer-pick i { width: 11px; height: 11px; border: 1px solid #8a949c; }
 .wf-table tbody tr.material-match { background: #f2fbf4; }
 .wf-table tbody tr.material-match td:first-child { box-shadow: inset 2px 0 0 var(--spx-green); }
+
+/* ---- IA batch 3: 04/05/06 result-first layout (SPX flat style) ---- */
+.spx-doc-body .wf-card-subhead { text-transform: none; letter-spacing: 0; font-weight: 600; }
+.wf-spacer { flex: 1 1 auto; }
+.wf-empty-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.wf-empty-actions .wf-button, .wf-block-reason + .spx-run-actions .wf-button { width: auto; margin: 0; }
+.wf-empty strong { display: block; color: var(--spx-ink); font-size: 12px; margin-bottom: 3px; }
+
+/* 04: results above the (collapsible) inputs. */
+.wf-result-panel { border: 1px solid var(--spx-line); background: #fff; margin: 0 0 10px; }
+.wf-result-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; padding: 5px 8px; border-bottom: 1px solid var(--spx-line-soft); background: #f5f7f9; }
+.wf-result-head strong { font-size: 12px; font-weight: 600; }
+.wf-result-head .wf-button { width: auto; margin: 0; min-width: 92px; }
+.wf-result-table { margin: 0; }
+.wf-result-table td { vertical-align: top; }
+.wf-condition { color: #34404b; font-size: 10px; white-space: nowrap; }
+.wf-repeats { display: grid; gap: 1px; }
+.wf-repeat { display: flex; align-items: center; gap: 5px; font-size: 10px; }
+.wf-repeat code { font: 10px "Consolas", monospace; color: #17212b; }
+.wf-repeat > span:first-child { color: var(--spx-muted); }
+.wf-repeat .wf-status { padding: 0 4px; font-size: 9px; }
+.wf-experiment-list { display: grid; gap: 3px; margin: 0 0 10px; }
+.wf-experiment-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 10px; text-align: left; border: 1px solid var(--spx-line); background: #fff; padding: 4px 7px; cursor: pointer; font: inherit; color: var(--spx-ink); }
+.wf-experiment-row:hover { border-color: var(--spx-blue); background: #f7fbff; }
+.wf-experiment-row.active { border-color: var(--spx-blue); background: var(--spx-blue-soft); }
+.wf-experiment-row strong { font-size: 11px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wf-experiment-row span { color: var(--spx-muted); font-size: 9px; }
+.wf-variant-table input { width: 100%; }
+.wf-doe-factors { display: grid; gap: 5px; }
+.wf-doe-factor { display: grid; grid-template-columns: minmax(110px, 1fr) minmax(120px, 1fr) minmax(160px, 1.6fr) auto; gap: 5px 8px; align-items: end; border: 1px solid var(--spx-line-soft); background: #fbfcfd; padding: 5px 6px; }
+.wf-doe-factor .wf-link { align-self: center; }
+.wf-experiment-inputs .spx-field-grid { padding: 0 0 6px; }
+
+/* 05: conditions first, views with axes + legend, advanced folded away. */
+.wf-analysis-conditions { border: 1px solid var(--spx-line); background: #fff; margin-bottom: 8px; }
+.wf-condition-chips { display: flex; flex-wrap: wrap; gap: 4px; padding: 6px 8px; }
+.wf-condition-chip { display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--spx-line); background: #fbfcfd; padding: 2px 6px; font-size: 10px; }
+.wf-condition-chip strong { font-weight: 600; }
+.wf-compare-grid figure { display: flex; flex-direction: column; gap: 4px; }
+.wf-compare-legend { display: flex; flex-wrap: wrap; gap: 3px 9px; font-size: 9px; color: #34404b; }
+.wf-compare-legend span { display: inline-flex; align-items: center; gap: 3px; }
+.wf-compare-legend i { width: 9px; height: 9px; border: 1px solid #8a949c; }
+.wf-compare-legend em { font-style: normal; color: var(--spx-muted); }
+.wf-field-action { display: flex; align-items: end; }
+.wf-field-action .wf-button { width: auto; margin: 0; }
+.wf-analysis-advanced .spx-field-grid { padding: 4px 0 6px; }
+.wf-analysis-advanced .wf-table { margin-top: 6px; }
+
+/* 06: labelled form, visible blocking reason, real report preview. */
+.wf-report-summary { margin: 0 0 8px; }
+.wf-report-summary strong { font-size: 11px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wf-report-form { padding: 0 0 8px; }
+.wf-report-form textarea { min-height: 56px; width: 100%; border: 1px solid var(--spx-line); background: #fff; color: var(--spx-ink); padding: 4px 6px; font: 11px/1.45 inherit; border-radius: 0; }
+.wf-block-reason { margin: 0 0 6px; padding: 4px 7px; border-left: 2px solid var(--spx-amber); background: #fffaf0; color: #6b4a00; font-size: 10px; }
+.wf-report-result { margin-top: 8px; }
+.wf-report-conclusions { border: 1px solid var(--spx-line); border-top: 0; background: #fbfcfd; padding: 5px 8px; }
+.wf-report-conclusions strong { font-size: 10px; color: var(--spx-muted); font-weight: 600; }
+.wf-report-conclusions p { margin: 3px 0 0; font-size: 11px; color: #17212b; white-space: pre-wrap; }
+.wf-report-preview { width: 100%; height: 420px; border: 1px solid var(--spx-line); border-top: 0; background: #fff; }
+
+/* Compact summary rows keep 05's comparison table inside the first screen. */
+.spx-doc-body .wf-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 3px 12px; }
