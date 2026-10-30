@@ -42,6 +42,8 @@ class WorkflowOpenApiTests(unittest.TestCase):
             "/api/v1/workflow/library/import",
             "/api/v1/workflow/library/items",
             "/api/v1/workflow/library/items/{item_id}",
+            "/api/v1/workflow/projects",
+            "/api/v1/workflow/projects/{project_id}",
         ):
             self.assertIn(path, paths)
         self.assertIn("RoutePlanV1", schema["components"]["schemas"])
@@ -59,6 +61,8 @@ class WorkflowOpenApiTests(unittest.TestCase):
             "LibraryItemCreateRequest",
             "LibraryItemUpdateRequest",
             "LibraryItemListResponse",
+            "ProjectRecordV1",
+            "ProjectListResponse",
         ):
             self.assertIn(name, schema["components"]["schemas"])
         for name in (
@@ -82,6 +86,18 @@ class WorkflowOpenApiTests(unittest.TestCase):
         self.assertFalse(expand_request.get("additionalProperties", False))
         self.assertIn("variables", expand_request["properties"])
         self.assertNotEqual(expand_request["properties"]["variables"], {})
+        project_record = schema["components"]["schemas"]["ProjectRecordV1"]
+        for field in ("projectId", "name", "dimension", "stepCount", "updatedAt"):
+            self.assertIn(field, project_record["required"])
+        self.assertFalse(project_record.get("additionalProperties", False))
+        self.assertEqual(
+            paths["/api/v1/workflow/projects"]["post"]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ProjectV7",
+        )
+        self.assertEqual(
+            paths["/api/v1/workflow/projects/{project_id}"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ProjectV7",
+        )
         static = json.loads((Path(__file__).resolve().parents[1] / "docs" / "workflow-openapi.json").read_text(encoding="utf-8"))
         self.assertEqual(static["info"]["title"], schema["info"]["title"])
         self.assertEqual(set(static["paths"]), set(paths))

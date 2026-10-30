@@ -488,6 +488,25 @@ class LibraryItemListResponse(StrictModel):
     items: list[LibraryItemV1]
 
 
+ProjectId = Annotated[str, Field(pattern=r"^proj_[a-f0-9]{24}$")]
+
+
+class ProjectRecordV1(StrictModel):
+    """Summary of one persisted project; the document itself is ``ProjectV7``."""
+
+    schemaVersion: Literal[1] = 1
+    projectId: ProjectId
+    name: Annotated[str, Field(min_length=1, max_length=80)]
+    dimension: Literal[2, 3]
+    stepCount: Annotated[int, Field(ge=0)]
+    createdAt: str
+    updatedAt: str
+
+
+class ProjectListResponse(StrictModel):
+    projects: list[ProjectRecordV1]
+
+
 class ExpandFlowDefinitionRequest(StrictModel):
     variables: dict[str, float | int | str | bool] = Field(default_factory=dict)
 
@@ -1151,6 +1170,53 @@ async def run_experiment(experiment_id: str, request: Request) -> dict:
     if supervisor is None:
         raise HTTPException(status_code=503, detail="supervisor is unavailable")
     return _call(lambda: start_experiment(get_store(), supervisor, experiment_id))
+
+
+@router.post("/projects", response_model=ProjectRecordV1, status_code=201)
+async def post_project(request: ProjectV7, response: Response) -> ProjectRecordV1:
+    """Persist one project document; nothing is compiled or routed."""
+
+    record, created = _call(
+        lambda: get_store().create_project(
+            request.model_dump(mode="json", exclude_none=True)
+        )
+    )
+    if not created:
+        # Same name and identical content: report the stored record instead of
+        # creating a duplicate row.
+        response.status_code = 200
+    return ProjectRecordV1.model_validate(record)
+
+
+@router.get("/projects", response_model=ProjectListResponse)
+async def get_projects() -> ProjectListResponse:
+    rows = _call(get_store().list_projects)
+    return ProjectListResponse(
+        projects=[ProjectRecordV1.model_validate(row) for row in rows]
+    )
+
+
+@router.get("/projects/{project_id}", response_model=ProjectV7, response_model_exclude_none=True)
+async def get_project(project_id: str) -> ProjectV7:
+    return ProjectV7.model_validate(_call(lambda: get_store().get_project(project_id)))
+
+
+@router.put("/projects/{project_id}", response_model=ProjectRecordV1)
+async def put_project(project_id: str, request: ProjectV7) -> ProjectRecordV1:
+    """Replace the whole project document, steps included."""
+
+    record = _call(
+        lambda: get_store().update_project(
+            project_id, request.model_dump(mode="json", exclude_none=True)
+        )
+    )
+    return ProjectRecordV1.model_validate(record)
+
+
+@router.delete("/projects/{project_id}", status_code=204)
+async def delete_project(project_id: str) -> Response:
+    _call(lambda: get_store().delete_project(project_id))
+    return Response(status_code=204)
 
 
 def _now_iso() -> str:

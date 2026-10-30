@@ -285,7 +285,9 @@ class LibraryItemStoreTests(unittest.TestCase):
         self.root = storage.VAR / f"test-library-items-{suffix}"
         self.root.mkdir(parents=True, exist_ok=True)
         self.store = WorkflowStore(self.root / "workflow.sqlite3")
-        self.store.initialize()
+        # These tests assert exact library contents; the built-in presets are
+        # covered by tests/test_workflow_projects.py.
+        self.store.initialize(seed=False)
 
     def _item(self, category: str = "material", name: str = "Silicon", **overrides):
         payload = {
@@ -398,7 +400,7 @@ class LibraryItemStoreTests(unittest.TestCase):
     def test_schema_9_migration_adds_the_library_items_table(self) -> None:
         path = self.root / "migrate.sqlite3"
         legacy = WorkflowStore(path)
-        legacy.initialize()
+        legacy.initialize(seed=False)
         # Simulate a database written before schema 9: no table, version 8.
         with sqlite3.connect(path) as connection:
             connection.execute("DROP TABLE library_items")
@@ -406,7 +408,7 @@ class LibraryItemStoreTests(unittest.TestCase):
         self.assertNotEqual(SCHEMA_VERSION, "8")
 
         upgraded = WorkflowStore(path)
-        upgraded.initialize()
+        upgraded.initialize(seed=False)
         self.assertEqual(upgraded.schema_version(), SCHEMA_VERSION)
         with sqlite3.connect(path) as connection:
             tables = {
@@ -423,14 +425,14 @@ class LibraryItemStoreTests(unittest.TestCase):
         for version in ("6", "7", "8"):
             with self.subTest(version=version):
                 path = self.root / f"migrate-{version}.sqlite3"
-                WorkflowStore(path).initialize()
+                WorkflowStore(path).initialize(seed=False)
                 with sqlite3.connect(path) as connection:
                     connection.execute("DROP TABLE library_items")
                     connection.execute(
                         "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'", (version,)
                     )
                 upgraded = WorkflowStore(path)
-                upgraded.initialize()
+                upgraded.initialize(seed=False)
                 self.assertEqual(upgraded.schema_version(), SCHEMA_VERSION)
                 self.assertEqual(upgraded.list_library_items(), [])
 

@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from pydantic import ValidationError
 
 from .binding import verify_binding
 from .hashing import full_project_hash
@@ -19,7 +21,7 @@ from .metrology import (
     MetricDefinitionV1,
     measure_snapshot,
 )
-from ..models import parse_project
+from ..models import ProjectV7, parse_project
 from .models import CompiledWorkflowV1
 from .modules import FlowDefinitionV2, ModuleV1, flow_definition_pins, module_step_pins
 from .provenance import VerificationRecordV1
@@ -35,7 +37,13 @@ from .routes import (
 from .verification import prefix_compatibility, verify_route_plan_compiles
 
 
-SCHEMA_VERSION = "9"
+SCHEMA_VERSION = "10"
+
+
+def new_project_id() -> str:
+    """Return a server-generated project identity."""
+
+    return f"proj_{uuid.uuid4().hex[:24]}"
 
 
 class WorkflowError(Exception):
@@ -58,7 +66,7 @@ class WorkflowStore:
     def __init__(self, path: Path):
         self.path = path
 
-    def initialize(self) -> None:
+    def initialize(self, *, seed: bool = True) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if self.path.exists():
             # Read-only preflight: an unknown future schema must be rejected
@@ -71,7 +79,7 @@ class WorkflowStore:
                     row = preflight.execute(
                         "SELECT value FROM schema_meta WHERE key = 'schema_version'"
                     ).fetchone()
-                    if row is not None and row[0] not in {"1", "2", "3", "4", "5", "6", "7", "8", SCHEMA_VERSION}:
+                    if row is not None and row[0] not in {"1", "2", "3", "4", "5", "6", "7", "8", "9", SCHEMA_VERSION}:
                         raise RuntimeError(
                             f"unsupported workflow schema version {row[0]!r}; "
                             f"expected {SCHEMA_VERSION!r}"
@@ -260,6 +268,13 @@ class WorkflowStore:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS projects (
+                    project_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    document_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS geometry_bindings (
                     binding_id TEXT PRIMARY KEY,
                     binding_json TEXT NOT NULL,
@@ -322,6 +337,7 @@ class WorkflowStore:
                 CREATE INDEX IF NOT EXISTS measurements_recipe_idx ON measurements(recipe_id, recipe_version);
                 CREATE INDEX IF NOT EXISTS measurement_verifications_idx ON measurement_verifications(measurement_id);
                 CREATE INDEX IF NOT EXISTS library_items_category_idx ON library_items(category);
+                CREATE UNIQUE INDEX IF NOT EXISTS projects_name_idx ON projects(name);
                 CREATE TABLE IF NOT EXISTS schema_meta (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
@@ -375,7 +391,7 @@ class WorkflowStore:
                     "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
                     (SCHEMA_VERSION,),
                 )
-            elif version_row["value"] in {"3", "4", "5", "6", "7", "8"}:
+            elif version_row["value"] in {"3", "4", "5", "6", "7", "8", "9"}:
                 connection.execute(
                     "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
                     (SCHEMA_VERSION,),
@@ -385,6 +401,11 @@ class WorkflowStore:
                     f"unsupported workflow schema version {version_row['value']!r}; "
                     f"expected {SCHEMA_VERSION!r}"
                 )
+        if seed:
+            # A brand-new install should not open the Library on four empty
+            # categories. Seeding is idempotent and never touches a category
+            # that already holds user entries.
+            self.seed_library_defaults()
 
     def _migrate_legacy_compatibility(self, connection: sqlite3.Connection) -> None:
         """Repair v2 prefix summaries only after a full cross-compile check.
@@ -2220,6 +2241,204 @@ class WorkflowStore:
             )
             if cursor.rowcount == 0:
                 raise WorkflowNotFound(f"library item {item_id!r} does not exist")
+
+    def seed_library_items(self, documents: Sequence[Mapping[str, Any]]) -> int:
+        """Insert built-in presets into library categories that are still empty.
+
+        The emptiness test is taken once per category, before any preset of
+        that category is written, so the first run writes every preset while a
+        later run writes nothing. A category that already holds user entries is
+        never touched, and the deterministic preset ids make a re-run unable to
+        duplicate a row even if an earlier seed was interrupted.
+        """
+
+        inserted = 0
+        with self._connect() as connection:
+            categories = {str(document.get("category") or "") for document in documents}
+            empty = {
+                category: connection.execute(
+                    "SELECT COUNT(*) FROM library_items WHERE category = ?", (category,)
+                ).fetchone()[0]
+                == 0
+                for category in categories
+                if category
+            }
+            # The library lists newest first. Inserting the presets in reverse
+            # makes the declared order (etch, deposit, single particle) the
+            # order a user sees, while user-created items still land on top.
+            for document in reversed(list(documents)):
+                category = str(document.get("category") or "")
+                item_id = str(document.get("itemId") or "")
+                payload = document.get("payload")
+                if not empty.get(category) or not item_id or not isinstance(payload, dict):
+                    continue
+                timestamp = str(document.get("createdAt") or self._now())
+                cursor = connection.execute(
+                    "INSERT OR IGNORE INTO library_items"
+                    " (item_id, category, name, description, payload_json, created_at, updated_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        item_id,
+                        category,
+                        str(document.get("name") or ""),
+                        str(document.get("description") or ""),
+                        self._dump(payload),
+                        timestamp,
+                        str(document.get("updatedAt") or timestamp),
+                    ),
+                )
+                inserted += cursor.rowcount
+        return inserted
+
+    def seed_library_defaults(self) -> int:
+        """Seed the built-in material and process presets (idempotent)."""
+
+        from .library_presets import seed_library_defaults
+
+        return seed_library_defaults(self, now=self._now())
+
+    # ------------------------------------------------------------------
+    # Persisted projects (schema 10)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _project_document(document: Mapping[str, Any]) -> dict[str, Any]:
+        """Validate one ProjectV7 document and return its canonical JSON form."""
+
+        try:
+            project = ProjectV7.model_validate(dict(document))
+        except ValidationError as exc:
+            first = exc.errors(include_url=False, include_context=False)[0]
+            location = ".".join(
+                str(part) for part in first.get("loc", ()) if part != "__root__"
+            )
+            detail = first.get("msg") or "invalid project"
+            where = f" at {location}" if location else ""
+            raise WorkflowValidation(
+                f"project document is not a valid ProjectV7{where}: {detail}"
+            ) from exc
+        if not str(project.name).strip():
+            raise WorkflowValidation("project name must not be blank")
+        return project.model_dump(mode="json", exclude_none=True)
+
+    @staticmethod
+    def _project_record(row: sqlite3.Row) -> dict[str, Any]:
+        document = json.loads(row["document_json"])
+        steps = document.get("steps")
+        return {
+            "schemaVersion": 1,
+            "projectId": row["project_id"],
+            "name": row["name"],
+            "dimension": document.get("dimension"),
+            "stepCount": len(steps) if isinstance(steps, list) else 0,
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
+
+    def create_project(self, document: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+        """Store one project; return ``(record, created)``.
+
+        Creating the same name with identical content is idempotent and returns
+        the stored record with ``created`` false. The same name with different
+        content is a conflict: project names are the human identity in the
+        project list, so two silently diverging rows would be ambiguous.
+        """
+
+        validated = self._project_document(document)
+        name = str(validated["name"])
+        canonical = self._dump(validated)
+        timestamp = self._now()
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT * FROM projects WHERE name = ?", (name,)
+            ).fetchone()
+            if existing is not None:
+                if existing["document_json"] != canonical:
+                    raise WorkflowConflict(
+                        f"project name {name!r} already exists with different content"
+                    )
+                return self._project_record(existing), False
+            project_id = new_project_id()
+            try:
+                connection.execute(
+                    "INSERT INTO projects"
+                    " (project_id, name, document_json, created_at, updated_at)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (project_id, name, canonical, timestamp, timestamp),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise WorkflowConflict(
+                    f"project name {name!r} already exists with different content"
+                ) from exc
+            row = connection.execute(
+                "SELECT * FROM projects WHERE project_id = ?", (project_id,)
+            ).fetchone()
+        return self._project_record(row), True
+
+    def get_project(self, project_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT document_json FROM projects WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+        if row is None:
+            raise WorkflowNotFound(f"project {project_id!r} does not exist")
+        try:
+            return json.loads(row["document_json"])
+        except ValueError as exc:
+            raise WorkflowValidation(f"stored project {project_id!r} is invalid") from exc
+
+    def list_projects(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM projects ORDER BY updated_at DESC, rowid DESC"
+            ).fetchall()
+        return [self._project_record(row) for row in rows]
+
+    def update_project(self, project_id: str, document: Mapping[str, Any]) -> dict[str, Any]:
+        """Replace one stored project document.
+
+        A PUT always replaces the whole document, including ``steps``: there is
+        no partial step merge, so a removed step stays removed. Re-sending the
+        stored content is a no-op and keeps the original ``updatedAt``.
+        """
+
+        validated = self._project_document(document)
+        name = str(validated["name"])
+        canonical = self._dump(validated)
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT * FROM projects WHERE project_id = ?", (project_id,)
+            ).fetchone()
+            if existing is None:
+                raise WorkflowNotFound(f"project {project_id!r} does not exist")
+            collision = connection.execute(
+                "SELECT project_id FROM projects WHERE name = ? AND project_id <> ?",
+                (name, project_id),
+            ).fetchone()
+            if collision is not None:
+                raise WorkflowConflict(
+                    f"project name {name!r} already exists with different content"
+                )
+            if existing["document_json"] == canonical:
+                return self._project_record(existing)
+            connection.execute(
+                "UPDATE projects SET name = ?, document_json = ?, updated_at = ?"
+                " WHERE project_id = ?",
+                (name, canonical, self._now(), project_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM projects WHERE project_id = ?", (project_id,)
+            ).fetchone()
+        return self._project_record(row)
+
+    def delete_project(self, project_id: str) -> None:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM projects WHERE project_id = ?", (project_id,)
+            )
+            if cursor.rowcount == 0:
+                raise WorkflowNotFound(f"project {project_id!r} does not exist")
 
     def register_binding(self, binding) -> Any:
         payload = binding.model_dump(mode="json", exclude_none=True)
