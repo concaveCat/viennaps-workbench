@@ -930,25 +930,29 @@ class SpecializedStepV7(StrictModel):
         if set(self.nativeParameters) - optional_parameters != expected_parameters:
             raise ValueError(f"{self.nativeModel} nativeParameters must contain exactly {sorted(expected_parameters)}"
                              + (f" (optional: {sorted(optional_parameters)})" if optional_parameters else ""))
-        if self.surfaceDiffusion is not None and self.surfaceDiffusion.enabled:
-            # ViennaPS 4.6.2 only builds the surface-diffusion stencil for the
-            # ALD surface model, and only when its native coverage diffusion
-            # coefficient is positive. Accepting this object anywhere else
-            # would create a knob that silently does nothing.
+        if self.surfaceDiffusion is not None:
+            # Placement is ALD-only whenever the object exists, including a
+            # disabled token: there is no other 4.6.2 process with a native
+            # surface-diffusion flag, so accepting it elsewhere would make the
+            # schema claim a capability the engine does not have.
             if self.nativeModel != "ald":
                 raise ValueError(
                     "surfaceDiffusion is only available for specialized:ald; "
                     f"{self.nativeModel} has no native surface-diffusion flag")
-            coefficient = self.nativeParameters.get("coverageDiffusionCoefficient")
-            try:
-                finite = isinstance(coefficient, (int, float)) and not isinstance(coefficient, bool) \
-                    and math.isfinite(float(coefficient)) and float(coefficient) > 0.0
-            except (TypeError, ValueError):
-                finite = False
-            if not finite:
-                raise ValueError(
-                    "enabled surfaceDiffusion requires nativeParameters.coverageDiffusionCoefficient > 0; "
-                    "ViennaPS 4.6.2 never builds the stencil for zero")
+            if self.surfaceDiffusion.enabled:
+                # ViennaPS 4.6.2 only builds the stencil when the ALD surface
+                # model reports a positive coverage diffusion coefficient;
+                # a disabled token is inert and may keep a zero coefficient.
+                coefficient = self.nativeParameters.get("coverageDiffusionCoefficient")
+                try:
+                    finite = isinstance(coefficient, (int, float)) and not isinstance(coefficient, bool) \
+                        and math.isfinite(float(coefficient)) and float(coefficient) > 0.0
+                except (TypeError, ValueError):
+                    finite = False
+                if not finite:
+                    raise ValueError(
+                        "enabled surfaceDiffusion requires nativeParameters.coverageDiffusionCoefficient > 0; "
+                        "ViennaPS 4.6.2 never builds the stencil for zero")
         return self
 
 

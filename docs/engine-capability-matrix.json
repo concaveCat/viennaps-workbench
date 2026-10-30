@@ -25,9 +25,9 @@
     3
   ],
   "summary": {
-    "advanced-parameter-or-output-not-exposed": 12,
+    "advanced-parameter-or-output-not-exposed": 11,
     "engine-model-not-exposed": 7,
-    "exposed": 59,
+    "exposed": 60,
     "internal-or-not-user-facing": 18
   },
   "classes": [
@@ -1497,7 +1497,7 @@
       ],
       "constructor": "SurfaceDiffusionParameters()",
       "docSummary": "Surface diffusion Laplacian stencil for a scalar field on the disk mesh (radius, normals, stability).",
-      "classification": "advanced-parameter-or-output-not-exposed",
+      "classification": "exposed",
       "exposedBy": [
         "steps[].surfaceDiffusion on specialized:ald when coverageDiffusionCoefficient > 0"
       ],
@@ -2720,7 +2720,7 @@
     {
       "id": "B3",
       "title": "SurfaceDiffusionParameters for ALD coverage smoothing",
-      "classification": "advanced-parameter-or-output-not-exposed",
+      "classification": "exposed",
       "items": [
         "SurfaceDiffusionParameters"
       ],

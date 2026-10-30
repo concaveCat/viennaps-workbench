@@ -19,7 +19,7 @@ behaviour changed.
 
 | Classification | Meaning | Count |
 | --- | --- | --- |
-| `exposed` | Reachable from a submitted project today, with its user-facing parameters | 59 |
+| `exposed` | Reachable from a submitted project today, with its user-facing parameters | 60 |
 | `engine-model-not-exposed` | A real native process model with no step, catalog entry or API field | 7 |
 | `advanced-parameter-or-output-not-exposed` | Only a strict subset is reachable, or the object is output-only | 12 |
 | `internal-or-not-user-facing` | Native plumbing, base classes, callbacks, writer/enum utilities | 18 |
@@ -54,11 +54,12 @@ what the docstring implies. Empty `dimensions` means the class never sees a doma
 | `SelectiveEpitaxy` | `specialized/selectiveEpitaxy` | 2/3 | native `Material` enum only, no `nvFactors` |
 | `NeutralTransport` | `specialized/neutralTransport` | 2/3 | all 12 parameters |
 
-### Parameter objects with full coverage (8)
+### Parameter objects with full coverage (9)
 
 `FluorocarbonParameters`, `FluorocarbonParametersIons`, `FluorocarbonMaterialParameters`,
 `IBEParameters`, `IBEParametersCos4Yield`, `NeutralTransportParameters`, `SingleParticleALDParams`,
-`AtomicLayerProcessParameters`.
+`AtomicLayerProcessParameters`, `SurfaceDiffusionParameters` (all seven members; only through
+`specialized:ald` `surfaceDiffusion`, and only when `coverageDiffusionCoefficient > 0`).
 
 ### Plasma sub-parameter families (B1, exposed)
 
@@ -87,7 +88,7 @@ Fields shared with flat inputs use the flat catalog defaults (for example
 
 ### Geometry, output and material surface
 
-(59 `exposed` rows in the matrix overall, including the 18 models above.)
+(60 `exposed` rows in the matrix overall, including the 18 models above.)
 
 `MakePlane`, `MakeTrench`, `MakeHole` (`FULL` only), `MakeFin` (native + boolean construction),
 multi-layer `stack` (composed from `MakePlane` + `GeometryFactory`), `GeometryFactory`,
@@ -123,7 +124,6 @@ custom material catalog.
 | `CF4O2ParametersSiGe` | B1: `beta_sigma`, `k_sigma`, `rho` | sputter/yield fields and `x`; `k_sigma_SiGe` method | A full SiGe yield editor is not available because the native branch does not read those fields |
 | `CoverageParameters` | `tolerance = 1e-3` (hard-coded) | `tolerance`, `maxIterations`, `initialized` | Convergence cannot be tightened or loosened |
 | `RateSet` | `model: directional` `rateSets[]`: 1–8 sets, per-set direction, velocities, masks and visibility | `print()` (debug helper) | Multiple simultaneous directions and per-set masks are now declarative |
-| `SurfaceDiffusionParameters` | `specialized:ald` `surfaceDiffusion` (7 members) when `coverageDiffusionCoefficient > 0` | level-set/geometry smoothing | 4.6.2 only builds the ALP coverage stencil; it diffuses the `Coverage` scalar, not the surface. See [`ald-surface-diffusion-contract.md`](ald-surface-diffusion-contract.md) |
 | `DenseCellSet` | OxideRegrowth by-product JSON only | generic per-step generation, height/cover/periodic options, filling fractions, user scalars, VTU export, continuation | No project can request a volumetric field of its own |
 | `Oxidation` advanced setters | 13 of ~40 | CFL, coupling/mechanics/Stokes/pressure iterations+tolerances, solve bounds, `maxGridPoints`, simple relaxation, mask contact/traction mechanics, `GpuMode`/`GpuPreconditioner`, model-level `saveSurfaceMesh`/`saveVolumeMesh` helpers (the workbench writes the same meshes through `Domain`), `estimatePlanarOxideThickness` | Separate solver surface; unproven on this host |
 | `SiliconOrientation.Si110` | 3 of 4 | `Si110` | Exists in 4.6.2, missing only because it was never evidenced |
