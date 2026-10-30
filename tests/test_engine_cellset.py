@@ -409,6 +409,29 @@ class CellSetWorkflow(unittest.IsolatedAsyncioTestCase):
                     f"/api/runs/{run_id}/artifacts/{step_id}?fileName={rows[0]['fileName']}")
                 self.assertEqual(response[0], 200, response[2])
 
+    async def test_eager_no_op_preserves_unrelated_output_rows(self) -> None:
+        value = no_op_project()
+        value["outputSettings"]["nativeMetadata"] = True
+        with patch.dict(os.environ, {"VIENNAPS_WORKBENCH_LAZY_SNAPSHOTS": "0"}):
+            run_id, manifest = await self.run_project(value)
+        step_id = "cellset_noop_01"
+        self.assertTrue((storage.run_path(run_id) / "cellset_etch_01.json").is_file())
+        rows = self.outputs(manifest, step_id)
+        self.assertEqual([row["kind"] for row in rows],
+                         ["cellSet", "cellSetSummary", "nativeMetadata"], rows)
+        for row in rows[:2]:
+            self.assertIn(step_id, row["fileName"])
+        native_metadata = rows[2]
+        self.assertIn("cellset_etch_01", native_metadata["fileName"])
+        self.assertTrue((storage.run_path(run_id) / native_metadata["fileName"]).is_file())
+        response = await asgi_request(
+            f"/api/runs/{run_id}/artifacts/{step_id}?fileName={native_metadata['fileName']}")
+        self.assertEqual(response[0], 200, response[2])
+        snapshot = self.snapshot(run_id, step_id)
+        self.assertEqual([row["kind"] for row in snapshot["outputs"]],
+                         ["cellSet", "cellSetSummary", "nativeMetadata"])
+        self.assertTrue(all(step_id in row["fileName"] for row in snapshot["outputs"][:2]))
+
     async def test_periodic_domain_uses_the_real_cell_set_boundary(self) -> None:
         configured = project(2, cell_set=enabled(periodic=True, format="json"), boundary="periodic")
         run_id, manifest = await self.run_project(configured)
