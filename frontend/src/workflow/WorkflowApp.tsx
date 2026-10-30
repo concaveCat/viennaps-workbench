@@ -490,10 +490,13 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [openMenu, setOpenMenu] = useState<string | null>(null);
   const [clipToolsOpen, setClipToolsOpen] = useState(false);
   const [setupMode, setSetupMode] = useState<'home' | 'new' | 'examples' | 'project'>('home');
+  const [selectedFlowStepId, setSelectedFlowStepId] = useState<string | null>(null);
   const [draft, setDraft] = useState({
-    name: 'New Project', geometry: '2d-plane', gridDelta: 0.2, xExtent: 4, yExtent: 4,
+    name: 'New Project', dimension: 2 as 2 | 3, geometry: 'plane' as 'plane' | 'trench' | 'hole' | 'fin',
+    gridDelta: 0.2, xExtent: 4, yExtent: 4,
     width: 1, depth: 2, radius: 1, finHeight: 1.2, height: 0,
-    operation: 'etch', rate: 0.02, duration: 0.02, engine: 'cpu', seed: 7, timeout: 60,
+    taperAngle: 0, maskHeight: 0,
+    engine: 'cpu', seed: 7, timeout: 60, raysPerPoint: 16, cpuThreads: 1,
   });
   const [aboutOpen, setAboutOpen] = useState(false);
   const gdsInput = useRef<HTMLInputElement>(null);
@@ -509,6 +512,11 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   useEffect(() => {
     if (gds) setClipToolsOpen(true);
   }, [gds]);
+
+  useEffect(() => {
+    const steps = compile?.compile.project.steps ?? [];
+    setSelectedFlowStepId(previous => steps.some(step => step.id === previous) ? previous : (steps[0]?.id ?? null));
+  }, [compile]);
 
   useEffect(() => {
     const steps = (project?.steps ?? []).filter(step => step.enabled);
@@ -603,6 +611,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   }, [compile, decisionThroughId, authoredByCompiled]);
 
   const activeSteps = useMemo(() => (compile?.compile.project.steps ?? []).filter(step => step.enabled), [compile]);
+  const selectedFlowStep = compile?.compile.project.steps.find(step => step.id === selectedFlowStepId) ?? null;
   const canAdopt = !!project && !busy;
   const canRoute = !!compile && !busy;
   const canRun = !!segment && segment.status === 'planned' && !busy;
@@ -676,28 +685,44 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setActivityLog(previous => [...previous.slice(-79), `${new Date().toLocaleTimeString()}  已载入示例: ${label}`]);
   };
 
+  const setDraftDimension = (dimension: 2 | 3) => {
+    setDraft(previous => ({
+      ...previous,
+      dimension,
+      geometry: dimension === 2
+        ? (previous.geometry === 'trench' ? 'trench' : 'plane')
+        : (previous.geometry === 'fin' ? 'fin' : 'hole'),
+    }));
+  };
+
   const createDraftProject = () => {
-    const is3d = draft.geometry === '3d-hole' || draft.geometry === '3d-fin';
-    const dimension = is3d ? 3 : 2;
+    const dimension = draft.dimension;
+    const is3d = dimension === 3;
     const name = draft.name.trim() || 'New Project';
     const gridDelta = Math.max(0.01, Number(draft.gridDelta) || 0.2);
     const xExtent = Math.max(gridDelta * 4, Number(draft.xExtent) || 4);
     const yExtent = Math.max(gridDelta * 4, Number(draft.yExtent) || 4);
-    const geometry = draft.geometry === '2d-trench'
-      ? { kind: 'trench', width: Number(draft.width) || 1, depth: Number(draft.depth) || 2, taperAngle: 0, maskHeight: 0, maskTaperAngle: 0, substrateMaterial: 'Si', maskMaterial: 'Mask' }
-      : draft.geometry === '3d-hole'
-        ? { kind: 'hole', radius: Number(draft.radius) || 1, depth: Number(draft.depth) || 2, taperAngle: 0, maskHeight: 0, maskTaperAngle: 0, substrateMaterial: 'Si', maskMaterial: 'Mask' }
-        : draft.geometry === '3d-fin'
-          ? { kind: 'fin', width: Number(draft.width) || 1, height: Number(draft.finHeight) || 1.2, taperAngle: 0, maskHeight: 0, maskTaperAngle: 0, substrateMaterial: 'Si', maskMaterial: 'Mask' }
-          : { kind: 'plane', height: Number(draft.height) || 0, substrateMaterial: 'Si' };
-    const step: Record<string, unknown> = {
-      id: 'step_new_01', name: draft.operation === 'deposit' ? 'deposit' : 'etch',
-      enabled: true, operation: draft.operation, model: 'isotropic',
-      rateMagnitude: Math.min(2, Math.max(0, Number(draft.rate) || 0)),
-      duration: Math.min(600, Math.max(0.01, Number(draft.duration) || 0.02)),
-      rateMode: 'uniform',
+    const common = {
+      taperAngle: Number(draft.taperAngle) || 0,
+      maskHeight: Math.max(0, Number(draft.maskHeight) || 0),
+      maskTaperAngle: 0,
+      substrateMaterial: 'Si',
+      maskMaterial: 'Mask',
     };
-    if (draft.operation === 'deposit') step.depositMaterial = 'SiO2';
+    const geometry = draft.geometry === 'trench'
+      ? { kind: 'trench', width: Number(draft.width) || 1, depth: Number(draft.depth) || 2, ...common }
+      : draft.geometry === 'hole'
+        ? { kind: 'hole', radius: Number(draft.radius) || 1, depth: Number(draft.depth) || 2, ...common }
+        : draft.geometry === 'fin'
+          ? { kind: 'fin', width: Number(draft.width) || 1, height: Number(draft.finHeight) || 1.2, ...common, construction: 'native' }
+          : { kind: 'plane', height: Number(draft.height) || 0, substrateMaterial: 'Si' };
+    // The execution schema requires at least one step. A zero-rate no-op keeps
+    // the project immediately compilable; real process steps live in 02 Flow.
+    const step: Record<string, unknown> = {
+      id: 'step_initial_01', name: 'initial no-op', enabled: true,
+      operation: 'etch', model: 'isotropic', rateMagnitude: 0,
+      duration: 0.01, rateMode: 'uniform',
+    };
     const projectPayload = {
       schemaVersion: 7, name, dimension,
       units: { length: 'um', time: 's', rate: 'um/s', angle: 'deg' },
@@ -707,13 +732,16 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       geometry,
       steps: [step],
       solver: {
-        timeStepRatio: 0.25, raysPerPoint: 16, cpuThreads: 1,
+        timeStepRatio: 0.25,
+        raysPerPoint: Math.max(1, Number(draft.raysPerPoint) || 16),
+        cpuThreads: Math.max(1, Number(draft.cpuThreads) || 1),
         random: { mode: 'fixed', seed: Number(draft.seed) || 7 },
-        enginePreference: draft.engine, timeoutSeconds: Math.max(5, Number(draft.timeout) || 60),
+        enginePreference: draft.engine,
+        timeoutSeconds: Math.max(5, Number(draft.timeout) || 60),
       },
       ...(is3d ? { view3D: {
         projection: 'parallel', camera: null, displayMode: 'surface',
-        visibleMaterialIds: [0, 10, 30], opacityByMaterial: { '0': 1.0, '10': 1.0, '30': 1.0 },
+        visibleMaterialIds: [], opacityByMaterial: {},
         clip: { enabled: false, axis: 'x', position: 0.0, keep: 'positive' },
         section: { enabled: false, axis: 'y', position: 0.0 },
       } } : { view: { panX: 0, panH: 0, zoom: 1, showGrid: true } }),
@@ -1518,54 +1546,82 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
 
           {setupMode === 'new' && <div className="spx-sheet">
             <div className="spx-sheet-title">新建工程 / New Project</div>
-            <div className="spx-field-grid">
-              <label className="spx-field span-2"><span>工程名称</span><input aria-label="新工程名称" value={draft.name} onChange={event => setDraftField('name', event.target.value)} /></label>
-              <label className="spx-field"><span>几何模板</span>
-                <select aria-label="新工程几何" value={draft.geometry} onChange={event => setDraftField('geometry', event.target.value)}>
-                  <option value="2d-plane">2D 平面</option>
-                  <option value="2d-trench">2D Trench</option>
-                  <option value="3d-hole">3D 孔</option>
-                  <option value="3d-fin">3D Fin</option>
-                </select>
-              </label>
-              <label className="spx-field"><span>网格 gridDelta (µm)</span><input aria-label="新工程 gridDelta" type="number" value={draft.gridDelta} onChange={event => setDraftField('gridDelta', Number(event.target.value))} /></label>
-              <label className="spx-field"><span>X extent (µm)</span><input aria-label="新工程 xExtent" type="number" value={draft.xExtent} onChange={event => setDraftField('xExtent', Number(event.target.value))} /></label>
-              {(draft.geometry === '3d-hole' || draft.geometry === '3d-fin') && <label className="spx-field"><span>Y extent (µm)</span><input aria-label="新工程 yExtent" type="number" value={draft.yExtent} onChange={event => setDraftField('yExtent', Number(event.target.value))} /></label>}
-              {draft.geometry === '2d-plane' && <label className="spx-field"><span>Plane height (µm)</span><input aria-label="新工程高度" type="number" value={draft.height} onChange={event => setDraftField('height', Number(event.target.value))} /></label>}
-              {draft.geometry === '2d-trench' && <>
-                <label className="spx-field"><span>Trench width (µm)</span><input aria-label="新工程 Trench 宽度" type="number" value={draft.width} onChange={event => setDraftField('width', Number(event.target.value))} /></label>
-                <label className="spx-field"><span>Trench depth (µm)</span><input aria-label="新工程 Trench 深度" type="number" value={draft.depth} onChange={event => setDraftField('depth', Number(event.target.value))} /></label>
-              </>}
-              {draft.geometry === '3d-hole' && <>
-                <label className="spx-field"><span>Hole radius (µm)</span><input aria-label="新工程孔半径" type="number" value={draft.radius} onChange={event => setDraftField('radius', Number(event.target.value))} /></label>
-                <label className="spx-field"><span>Hole depth (µm)</span><input aria-label="新工程孔深度" type="number" value={draft.depth} onChange={event => setDraftField('depth', Number(event.target.value))} /></label>
-              </>}
-              {draft.geometry === '3d-fin' && <>
-                <label className="spx-field"><span>Fin width (µm)</span><input aria-label="新工程 Fin 宽度" type="number" value={draft.width} onChange={event => setDraftField('width', Number(event.target.value))} /></label>
-                <label className="spx-field"><span>Fin height (µm)</span><input aria-label="新工程 Fin 高度" type="number" value={draft.finHeight} onChange={event => setDraftField('finHeight', Number(event.target.value))} /></label>
-              </>}
-              <label className="spx-field"><span>首步操作</span>
-                <select aria-label="新工程首步操作" value={draft.operation} onChange={event => setDraftField('operation', event.target.value)}>
-                  <option value="etch">etch</option>
-                  <option value="deposit">deposit</option>
-                </select>
-              </label>
-              <label className="spx-field"><span>Rate (µm/s)</span><input aria-label="新工程 rate" type="number" value={draft.rate} onChange={event => setDraftField('rate', Number(event.target.value))} /></label>
-              <label className="spx-field"><span>Duration (s)</span><input aria-label="新工程 duration" type="number" value={draft.duration} onChange={event => setDraftField('duration', Number(event.target.value))} /></label>
-              <label className="spx-field"><span>Engine</span>
-                <select aria-label="新工程引擎" value={draft.engine} onChange={event => setDraftField('engine', event.target.value)}>
-                  <option value="cpu">CPU</option>
-                  <option value="gpu">GPU</option>
-                  <option value="auto">Auto</option>
-                </select>
-              </label>
-              <label className="spx-field"><span>Seed</span><input aria-label="新工程 seed" type="number" value={draft.seed} onChange={event => setDraftField('seed', Number(event.target.value))} /></label>
-              <label className="spx-field"><span>Timeout (s)</span><input aria-label="新工程 timeout" type="number" value={draft.timeout} onChange={event => setDraftField('timeout', Number(event.target.value))} /></label>
+            <div className="spx-form-groups">
+              <section className="spx-field-group">
+                <div className="spx-group-title">General</div>
+                <div className="spx-field-grid">
+                  <label className="spx-field span-2"><span>工程名称</span><input aria-label="新工程名称" value={draft.name} onChange={event => setDraftField('name', event.target.value)} /></label>
+                  <div className="spx-field"><span>Dimension</span>
+                    <div className="spx-segment">
+                      <button type="button" className={draft.dimension === 2 ? 'active' : ''} onClick={() => setDraftDimension(2)}>2D</button>
+                      <button type="button" className={draft.dimension === 3 ? 'active' : ''} onClick={() => setDraftDimension(3)}>3D</button>
+                    </div>
+                  </div>
+                </div>
+              </section>
+
+              <section className="spx-field-group">
+                <div className="spx-group-title">Geometry</div>
+                <div className="spx-geometry-picks">
+                  {(draft.dimension === 2 ? ['plane', 'trench'] : ['hole', 'fin']).map(kind => <button
+                    type="button" key={kind}
+                    className={draft.geometry === kind ? 'active' : ''}
+                    onClick={() => setDraftField('geometry', kind)}
+                  >{kind === 'plane' ? 'Plane' : kind === 'trench' ? 'Trench' : kind === 'hole' ? 'Hole' : 'Fin'}</button>)}
+                </div>
+                <div className="spx-field-grid">
+                  {draft.geometry === 'plane' && <label className="spx-field"><span>Plane height (µm)</span><input aria-label="新工程高度" type="number" value={draft.height} onChange={event => setDraftField('height', Number(event.target.value))} /></label>}
+                  {draft.geometry === 'trench' && <>
+                    <label className="spx-field"><span>Trench width (µm)</span><input aria-label="新工程 Trench 宽度" type="number" value={draft.width} onChange={event => setDraftField('width', Number(event.target.value))} /></label>
+                    <label className="spx-field"><span>Trench depth (µm)</span><input aria-label="新工程 Trench 深度" type="number" value={draft.depth} onChange={event => setDraftField('depth', Number(event.target.value))} /></label>
+                  </>}
+                  {draft.geometry === 'hole' && <>
+                    <label className="spx-field"><span>Hole radius (µm)</span><input aria-label="新工程孔半径" type="number" value={draft.radius} onChange={event => setDraftField('radius', Number(event.target.value))} /></label>
+                    <label className="spx-field"><span>Hole depth (µm)</span><input aria-label="新工程孔深度" type="number" value={draft.depth} onChange={event => setDraftField('depth', Number(event.target.value))} /></label>
+                  </>}
+                  {draft.geometry === 'fin' && <>
+                    <label className="spx-field"><span>Fin width (µm)</span><input aria-label="新工程 Fin 宽度" type="number" value={draft.width} onChange={event => setDraftField('width', Number(event.target.value))} /></label>
+                    <label className="spx-field"><span>Fin height (µm)</span><input aria-label="新工程 Fin 高度" type="number" value={draft.finHeight} onChange={event => setDraftField('finHeight', Number(event.target.value))} /></label>
+                  </>}
+                  {draft.geometry !== 'plane' && <>
+                    <label className="spx-field"><span>Taper angle (deg)</span><input aria-label="新工程 taper" type="number" value={draft.taperAngle} onChange={event => setDraftField('taperAngle', Number(event.target.value))} /></label>
+                    <label className="spx-field"><span>Mask height (µm)</span><input aria-label="新工程 maskHeight" type="number" value={draft.maskHeight} onChange={event => setDraftField('maskHeight', Number(event.target.value))} /></label>
+                  </>}
+                </div>
+                <p className="spx-help">参数化几何用于新建工程；GDS / Clip 流程请在 02 流程区上传版图，或使用“导入 JSON”。</p>
+              </section>
+
+              <section className="spx-field-group">
+                <div className="spx-group-title">Domain &amp; Grid</div>
+                <div className="spx-field-grid">
+                  <label className="spx-field"><span>gridDelta (µm)</span><input aria-label="新工程 gridDelta" type="number" value={draft.gridDelta} onChange={event => setDraftField('gridDelta', Number(event.target.value))} /></label>
+                  <label className="spx-field"><span>X extent (µm)</span><input aria-label="新工程 xExtent" type="number" value={draft.xExtent} onChange={event => setDraftField('xExtent', Number(event.target.value))} /></label>
+                  {draft.dimension === 3 && <label className="spx-field"><span>Y extent (µm)</span><input aria-label="新工程 yExtent" type="number" value={draft.yExtent} onChange={event => setDraftField('yExtent', Number(event.target.value))} /></label>}
+                </div>
+              </section>
+
+              <section className="spx-field-group">
+                <div className="spx-group-title">Solver</div>
+                <div className="spx-field-grid">
+                  <label className="spx-field"><span>Engine</span>
+                    <select aria-label="新工程引擎" value={draft.engine} onChange={event => setDraftField('engine', event.target.value)}>
+                      <option value="cpu">CPU</option>
+                      <option value="gpu">GPU</option>
+                      <option value="auto">Auto</option>
+                    </select>
+                  </label>
+                  <label className="spx-field"><span>Seed</span><input aria-label="新工程 seed" type="number" value={draft.seed} onChange={event => setDraftField('seed', Number(event.target.value))} /></label>
+                  <label className="spx-field"><span>Timeout (s)</span><input aria-label="新工程 timeout" type="number" value={draft.timeout} onChange={event => setDraftField('timeout', Number(event.target.value))} /></label>
+                  <label className="spx-field"><span>Rays per point</span><input aria-label="新工程 rays" type="number" value={draft.raysPerPoint} onChange={event => setDraftField('raysPerPoint', Number(event.target.value))} /></label>
+                  <label className="spx-field"><span>CPU threads</span><input aria-label="新工程线程" type="number" value={draft.cpuThreads} onChange={event => setDraftField('cpuThreads', Number(event.target.value))} /></label>
+                </div>
+              </section>
             </div>
             <div className="spx-sheet-actions">
               <button type="button" className="wf-button primary" onClick={createDraftProject}>创建工程</button>
               <button type="button" className="wf-button" onClick={() => setSetupMode('home')}>取消</button>
             </div>
+            <p className="spx-help spx-form-note">创建后会自动加入一个 no-op 初始步骤，保证可立即编译；真实工艺步骤在 02 流程中编辑。</p>
           </div>}
 
           {setupMode === 'examples' && <div className="spx-samples">
@@ -1674,38 +1730,65 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         </section>
 
         <section className={`wf-card wf-flow ${zone === 'flow' ? '' : 'wf-hidden'}`}>
-          <div className="wf-card-head"><span>02</span><h2>流程 / Route</h2></div>
-          {!compile && <div className="wf-empty">采纳工程后显示编译后的步骤。</div>}
+          <div className="wf-card-head"><span>02</span><h2>流程 / Process Flow</h2></div>
+          {!compile && <div className="wf-empty">采纳工程后显示流程步骤。</div>}
           {compile && <>
-            <div className="wf-muted">{compile.projectName} · {compile.dimension}D · {activeSteps.length} 个启用步骤</div>
-            <div className="wf-step-list">
-              {compile.compile.project.steps.map((step, index) => (
-                <div className={`wf-step ${step.enabled ? '' : 'off'}`} key={step.id}>
-                  <span className="wf-step-index">{String(index + 1).padStart(2, '0')}</span>
-                  <span className="wf-step-name">{step.name}</span>
-                  <span className="wf-step-model">{STEP_LABELS[step.model] ?? step.model}</span>
-                </div>
-              ))}
+            <div className="spx-flow-summary">
+              <div><span>Project</span><strong>{compile.projectName}</strong></div>
+              <div><span>Dimension</span><strong>{compile.dimension}D</strong></div>
+              <div><span>Enabled steps</span><strong>{activeSteps.length}</strong></div>
+              <div><span>Compile</span><strong>{compile.compileId.slice(0, 16)}…</strong></div>
             </div>
-            <button className="wf-button primary" disabled={!canRoute} onClick={() => void createRoute()}>
-              {busy === 'route' ? '创建中…' : '创建首个 Route'}
-            </button>
-            <button className="wf-button ghost" disabled={!compile || !!busy} onClick={() => void saveTemplate()}>保存当前步骤为模板</button>
-            <div className="wf-template-row">
-              <select aria-label="模板选择" value={templateId} onChange={event => setTemplateId(event.target.value)}>
-                <option value="">选择模板</option>
-                {templates.map(item => <option key={item.templateId} value={item.templateId}>{item.name} · {item.stepCount} 步</option>)}
-              </select>
-              <button className="wf-button ghost" disabled={!project || !templateId || !!busy} onClick={() => void applyTemplate('replace')}>替换流程</button>
-              <button className="wf-button ghost" disabled={!project || !templateId || !!busy} onClick={() => void applyTemplate('append')}>插入模板</button>
+            <div className="spx-flow-toolbar">
+              <button className="wf-button primary" disabled={!canRoute} onClick={() => void createRoute()}>{busy === 'route' ? '创建中…' : '创建首个 Route'}</button>
+              <button className="wf-button" aria-label="保存当前步骤为模板" disabled={!compile || !!busy} onClick={() => void saveTemplate()}>保存为模板</button>
+              <button className="wf-button" disabled={!compile || !!busy} onClick={() => void compareCompile()}>比较上一版</button>
             </div>
-            <div className="wf-template-row">
-              <input aria-label="模板变量值" value={templateVariable} onChange={event => setTemplateVariable(event.target.value)} />
-              <button className="wf-button ghost" disabled={!compile || !!busy} onClick={() => void compareCompile()}>比较上一版</button>
+            <div className="spx-flow-template">
+              <label><span>模板</span>
+                <select aria-label="模板选择" value={templateId} onChange={event => setTemplateId(event.target.value)}>
+                  <option value="">选择模板</option>
+                  {templates.map(item => <option key={item.templateId} value={item.templateId}>{item.name} · {item.stepCount} 步</option>)}
+                </select>
+              </label>
+              <label><span>duration 覆盖</span><input aria-label="模板变量值" value={templateVariable} onChange={event => setTemplateVariable(event.target.value)} /></label>
+              <button className="wf-button" disabled={!project || !templateId || !!busy} onClick={() => void applyTemplate('replace')}>替换流程</button>
+              <button className="wf-button" disabled={!project || !templateId || !!busy} onClick={() => void applyTemplate('append')}>插入模板</button>
+            </div>
+            <div className="spx-flow-body">
+              <div className="spx-flow-list">
+                <table className="wf-table" aria-label="流程步骤">
+                  <thead><tr><th>#</th><th>Step</th><th>Model</th><th>Operation</th><th>Enabled</th></tr></thead>
+                  <tbody>{compile.compile.project.steps.map((step, index) => (
+                    <tr key={step.id} className={selectedFlowStepId === step.id ? 'selected' : ''} onClick={() => setSelectedFlowStepId(step.id)}>
+                      <td>{String(index + 1).padStart(2, '0')}</td>
+                      <td>{step.name}</td>
+                      <td>{STEP_LABELS[step.model] ?? step.model}</td>
+                      <td>{step.operation ?? '—'}</td>
+                      <td>{step.enabled ? 'yes' : 'no'}</td>
+                    </tr>
+                  ))}</tbody>
+                </table>
+              </div>
+              <div className="spx-step-inspector">
+                <div className="spx-step-inspector-title">Step Properties</div>
+                {selectedFlowStep ? <>
+                  <div className="spx-prop"><span>Name</span><code>{selectedFlowStep.name}</code></div>
+                  <div className="spx-prop"><span>Model</span><code>{selectedFlowStep.model}</code></div>
+                  <div className="spx-prop"><span>Operation</span><code>{selectedFlowStep.operation ?? '—'}</code></div>
+                  <div className="spx-prop"><span>Duration</span><code>{String((selectedFlowStep as unknown as Record<string, unknown>).duration ?? '—')} s</code></div>
+                  <div className="spx-prop"><span>Rate</span><code>{String((selectedFlowStep as unknown as Record<string, unknown>).rateMagnitude ?? '—')}</code></div>
+                  <div className="spx-prop"><span>Authored ID</span><code>{compile.compile.sourceMap?.find(entry => entry.stepId === selectedFlowStep.id)?.authoredStepId ?? selectedFlowStep.id}</code></div>
+                  <p className="spx-help">编译后的步骤是只读快照。修改请用模板、模块化流程或重新采纳工程。</p>
+                </> : <p className="spx-help">选择左侧步骤查看参数。</p>}
+              </div>
             </div>
             {compileDiff && <div className="wf-summary"><strong>Compile diff</strong><span>+{compileDiff.addedStepIds.length} / -{compileDiff.removedStepIds.length} / moved {compileDiff.movedStepIds.length} / changed {compileDiff.changedStepIds.length}</span><span>affected: {compileDiff.affectedStepIds.map(id => id.slice(0, 8)).join(', ') || '—'}</span>{compileDiff.details?.slice(0, 3).map(item => <span key={item.stepId}>{item.stepId.slice(0, 8)}: {String(item.before.duration ?? '—')} → {String(item.after.duration ?? '—')}</span>)}</div>}
           </>}
           {route && <div className="wf-summary"><strong>{route.route.name}</strong><span>{route.segments.length} Segment · {route.stepOrder.length} Step · head {route.route.headAttemptId.slice(0, 10)}…</span></div>}
+          <details className="spx-advanced">
+            <summary>高级：模块化流程定义（JSON）</summary>
+            <div className="spx-advanced-body">
           <div className="wf-card-subhead">模块化流程</div>
           <p className="wf-muted">保存模块与流程定义后展开预览；编译复用现有 Compile 与 SourceMap，不另起执行路径。</p>
           <textarea aria-label="模块 JSON" value={moduleJson} onChange={event => setModuleJson(event.target.value)} placeholder="模块 JSON" />
@@ -1741,6 +1824,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               </tbody>
             </table>
           </>}
+            </div>
+          </details>
           <div className="wf-card-subhead">共享流程库</div>
           <p className="wf-muted">导出全部模块、流程定义、模板与当前实验的可复用条件；导入时明确 reject/clone 冲突策略。实验只保留条件、重复数与 seed，不带运行状态。</p>
           <div className="wf-template-row">
@@ -1770,11 +1855,16 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               </tr>)}
             </tbody>
           </table>}
-          <textarea aria-label="共享库 JSON" value={libraryBundleJson} onChange={event => setLibraryBundleJson(event.target.value)} placeholder="粘贴 bundle JSON 以便跨机器交换" />
-          <div className="wf-template-row">
-            <button className="wf-button ghost" aria-label="从 JSON 导入共享库" disabled={!libraryBundleJson.trim() || !!busy} onClick={() => void importLibraryJson()}>{busy === 'library' ? '处理中…' : '从 JSON 导入'}</button>
-            <span className="wf-muted">bundleId 由内容 hash 生成；reject 保留原 ID，clone 为定义/模板/实验生成新 ID。</span>
-          </div>
+          <details className="spx-advanced">
+            <summary>高级：粘贴 bundle JSON</summary>
+            <div className="spx-advanced-body">
+              <textarea aria-label="共享库 JSON" value={libraryBundleJson} onChange={event => setLibraryBundleJson(event.target.value)} placeholder="粘贴 bundle JSON 以便跨机器交换" />
+              <div className="wf-template-row">
+                <button className="wf-button ghost" aria-label="从 JSON 导入共享库" disabled={!libraryBundleJson.trim() || !!busy} onClick={() => void importLibraryJson()}>{busy === 'library' ? '处理中…' : '从 JSON 导入'}</button>
+                <span className="wf-muted">bundleId 由内容 hash 生成；reject 保留原 ID，clone 为定义/模板/实验生成新 ID。</span>
+              </div>
+            </div>
+          </details>
           {libraryResult && <div className="wf-summary" aria-label="共享库导入结果">
             <strong>{libraryResult.bundleId}</strong>
             <span>定义: {libraryResult.definitionIds.join(', ') || '—'}</span>

@@ -65,6 +65,7 @@ try {
 
   // P4-1: module + definition + loop expansion + compile.
   await page.getByRole('button', { name: '02 流程' }).click();
+  await page.getByText('高级：模块化流程定义（JSON）').click();
   await page.getByLabel('模块 JSON').fill(moduleJson);
   await page.getByRole('button', { name: '保存模块' }).click();
   await page.getByLabel('流程定义 JSON').fill(definitionJson);
