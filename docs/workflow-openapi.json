@@ -7047,6 +7047,127 @@
         "title": "ProjectV7",
         "type": "object"
       },
+      "ProjectWorkflowSegmentRunV1": {
+        "additionalProperties": false,
+        "description": "One executed segment and the run/measurement it produced.",
+        "properties": {
+          "measurementId": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 3,
+                "pattern": "^m_[A-Za-z0-9_-]+$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Measurementid"
+          },
+          "runId": {
+            "maxLength": 64,
+            "minLength": 3,
+            "pattern": "^[A-Za-z0-9_-]+$",
+            "title": "Runid",
+            "type": "string"
+          },
+          "segmentId": {
+            "maxLength": 64,
+            "minLength": 3,
+            "pattern": "^[A-Za-z0-9_-]+$",
+            "title": "Segmentid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "segmentId",
+          "runId"
+        ],
+        "title": "ProjectWorkflowSegmentRunV1",
+        "type": "object"
+      },
+      "ProjectWorkflowStateV1": {
+        "additionalProperties": false,
+        "description": "The 03 page state of one persisted project.",
+        "properties": {
+          "compileId": {
+            "anyOf": [
+              {
+                "pattern": "^c_[a-f0-9]{24}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Compileid"
+          },
+          "experimentIds": {
+            "items": {
+              "maxLength": 64,
+              "minLength": 4,
+              "pattern": "^exp_[A-Za-z0-9_-]+$",
+              "type": "string"
+            },
+            "maxItems": 128,
+            "title": "Experimentids",
+            "type": "array"
+          },
+          "measurementIds": {
+            "items": {
+              "maxLength": 64,
+              "minLength": 3,
+              "pattern": "^m_[A-Za-z0-9_-]+$",
+              "type": "string"
+            },
+            "maxItems": 256,
+            "title": "Measurementids",
+            "type": "array"
+          },
+          "routeId": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 3,
+                "pattern": "^[A-Za-z0-9_-]+$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Routeid"
+          },
+          "schemaVersion": {
+            "const": 1,
+            "default": 1,
+            "title": "Schemaversion",
+            "type": "integer"
+          },
+          "segmentRuns": {
+            "items": {
+              "$ref": "#/components/schemas/ProjectWorkflowSegmentRunV1"
+            },
+            "maxItems": 128,
+            "title": "Segmentruns",
+            "type": "array"
+          },
+          "updatedAt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updatedat"
+          }
+        },
+        "title": "ProjectWorkflowStateV1",
+        "type": "object"
+      },
       "ProtocolListResponse": {
         "additionalProperties": false,
         "properties": {
@@ -9252,6 +9373,22 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/": {
+      "get": {
+        "operationId": "frontend_not_built__get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Frontend Not Built"
+      }
+    },
     "/api/capabilities": {
       "get": {
         "operationId": "capabilities_api_capabilities_get",
@@ -13903,6 +14040,133 @@
           }
         },
         "summary": "Put Project",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/projects/{project_id}/state": {
+      "delete": {
+        "operationId": "delete_project_workflow_state_api_v1_workflow_projects__project_id__state_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Project Workflow State",
+        "tags": [
+          "workflow"
+        ]
+      },
+      "get": {
+        "description": "Return the project's 03-page state; unset state is an empty document.",
+        "operationId": "get_project_workflow_state_api_v1_workflow_projects__project_id__state_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectWorkflowStateV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Project Workflow State",
+        "tags": [
+          "workflow"
+        ]
+      },
+      "put": {
+        "description": "Save the project's 03-page state; dangling references are rejected.",
+        "operationId": "put_project_workflow_state_api_v1_workflow_projects__project_id__state_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectWorkflowStateV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectWorkflowStateV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Project Workflow State",
         "tags": [
           "workflow"
         ]
