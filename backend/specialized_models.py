@@ -55,6 +55,28 @@ def advanced_boolean(key: str, default: bool) -> dict[str, Any]:
     return {"key": key, "kind": "boolean", "default": default}
 
 
+# Flat catalog fields are also the effective values the worker passes when
+# ``advanced`` is omitted. The advanced schema below takes every shared default
+# from these lists, so a client materialising the catalog cannot change
+# behaviour by accident.
+PLASMA_FLAT_FIELDS = [
+    number("ionFlux", 1), number("etchantFlux", 1), number("oxygenFlux", 0.2),
+    number("meanIonEnergy", 100), number("sigmaIonEnergy", 10), number("ionExponent", 100),
+    number("oxySputterYield", 3), number("etchStopDepth", -1_000_000, minimum=-1_000_000),
+]
+SF6C4F8_FLAT_FIELDS = [
+    number("ionFlux", 1), number("etchantFlux", 1), number("meanEnergy", 100),
+    number("sigmaEnergy", 10), number("ionExponent", 300),
+    number("etchStopDepth", -1_000_000, minimum=-1_000_000),
+]
+CF4O2_FLAT_FIELDS = [
+    number("ionFlux", 1), number("etchantFlux", 1), number("oxygenFlux", 0.2),
+    number("polymerFlux", 0.2), number("meanIonEnergy", 100), number("sigmaIonEnergy", 10),
+    number("ionExponent", 100), number("oxySputterYield", 3), number("polySputterYield", 3),
+    number("etchStopDepth", -1_000_000, minimum=-1_000_000),
+]
+
+
 # Payload keys are lower-case aliases; ``native`` is the exact installed member
 # path. Defaults and ranges come from introspecting ViennaPS 4.6.2
 # (PlasmaEtchingParameters*/CF4O2Parameters*) and the flat overloads, not from
@@ -86,9 +108,12 @@ _PLASMA_ADVANCED_TEMPLATE: dict[str, Any] = {
             advanced_number("a3", -4.3, minimum=-1_000_000.0), advanced_number("a4", 1.95, minimum=-1_000_000.0),
             advanced_boolean("usePolyCosThetaYield", False),
         ]},
+        # Substrate.B_ie is declared by the native struct but unused by the
+        # CPU surface model (the angle-dependent branch is commented out), so
+        # it is deliberately not exposed.
         "substrate": {"native": "Substrate", "fields": [
             advanced_number("A_ie", 7.0), advanced_number("A_sp", 0.0337),
-            advanced_number("B_ie", 0.8), advanced_number("B_sp", 9.3),
+            advanced_number("B_sp", 9.3),
             advanced_number("Eth_ie", 15.0), advanced_number("Eth_sp", 20.0),
             advanced_number("beta_sigma", 0.04), advanced_number("k_sigma", 300.0),
             advanced_number("rho", 5.02, minimum=0.000001),
@@ -96,8 +121,8 @@ _PLASMA_ADVANCED_TEMPLATE: dict[str, Any] = {
     },
     "scalars": [advanced_number("passivationFlux", 100.0)],
     "maps": [
-        {"key": "beta_E", "native": "beta_E", "default": 1.0, "minimum": 0.0, "maximum": 1_000_000.0},
-        {"key": "beta_P", "native": "beta_P", "default": 1.0, "minimum": 0.0, "maximum": 1_000_000.0},
+        {"key": "beta_E", "native": "beta_E", "default": 1.0, "minimum": 0.0, "maximum": 1.0},
+        {"key": "beta_P", "native": "beta_P", "default": 1.0, "minimum": 0.0, "maximum": 1.0},
         {"key": "rateFactors", "native": "rateFactors", "default": 1.0, "minimum": 0.0, "maximum": 1_000_000.0},
     ],
 }
@@ -126,11 +151,13 @@ _CF4O2_ADVANCED: dict[str, Any] = {
             advanced_number("beta_sigma", 0.04), advanced_number("k_sigma", 300.0),
             advanced_number("rho", 5.02, minimum=0.000001),
         ]},
+        # The native CF4O2 surface model only consumes SiGe.beta_sigma,
+        # SiGe.k_sigma and SiGe.rho. A_ie/A_sp/Eth_ie/Eth_sp are ignored in the
+        # SiGe branch, and x only computes the initial k_sigma default (it does
+        # not recompute it when changed), so those fields are not exposed.
         "siGe": {"native": "SiGe", "fields": [
-            advanced_number("A_ie", 6.5), advanced_number("A_sp", 0.03),
-            advanced_number("Eth_ie", 14.0), advanced_number("Eth_sp", 18.0),
             advanced_number("beta_sigma", 0.04), advanced_number("k_sigma", 345.168420976798),
-            advanced_number("rho", 4.84, minimum=0.000001), advanced_number("x", 0.3, maximum=1.0),
+            advanced_number("rho", 4.84, minimum=0.000001),
         ]},
     },
     "scalars": [advanced_boolean("fluxIncludeSticking", False)],
@@ -161,57 +188,98 @@ _FLAT_MAPPING_CF4O2 = {
 }
 
 
-def _plasma_advanced(flat_mapping: dict[str, str], default_patches: dict[str, float]) -> dict[str, Any]:
-    """Clone the shared PlasmaEtchingParameters schema for one model.
+def _apply_flat_defaults(advanced: dict[str, Any], fields: list[dict[str, Any]],
+                         flat_mapping: dict[str, str]) -> None:
+    """Make shared advanced defaults equal the flat catalog defaults.
 
-    The plasma models share the parameter class but not all native defaults:
-    HBrO2Etching lowers three Substrate values and SF6C4F8Etching uses a zero
-    passivation flux. The catalog defaults mirror those model-specific values so
-    an omitted advanced block reports the same number the flat overload uses.
+    ``defaultSource`` distinguishes a value the workbench already sends through
+    the flat overload (``flat``) from a native parameter-class default with no
+    flat equivalent (``nativeParameterClass``/``nativeMaterialMap``).
     """
+    flat_defaults = {field["key"]: field["default"] for field in fields}
+    targets: dict[str, dict[str, Any]] = {}
+    for block in advanced["blocks"].values():
+        for field in block["fields"]:
+            targets[f'{block["native"]}.{field["key"]}'] = field
+    for field in advanced["scalars"]:
+        targets[field["key"]] = field
+    for flat_key, native_path in flat_mapping.items():
+        target = targets.get(native_path)
+        if target is None:
+            continue
+        target["default"] = flat_defaults[flat_key]
+        target["flatKey"] = flat_key
+        target["defaultSource"] = "flat"
+    for block in advanced["blocks"].values():
+        for field in block["fields"]:
+            field.setdefault("defaultSource", "nativeParameterClass")
+    for field in advanced["scalars"]:
+        field.setdefault("defaultSource", "nativeParameterClass")
+    for row in advanced["maps"]:
+        row.setdefault("defaultSource", "nativeMaterialMap")
+
+
+def _plasma_advanced(fields: list[dict[str, Any]], flat_mapping: dict[str, str], *,
+                     drop_blocks: tuple[str, ...] = (), drop_scalars: tuple[str, ...] = (),
+                     drop_maps: tuple[str, ...] = (), default_patches: dict[str, float] | None = None,
+                     rejected: dict[str, str] | None = None) -> dict[str, Any]:
+    """Clone the shared PlasmaEtchingParameters schema for one model."""
     advanced = deepcopy(_PLASMA_ADVANCED_TEMPLATE)
+    advanced["blocks"] = {name: block for name, block in advanced["blocks"].items()
+                          if name not in drop_blocks}
+    advanced["scalars"] = [field for field in advanced["scalars"]
+                           if field["key"] not in drop_scalars]
+    advanced["maps"] = [row for row in advanced["maps"] if row["key"] not in drop_maps]
     advanced["flatMapping"] = dict(flat_mapping)
+    _apply_flat_defaults(advanced, fields, flat_mapping)
     by_block = {block["native"]: block for block in advanced["blocks"].values()}
     by_scalar = {field["key"]: field for field in advanced["scalars"]}
-    for path, value in default_patches.items():
+    for path, value in (default_patches or {}).items():
         if "." in path:
             block_name, field_name = path.split(".", 1)
             next(field for field in by_block[block_name]["fields"] if field["key"] == field_name)["default"] = value
         else:
             by_scalar[path]["default"] = value
+    if rejected:
+        advanced["rejectedKeys"] = dict(rejected)
+    return advanced
+
+
+def _cf4o2_advanced() -> dict[str, Any]:
+    advanced = deepcopy(_CF4O2_ADVANCED)
+    advanced["flatMapping"] = dict(_FLAT_MAPPING_CF4O2)
+    _apply_flat_defaults(advanced, CF4O2_FLAT_FIELDS, _FLAT_MAPPING_CF4O2)
     return advanced
 
 
 CATALOG: list[dict[str, Any]] = [
     {"id": "sf6o2", "label": "SF₆/O₂ 等离子体刻蚀", "nativeClass": "SF6O2Etching", "operation": "etch", "usesFlux": True,
      "optionalKeys": ["advanced"],
-     "advanced": _plasma_advanced(_FLAT_MAPPING_SF6, {}),
-     "fields": [number("ionFlux", 1), number("etchantFlux", 1), number("oxygenFlux", 0.2),
-                number("meanIonEnergy", 100), number("sigmaIonEnergy", 10), number("ionExponent", 100),
-                number("oxySputterYield", 3), number("etchStopDepth", -1_000_000, minimum=-1_000_000)]},
+     "advanced": _plasma_advanced(PLASMA_FLAT_FIELDS, _FLAT_MAPPING_SF6),
+     "fields": list(PLASMA_FLAT_FIELDS)},
     {"id": "cf4o2", "label": "CF₄/O₂ 等离子体刻蚀", "nativeClass": "CF4O2Etching", "operation": "etch", "usesFlux": True,
      "optionalKeys": ["advanced"],
-     "advanced": {**deepcopy(_CF4O2_ADVANCED), "flatMapping": dict(_FLAT_MAPPING_CF4O2)},
-     "fields": [number("ionFlux", 1), number("etchantFlux", 1), number("oxygenFlux", 0.2), number("polymerFlux", 0.2),
-                number("meanIonEnergy", 100), number("sigmaIonEnergy", 10), number("ionExponent", 100),
-                number("oxySputterYield", 3), number("polySputterYield", 3), number("etchStopDepth", -1_000_000, minimum=-1_000_000)]},
+     "advanced": _cf4o2_advanced(),
+     "fields": list(CF4O2_FLAT_FIELDS)},
     {"id": "hbro2", "label": "HBr/O₂ 等离子体刻蚀", "nativeClass": "HBrO2Etching", "operation": "etch", "usesFlux": True,
      "optionalKeys": ["advanced"],
      # HBrO2Etching's native defaults differ from PlasmaEtchingParameters():
      # Substrate.A_ie/A_sp/Eth_sp are 5.0/0.5/30.0 instead of 7.0/0.0337/20.0.
-     "advanced": _plasma_advanced(_FLAT_MAPPING_SF6, {
+     "advanced": _plasma_advanced(PLASMA_FLAT_FIELDS, _FLAT_MAPPING_SF6, default_patches={
          "Substrate.A_ie": 5.0, "Substrate.A_sp": 0.5, "Substrate.Eth_sp": 30.0}),
-     "fields": [number("ionFlux", 1), number("etchantFlux", 1), number("oxygenFlux", 0.2),
-                number("meanIonEnergy", 100), number("sigmaIonEnergy", 10), number("ionExponent", 100),
-                number("oxySputterYield", 3), number("etchStopDepth", -1_000_000, minimum=-1_000_000)]},
+     "fields": list(PLASMA_FLAT_FIELDS)},
     {"id": "sf6c4f8", "label": "SF₆/C₄F₈ 等离子体刻蚀", "nativeClass": "SF6C4F8Etching", "operation": "etch", "usesFlux": True,
      "optionalKeys": ["advanced"],
-     # SF6C4F8Etching defaults to Ions.exponent=300 and passivationFlux=0
-     # instead of the parameter class defaults 500 and 100.
-     "advanced": _plasma_advanced(_FLAT_MAPPING_SF6C4F8,
-                                  {"Ions.exponent": 300.0, "passivationFlux": 0.0}),
-     "fields": [number("ionFlux", 1), number("etchantFlux", 1), number("meanEnergy", 100),
-                number("sigmaEnergy", 10), number("ionExponent", 300), number("etchStopDepth", -1_000_000, minimum=-1_000_000)]},
+     # SF6C4F8Etching has no passivation particle: its surface model
+     # dereferences a missing "passivationFlux" flux scalar when the value is
+     # positive (SIGSEGV). The model also does not read the Passivation block or
+     # beta_P, so those are absent from this model's allowlist.
+     "advanced": _plasma_advanced(
+         SF6C4F8_FLAT_FIELDS, _FLAT_MAPPING_SF6C4F8,
+         drop_blocks=("passivation",), drop_scalars=("passivationFlux",), drop_maps=("beta_P",),
+         rejected={"passivationFlux": "SF6C4F8Etching has no passivation particle; a positive value "
+                                     "dereferences a missing native flux scalar and can SIGSEGV"}),
+     "fields": list(SF6C4F8_FLAT_FIELDS)},
     {"id": "fluorocarbon", "label": "Fluorocarbon 等离子体刻蚀", "nativeClass": "FluorocarbonEtching", "operation": "etch", "usesFlux": True,
      "fields": [number("ionFlux", 1), number("etchantFlux", 1), number("polyFlux", 0.2),
                 number("k_ie", 2), number("k_ev", 2), number("delta_p", 1), number("temperature", 300),

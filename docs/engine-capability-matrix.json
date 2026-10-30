@@ -25,9 +25,9 @@
     3
   ],
   "summary": {
-    "advanced-parameter-or-output-not-exposed": 20,
+    "advanced-parameter-or-output-not-exposed": 12,
     "engine-model-not-exposed": 7,
-    "exposed": 51,
+    "exposed": 59,
     "internal-or-not-user-facing": 18
   },
   "classes": [
@@ -160,7 +160,7 @@
         "model:specialized/sf6o2 (schema 7)",
         "backend/specialized_models.py:sf6o2"
       ],
-      "notes": "Uses the flat 8-argument constructor; CoverageParameters.tolerance is fixed at 1e-3.",
+      "notes": "Flat 8-argument form by default; optional nativeParameters.advanced selects the PlasmaEtchingParameters overload (Ions/Mask/Passivation/Polymer/Substrate, maps). CoverageParameters.tolerance is fixed at 1e-3.",
       "members": {
         "exposed": [
           "ionFlux",
@@ -196,7 +196,7 @@
         "model:specialized/cf4o2 (schema 7)",
         "backend/specialized_models.py:cf4o2"
       ],
-      "notes": "The full CF4O2Parameters object is not reachable: only the flat 10-argument constructor. Unlike SF6O2/HBrO2 there is no defaultParameters() binding (getParameters() only), so native defaults cannot be read back without constructing the object.",
+      "notes": "Flat 10-argument form by default; optional nativeParameters.advanced selects the CF4O2Parameters overload (Ions/Mask/Passivation/Si/SiGe, gamma_*, fluxIncludeSticking).",
       "members": {
         "exposed": [
           "ionFlux",
@@ -232,7 +232,7 @@
         "model:specialized/hbro2 (schema 7)",
         "backend/specialized_models.py:hbro2"
       ],
-      "notes": "Exposes defaultParameters() and getParameters() like SF6O2; the workbench keeps the flat constructor so replayed runs never depend on native defaults.",
+      "notes": "Flat 8-argument form by default; advanced selects PlasmaEtchingParameters. HBrO2-specific Substrate defaults are preserved; Substrate.B_ie is not exposed.",
       "members": {
         "exposed": [
           "ionFlux",
@@ -264,7 +264,7 @@
         "model:specialized/sf6c4f8 (schema 7)",
         "backend/specialized_models.py:sf6c4f8"
       ],
-      "notes": "Exposes defaultParameters() and getParameters(); the workbench keeps the flat form for replay stability.",
+      "notes": "Flat 6-argument form by default; advanced selects PlasmaEtchingParameters. No passivation particle exists: passivation, passivationFlux and beta_P are deliberately rejected (positive passivationFlux SIGSEGVs).",
       "members": {
         "exposed": [
           "ionFlux",
@@ -813,27 +813,28 @@
       "docSummary": "Nested parameter object for SF6O2/HBrO2/SF6C4F8 plasma etching models.",
       "classification": "advanced-parameter-or-output-not-exposed",
       "exposedBy": [
-        "model:specialized/sf6o2, hbro2, sf6c4f8 (flat constructor subset only)"
+        "model:specialized/{sf6o2,hbro2,sf6c4f8} nativeParameters.advanced",
+        "backend/specialized_models.py:_plasma_advanced"
       ],
-      "notes": "Only reachable through the flat model constructors; no project can set the nested blocks today.",
+      "notes": "B1 exposes the nested families through nativeParameters.advanced with a strict per-model allowlist. Flat-only defaults are preserved when advanced is omitted; Substrate.B_ie and SF6C4F8 passivation are rejected.",
       "members": {
         "exposed": [
           "ionFlux",
           "etchantFlux",
-          "etchStopDepth",
-          "Ions.meanEnergy/sigmaEnergy/exponent/n_l/inflectAngle/minAngle"
-        ],
-        "notExposed": [
-          "beta_E",
-          "beta_P",
           "passivationFlux",
-          "rateFactors",
+          "etchStopDepth",
+          "Ions",
           "Mask",
           "Passivation",
           "Polymer",
           "Substrate",
-          "Ions.thetaRMin",
-          "Ions.thetaRMax"
+          "beta_E",
+          "beta_P",
+          "rateFactors"
+        ],
+        "notExposed": [
+          "Substrate.B_ie (declared but unused by the CPU surface model)",
+          "Passivation/beta_P on SF6C4F8 (no passivation particle)"
         ]
       },
       "partialExposure": true
@@ -848,15 +849,15 @@
       ],
       "constructor": "PlasmaEtchingParametersIons()",
       "docSummary": "Ion energy/angle distribution parameters.",
-      "classification": "advanced-parameter-or-output-not-exposed",
+      "classification": "exposed",
       "exposedBy": [],
-      "notes": "meanEnergy/sigmaEnergy/exponent/n_l/inflectAngle/minAngle are reachable through the flat constructor; the angular reflection bounds are not.",
+      "notes": "Exposed through nativeParameters.advanced for sf6o2/hbro2/sf6c4f8, with per-field ranges and flat-equivalent defaults where a flat field exists.",
       "members": {
-        "exposed": [],
-        "notExposed": [
+        "exposed": [
           "thetaRMin",
           "thetaRMax"
-        ]
+        ],
+        "notExposed": []
       }
     },
     {
@@ -869,17 +870,17 @@
       ],
       "constructor": "PlasmaEtchingParametersMask()",
       "docSummary": "Mask sputter parameters (A_sp, B_sp, Eth_sp, rho).",
-      "classification": "advanced-parameter-or-output-not-exposed",
+      "classification": "exposed",
       "exposedBy": [],
-      "notes": "Mask chemistry is compiled into the model defaults; no override path.",
+      "notes": "Exposed through nativeParameters.advanced for sf6o2/hbro2/sf6c4f8, with per-field ranges and flat-equivalent defaults where a flat field exists.",
       "members": {
-        "exposed": [],
-        "notExposed": [
+        "exposed": [
           "A_sp",
           "B_sp",
           "Eth_sp",
           "rho"
-        ]
+        ],
+        "notExposed": []
       }
     },
     {
@@ -892,15 +893,15 @@
       ],
       "constructor": "PlasmaEtchingParametersPassivation()",
       "docSummary": "Ion-enhanced passivation removal (A_ie, Eth_ie).",
-      "classification": "advanced-parameter-or-output-not-exposed",
+      "classification": "exposed",
       "exposedBy": [],
-      "notes": "Passivation removal is fixed at native defaults.",
+      "notes": "Exposed through nativeParameters.advanced for sf6o2/hbro2 (passivation particle present). SF6C4F8 rejects the block because it has no passivation particle.",
       "members": {
-        "exposed": [],
-        "notExposed": [
+        "exposed": [
           "A_ie",
           "Eth_ie"
-        ]
+        ],
+        "notExposed": []
       }
     },
     {
@@ -913,12 +914,11 @@
       ],
       "constructor": "PlasmaEtchingParametersPolymer()",
       "docSummary": "Polymer sputter yield and cos-theta coefficients.",
-      "classification": "advanced-parameter-or-output-not-exposed",
+      "classification": "exposed",
       "exposedBy": [],
-      "notes": "Relevant for polymerising CF4/O2 and C4F8 chemistries; entirely unreachable.",
+      "notes": "Exposed through nativeParameters.advanced for sf6o2/hbro2/sf6c4f8; the native surface model uses it for geometry containing Material::Polymer.",
       "members": {
-        "exposed": [],
-        "notExposed": [
+        "exposed": [
           "A_sp",
           "B_sp",
           "Eth_sp",
@@ -928,7 +928,8 @@
           "a4",
           "rho",
           "usePolyCosThetaYield"
-        ]
+        ],
+        "notExposed": []
       }
     },
     {
@@ -942,22 +943,26 @@
       "constructor": "PlasmaEtchingParametersSubstrate()",
       "docSummary": "Substrate ion/sputter yield parameters incl. beta_sigma/k_sigma.",
       "classification": "advanced-parameter-or-output-not-exposed",
-      "exposedBy": [],
-      "notes": "Substrate yield calibration is the main remaining physics knob for plasma models.",
+      "exposedBy": [
+        "model:specialized/{sf6o2,hbro2,sf6c4f8} nativeParameters.advanced"
+      ],
+      "notes": "Exposed through nativeParameters.advanced except the unused B_ie field; HBrO2-specific defaults are preserved.",
       "members": {
-        "exposed": [],
-        "notExposed": [
+        "exposed": [
           "A_ie",
           "A_sp",
-          "B_ie",
           "B_sp",
           "Eth_ie",
           "Eth_sp",
           "beta_sigma",
           "k_sigma",
           "rho"
+        ],
+        "notExposed": [
+          "B_ie (declared but unused by the CPU surface model)"
         ]
-      }
+      },
+      "partialExposure": true
     },
     {
       "className": "CF4O2Parameters",
@@ -971,30 +976,33 @@
       "docSummary": "Full CF4/O2 parameter object with surface-reaction gammas and material blocks.",
       "classification": "advanced-parameter-or-output-not-exposed",
       "exposedBy": [
-        "model:specialized/cf4o2 (flat constructor subset only)"
+        "model:specialized/cf4o2 nativeParameters.advanced",
+        "backend/specialized_models.py:_cf4o2_advanced"
       ],
-      "notes": "Chemically the richest unexposed surface model: 12 of 17 members are unreachable.",
+      "notes": "B1 exposes all consumed parameter families through nativeParameters.advanced; SiGe is limited to beta_sigma/k_sigma/rho because the native branch ignores the sputter/yield fields and x does not recompute k_sigma.",
       "members": {
         "exposed": [
           "ionFlux",
           "etchantFlux",
           "oxygenFlux",
           "polymerFlux",
-          "etchStopDepth"
-        ],
-        "notExposed": [
+          "etchStopDepth",
+          "Ions",
+          "Mask",
+          "Passivation",
+          "Si",
+          "SiGe",
           "gamma_C",
           "gamma_C_oxidized",
           "gamma_F",
           "gamma_F_oxidized",
           "gamma_O",
           "gamma_O_passivated",
-          "fluxIncludeSticking",
-          "Ions",
-          "Mask",
-          "Passivation",
-          "Si",
-          "SiGe"
+          "fluxIncludeSticking"
+        ],
+        "notExposed": [
+          "SiGe.A_ie/A_sp/Eth_ie/Eth_sp/x (ignored by the native SiGe branch)",
+          "SiGe.k_sigma_SiGe (method, not a parameter field)"
         ]
       },
       "partialExposure": true
@@ -1009,19 +1017,19 @@
       ],
       "constructor": "CF4O2ParametersIons()",
       "docSummary": "CF4/O2 ion distribution (no thetaR bounds in this family).",
-      "classification": "advanced-parameter-or-output-not-exposed",
+      "classification": "exposed",
       "exposedBy": [],
-      "notes": "Values only arrive via the flat model constructor.",
+      "notes": "Exposed through model:specialized/cf4o2 nativeParameters.advanced with per-field ranges.",
       "members": {
-        "exposed": [],
-        "notExposed": [
+        "exposed": [
           "exponent",
           "inflectAngle",
           "meanEnergy",
           "minAngle",
           "n_l",
           "sigmaEnergy"
-        ]
+        ],
+        "notExposed": []
       }
     },
     {
@@ -1034,16 +1042,16 @@
       ],
       "constructor": "CF4O2ParametersMask()",
       "docSummary": "CF4/O2 mask sputter parameters.",
-      "classification": "advanced-parameter-or-output-not-exposed",
+      "classification": "exposed",
       "exposedBy": [],
-      "notes": "No override path.",
+      "notes": "Exposed through model:specialized/cf4o2 nativeParameters.advanced with per-field ranges.",
       "members": {
-        "exposed": [],
-        "notExposed": [
+        "exposed": [
           "A_sp",
           "Eth_sp",
           "rho"
-        ]
+        ],
+        "notExposed": []
       }
     },
     {
@@ -1056,17 +1064,17 @@
       ],
       "constructor": "CF4O2ParametersPassivation()",
       "docSummary": "Carbon/oxygen ion-enhanced passivation removal.",
-      "classification": "advanced-parameter-or-output-not-exposed",
+      "classification": "exposed",
       "exposedBy": [],
-      "notes": "No override path.",
+      "notes": "Exposed through model:specialized/cf4o2 nativeParameters.advanced with per-field ranges.",
       "members": {
-        "exposed": [],
-        "notExposed": [
+        "exposed": [
           "A_C_ie",
           "A_O_ie",
           "Eth_C_ie",
           "Eth_O_ie"
-        ]
+        ],
+        "notExposed": []
       }
     },
     {
@@ -1079,12 +1087,11 @@
       ],
       "constructor": "CF4O2ParametersSi()",
       "docSummary": "Silicon substrate yields inside the CF4/O2 model.",
-      "classification": "advanced-parameter-or-output-not-exposed",
+      "classification": "exposed",
       "exposedBy": [],
-      "notes": "No override path.",
+      "notes": "Exposed through model:specialized/cf4o2 nativeParameters.advanced with per-field ranges.",
       "members": {
-        "exposed": [],
-        "notExposed": [
+        "exposed": [
           "A_ie",
           "A_sp",
           "Eth_ie",
@@ -1092,7 +1099,8 @@
           "beta_sigma",
           "k_sigma",
           "rho"
-        ]
+        ],
+        "notExposed": []
       }
     },
     {
@@ -1106,22 +1114,26 @@
       "constructor": "CF4O2ParametersSiGe()",
       "docSummary": "SiGe substrate yields (adds x and k_sigma_SiGe).",
       "classification": "advanced-parameter-or-output-not-exposed",
-      "exposedBy": [],
-      "notes": "SiGe etching through the CF4/O2 model is therefore not selectable.",
+      "exposedBy": [
+        "model:specialized/cf4o2 nativeParameters.advanced.siGe"
+      ],
+      "notes": "Only the three fields the native CF4O2 SiGe branch consumes are exposed; it is not a full SiGe yield editor.",
       "members": {
-        "exposed": [],
+        "exposed": [
+          "beta_sigma",
+          "k_sigma",
+          "rho"
+        ],
         "notExposed": [
           "A_ie",
           "A_sp",
           "Eth_ie",
           "Eth_sp",
-          "beta_sigma",
-          "k_sigma",
-          "k_sigma_SiGe",
-          "rho",
-          "x"
+          "x (ignored by the native SiGe branch; x only seeds k_sigma)",
+          "k_sigma_SiGe (method)"
         ]
-      }
+      },
+      "partialExposure": true
     },
     {
       "className": "FluorocarbonParameters",
@@ -2678,13 +2690,14 @@
         "CF4O2Parameters*"
       ],
       "risk": "high",
-      "notes": "Nine nested parameter blocks (Ions/Mask/Passivation/Polymer/Substrate/Si/SiGe plus gamma_* and fluxIncludeSticking) change the physics substantially and have no workbench evidence yet.",
+      "notes": "Implemented by the optional nativeParameters.advanced object plus the parameter-object overloads. The allowlist is the native-consumed subset: inert SiGe fields, Substrate.B_ie, and the SF6C4F8 passivation family are rejected. Advanced defaults for flat-shared fields equal the flat catalog defaults; model-specific native defaults and per-material maps are recorded in run metadata.",
       "acceptanceCriteria": [
-        "An optional nativeParameters.advanced object is accepted per plasma model with a strict per-model allowlist; unknown keys are rejected.",
+        "An optional nativeParameters.advanced object is accepted per plasma model with a strict per-model allowlist; unknown/inert keys are rejected.",
         "Omitting the object leaves the request hash of every existing project unchanged.",
-        "Defaults read back equal to the native defaults for each block (recorded in the run evidence).",
-        "A golden run with two changed sub-parameters matches a direct native reference within 1e-6 um and is archived as evidence before the UI shows the fields."
-      ]
+        "Advanced defaults for flat-shared fields equal the flat catalog defaults; native-only defaults are read back and recorded in run metadata.",
+        "2D and 3D golden runs for sf6o2, hbro2, sf6c4f8 and a cf4o2 SiGe case match independent native references within 1e-6 um; archived docs evidence is still pending."
+      ],
+      "status": "implemented-backend-api"
     },
     {
       "id": "B2",

@@ -19,8 +19,11 @@ def _read_native_values(params: Any, spec: dict[str, Any], material_handle: Any,
     values: dict[str, Any] = {"blocks": {}, "scalars": {}, "maps": {}}
     for name, block in spec["blocks"].items():
         native = getattr(params, block["native"])
-        values["blocks"][name] = {field["key"]: float(getattr(native, field["key"]))
-                                  for field in block["fields"]}
+        values["blocks"][name] = {
+            field["key"]: (bool(getattr(native, field["key"])) if field["kind"] == "boolean"
+                           else float(getattr(native, field["key"])))
+            for field in block["fields"]
+        }
     for field in spec["scalars"]:
         value = getattr(params, field["key"])
         values["scalars"][field["key"]] = value if field["kind"] == "boolean" else float(value)
@@ -50,9 +53,10 @@ def _build_plasma_model(ps: Any, model_id: str, spec: dict[str, Any], parameters
     Without ``advanced`` this is exactly the pre-existing flat float overload.
     With ``advanced`` the flat model is built first, its model-owned
     ``getParameters()`` object is used as the base (preserving each model's
-    native defaults such as HBrO2's Substrate values and SF6C4F8's zero
-    passivation flux), the flat values are applied explicitly, then the
-    validated advanced overrides, and the parameter-object overload is called.
+    native defaults such as HBrO2's Substrate values and SF6C4F8's
+    non-passivating defaults), the flat values are applied explicitly, then
+    the validated advanced overrides, and the parameter-object overload is
+    called. Model-specific rejected keys are checked before any native call.
     """
     native_class = getattr(ps, spec["nativeClass"])
     flat_args = tuple(float(parameters[key]) for key in flat_keys)
@@ -68,6 +72,10 @@ def _build_plasma_model(ps: Any, model_id: str, spec: dict[str, Any], parameters
     allowed_blocks = advanced_schema["blocks"]
     allowed_scalars = {field["key"]: field for field in advanced_schema["scalars"]}
     allowed_maps = {row["key"]: row for row in advanced_schema["maps"]}
+    rejected = advanced_schema.get("rejectedKeys", {})
+    if rejected_keys := sorted(set(advanced) & set(rejected)):
+        raise RuntimeError(f"{model_id} advanced.{rejected_keys[0]} is not supported: "
+                           f"{rejected[rejected_keys[0]]}")
     unknown = sorted(set(advanced) - set(allowed_blocks) - set(allowed_scalars) - set(allowed_maps))
     if unknown:
         raise RuntimeError(f"{model_id} advanced native parameters contain unknown keys {unknown}")

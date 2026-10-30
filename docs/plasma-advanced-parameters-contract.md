@@ -6,14 +6,8 @@ render it later.
 
 ## 1. Why this exists
 
-`worker/specialized.py` historically called the flat float overloads:
-
-```python
-ps.SF6O2Etching(ionFlux, etchantFlux, oxygenFlux, meanIonEnergy, sigmaIonEnergy,
-                ionExponent, oxySputterYield, etchStopDepth)
-```
-
-ViennaPS 4.6.2 also binds the parameter-object overloads:
+`worker/specialized.py` historically called the flat float overloads. ViennaPS
+4.6.2 also binds the parameter-object overloads:
 
 | model | parameter class | constructor |
 |---|---|---|
@@ -22,10 +16,9 @@ ViennaPS 4.6.2 also binds the parameter-object overloads:
 | `sf6c4f8` | `PlasmaEtchingParameters` | `ps.SF6C4F8Etching(parameters)` |
 | `cf4o2` | `CF4O2Parameters` | `ps.CF4O2Etching(parameters)` |
 
-The nested families (`Ions`, `Mask`, `Passivation`, `Polymer`, `Substrate`,
-`Si`, `SiGe`, `gamma_*`, `fluxIncludeSticking`, material maps) were previously
-unreachable. They are now exposed through an optional, strict
-`nativeParameters.advanced` object.
+The nested parameter families are exposed through an optional, strict
+`nativeParameters.advanced` object. The allowlist is the subset the installed
+CPU models actually read, not every member of the native structs.
 
 ## 2. Payload shape
 
@@ -61,115 +54,167 @@ Rules:
 * `advanced` is accepted only for `sf6o2`, `cf4o2`, `hbro2`, and `sf6c4f8`.
   Other specialized models reject the key.
 * Unknown top-level blocks, unknown nested fields, wrong JSON types, non-finite
-  numbers, and out-of-range numbers are rejected; nothing is silently dropped.
+  numbers, astronomically large integers, and out-of-range numbers are
+  rejected; nothing is silently dropped.
 * Nested numbers use native units. Angles are **radians** (the installed
   `Ions.minAngle/inflectAngle/thetaRMin/thetaRMax` are radians), not degrees.
+* `beta_*` maps are sticking probabilities in `[0, 1]`; `gamma_*` maps are also
+  in `[0, 1]`. `rateFactors` is a non-negative multiplier in `[0, 1e6]`.
 
 ## 3. Exact exposed schema
 
-### 3.1 `sf6o2`, `hbro2` — `PlasmaEtchingParameters`
+Each advanced field carries `defaultSource`:
 
-Same block/field allowlist. Defaults differ only where noted in §4.
+* `"flat"` — the field has a flat equivalent and the published default equals
+  the flat catalog default; `flatKey` names that flat field. Materialising the
+  catalog into `advanced` therefore cannot change behaviour.
+* `"nativeParameterClass"` — no flat equivalent; the default is the installed
+  parameter-class/model default.
+* `"nativeMaterialMap"` — a `MaterialValueMap`; `default` is the map fallback,
+  and per-material native defaults are model-specific and recorded at run time.
+
+### 3.1 `sf6o2` — `PlasmaEtchingParameters`
 
 ```text
 advanced.ions
-  meanEnergy        0 .. 1e6        default 100
-  sigmaEnergy       0 .. 1e6        default 10
-  exponent          0 .. 1e6        default 500
-  n_l               0 .. 1e6        default 10
-  minAngle          0 .. pi rad     default 1.3962634
-  inflectAngle      0 .. pi rad     default 1.55334303
-  thetaRMin         0 .. pi rad     default 1.2217304763960306
-  thetaRMax         0 .. pi rad     default 1.5707963267948966
+  meanEnergy        0 .. 1e6        default 100    flat: meanIonEnergy
+  sigmaEnergy       0 .. 1e6        default 10     flat: sigmaIonEnergy
+  exponent          0 .. 1e6        default 100    flat: ionExponent
+  n_l               0 .. 1e6        default 10     native
+  minAngle          0 .. pi rad     default 1.3962634       native
+  inflectAngle      0 .. pi rad     default 1.55334303      native
+  thetaRMin         0 .. pi rad     default 1.2217304763960306 native
+  thetaRMax         0 .. pi rad     default 1.5707963267948966 native
 
 advanced.mask
-  A_sp              0 .. 1e6        default 0.0139
-  B_sp              0 .. 1e6        default 9.3
-  Eth_sp            0 .. 1e6        default 20
-  rho               1e-6 .. 1e6     default 500
+  A_sp              0 .. 1e6        default 0.0139 native
+  B_sp              0 .. 1e6        default 9.3    native
+  Eth_sp            0 .. 1e6        default 20     native
+  rho               1e-6 .. 1e6     default 500    native
 
 advanced.passivation
-  A_ie              0 .. 1e6        default 3
-  Eth_ie            0 .. 1e6        default 10
+  A_ie              0 .. 1e6        default 3      flat: oxySputterYield
+  Eth_ie            0 .. 1e6        default 10     native
 
 advanced.polymer
-  A_sp              0 .. 1e6        default 0.02
-  B_sp              0 .. 1e6        default 8.5
-  Eth_sp            0 .. 1e6        default 15
-  rho               1e-6 .. 1e6     default 5
-  a1                -1e6 .. 1e6     default -0.26
-  a2                -1e6 .. 1e6     default 2.72
-  a3                -1e6 .. 1e6     default -4.3
-  a4                -1e6 .. 1e6     default 1.95
-  usePolyCosThetaYield  boolean    default false
+  A_sp              0 .. 1e6        default 0.02   native
+  B_sp              0 .. 1e6        default 8.5    native
+  Eth_sp            0 .. 1e6        default 15     native
+  rho               1e-6 .. 1e6     default 5      native
+  a1                -1e6 .. 1e6     default -0.26  native
+  a2                -1e6 .. 1e6     default 2.72   native
+  a3                -1e6 .. 1e6     default -4.3   native
+  a4                -1e6 .. 1e6     default 1.95   native
+  usePolyCosThetaYield  boolean    default false  native
 
 advanced.substrate
-  A_ie              0 .. 1e6        default 7
-  A_sp              0 .. 1e6        default 0.0337
-  B_ie              0 .. 1e6        default 0.8
-  B_sp              0 .. 1e6        default 9.3
-  Eth_ie            0 .. 1e6        default 15
-  Eth_sp            0 .. 1e6        default 20
-  beta_sigma        0 .. 1e6        default 0.04
-  k_sigma           0 .. 1e6        default 300
-  rho               1e-6 .. 1e6     default 5.02
+  A_ie              0 .. 1e6        default 7      native
+  A_sp              0 .. 1e6        default 0.0337 native
+  B_sp              0 .. 1e6        default 9.3    native
+  Eth_ie            0 .. 1e6        default 15     native
+  Eth_sp            0 .. 1e6        default 20     native
+  beta_sigma        0 .. 1e6        default 0.04   native
+  k_sigma           0 .. 1e6        default 300    native
+  rho               1e-6 .. 1e6     default 5.02   native
+  # Substrate.B_ie exists in the native struct but is unused by the CPU model
 
-advanced.passivationFlux   0 .. 1e6   default 100
+advanced.passivationFlux   0 .. 1e6   default 0.2   flat: oxygenFlux
 
-advanced.beta_E      map {default 1, byMaterial {material: value}}  0 .. 1e6
-advanced.beta_P      map {default 1, byMaterial {material: value}}  0 .. 1e6
+advanced.beta_E      map {default 1, byMaterial {material: value}}  0 .. 1
+advanced.beta_P      map {default 1, byMaterial {material: value}}  0 .. 1
 advanced.rateFactors map {default 1, byMaterial {material: value}}  0 .. 1e6
 ```
 
-The flat fields already expose the top-level `ionFlux`, `etchantFlux`,
-`etchStopDepth` and (for `sf6o2`/`hbro2`) `oxygenFlux`; they are deliberately
-not duplicated in `advanced`. `advanced.passivationFlux` is the native top-level
-name and, when present, is applied after `oxygenFlux`.
+### 3.2 `hbro2` — `PlasmaEtchingParameters`
 
-### 3.2 `cf4o2` — `CF4O2Parameters`
+Same block/field allowlist and flat mappings as `sf6o2`. Model-specific native
+defaults differ only in the substrate block:
+
+```text
+advanced.substrate.A_ie      default 5    (sf6o2: 7)
+advanced.substrate.A_sp      default 0.5  (sf6o2: 0.0337)
+advanced.substrate.Eth_sp    default 30   (sf6o2: 20)
+```
+
+`ions.meanEnergy=100`, `ions.sigmaEnergy=10`, `ions.exponent=100`,
+`passivation.A_ie=3`, and `passivationFlux=0.2` match the workbench flat
+defaults. `beta_E` per-material native defaults are 0.1 for Si/Mask in HBrO2.
+
+### 3.3 `sf6c4f8` — `PlasmaEtchingParameters`
 
 ```text
 advanced.ions
-  meanEnergy        0 .. 1e6        default 100
-  sigmaEnergy       0 .. 1e6        default 10
-  exponent          0 .. 1e6        default 500
-  n_l               0 .. 1e6        default 10
-  minAngle          0 .. pi rad     default 1.3962634
-  inflectAngle      0 .. pi rad     default 1.55334303
-  # thetaRMin/thetaRMax do not exist on CF4O2ParametersIons
+  meanEnergy        0 .. 1e6        default 100    flat: meanEnergy
+  sigmaEnergy       0 .. 1e6        default 10     flat: sigmaEnergy
+  exponent          0 .. 1e6        default 300    flat: ionExponent
+  n_l               0 .. 1e6        default 10     native
+  minAngle          0 .. pi rad     default 1.3962634       native
+  inflectAngle      0 .. pi rad     default 1.55334303      native
+  thetaRMin         0 .. pi rad     default 1.2217304763960306 native
+  thetaRMax         0 .. pi rad     default 1.5707963267948966 native
+
+advanced.mask      (same as sf6o2: A_sp, B_sp, Eth_sp, rho)
+advanced.polymer   (same as sf6o2)
+advanced.substrate (same fields/values as sf6o2, no B_ie)
+
+advanced.beta_E      map {default 1, byMaterial {material: value}}  0 .. 1
+advanced.rateFactors map {default 1, byMaterial {material: value}}  0 .. 1e6
+```
+
+**No passivation family is exposed.** `SF6C4F8Etching` creates no passivation
+particle. Its native surface model still tests `params.passivationFlux > 0`
+and then dereferences the missing `"passivationFlux"` flux scalar, which
+SIGSEGVs. Therefore:
+
+* `advanced.passivationFlux` is rejected with an explicit error;
+* `advanced.passivation` is not in the allowlist;
+* `advanced.beta_P` is not in the allowlist.
+
+The `polymer` block remains exposed because the native surface model has a
+real `Material::Polymer` sputter branch, even though this model does not
+deposit polymer itself.
+
+### 3.4 `cf4o2` — `CF4O2Parameters`
+
+```text
+advanced.ions
+  meanEnergy        0 .. 1e6        default 100    flat: meanIonEnergy
+  sigmaEnergy       0 .. 1e6        default 10     flat: sigmaIonEnergy
+  exponent          0 .. 1e6        default 100    flat: ionExponent
+  n_l               0 .. 1e6        default 10     native
+  minAngle          0 .. pi rad     default 1.3962634  native
+  inflectAngle      0 .. pi rad     default 1.55334303 native
+  # no thetaRMin/thetaRMax in CF4O2ParametersIons
 
 advanced.mask
-  A_sp              0 .. 1e6        default 0.0139
-  Eth_sp            0 .. 1e6        default 20
-  rho               1e-6 .. 1e6     default 500
-  # B_sp does not exist on CF4O2ParametersMask
+  A_sp              0 .. 1e6        default 0.0139 native
+  Eth_sp            0 .. 1e6        default 20     native
+  rho               1e-6 .. 1e6     default 500    native
+  # no B_sp in CF4O2ParametersMask
 
 advanced.passivation
-  A_C_ie            0 .. 1e6        default 3
-  A_O_ie            0 .. 1e6        default 3
-  Eth_C_ie          0 .. 1e6        default 10
-  Eth_O_ie          0 .. 1e6        default 10
+  A_O_ie            0 .. 1e6        default 3      flat: oxySputterYield
+  A_C_ie            0 .. 1e6        default 3      flat: polySputterYield
+  Eth_O_ie          0 .. 1e6        default 10     native
+  Eth_C_ie          0 .. 1e6        default 10     native
 
 advanced.si
-  A_ie              0 .. 1e6        default 7
-  A_sp              0 .. 1e6        default 0.0337
-  Eth_ie            0 .. 1e6        default 15
-  Eth_sp            0 .. 1e6        default 20
-  beta_sigma        0 .. 1e6        default 0.04
-  k_sigma           0 .. 1e6        default 300
-  rho               1e-6 .. 1e6     default 5.02
+  A_ie              0 .. 1e6        default 7      native
+  A_sp              0 .. 1e6        default 0.0337 native
+  Eth_ie            0 .. 1e6        default 15     native
+  Eth_sp            0 .. 1e6        default 20     native
+  beta_sigma        0 .. 1e6        default 0.04   native
+  k_sigma           0 .. 1e6        default 300    native
+  rho               1e-6 .. 1e6     default 5.02   native
 
 advanced.siGe
-  A_ie              0 .. 1e6        default 6.5
-  A_sp              0 .. 1e6        default 0.03
-  Eth_ie            0 .. 1e6        default 14
-  Eth_sp            0 .. 1e6        default 18
-  beta_sigma        0 .. 1e6        default 0.04
-  k_sigma           0 .. 1e6        default 345.168420976798
-  rho               1e-6 .. 1e6     default 4.84
-  x                 0 .. 1            default 0.3
+  beta_sigma        0 .. 1e6        default 0.04   native
+  k_sigma           0 .. 1e6        default 345.168420976798 native
+  rho               1e-6 .. 1e6     default 4.84   native
+  # A_ie/A_sp/Eth_ie/Eth_sp are ignored by the native SiGe branch;
+  # x only seeds the initial k_sigma default and does not recompute k_sigma.
 
-advanced.fluxIncludeSticking   boolean   default false
+advanced.fluxIncludeSticking   boolean   default false   native
 
 advanced.gamma_C             map {default 1, byMaterial {material: value}}  0 .. 1
 advanced.gamma_C_oxidized    map {default 1, byMaterial {material: value}}  0 .. 1
@@ -179,30 +224,31 @@ advanced.gamma_O             map {default 1, byMaterial {material: value}}  0 ..
 advanced.gamma_O_passivated  map {default 1, byMaterial {material: value}}  0 .. 1
 ```
 
-`CF4O2ParametersSiGe.k_sigma_SiGe(x)` is a method, not a parameter field, so it
-is not exposed. Set `advanced.siGe.k_sigma` directly.
+`gamma_*` maps are read by the native etchant/oxygen/polymer particles only
+when `fluxIncludeSticking=true`; the fields remain exposed because they are
+active in that mode. `CF4O2ParametersSiGe.k_sigma_SiGe(x)` is a method, not a
+field, so it is not exposed.
 
-Cross-model blocks are rejected (for example `polymer`, `substrate`, `beta_E`,
-`passivationFlux`, or `ions.thetaRMin` under `cf4o2`, and `si`, `siGe`,
-`gamma_*`, or `fluxIncludeSticking` under the `PlasmaEtchingParameters` models).
+## 4. How defaults are derived
 
-## 4. Native defaults are per model, not per parameter class
+For fields shared with a flat field, the catalog default is the **flat catalog
+default** the worker already sends, not the C++ parameter-class default:
 
-The installed binding does not use one set of defaults for a shared class. The
-catalog and the run metadata record the effective model defaults:
+| shared field | flat source | advanced default |
+|---|---|---|
+| `ions.meanEnergy` | `meanIonEnergy` | 100 |
+| `ions.sigmaEnergy` | `sigmaIonEnergy` | 10 |
+| `ions.exponent` | `ionExponent` | 100 (`sf6o2`/`hbro2`/`cf4o2`), 300 (`sf6c4f8`) |
+| `passivation.A_ie` | `oxySputterYield` | 3 (`sf6o2`/`hbro2`) |
+| `passivation.A_O_ie` | `oxySputterYield` | 3 (`cf4o2`) |
+| `passivation.A_C_ie` | `polySputterYield` | 3 (`cf4o2`) |
+| `passivationFlux` | `oxygenFlux` | 0.2 (`sf6o2`/`hbro2`; removed for `sf6c4f8`) |
 
-| model | deviation from `PlasmaEtchingParameters()` / `CF4O2Parameters()` |
-|---|---|
-| `sf6o2` | none |
-| `hbro2` | `Substrate.A_ie=5` (not 7), `Substrate.A_sp=0.5` (not 0.0337), `Substrate.Eth_sp=30` (not 20) |
-| `sf6c4f8` | `Ions.exponent=300` (not 500), `passivationFlux=0` (not 100) |
-| `cf4o2` | none in the exposed fields |
-
-The per-material defaults of `beta_E`, `beta_P`, `rateFactors` and the
-`gamma_*` maps also depend on the model (for example `beta_E[Si]` is 0.7 for
-`sf6o2`, 0.1 for `hbro2`, and `gamma_F[Si]` is 0.7 for `cf4o2`). They are not
-guessed from the generic class default; the runtime metadata records the
-actual per-material readback.
+Thus `sf6o2`/`hbro2` expose `ions.exponent=100` and
+`passivationFlux=0.2`, not the raw class defaults 500/100. `cf4o2` exposes
+`ions.exponent=100`, not 500. Native-only fields keep the model's installed
+default; HBrO2's substrate overrides and the per-material map defaults are
+recorded in run metadata.
 
 ## 5. Native construction path
 
@@ -220,7 +266,7 @@ With `advanced`:
 nativeParameters.advanced present
   -> flat_model = ps.<Model>(*flat_values)      # same flat overload
   -> params = flat_model.getParameters()        # model-owned parameter object
-  -> re-apply every flat field through the documented flatMapping
+  -> re-apply every flat field through flatMapping
   -> snapshot defaults                         # before advanced overrides
   -> apply validated advanced blocks/scalars/maps
   -> model = ps.<Model>(params)                 # parameter-object overload
@@ -230,8 +276,8 @@ nativeParameters.advanced present
 
 The flat model is used as the base instead of constructing a fresh
 `PlasmaEtchingParameters()`/`CF4O2Parameters()` because the flat overloads
-install model-specific values (see §4) and per-material map values. Using a
-fresh parameter class would silently change physics for HBrO2 and SF6C4F8.
+install model-specific values and per-material map values. Using a fresh
+parameter class would silently change physics for HBrO2 and SF6C4F8.
 
 Flat-to-native mapping (also recorded in metadata as `flatMapping`):
 
@@ -264,12 +310,25 @@ Flat-to-native mapping (also recorded in metadata as `flatMapping`):
 
 The installed binding returns `getParameters()` as a reference into the model;
 the flat model must stay alive until the final constructor has consumed it.
-This is why the worker keeps `flat_model` in scope until after
-`ps.<Model>(params)`. A controlled probe also showed that passing
+A controlled probe also showed that passing
 `ps.<Model>.defaultParameters()` directly into the parameter-object constructor
 can leave `Ions.thetaRMax` uninitialized, so that overload is not used.
 
-## 6. Run metadata
+## 6. What each model consumes
+
+| model | consumed advanced families | deliberately absent |
+|---|---|---|
+| `sf6o2` | ions, mask, passivation, polymer, substrate, `passivationFlux`, `beta_E`, `beta_P`, `rateFactors` | `Substrate.B_ie` (native struct field unused by CPU model) |
+| `hbro2` | same as `sf6o2` | `Substrate.B_ie` |
+| `sf6c4f8` | ions, mask, polymer, substrate, `beta_E`, `rateFactors` | `passivation`, `passivationFlux`, `beta_P` (no passivation particle; positive flux SIGSEGVs), `Substrate.B_ie` |
+| `cf4o2` | ions, mask, passivation, Si, SiGe (`beta_sigma`/`k_sigma`/`rho` only), `fluxIncludeSticking`, `gamma_*` maps | SiGe `A_ie`/`A_sp`/`Eth_ie`/`Eth_sp`/`x` (ignored by native SiGe branch), `k_sigma_SiGe` method |
+
+`sf6o2`/`hbro2` create the passivation particle only when
+`passivationFlux > 0`; the `passivation` block and `beta_P` affect physics in
+that mode. `polymer` affects only geometry containing `Material::Polymer`.
+`gamma_*` affects sticking only when `fluxIncludeSticking=true`.
+
+## 7. Run metadata
 
 For every run that contains `advanced`, `execution.nativeModel` (and the
 per-step `actualParameters.nativeModel`) contains:
@@ -287,50 +346,59 @@ per-step `actualParameters.nativeModel`) contains:
 }
 ```
 
-`defaults` is the flat-path native value before any advanced override;
-`effective` is what the constructed model received. Maps record `default` and
-the per-material values for the catalog materials supplied to the worker; if a
-name cannot be resolved by the native `MaterialRegistry`, it is listed in
-`unresolvedMaterialNames` instead of being silently omitted.
+`defaults` is the flat-path value before any advanced override; `effective` is
+what the constructed model received. JSON booleans stay booleans in metadata
+(for example `polymer.usePolyCosThetaYield` and
+`cf4o2.fluxIncludeSticking`); block booleans are not coerced to `1.0/0.0`.
+Maps record `default` and per-material values; unresolved native registry names
+are listed in `unresolvedMaterialNames`.
 
-## 7. Validation
+## 8. Validation
 
 `backend/validation.py` enforces the same schema used by the worker:
 
 * `advanced` must be a JSON object for one of the four plasma models;
 * unknown top-level keys, unknown block keys, and unknown map keys are errors;
+* explicitly rejected keys produce a model-specific message
+  (`sf6c4f8.advanced.passivationFlux`);
 * numbers must be finite JSON numbers inside the published range; booleans must
-  be JSON booleans (no `0`/`1` coercion);
+  be JSON booleans (no `0`/`1` coercion); huge integers that overflow
+  `float()` are rejected as non-finite;
 * `thetaRMin <= thetaRMax` and `minAngle <= inflectAngle` are enforced for the
   `PlasmaEtchingParameters` ion block;
 * `byMaterial` keys must name installed catalog materials (custom materials and
   the `Polymer` pseudo-material are not accepted here);
 * existing flat-field validation is untouched and still runs first;
-* the worker re-checks the allowlist and raises if it is asked to set a member
-  that the schema does not describe (no silent fallback).
+* the worker re-checks the allowlist/rejected keys and raises if it is asked to
+  set a member that the schema does not describe (no silent fallback).
 
-## 8. Evidence and limitations
+## 9. Evidence and limitations
 
 `tests/test_plasma_advanced.py` pins:
 
 * the eight pre-B1 request hashes are unchanged when `advanced` is omitted;
-* the catalog schema equals the introspected installed members (including the
-  absence of `thetaR*`/`B_sp` under CF4O2 and the presence of every family);
-* catalog defaults equal the flat overload's native defaults for each model;
+* the catalog schema equals the native-consumed subset, including the rejected
+  inert fields (`SiGe` extras, `Substrate.B_ie`, SF6C4F8 passivation family);
+* advanced defaults equal the effective flat defaults for shared fields and the
+  installed native defaults for native-only fields;
 * empty `advanced` reconstructs the flat path with identical values;
-* 2D **and** 3D golden runs with `ions.meanEnergy=60` and `substrate.A_ie=4`
-  match an independently constructed native reference within `1e-6 um`
-  (observed difference: 0.0), while differing from the default run;
-* unknown key, cross-model block, type, range, and material-name negatives;
+* 2D **and** 3D golden runs for `sf6o2`, `hbro2`, `sf6c4f8`, and a SiGe
+  `cf4o2` case match an independently constructed native reference within
+  `1e-6 um`, while differing from the corresponding no-advanced run;
+* run-level map/scalar/boolean overrides (`beta_E`, `rateFactors`, `gamma_F`,
+  `fluxIncludeSticking`, `usePolyCosThetaYield`) and the CF4O2 SiGe
+  `k_sigma`/`rho` path;
+* unknown key, inert/cross-model block, type, range, angle, material, huge
+  integer, and SF6C4F8 passivation-flux negatives (including the worker guard);
 * save/reopen, run metadata, replay-project round-trip, and replay execution.
 
 Limitations:
 
 * No custom materials: the built-in plasma models have no verified parameter
   rows for custom materials, so existing validation still rejects them.
-* The gamma/beta map *per-material* native defaults are not statically listed in
-  the catalog; they are model-specific and are recorded at run time.
-* `docs/*-evidence/` is not modified by this task, so the B1 acceptance "archived
-  evidence" step remains open even though the automated golden comparison is in
-  the test suite.
+* The gamma/beta map per-material native defaults are not statically listed in
+  the catalog; they are model-specific and recorded at run time.
+* `docs/*-evidence/` is not modified by this task, so the B1 acceptance
+  “archived evidence” step remains open even though the automated golden
+  comparison is in the test suite.
 * This is a backend/API contract only; no frontend field is exposed.

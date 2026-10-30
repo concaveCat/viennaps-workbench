@@ -19,9 +19,9 @@ behaviour changed.
 
 | Classification | Meaning | Count |
 | --- | --- | --- |
-| `exposed` | Reachable from a submitted project today, with its user-facing parameters | 51 |
+| `exposed` | Reachable from a submitted project today, with its user-facing parameters | 59 |
 | `engine-model-not-exposed` | A real native process model with no step, catalog entry or API field | 7 |
-| `advanced-parameter-or-output-not-exposed` | Only a strict subset is reachable, or the object is output-only | 20 |
+| `advanced-parameter-or-output-not-exposed` | Only a strict subset is reachable, or the object is output-only | 12 |
 | `internal-or-not-user-facing` | Native plumbing, base classes, callbacks, writer/enum utilities | 18 |
 | `absent-in-engine` | Not in ViennaPS at all; SPX (Sentaurus Process Explorer) reference only | 8 rows in `spxOnly` |
 
@@ -39,10 +39,10 @@ what the docstring implies. Empty `dimensions` means the class never sees a doma
 | `SingleParticleProcess` | `model: singleParticle` | 2/3 | CPU_DISK / GPU_DISK, explicit seed + `raysPerPoint` |
 | `DirectionalProcess` | `model: directional` (schema 5+) | 2/3 | single-velocity overload only |
 | `MultiParticleProcess` | `model: multiParticle` (schema 7) | 2/3 | declarative ion/neutral species + linear rate coefficients |
-| `SF6O2Etching` | `specialized/sf6o2` | 2/3 | flat 8-argument form + fixed coverage tolerance |
-| `CF4O2Etching` | `specialized/cf4o2` | 2/3 | flat 10-argument form |
-| `HBrO2Etching` | `specialized/hbro2` | 2/3 | flat 8-argument form |
-| `SF6C4F8Etching` | `specialized/sf6c4f8` | 2/3 | flat 6-argument form |
+| `SF6O2Etching` | `specialized/sf6o2` | 2/3 | flat 8-argument form or `advanced` → `PlasmaEtchingParameters`; fixed coverage tolerance |
+| `CF4O2Etching` | `specialized/cf4o2` | 2/3 | flat 10-argument form or `advanced` → `CF4O2Parameters` |
+| `HBrO2Etching` | `specialized/hbro2` | 2/3 | flat 8-argument form or `advanced` → `PlasmaEtchingParameters` |
+| `SF6C4F8Etching` | `specialized/sf6c4f8` | 2/3 | flat 6-argument form or `advanced` → `PlasmaEtchingParameters`; no passivation family |
 | `FluorocarbonEtching` | `specialized/fluorocarbon` | 2/3 | full per-material parameter table |
 | `IonBeamEtching` | `specialized/ionBeam` | 2/3 | full `IBEParameters` + cos⁴ yield + redeposition |
 | `WetEtching` | `specialized/wetEtch` | 2/3 | both constructor overloads behind `useCrystallineRates` |
@@ -60,6 +60,26 @@ what the docstring implies. Empty `dimensions` means the class never sees a doma
 `IBEParameters`, `IBEParametersCos4Yield`, `NeutralTransportParameters`, `SingleParticleALDParams`,
 `AtomicLayerProcessParameters`.
 
+### Plasma sub-parameter families (B1, exposed)
+
+The four plasma models accept optional `nativeParameters.advanced`. The
+allowlist is the subset the installed CPU models actually consume:
+
+| Class | Exposed through `advanced` | Still not exposed |
+| --- | --- | --- |
+| `PlasmaEtchingParameters` | `Ions`, `Mask`, `Passivation` (SF6O2/HBrO2), `Polymer`, `Substrate`, `beta_E`, `beta_P` (SF6O2/HBrO2), `rateFactors`, `passivationFlux` (SF6O2/HBrO2) | `Substrate.B_ie` (native struct field unused by the CPU surface model); SF6C4F8 `passivation`/`passivationFlux`/`beta_P` (no passivation particle; positive flux SIGSEGVs) |
+| `PlasmaEtchingParametersIons/Mask/Passivation/Polymer` | all consumed fields, including `thetaRMin`/`thetaRMax` for the Plasma family | — |
+| `PlasmaEtchingParametersSubstrate` | `A_ie`, `A_sp`, `B_sp`, `Eth_ie`, `Eth_sp`, `beta_sigma`, `k_sigma`, `rho` | `B_ie` (unused) |
+| `CF4O2Parameters` | `Ions`, `Mask`, `Passivation`, `Si`, `SiGe`, all `gamma_*`, `fluxIncludeSticking` | `SiGe.A_ie/A_sp/Eth_ie/Eth_sp/x` (ignored by the native SiGe branch); `k_sigma_SiGe` is a method |
+| `CF4O2ParametersIons/Mask/Passivation/Si` | all fields | — |
+| `CF4O2ParametersSiGe` | `beta_sigma`, `k_sigma`, `rho` | the sputter/yield fields and `x`; use `k_sigma` directly |
+
+Advanced defaults are documented in
+[`plasma-advanced-parameters-contract.md`](plasma-advanced-parameters-contract.md).
+Fields shared with flat inputs use the flat catalog defaults (for example
+`ions.exponent=100`, `passivationFlux=0.2`); native-only fields are labelled
+`nativeParameterClass`/`nativeMaterialMap`.
+
 ### Near-complete solver objects
 
 `AdvectionParameters` (10/11 members; `integrationScheme` missing) and `RayTracingParameters`
@@ -67,7 +87,7 @@ what the docstring implies. Empty `dimensions` means the class never sees a doma
 
 ### Geometry, output and material surface
 
-(51 `exposed` rows in the matrix overall, including the 18 models above.)
+(59 `exposed` rows in the matrix overall, including the 18 models above.)
 
 `MakePlane`, `MakeTrench`, `MakeHole` (`FULL` only), `MakeFin` (native + boolean construction),
 multi-layer `stack` (composed from `MakePlane` + `GeometryFactory`), `GeometryFactory`,
@@ -97,14 +117,10 @@ custom material catalog.
 
 | Native class | Reachable subset | Missing | Why it matters |
 | --- | --- | --- | --- |
-| `PlasmaEtchingParameters` | `ionFlux`, `etchantFlux`, `etchStopDepth`, part of `Ions` | `beta_E`, `beta_P`, `passivationFlux`, `rateFactors`, `Mask`, `Passivation`, `Polymer`, `Substrate` | The nested blocks are where plasma physics actually lives |
-| `PlasmaEtchingParametersIons` | 6 of 8 | `thetaRMin`, `thetaRMax` | Angular reflection bounds are fixed |
-| `PlasmaEtchingParametersMask` | — | `A_sp`, `B_sp`, `Eth_sp`, `rho` | Mask erosion cannot be calibrated |
-| `PlasmaEtchingParametersPassivation` | — | `A_ie`, `Eth_ie` | Passivation removal fixed at defaults |
-| `PlasmaEtchingParametersPolymer` | — | `A_sp/B_sp/Eth_sp`, `a1..a4`, `rho`, `usePolyCosThetaYield` | Polymerising C₄F₈ chemistry unreachable |
-| `PlasmaEtchingParametersSubstrate` | — | 9 members incl. `beta_sigma`, `k_sigma` | Main remaining substrate-yield knob |
-| `CF4O2Parameters` | 5 of 17 | 7 `gamma_*`, `fluxIncludeSticking`, all material blocks | Chemically richest unreachable surface model |
-| `CF4O2ParametersIons/Mask/Passivation/Si/SiGe` | — | all | SiGe etching via CF₄/O₂ not selectable |
+| `PlasmaEtchingParameters` | B1: `Ions`, `Mask`, `Passivation` (SF6O2/HBrO2), `Polymer`, `Substrate`, `beta_E`, `beta_P` (SF6O2/HBrO2), `rateFactors`, `passivationFlux` (SF6O2/HBrO2) | `Substrate.B_ie` (unused); SF6C4F8 `passivation`/`passivationFlux`/`beta_P` (no particle; positive flux SIGSEGVs) | Remaining gaps are inert or unsafe, not missing physics controls |
+| `PlasmaEtchingParametersSubstrate` | B1: all consumed fields except `B_ie` | `B_ie` (unused by the CPU surface model) | No useful substrate-yield knob remains hidden |
+| `CF4O2Parameters` | B1: `Ions`, `Mask`, `Passivation`, `Si`, `SiGe` (`beta_sigma`/`k_sigma`/`rho`), `gamma_*`, `fluxIncludeSticking` | `SiGe.A_ie/A_sp/Eth_ie/Eth_sp/x` (ignored by native SiGe branch); `k_sigma_SiGe` method | SiGe chemistry is represented by the three fields the native branch reads |
+| `CF4O2ParametersSiGe` | B1: `beta_sigma`, `k_sigma`, `rho` | sputter/yield fields and `x`; `k_sigma_SiGe` method | A full SiGe yield editor is not available because the native branch does not read those fields |
 | `CoverageParameters` | `tolerance = 1e-3` (hard-coded) | `tolerance`, `maxIterations`, `initialized` | Convergence cannot be tightened or loosened |
 | `RateSet` | 4 fields flattened into the scalar `directional` step | multi-`RateSet` sequences, per-set masks | Per-material direction/velocity impossible |
 | `SurfaceDiffusionParameters` | — | 7 members | No workbench code path constructs it; it is a level-set smoothing model, so an insertion point must be evidenced first |
@@ -187,14 +203,25 @@ hashes when unused.
   3. count and magnitude of radii/half-axes are bounded;
   4. `CustomSphereDistribution` is catalogued only after a passing 2D **and** 3D probe is archived.
 
-### Batch B1 — full plasma sub-parameter families
+### Batch B1 — full plasma sub-parameter families (implemented backend/API)
 
-- Optional `nativeParameters.advanced` with a strict per-model allowlist; unknown keys rejected.
+- Status: implemented by the optional `nativeParameters.advanced` object and the
+  parameter-object overloads. The allowlist is the native-consumed subset, not
+  every struct member:
+  - `Substrate.B_ie`, `SiGe.A_ie/A_sp/Eth_ie/Eth_sp/x`, and the SF6C4F8
+    passivation family are rejected as inert/unsafe;
+  - SF6C4F8 `passivationFlux > 0` would dereference a missing native flux
+    scalar (SIGSEGV) and is rejected by validation and the worker.
+- Advanced defaults for fields shared with flat inputs equal the flat catalog
+  defaults; native-only defaults are labelled and recorded at run time.
 - Acceptance:
   1. omitting it leaves every existing project's request hash unchanged;
-  2. defaults read back equal to native defaults and are recorded in run evidence;
-  3. one golden run with two changed sub-parameters matches a direct native reference within `1e-6 µm`
-     and is archived before any UI field appears.
+  2. defaults read back equal to the effective flat/native defaults and are
+     recorded in run evidence;
+  3. 2D and 3D golden runs for sf6o2, hbro2, sf6c4f8 and a cf4o2-SiGe case
+     match direct native references within `1e-6 µm`; archived `docs/*-evidence`
+     is still pending;
+  4. no UI field is added by this backend/API change.
 
 ### Batch B2 — multi-`RateSet` directional model
 
