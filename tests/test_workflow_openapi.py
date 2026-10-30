@@ -24,10 +24,28 @@ class WorkflowOpenApiTests(unittest.TestCase):
             "/api/v1/workflow/measurements/{measurement_id}/provenance",
             "/api/v1/workflow/equivalence/check",
             "/api/v1/workflow/gc/dry-run",
+            "/api/v1/workflow/modules",
+            "/api/v1/workflow/modules/{module_id}",
+            "/api/v1/workflow/flows/definitions",
+            "/api/v1/workflow/flows/definitions/{definition_id}",
+            "/api/v1/workflow/flows/definitions/{definition_id}/expand",
+            "/api/v1/workflow/flows/definitions/{definition_id}/compile",
         ):
             self.assertIn(path, paths)
         self.assertIn("RoutePlanV1", schema["components"]["schemas"])
         self.assertIn("MeasurementResultV1", schema["components"]["schemas"])
+        for name in (
+            "ModuleV1",
+            "FlowDefinitionV2-Input",
+            "FlowDefinitionV2-Output",
+            "ExpandedFlowV1",
+            "ExpandFlowDefinitionRequest",
+        ):
+            self.assertIn(name, schema["components"]["schemas"])
+        expand_request = schema["components"]["schemas"]["ExpandFlowDefinitionRequest"]
+        self.assertFalse(expand_request.get("additionalProperties", False))
+        self.assertIn("variables", expand_request["properties"])
+        self.assertNotEqual(expand_request["properties"]["variables"], {})
         static = json.loads((Path(__file__).resolve().parents[1] / "docs" / "workflow-openapi.json").read_text(encoding="utf-8"))
         self.assertEqual(static["info"]["title"], schema["info"]["title"])
         self.assertEqual(set(static["paths"]), set(paths))

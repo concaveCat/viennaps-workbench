@@ -1581,6 +1581,50 @@
         "title": "CompileDiffV1",
         "type": "object"
       },
+      "CompileFlowDefinitionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "flowId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Flowid"
+          },
+          "project": {
+            "$ref": "#/components/schemas/ProjectV7"
+          },
+          "variables": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "boolean"
+                }
+              ]
+            },
+            "title": "Variables",
+            "type": "object"
+          }
+        },
+        "required": [
+          "project"
+        ],
+        "title": "CompileFlowDefinitionRequest",
+        "type": "object"
+      },
       "CompileListResponse": {
         "additionalProperties": false,
         "properties": {
@@ -2747,6 +2791,205 @@
         "title": "ExecutionEvidenceV1",
         "type": "object"
       },
+      "ExpandFlowDefinitionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "variables": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "boolean"
+                }
+              ]
+            },
+            "title": "Variables",
+            "type": "object"
+          }
+        },
+        "title": "ExpandFlowDefinitionRequest",
+        "type": "object"
+      },
+      "ExpandedFlowV1": {
+        "additionalProperties": false,
+        "properties": {
+          "definitionId": {
+            "maxLength": 64,
+            "minLength": 3,
+            "pattern": "^[A-Za-z][A-Za-z0-9_-]*$",
+            "title": "Definitionid",
+            "type": "string"
+          },
+          "flowId": {
+            "maxLength": 64,
+            "minLength": 8,
+            "pattern": "^[A-Za-z0-9_-]+$",
+            "title": "Flowid",
+            "type": "string"
+          },
+          "iterations": {
+            "items": {
+              "$ref": "#/components/schemas/IterationV1"
+            },
+            "title": "Iterations",
+            "type": "array"
+          },
+          "maxDepth": {
+            "minimum": 0.0,
+            "title": "Maxdepth",
+            "type": "integer"
+          },
+          "moduleInstances": {
+            "items": {
+              "$ref": "#/components/schemas/ModuleInstanceV1"
+            },
+            "title": "Moduleinstances",
+            "type": "array"
+          },
+          "revision": {
+            "minimum": 1.0,
+            "title": "Revision",
+            "type": "integer"
+          },
+          "stepCount": {
+            "minimum": 0.0,
+            "title": "Stepcount",
+            "type": "integer"
+          },
+          "stepIdPolicy": {
+            "default": "v1-base32-lower-nopad-20",
+            "title": "Stepidpolicy",
+            "type": "string"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/ExpandedStepV1"
+            },
+            "title": "Steps",
+            "type": "array"
+          },
+          "variables": {
+            "items": {
+              "$ref": "#/components/schemas/ResolvedVariableV1"
+            },
+            "title": "Variables",
+            "type": "array"
+          }
+        },
+        "required": [
+          "definitionId",
+          "flowId",
+          "revision",
+          "steps",
+          "stepCount",
+          "maxDepth"
+        ],
+        "title": "ExpandedFlowV1",
+        "type": "object"
+      },
+      "ExpandedStepV1": {
+        "additionalProperties": false,
+        "properties": {
+          "authoredStepId": {
+            "maxLength": 64,
+            "minLength": 8,
+            "pattern": "^[A-Za-z0-9_-]+$",
+            "title": "Authoredstepid",
+            "type": "string"
+          },
+          "flowPath": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Flowpath",
+            "type": "string"
+          },
+          "iterationKey": {
+            "maxLength": 32,
+            "minLength": 1,
+            "pattern": "^i[0-9]+$",
+            "title": "Iterationkey",
+            "type": "string"
+          },
+          "moduleId": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 3,
+                "pattern": "^[A-Za-z][A-Za-z0-9_-]*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Moduleid"
+          },
+          "moduleInstanceId": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 3,
+                "pattern": "^[A-Za-z][A-Za-z0-9_-]*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Moduleinstanceid"
+          },
+          "moduleInstanceIdPath": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Moduleinstanceidpath",
+            "type": "string"
+          },
+          "parameterProvenance": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ParameterProvenanceV1"
+            },
+            "title": "Parameterprovenance",
+            "type": "object"
+          },
+          "step": {
+            "additionalProperties": true,
+            "title": "Step",
+            "type": "object"
+          },
+          "stepId": {
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9_-]+$",
+            "title": "Stepid",
+            "type": "string"
+          },
+          "variableRefs": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Variablerefs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "authoredStepId",
+          "stepId",
+          "flowPath",
+          "moduleInstanceIdPath",
+          "iterationKey",
+          "step"
+        ],
+        "title": "ExpandedStepV1",
+        "type": "object"
+      },
       "ExperimentRetentionRequest": {
         "additionalProperties": false,
         "properties": {
@@ -2814,6 +3057,507 @@
         "title": "FixedRandom",
         "type": "object"
       },
+      "FlowDefinitionListResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "definitions": {
+            "items": {
+              "$ref": "#/components/schemas/FlowDefinitionSummaryV1"
+            },
+            "title": "Definitions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "definitions"
+        ],
+        "title": "FlowDefinitionListResponse",
+        "type": "object"
+      },
+      "FlowDefinitionSummaryV1": {
+        "additionalProperties": false,
+        "properties": {
+          "definitionId": {
+            "title": "Definitionid",
+            "type": "string"
+          },
+          "flowId": {
+            "title": "Flowid",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "nodeCount": {
+            "minimum": 0.0,
+            "title": "Nodecount",
+            "type": "integer"
+          },
+          "revision": {
+            "minimum": 1.0,
+            "title": "Revision",
+            "type": "integer"
+          },
+          "updatedAt": {
+            "title": "Updatedat",
+            "type": "string"
+          },
+          "variableCount": {
+            "minimum": 0.0,
+            "title": "Variablecount",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "definitionId",
+          "flowId",
+          "revision",
+          "name",
+          "nodeCount",
+          "variableCount",
+          "updatedAt"
+        ],
+        "title": "FlowDefinitionSummaryV1",
+        "type": "object"
+      },
+      "FlowDefinitionV2-Input": {
+        "additionalProperties": false,
+        "description": "A flow with variables, literal steps, module calls and repeat loops.",
+        "properties": {
+          "definitionId": {
+            "maxLength": 64,
+            "minLength": 3,
+            "pattern": "^[A-Za-z][A-Za-z0-9_-]*$",
+            "title": "Definitionid",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "maxLength": 2000,
+            "title": "Description",
+            "type": "string"
+          },
+          "flowId": {
+            "maxLength": 64,
+            "minLength": 8,
+            "pattern": "^[A-Za-z0-9_-]+$",
+            "title": "Flowid",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "nodes": {
+            "items": {
+              "discriminator": {
+                "mapping": {
+                  "module-call": "#/components/schemas/FlowNodeModuleCallV1",
+                  "repeat": "#/components/schemas/FlowNodeRepeatV1-Input",
+                  "step": "#/components/schemas/FlowNodeStepV1"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/FlowNodeStepV1"
+                },
+                {
+                  "$ref": "#/components/schemas/FlowNodeModuleCallV1"
+                },
+                {
+                  "$ref": "#/components/schemas/FlowNodeRepeatV1-Input"
+                }
+              ]
+            },
+            "minItems": 1,
+            "title": "Nodes",
+            "type": "array"
+          },
+          "revision": {
+            "minimum": 1.0,
+            "title": "Revision",
+            "type": "integer"
+          },
+          "schemaVersion": {
+            "const": 2,
+            "default": 2,
+            "title": "Schemaversion",
+            "type": "integer"
+          },
+          "solver": {
+            "$ref": "#/components/schemas/SolverV7"
+          },
+          "variables": {
+            "items": {
+              "$ref": "#/components/schemas/FlowVariableV1"
+            },
+            "maxItems": 64,
+            "title": "Variables",
+            "type": "array"
+          }
+        },
+        "required": [
+          "definitionId",
+          "flowId",
+          "revision",
+          "name",
+          "nodes",
+          "solver"
+        ],
+        "title": "FlowDefinitionV2",
+        "type": "object"
+      },
+      "FlowDefinitionV2-Output": {
+        "additionalProperties": false,
+        "description": "A flow with variables, literal steps, module calls and repeat loops.",
+        "properties": {
+          "definitionId": {
+            "maxLength": 64,
+            "minLength": 3,
+            "pattern": "^[A-Za-z][A-Za-z0-9_-]*$",
+            "title": "Definitionid",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "maxLength": 2000,
+            "title": "Description",
+            "type": "string"
+          },
+          "flowId": {
+            "maxLength": 64,
+            "minLength": 8,
+            "pattern": "^[A-Za-z0-9_-]+$",
+            "title": "Flowid",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "nodes": {
+            "items": {
+              "discriminator": {
+                "mapping": {
+                  "module-call": "#/components/schemas/FlowNodeModuleCallV1",
+                  "repeat": "#/components/schemas/FlowNodeRepeatV1-Output",
+                  "step": "#/components/schemas/FlowNodeStepV1"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/FlowNodeStepV1"
+                },
+                {
+                  "$ref": "#/components/schemas/FlowNodeModuleCallV1"
+                },
+                {
+                  "$ref": "#/components/schemas/FlowNodeRepeatV1-Output"
+                }
+              ]
+            },
+            "minItems": 1,
+            "title": "Nodes",
+            "type": "array"
+          },
+          "revision": {
+            "minimum": 1.0,
+            "title": "Revision",
+            "type": "integer"
+          },
+          "schemaVersion": {
+            "const": 2,
+            "default": 2,
+            "title": "Schemaversion",
+            "type": "integer"
+          },
+          "solver": {
+            "$ref": "#/components/schemas/SolverV7"
+          },
+          "variables": {
+            "items": {
+              "$ref": "#/components/schemas/FlowVariableV1"
+            },
+            "maxItems": 64,
+            "title": "Variables",
+            "type": "array"
+          }
+        },
+        "required": [
+          "definitionId",
+          "flowId",
+          "revision",
+          "name",
+          "nodes",
+          "solver"
+        ],
+        "title": "FlowDefinitionV2",
+        "type": "object"
+      },
+      "FlowNodeModuleCallV1": {
+        "additionalProperties": false,
+        "properties": {
+          "instanceId": {
+            "maxLength": 64,
+            "minLength": 3,
+            "pattern": "^[A-Za-z][A-Za-z0-9_-]*$",
+            "title": "Instanceid",
+            "type": "string"
+          },
+          "kind": {
+            "const": "module-call",
+            "title": "Kind",
+            "type": "string"
+          },
+          "moduleId": {
+            "maxLength": 64,
+            "minLength": 3,
+            "pattern": "^[A-Za-z][A-Za-z0-9_-]*$",
+            "title": "Moduleid",
+            "type": "string"
+          },
+          "parameters": {
+            "additionalProperties": true,
+            "title": "Parameters",
+            "type": "object"
+          }
+        },
+        "required": [
+          "kind",
+          "instanceId",
+          "moduleId"
+        ],
+        "title": "FlowNodeModuleCallV1",
+        "type": "object"
+      },
+      "FlowNodeRepeatV1-Input": {
+        "additionalProperties": false,
+        "properties": {
+          "body": {
+            "items": {
+              "discriminator": {
+                "mapping": {
+                  "module-call": "#/components/schemas/FlowNodeModuleCallV1",
+                  "repeat": "#/components/schemas/FlowNodeRepeatV1-Input",
+                  "step": "#/components/schemas/FlowNodeStepV1"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/FlowNodeStepV1"
+                },
+                {
+                  "$ref": "#/components/schemas/FlowNodeModuleCallV1"
+                },
+                {
+                  "$ref": "#/components/schemas/FlowNodeRepeatV1-Input"
+                }
+              ]
+            },
+            "minItems": 1,
+            "title": "Body",
+            "type": "array"
+          },
+          "count": {
+            "anyOf": [
+              {
+                "maximum": 50.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Count"
+          },
+          "kind": {
+            "const": "repeat",
+            "title": "Kind",
+            "type": "string"
+          },
+          "loopVariable": {
+            "default": "i",
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+            "title": "Loopvariable",
+            "type": "string"
+          },
+          "repeatId": {
+            "maxLength": 64,
+            "minLength": 3,
+            "pattern": "^[A-Za-z][A-Za-z0-9_-]*$",
+            "title": "Repeatid",
+            "type": "string"
+          },
+          "values": {
+            "anyOf": [
+              {
+                "items": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "boolean"
+                    }
+                  ]
+                },
+                "maxItems": 50,
+                "minItems": 1,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Values"
+          }
+        },
+        "required": [
+          "kind",
+          "repeatId",
+          "body"
+        ],
+        "title": "FlowNodeRepeatV1",
+        "type": "object"
+      },
+      "FlowNodeRepeatV1-Output": {
+        "additionalProperties": false,
+        "properties": {
+          "body": {
+            "items": {
+              "discriminator": {
+                "mapping": {
+                  "module-call": "#/components/schemas/FlowNodeModuleCallV1",
+                  "repeat": "#/components/schemas/FlowNodeRepeatV1-Output",
+                  "step": "#/components/schemas/FlowNodeStepV1"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/FlowNodeStepV1"
+                },
+                {
+                  "$ref": "#/components/schemas/FlowNodeModuleCallV1"
+                },
+                {
+                  "$ref": "#/components/schemas/FlowNodeRepeatV1-Output"
+                }
+              ]
+            },
+            "minItems": 1,
+            "title": "Body",
+            "type": "array"
+          },
+          "count": {
+            "anyOf": [
+              {
+                "maximum": 50.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Count"
+          },
+          "kind": {
+            "const": "repeat",
+            "title": "Kind",
+            "type": "string"
+          },
+          "loopVariable": {
+            "default": "i",
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+            "title": "Loopvariable",
+            "type": "string"
+          },
+          "repeatId": {
+            "maxLength": 64,
+            "minLength": 3,
+            "pattern": "^[A-Za-z][A-Za-z0-9_-]*$",
+            "title": "Repeatid",
+            "type": "string"
+          },
+          "values": {
+            "anyOf": [
+              {
+                "items": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "boolean"
+                    }
+                  ]
+                },
+                "maxItems": 50,
+                "minItems": 1,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Values"
+          }
+        },
+        "required": [
+          "kind",
+          "repeatId",
+          "body"
+        ],
+        "title": "FlowNodeRepeatV1",
+        "type": "object"
+      },
+      "FlowNodeStepV1": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "step",
+            "title": "Kind",
+            "type": "string"
+          },
+          "step": {
+            "additionalProperties": true,
+            "title": "Step",
+            "type": "object"
+          }
+        },
+        "required": [
+          "kind",
+          "step"
+        ],
+        "title": "FlowNodeStepV1",
+        "type": "object"
+      },
       "FlowTemplateV1": {
         "additionalProperties": false,
         "properties": {
@@ -2863,6 +3607,59 @@
           "steps"
         ],
         "title": "FlowTemplateV1",
+        "type": "object"
+      },
+      "FlowVariableV1": {
+        "additionalProperties": false,
+        "properties": {
+          "default": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "boolean"
+              }
+            ],
+            "title": "Default"
+          },
+          "description": {
+            "default": "",
+            "maxLength": 512,
+            "title": "Description",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+            "title": "Name",
+            "type": "string"
+          },
+          "unit": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unit"
+          }
+        },
+        "required": [
+          "name",
+          "default"
+        ],
+        "title": "FlowVariableV1",
         "type": "object"
       },
       "FromTemplateRequest": {
@@ -3163,6 +3960,55 @@
           "sourcePower"
         ],
         "title": "IonParticleV7",
+        "type": "object"
+      },
+      "IterationV1": {
+        "additionalProperties": false,
+        "properties": {
+          "index": {
+            "maximum": 49.0,
+            "minimum": 0.0,
+            "title": "Index",
+            "type": "integer"
+          },
+          "path": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Path",
+            "type": "string"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "boolean"
+              }
+            ],
+            "title": "Value"
+          },
+          "variable": {
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+            "title": "Variable",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "variable",
+          "index",
+          "value"
+        ],
+        "title": "IterationV1",
         "type": "object"
       },
       "LayoutBoundsV1": {
@@ -3997,6 +4843,225 @@
           "material"
         ],
         "title": "MetrologyRecipeV1",
+        "type": "object"
+      },
+      "ModuleInstanceV1": {
+        "additionalProperties": false,
+        "properties": {
+          "instancePath": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Instancepath",
+            "type": "string"
+          },
+          "moduleId": {
+            "maxLength": 64,
+            "minLength": 3,
+            "pattern": "^[A-Za-z][A-Za-z0-9_-]*$",
+            "title": "Moduleid",
+            "type": "string"
+          },
+          "parameters": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "boolean"
+                }
+              ]
+            },
+            "title": "Parameters",
+            "type": "object"
+          }
+        },
+        "required": [
+          "instancePath",
+          "moduleId"
+        ],
+        "title": "ModuleInstanceV1",
+        "type": "object"
+      },
+      "ModuleListResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "modules": {
+            "items": {
+              "$ref": "#/components/schemas/ModuleSummaryV1"
+            },
+            "title": "Modules",
+            "type": "array"
+          }
+        },
+        "required": [
+          "modules"
+        ],
+        "title": "ModuleListResponse",
+        "type": "object"
+      },
+      "ModuleParameterV1": {
+        "additionalProperties": false,
+        "properties": {
+          "default": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default"
+          },
+          "description": {
+            "default": "",
+            "maxLength": 512,
+            "title": "Description",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+            "title": "Name",
+            "type": "string"
+          },
+          "required": {
+            "default": false,
+            "title": "Required",
+            "type": "boolean"
+          },
+          "unit": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unit"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "ModuleParameterV1",
+        "type": "object"
+      },
+      "ModuleSummaryV1": {
+        "additionalProperties": false,
+        "properties": {
+          "moduleId": {
+            "title": "Moduleid",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "parameterCount": {
+            "minimum": 0.0,
+            "title": "Parametercount",
+            "type": "integer"
+          },
+          "revision": {
+            "minimum": 1.0,
+            "title": "Revision",
+            "type": "integer"
+          },
+          "stepCount": {
+            "minimum": 0.0,
+            "title": "Stepcount",
+            "type": "integer"
+          },
+          "updatedAt": {
+            "title": "Updatedat",
+            "type": "string"
+          }
+        },
+        "required": [
+          "moduleId",
+          "name",
+          "revision",
+          "parameterCount",
+          "stepCount",
+          "updatedAt"
+        ],
+        "title": "ModuleSummaryV1",
+        "type": "object"
+      },
+      "ModuleV1": {
+        "additionalProperties": false,
+        "description": "A reusable step group with a typed parameter interface.",
+        "properties": {
+          "description": {
+            "default": "",
+            "maxLength": 2000,
+            "title": "Description",
+            "type": "string"
+          },
+          "moduleId": {
+            "maxLength": 64,
+            "minLength": 3,
+            "pattern": "^[A-Za-z][A-Za-z0-9_-]*$",
+            "title": "Moduleid",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "parameters": {
+            "items": {
+              "$ref": "#/components/schemas/ModuleParameterV1"
+            },
+            "maxItems": 64,
+            "title": "Parameters",
+            "type": "array"
+          },
+          "schemaVersion": {
+            "const": 1,
+            "default": 1,
+            "title": "Schemaversion",
+            "type": "integer"
+          },
+          "steps": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "title": "Steps",
+            "type": "array"
+          }
+        },
+        "required": [
+          "moduleId",
+          "name",
+          "steps"
+        ],
+        "title": "ModuleV1",
         "type": "object"
       },
       "MultiParticleRateCoefficientsV7": {
@@ -4930,6 +5995,62 @@
           "createdAt"
         ],
         "title": "ReportResponse",
+        "type": "object"
+      },
+      "ResolvedVariableV1": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+            "title": "Name",
+            "type": "string"
+          },
+          "source": {
+            "enum": [
+              "default",
+              "override"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "unit": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unit"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "boolean"
+              }
+            ],
+            "title": "Value"
+          }
+        },
+        "required": [
+          "name",
+          "value",
+          "source"
+        ],
+        "title": "ResolvedVariableV1",
         "type": "object"
       },
       "RouteFromCompileRequest": {
@@ -9472,6 +10593,212 @@
         ]
       }
     },
+    "/api/v1/workflow/flows/definitions": {
+      "get": {
+        "operationId": "list_flow_definitions_api_v1_workflow_flows_definitions_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FlowDefinitionListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Flow Definitions",
+        "tags": [
+          "workflow"
+        ]
+      },
+      "post": {
+        "operationId": "save_flow_definition_api_v1_workflow_flows_definitions_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FlowDefinitionV2-Input"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FlowDefinitionV2-Output"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Save Flow Definition",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/flows/definitions/{definition_id}": {
+      "get": {
+        "operationId": "get_flow_definition_api_v1_workflow_flows_definitions__definition_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "definition_id",
+            "required": true,
+            "schema": {
+              "title": "Definition Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FlowDefinitionV2-Output"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Flow Definition",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/flows/definitions/{definition_id}/compile": {
+      "post": {
+        "operationId": "compile_definition_api_v1_workflow_flows_definitions__definition_id__compile_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "definition_id",
+            "required": true,
+            "schema": {
+              "title": "Definition Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CompileFlowDefinitionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdoptProjectResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Compile Definition",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/flows/definitions/{definition_id}/expand": {
+      "post": {
+        "operationId": "expand_definition_api_v1_workflow_flows_definitions__definition_id__expand_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "definition_id",
+            "required": true,
+            "schema": {
+              "title": "Definition Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExpandFlowDefinitionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExpandedFlowV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Expand Definition",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
     "/api/v1/workflow/flows/from-project": {
       "post": {
         "operationId": "adopt_project_endpoint_api_v1_workflow_flows_from_project_post",
@@ -10307,6 +11634,108 @@
           }
         },
         "summary": "Get Recipe",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/modules": {
+      "get": {
+        "operationId": "list_modules_api_v1_workflow_modules_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModuleListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Modules",
+        "tags": [
+          "workflow"
+        ]
+      },
+      "post": {
+        "operationId": "save_module_api_v1_workflow_modules_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ModuleV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModuleV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Save Module",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/modules/{module_id}": {
+      "get": {
+        "operationId": "get_module_api_v1_workflow_modules__module_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "module_id",
+            "required": true,
+            "schema": {
+              "title": "Module Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModuleV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Module",
         "tags": [
           "workflow"
         ]

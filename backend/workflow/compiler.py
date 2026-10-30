@@ -56,17 +56,22 @@ def _template_project(flow: FlowRevisionV1, binding: GeometryBindingV1) -> Proje
     )
 
 
-def _compiled_steps(flow: FlowRevisionV1) -> tuple[list[Any], list[SourceMapEntryV1]]:
+def _compiled_steps(
+    flow: FlowRevisionV1,
+    placements: dict[str, tuple[str, str]] | None = None,
+) -> tuple[list[Any], list[SourceMapEntryV1]]:
     adapter = TypeAdapter(StepV7)
     compiled: list[Any] = []
     source_map: list[SourceMapEntryV1] = []
+    placements = placements or {}
 
     for step in flow.steps:
+        module_path, iteration_key = placements.get(step.id, ("root", "i0"))
         step_id = stable_step_id(
             flow_id=flow.flowId,
-            module_instance_id_path="root",
+            module_instance_id_path=module_path,
             authored_step_id=step.id,
-            iteration_key="i0",
+            iteration_key=iteration_key,
         )
         payload = step.model_dump(mode="json", exclude_none=True)
         payload["id"] = step_id
@@ -75,10 +80,10 @@ def _compiled_steps(flow: FlowRevisionV1) -> tuple[list[Any], list[SourceMapEntr
         source_map.append(
             SourceMapEntryV1(
                 stepId=step_id,
-                flowPath=f"root/{step.id}",
+                flowPath=f"{module_path}/{step.id}",
                 authoredStepId=step.id,
-                moduleInstanceIdPath="root",
-                iterationKey="i0",
+                moduleInstanceIdPath=module_path,
+                iterationKey=iteration_key,
                 parameterProvenance={
                     key: ParameterProvenanceV1(kind="literal", resolvedValue=value)
                     for key, value in payload.items()
@@ -95,11 +100,20 @@ def compile_flow(
     *,
     compiler_version: str = COMPILER_VERSION,
     engine_versions: dict[str, str] | None = None,
+    placements: dict[str, tuple[str, str]] | None = None,
+    variable_set: list[dict[str, Any]] | None = None,
+    overrides: list[dict[str, Any]] | None = None,
 ) -> CompiledWorkflowV1:
     """Compile a literal-step flow and a geometry binding into ProjectV7.
 
     Inputs are deep-copied before use. A later edit to ``flow`` or ``binding``
     must not mutate an already returned compile result or invalidate its hashes.
+
+    ``placements`` is the P4-1 extension: it maps an authored step id to the
+    module instance path and iteration key produced by module/loop expansion.
+    Omitting it keeps the P0 behavior (root instance, first iteration).
+    ``variable_set``/``overrides`` are provenance only; they never change step
+    ids.
     """
 
     flow = flow.model_copy(deep=True)
@@ -107,7 +121,7 @@ def compile_flow(
 
     template = _template_project(flow, binding)
     normalized_geometry = dict(template.geometry)
-    steps, source_map = _compiled_steps(flow)
+    steps, source_map = _compiled_steps(flow, placements)
 
     if binding.dimension == 3:
         project = ProjectV7(
@@ -136,7 +150,13 @@ def compile_flow(
             materialDefinitions=binding.materialDefinitions,
         )
 
-    flow_hash = sha256_hex(flow.model_dump(mode="json", exclude_none=True))
+    flow_payload = flow.model_dump(mode="json", exclude_none=True)
+    if placements:
+        flow_payload["placements"] = {
+            authored: {"moduleInstanceIdPath": path, "iterationKey": key}
+            for authored, (path, key) in sorted(placements.items())
+        }
+    flow_hash = sha256_hex(flow_payload)
     binding_hash = sha256_hex(binding.model_dump(mode="json", exclude_none=True))
     material_hash = sha256_hex(
         [item.model_dump(mode="json", exclude_none=True) for item in (binding.materialDefinitions or [])]
@@ -144,14 +164,16 @@ def compile_flow(
     project_hash = full_project_hash(project)
     source_map_digest = source_map_hash(source_map)
     engine_versions = dict(engine_versions or {})
+    variable_set = list(variable_set or [])
+    overrides = list(overrides or [])
 
     compile_id = compile_record_id(
         compiler_version=compiler_version,
         flow_revision_hash=flow_hash,
         geometry_binding_hash=binding_hash,
         material_definitions_hash=material_hash,
-        variable_set=[],
-        overrides=[],
+        variable_set=variable_set,
+        overrides=overrides,
         seed_policy="shared-run-seed",
         step_id_policy=STEP_ID_POLICY,
         engine_versions=engine_versions,
@@ -167,6 +189,8 @@ def compile_flow(
         materialCatalogVersion=binding.materialCatalogVersion,
         materialDefinitionsHash=material_hash,
         defaultValuesVersion=binding.defaultValuesVersion,
+        variableSet=variable_set,
+        overrides=overrides,
         engineVersions=engine_versions,
         stepIdPolicy=STEP_ID_POLICY,
         fullProjectHash=project_hash,

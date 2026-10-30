@@ -2,6 +2,18 @@
 
 from .compiler import COMPILER_VERSION, compile_flow
 from .ids import STEP_ID_POLICY, canonical_bytes, sha256_hex, stable_step_id
+from .modules import (
+    ExpandedFlowV1,
+    ExpandedStepV1,
+    ExpressionError,
+    FlowDefinitionV2,
+    ModuleError,
+    ModuleV1,
+    UnknownModuleError,
+    UnknownVariableError,
+    expand_flow_definition,
+    to_flow_revision,
+)
 from .models import (
     CompileDiffV1,
     CompiledWorkflowV1,
@@ -31,8 +43,14 @@ __all__ = [
     "CompileDiffV1",
     "CompileRecordV1",
     "CompiledWorkflowV1",
+    "ExpandedFlowV1",
+    "ExpandedStepV1",
+    "ExpressionError",
+    "FlowDefinitionV2",
     "FlowRevisionV1",
     "GeometryBindingV1",
+    "ModuleError",
+    "ModuleV1",
     "ParameterProvenanceV1",
     "PrefixCompatibilityV1",
     "RoutePlanV1",
@@ -41,9 +59,13 @@ __all__ = [
     "SegmentReuseV1",
     "SegmentV1",
     "SourceMapEntryV1",
+    "UnknownModuleError",
+    "UnknownVariableError",
     "canonical_bytes",
     "compile_flow",
+    "expand_flow_definition",
     "materialize_attempt",
     "sha256_hex",
     "stable_step_id",
+    "to_flow_revision",
 ]

@@ -20,6 +20,10 @@ def adopt_project(
     flow_id: str | None = None,
     steps: list[Any] | None = None,
     geometry_source: dict[str, Any] | None = None,
+    revision: int = 1,
+    placements: dict[str, tuple[str, str]] | None = None,
+    variable_set: list[dict[str, Any]] | None = None,
+    overrides: list[dict[str, Any]] | None = None,
 ) -> tuple[FlowRevisionV1, GeometryBindingV1, Any]:
     try:
         project = parse_project(project_payload)
@@ -61,12 +65,18 @@ def adopt_project(
     flow = FlowRevisionV1(
         schemaVersion=1,
         flowId=flow_id,
-        revision=1,
+        revision=revision,
         name=validated.name,
         steps=steps if steps is not None else validated.steps,
         solver=validated.solver,
     )
-    compiled = compile_flow(flow, binding)
+    compiled = compile_flow(
+        flow,
+        binding,
+        placements=placements,
+        variable_set=variable_set,
+        overrides=overrides,
+    )
     return flow, binding, compiled
 
 

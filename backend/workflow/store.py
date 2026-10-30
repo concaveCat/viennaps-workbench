@@ -20,6 +20,7 @@ from .metrology import (
 )
 from ..models import parse_project
 from .models import CompiledWorkflowV1
+from .modules import FlowDefinitionV2, ModuleV1
 from .provenance import VerificationRecordV1
 from .routes import (
     AttemptV1,
@@ -33,7 +34,7 @@ from .routes import (
 from .verification import prefix_compatibility, verify_route_plan_compiles
 
 
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
 
 
 class WorkflowError(Exception):
@@ -69,7 +70,7 @@ class WorkflowStore:
                     row = preflight.execute(
                         "SELECT value FROM schema_meta WHERE key = 'schema_version'"
                     ).fetchone()
-                    if row is not None and row[0] not in {"1", "2", "3", SCHEMA_VERSION}:
+                    if row is not None and row[0] not in {"1", "2", "3", "4", SCHEMA_VERSION}:
                         raise RuntimeError(
                             f"unsupported workflow schema version {row[0]!r}; "
                             f"expected {SCHEMA_VERSION!r}"
@@ -219,6 +220,23 @@ class WorkflowStore:
                     template_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS modules (
+                    module_id TEXT PRIMARY KEY,
+                    module_json TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS flow_definitions (
+                    definition_id TEXT PRIMARY KEY,
+                    flow_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    document_json TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS geometry_bindings (
                     binding_id TEXT PRIMARY KEY,
                     binding_json TEXT NOT NULL,
@@ -319,7 +337,7 @@ class WorkflowStore:
                     "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
                     (SCHEMA_VERSION,),
                 )
-            elif version_row["value"] == "3":
+            elif version_row["value"] in {"3", "4"}:
                 connection.execute(
                     "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
                     (SCHEMA_VERSION,),
@@ -1527,6 +1545,182 @@ class WorkflowStore:
             }
             for row in rows
         ]
+
+    def save_module(self, module: ModuleV1) -> dict[str, Any]:
+        """Create or update one module after the caller validated its content.
+
+        ``moduleId`` is the stable identity. Re-posting identical content is
+        idempotent; a validated change overwrites the row and bumps the stored
+        revision. Steps already expanded by compile records keep their own
+        hashes, so an edit never rewrites history.
+        """
+
+        payload = module.model_dump(mode="json", exclude_none=True)
+        digest = sha256_hex(payload)
+        now = self._now()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM modules WHERE module_id = ?", (module.moduleId,)
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    "INSERT INTO modules (module_id, module_json, content_hash, revision, created_at, updated_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (module.moduleId, self._dump(payload), digest, 1, now, now),
+                )
+                return self._module_summary(module, revision=1, updated_at=now)
+            if row["content_hash"] == digest:
+                return self._module_summary(module, revision=row["revision"], updated_at=row["updated_at"])
+            revision = int(row["revision"]) + 1
+            connection.execute(
+                "UPDATE modules SET module_json = ?, content_hash = ?, revision = ?, updated_at = ?"
+                " WHERE module_id = ?",
+                (self._dump(payload), digest, revision, now, module.moduleId),
+            )
+        return self._module_summary(module, revision=revision, updated_at=now)
+
+    @staticmethod
+    def _module_summary(module: ModuleV1, *, revision: int, updated_at: str) -> dict[str, Any]:
+        return {
+            "moduleId": module.moduleId,
+            "name": module.name,
+            "revision": revision,
+            "parameterCount": len(module.parameters),
+            "stepCount": len(module.steps),
+            "updatedAt": updated_at,
+        }
+
+    def get_module(self, module_id: str) -> ModuleV1:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT module_json FROM modules WHERE module_id = ?", (module_id,)
+            ).fetchone()
+        if row is None:
+            raise WorkflowNotFound(f"module {module_id!r} does not exist")
+        try:
+            return ModuleV1.model_validate(json.loads(row["module_json"]))
+        except (ValueError, TypeError) as exc:
+            raise WorkflowValidation(f"stored module {module_id!r} is invalid") from exc
+
+    def module_documents(self) -> list[ModuleV1]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT module_json FROM modules ORDER BY module_id"
+            ).fetchall()
+        documents: list[ModuleV1] = []
+        for row in rows:
+            try:
+                documents.append(ModuleV1.model_validate(json.loads(row["module_json"])))
+            except (ValueError, TypeError):
+                continue
+        return documents
+
+    def list_modules(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT module_json, revision, updated_at FROM modules ORDER BY updated_at DESC, rowid DESC"
+            ).fetchall()
+        summaries = []
+        for row in rows:
+            try:
+                module = ModuleV1.model_validate(json.loads(row["module_json"]))
+            except (ValueError, TypeError):
+                continue
+            summaries.append(
+                self._module_summary(module, revision=row["revision"], updated_at=row["updated_at"])
+            )
+        return summaries
+
+    def save_flow_definition(self, definition: FlowDefinitionV2) -> dict[str, Any]:
+        """Create or revise one flow definition.
+
+        A definition id is immutable identity; revision must increase when the
+        content changes. Re-posting identical content is idempotent.
+        """
+
+        payload = definition.model_dump(mode="json", exclude_none=True)
+        digest = sha256_hex(payload)
+        now = self._now()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM flow_definitions WHERE definition_id = ?",
+                (definition.definitionId,),
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    "INSERT INTO flow_definitions"
+                    " (definition_id, flow_id, revision, document_json, content_hash, created_at, updated_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        definition.definitionId,
+                        definition.flowId,
+                        definition.revision,
+                        self._dump(payload),
+                        digest,
+                        now,
+                        now,
+                    ),
+                )
+                return self._definition_summary(definition, updated_at=now)
+            if row["content_hash"] == digest:
+                return self._definition_summary(definition, updated_at=row["updated_at"])
+            if definition.revision <= int(row["revision"]):
+                raise WorkflowConflict(
+                    f"flow definition {definition.definitionId!r} already has revision "
+                    f"{row['revision']}; a changed document needs a higher revision"
+                )
+            connection.execute(
+                "UPDATE flow_definitions SET flow_id = ?, revision = ?, document_json = ?,"
+                " content_hash = ?, updated_at = ? WHERE definition_id = ?",
+                (
+                    definition.flowId,
+                    definition.revision,
+                    self._dump(payload),
+                    digest,
+                    now,
+                    definition.definitionId,
+                ),
+            )
+        return self._definition_summary(definition, updated_at=now)
+
+    @staticmethod
+    def _definition_summary(definition: FlowDefinitionV2, *, updated_at: str) -> dict[str, Any]:
+        return {
+            "definitionId": definition.definitionId,
+            "flowId": definition.flowId,
+            "revision": definition.revision,
+            "name": definition.name,
+            "nodeCount": len(definition.nodes),
+            "variableCount": len(definition.variables),
+            "updatedAt": updated_at,
+        }
+
+    def get_flow_definition(self, definition_id: str) -> FlowDefinitionV2:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT document_json FROM flow_definitions WHERE definition_id = ?",
+                (definition_id,),
+            ).fetchone()
+        if row is None:
+            raise WorkflowNotFound(f"flow definition {definition_id!r} does not exist")
+        try:
+            return FlowDefinitionV2.model_validate(json.loads(row["document_json"]))
+        except (ValueError, TypeError) as exc:
+            raise WorkflowValidation(f"stored flow definition {definition_id!r} is invalid") from exc
+
+    def list_flow_definitions(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT document_json, updated_at FROM flow_definitions ORDER BY updated_at DESC, rowid DESC"
+            ).fetchall()
+        summaries = []
+        for row in rows:
+            try:
+                definition = FlowDefinitionV2.model_validate(json.loads(row["document_json"]))
+            except (ValueError, TypeError):
+                continue
+            summaries.append(self._definition_summary(definition, updated_at=row["updated_at"]))
+        return summaries
 
     def register_binding(self, binding) -> Any:
         payload = binding.model_dump(mode="json", exclude_none=True)

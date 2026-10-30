@@ -183,6 +183,64 @@ type Provenance = {
   bindingStatus: string;
   verifications: Array<{ verificationId: string; status: string; createdAt: string; evidence: { methodVersion: string } }>;
 };
+type ExpandedModuleStep = {
+  authoredStepId: string;
+  stepId: string;
+  flowPath: string;
+  moduleInstanceIdPath: string;
+  iterationKey: string;
+  moduleId: string | null;
+  moduleInstanceId: string | null;
+  step: Record<string, unknown> & { name?: string; model?: string };
+  parameterProvenance: Record<string, { kind: string; source: string | null; resolvedValue: unknown }>;
+};
+type ModuleExpansion = {
+  definitionId: string;
+  flowId: string;
+  revision: number;
+  stepCount: number;
+  maxDepth: number;
+  steps: ExpandedModuleStep[];
+  variables: Array<{ name: string; value: unknown; unit: string | null; source: string }>;
+  iterations: Array<{ path: string; variable: string; index: number; value: unknown }>;
+  moduleInstances: Array<{ instancePath: string; moduleId: string; parameters: Record<string, unknown> }>;
+};
+
+const DEFAULT_MODULE_JSON = JSON.stringify({
+  schemaVersion: 1,
+  moduleId: 'mod_ui_etch',
+  name: 'UI etch module',
+  description: '',
+  parameters: [
+    { name: 'rate', default: 0.1, unit: 'um/s' },
+    { name: 'duration', default: 0.1, unit: 's' },
+  ],
+  steps: [{
+    id: 'etch_ui_a', name: 'etch', enabled: true, operation: 'etch', model: 'isotropic',
+    rateMagnitude: '${rate}', duration: '${duration}', rateMode: 'uniform',
+  }],
+}, null, 2);
+
+const DEFAULT_DEFINITION_JSON = JSON.stringify({
+  schemaVersion: 2,
+  definitionId: 'def_ui_demo',
+  flowId: 'flow_ui_demo',
+  revision: 1,
+  name: 'UI modular flow',
+  description: '',
+  variables: [{ name: 'rate', default: 0.1, unit: 'um/s' }],
+  nodes: [
+    { kind: 'module-call', instanceId: 'call_ui_a', moduleId: 'mod_ui_etch', parameters: { rate: '${rate}' } },
+    {
+      kind: 'repeat', repeatId: 'loop_ui', loopVariable: 'level', count: 2,
+      body: [{ kind: 'module-call', instanceId: 'call_ui_b', moduleId: 'mod_ui_etch', parameters: { rate: '${level * 0.05}' } }],
+    },
+  ],
+  solver: {
+    timeStepRatio: 0.25, raysPerPoint: 32, cpuThreads: 1,
+    random: { mode: 'fixed', seed: 7 }, enginePreference: 'cpu', timeoutSeconds: 30,
+  },
+}, null, 2);
 
 const LAYER_COLORS = ['#64d2ff', '#ffd166', '#7ee787', '#ff7b72', '#d2a8ff'];
 
@@ -294,6 +352,12 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     duration: (0.01 + index * 0.001).toFixed(4), replicates: index === 0 ? 2 : 1, seed: 20261029 + index,
   })));
   const [provenance, setProvenance] = useState<Provenance | null>(null);
+  const [moduleJson, setModuleJson] = useState(DEFAULT_MODULE_JSON);
+  const [definitionJson, setDefinitionJson] = useState(DEFAULT_DEFINITION_JSON);
+  const [definitionVariables, setDefinitionVariables] = useState('{}');
+  const [savedDefinitionId, setSavedDefinitionId] = useState('');
+  const [moduleStatus, setModuleStatus] = useState('');
+  const [expansion, setExpansion] = useState<ModuleExpansion | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [zone, setZone] = useState<'setup' | 'flow' | 'run' | 'experiment' | 'analyze' | 'report'>('setup');
   const [error, setError] = useState('');
@@ -650,6 +714,67 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setCompile(result); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);
   });
 
+  const parseJsonObject = (label: string, text: string): Record<string, unknown> => {
+    let parsed: unknown;
+    try { parsed = JSON.parse(text); } catch { throw new Error(`${label} 不是合法 JSON`); }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error(`${label} 必须是 JSON 对象`);
+    return parsed as Record<string, unknown>;
+  };
+
+  const definitionIdFromJson = useMemo(() => {
+    try {
+      const parsed = JSON.parse(definitionJson) as { definitionId?: unknown };
+      return typeof parsed.definitionId === 'string' ? parsed.definitionId : '';
+    } catch { return ''; }
+  }, [definitionJson]);
+  const activeDefinitionId = savedDefinitionId || definitionIdFromJson;
+
+  const readDefinitionVariables = () => {
+    const parsed = parseJsonObject('流程变量 JSON', definitionVariables);
+    for (const [name, value] of Object.entries(parsed)) {
+      const kind = typeof value;
+      if (value === null || !['string', 'number', 'boolean'].includes(kind)) throw new Error(`变量 ${name} 必须是标量`);
+    }
+    return parsed as Record<string, string | number | boolean>;
+  };
+
+  const saveModule = () => run('module', async () => {
+    const payload = parseJsonObject('模块 JSON', moduleJson);
+    const saved = await postJson<{ moduleId: string }>('/api/v1/workflow/modules', payload);
+    setModuleStatus(`模块 ${saved.moduleId} 已保存`);
+    setExpansion(null);
+  });
+
+  const saveDefinition = () => run('definition', async () => {
+    const payload = parseJsonObject('流程定义 JSON', definitionJson);
+    const saved = await postJson<{ definitionId: string }>('/api/v1/workflow/flows/definitions', payload);
+    setSavedDefinitionId(saved.definitionId);
+    setModuleStatus(`流程定义 ${saved.definitionId} 已保存`);
+    setExpansion(null);
+  });
+
+  const expandDefinition = () => run('expand', async () => {
+    if (!activeDefinitionId) throw new Error('流程定义 JSON 缺少 definitionId');
+    const result = await postJson<ModuleExpansion>(
+      `/api/v1/workflow/flows/definitions/${activeDefinitionId}/expand`,
+      { variables: readDefinitionVariables() },
+    );
+    setExpansion(result);
+    setModuleStatus(`展开 ${result.stepCount} 步 · 深度 ${result.maxDepth}`);
+  });
+
+  const compileDefinition = () => run('definition-compile', async () => {
+    if (!activeDefinitionId) throw new Error('流程定义 JSON 缺少 definitionId');
+    if (!project) throw new Error('先导入工程 JSON');
+    const result = await postJson<CompileInfo>(
+      `/api/v1/workflow/flows/definitions/${activeDefinitionId}/compile`,
+      { project, flowId: compile?.flowId, variables: readDefinitionVariables() },
+    );
+    if (compile) setPreviousCompile(compile);
+    setCompile(result); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);
+    setModuleStatus(`模块化流程已编译 · ${result.stepCount} 步`);
+  });
+
   const createDoe = () => run('doe', async () => {
     if (!project || !compile || !activeRecipeId) throw new Error('先完成一次测量以固定配方');
     const factors = doeFactors
@@ -969,6 +1094,41 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             {compileDiff && <div className="wf-summary"><strong>Compile diff</strong><span>+{compileDiff.addedStepIds.length} / -{compileDiff.removedStepIds.length} / moved {compileDiff.movedStepIds.length} / changed {compileDiff.changedStepIds.length}</span><span>affected: {compileDiff.affectedStepIds.map(id => id.slice(0, 8)).join(', ') || '—'}</span>{compileDiff.details?.slice(0, 3).map(item => <span key={item.stepId}>{item.stepId.slice(0, 8)}: {String(item.before.duration ?? '—')} → {String(item.after.duration ?? '—')}</span>)}</div>}
           </>}
           {route && <div className="wf-summary"><strong>{route.route.name}</strong><span>{route.segments.length} Segment · {route.stepOrder.length} Step · head {route.route.headAttemptId.slice(0, 10)}…</span></div>}
+          <div className="wf-card-subhead">模块化流程</div>
+          <p className="wf-muted">保存模块与流程定义后展开预览；编译复用现有 Compile 与 SourceMap，不另起执行路径。</p>
+          <textarea aria-label="模块 JSON" value={moduleJson} onChange={event => setModuleJson(event.target.value)} placeholder="模块 JSON" />
+          <div className="wf-template-row">
+            <button className="wf-button ghost" disabled={!!busy} onClick={() => void saveModule()}>{busy === 'module' ? '保存中…' : '保存模块'}</button>
+            <span className="wf-muted">moduleId 唯一；内容变更会递增模块修订</span>
+          </div>
+          <textarea aria-label="流程定义 JSON" value={definitionJson} onChange={event => setDefinitionJson(event.target.value)} placeholder="流程定义 JSON" />
+          <div className="wf-template-row">
+            <input aria-label="流程变量 JSON" value={definitionVariables} onChange={event => setDefinitionVariables(event.target.value)} placeholder='{"rate": 0.2}' />
+            <button className="wf-button ghost" disabled={!!busy} onClick={() => void saveDefinition()}>{busy === 'definition' ? '保存中…' : '保存定义'}</button>
+            <button className="wf-button ghost" disabled={!activeDefinitionId || !!busy} onClick={() => void expandDefinition()}>{busy === 'expand' ? '展开中…' : '展开预览'}</button>
+            <button className="wf-button primary" disabled={!activeDefinitionId || !project || !!busy} onClick={() => void compileDefinition()}>{busy === 'definition-compile' ? '编译中…' : '编译模块化流程'}</button>
+          </div>
+          {moduleStatus && <div className="wf-summary"><strong>{moduleStatus}</strong><span>definition {activeDefinitionId || '—'}</span></div>}
+          {expansion && <>
+            <div className="wf-summary">
+              <strong>展开预览</strong>
+              <span>{expansion.stepCount} 步 · 深度 {expansion.maxDepth}</span>
+              <span>{expansion.moduleInstances.length} 模块实例 · {expansion.iterations.length} 循环迭代</span>
+            </div>
+            {expansion.variables.length > 0 && <div className="wf-muted">变量: {expansion.variables.map(item => `${item.name}=${String(item.value)}${item.unit ? ` ${item.unit}` : ''} (${item.source})`).join(' · ')}</div>}
+            {expansion.iterations.length > 0 && <div className="wf-muted">循环: {expansion.iterations.map(item => `${item.path} · ${item.variable}[${item.index}]=${String(item.value)}`).join(' · ')}</div>}
+            {expansion.moduleInstances.length > 0 && <div className="wf-muted">模块实例: {expansion.moduleInstances.map(item => `${item.instancePath} → ${item.moduleId}`).join(' · ')}</div>}
+            <table className="wf-table">
+              <thead><tr><th>Authored ID</th><th>Module / path</th><th>参数</th></tr></thead>
+              <tbody>
+                {expansion.steps.map(step => <tr key={step.authoredStepId}>
+                  <td><code>{step.authoredStepId}</code></td>
+                  <td><code>{step.moduleId ? `${step.moduleId} @ ${step.moduleInstanceIdPath}` : step.flowPath}</code></td>
+                  <td>{Object.entries(step.parameterProvenance).map(([key, item]) => `${key}=${JSON.stringify(item.resolvedValue)}`).join(' · ')}</td>
+                </tr>)}
+              </tbody>
+            </table>
+          </>}
         </section>
 
         <section className={`wf-card wf-run ${zone === 'run' ? '' : 'wf-hidden'}`}>

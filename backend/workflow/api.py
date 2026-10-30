@@ -33,6 +33,13 @@ from .experiments import (
 )
 from .layouts import build_clip_gds, canonical_clip_hash, extract_clip_polygons, save_asset, structure_bounds
 from .models import CompileDiffV1, CompiledWorkflowV1, GeometryBindingV1
+from .modules import (
+    ExpandedFlowV1,
+    FlowDefinitionV2,
+    ModuleV1,
+    expand_flow_definition,
+    to_flow_revision,
+)
 from .provenance import ProvenanceVerificationV1, VerificationRecordV1
 from .routes import AttemptV1, RoutePlanV1, SegmentRefV1, SegmentReuseV1, SegmentV1
 from .templates import FlowTemplateV1, resolve_template
@@ -381,6 +388,43 @@ class TemplateSummaryV1(StrictModel):
 
 class TemplateListResponse(StrictModel):
     templates: list[TemplateSummaryV1]
+
+
+class ModuleSummaryV1(StrictModel):
+    moduleId: str
+    name: str
+    revision: Annotated[int, Field(ge=1)]
+    parameterCount: Annotated[int, Field(ge=0)]
+    stepCount: Annotated[int, Field(ge=0)]
+    updatedAt: str
+
+
+class ModuleListResponse(StrictModel):
+    modules: list[ModuleSummaryV1]
+
+
+class FlowDefinitionSummaryV1(StrictModel):
+    definitionId: str
+    flowId: str
+    revision: Annotated[int, Field(ge=1)]
+    name: str
+    nodeCount: Annotated[int, Field(ge=0)]
+    variableCount: Annotated[int, Field(ge=0)]
+    updatedAt: str
+
+
+class FlowDefinitionListResponse(StrictModel):
+    definitions: list[FlowDefinitionSummaryV1]
+
+
+class ExpandFlowDefinitionRequest(StrictModel):
+    variables: dict[str, float | int | str | bool] = Field(default_factory=dict)
+
+
+class CompileFlowDefinitionRequest(StrictModel):
+    project: ProjectV7
+    flowId: str | None = None
+    variables: dict[str, float | int | str | bool] = Field(default_factory=dict)
 
 
 class BranchRequest(StrictModel):
@@ -1184,6 +1228,121 @@ async def compile_clip(clip_id: str, request: ClipCompileRequest) -> AdoptProjec
 @router.post("/templates", response_model=FlowTemplateV1, status_code=201)
 async def register_template(template: FlowTemplateV1) -> FlowTemplateV1:
     return _call(lambda: get_store().register_template(template))
+
+
+def _expand_definition(definition_id: str, variables: dict[str, float | int | str | bool]):
+    store = get_store()
+    definition = store.get_flow_definition(definition_id)
+    try:
+        expanded = expand_flow_definition(
+            definition, store.module_documents(), variables=variables
+        )
+    except ValueError as exc:
+        raise WorkflowValidation(str(exc)) from exc
+    return definition, expanded
+
+
+@router.post("/modules", response_model=ModuleV1, status_code=201)
+async def save_module(module: ModuleV1) -> ModuleV1:
+    def operation():
+        get_store().save_module(module)
+        return module
+    return _call(operation)
+
+
+@router.get("/modules", response_model=ModuleListResponse)
+async def list_modules() -> ModuleListResponse:
+    rows = _call(get_store().list_modules)
+    return ModuleListResponse(modules=[ModuleSummaryV1.model_validate(row) for row in rows])
+
+
+@router.get("/modules/{module_id}", response_model=ModuleV1)
+async def get_module(module_id: str) -> ModuleV1:
+    return _call(lambda: get_store().get_module(module_id))
+
+
+@router.post("/flows/definitions", response_model=FlowDefinitionV2, status_code=201)
+async def save_flow_definition(definition: FlowDefinitionV2) -> FlowDefinitionV2:
+    def operation():
+        get_store().save_flow_definition(definition)
+        return definition
+    return _call(operation)
+
+
+@router.get("/flows/definitions", response_model=FlowDefinitionListResponse)
+async def list_flow_definitions() -> FlowDefinitionListResponse:
+    rows = _call(get_store().list_flow_definitions)
+    return FlowDefinitionListResponse(
+        definitions=[FlowDefinitionSummaryV1.model_validate(row) for row in rows]
+    )
+
+
+@router.get("/flows/definitions/{definition_id}", response_model=FlowDefinitionV2)
+async def get_flow_definition(definition_id: str) -> FlowDefinitionV2:
+    return _call(lambda: get_store().get_flow_definition(definition_id))
+
+
+@router.post("/flows/definitions/{definition_id}/expand", response_model=ExpandedFlowV1)
+async def expand_definition(
+    definition_id: str, request: ExpandFlowDefinitionRequest
+) -> ExpandedFlowV1:
+    _, expanded = _call(lambda: _expand_definition(definition_id, request.variables))
+    return expanded
+
+
+@router.post(
+    "/flows/definitions/{definition_id}/compile",
+    response_model=AdoptProjectResponse,
+    status_code=201,
+)
+async def compile_definition(
+    definition_id: str, request: CompileFlowDefinitionRequest
+) -> AdoptProjectResponse:
+    def operation():
+        store = get_store()
+        definition, expanded = _expand_definition(definition_id, request.variables)
+        try:
+            flow, placements = to_flow_revision(definition, expanded)
+        except ValueError as exc:
+            raise WorkflowValidation(str(exc)) from exc
+        payload = request.project.model_dump(mode="json", exclude_none=True)
+        payload["steps"] = [
+            step.model_dump(mode="json", exclude_none=True) for step in flow.steps
+        ]
+        variable_set = [
+            variable.model_dump(mode="json", exclude_none=True)
+            for variable in expanded.variables
+        ]
+        overrides = [
+            {"name": name, "value": value, "source": "request"}
+            for name, value in sorted(request.variables.items())
+        ]
+        try:
+            adopted_flow, binding, compiled = adopt_project(
+                payload,
+                flow_id=request.flowId or definition.flowId,
+                steps=flow.steps,
+                revision=definition.revision,
+                placements=placements,
+                variable_set=variable_set,
+                overrides=overrides,
+            )
+        except ValueError as exc:
+            raise WorkflowValidation(str(exc)) from exc
+        store.register_binding(binding)
+        store.register_compile(compiled)
+        return AdoptProjectResponse(
+            flowId=adopted_flow.flowId,
+            bindingId=binding.bindingId,
+            compileId=compiled.compileRecord.compileId,
+            projectName=compiled.project.name,
+            dimension=compiled.project.dimension,
+            stepCount=len(compiled.project.steps),
+            authoredSteps=flow.steps,
+            binding=binding,
+            compile=compiled,
+        )
+    return _call(operation)
 
 
 @router.get("/templates", response_model=TemplateListResponse)
