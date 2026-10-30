@@ -1869,18 +1869,21 @@ class WorkflowStore:
         return status
 
     def save_library_bundle(self, bundle: Any) -> dict[str, Any]:
+        """Register one content-addressed bundle, idempotently.
+
+        ``bundleId`` is the hash of the bundle content and deliberately excludes
+        ``createdAt`` and list order. Re-exporting the same content therefore has
+        to reuse the stored copy instead of failing as a content conflict; a
+        different content set always yields a different ``bundleId``.
+        """
+
         payload = bundle.model_dump(mode="json", exclude_none=True) if hasattr(bundle, "model_dump") else dict(bundle)
-        digest = sha256_hex(payload)
         with self._connect() as connection:
             existing = connection.execute(
                 "SELECT document_json FROM library_bundles WHERE bundle_id = ?",
                 (payload["bundleId"],),
             ).fetchone()
             if existing is not None:
-                if sha256_hex(json.loads(existing["document_json"])) != digest:
-                    raise WorkflowConflict(
-                        f"library bundle {payload['bundleId']} already exists with different content"
-                    )
                 return json.loads(existing["document_json"])
             connection.execute(
                 "INSERT INTO library_bundles (bundle_id, document_json, created_at) VALUES (?, ?, ?)",

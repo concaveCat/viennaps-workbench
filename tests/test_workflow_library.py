@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import unittest
 import uuid
 
@@ -257,6 +258,25 @@ class LibraryStoreTests(unittest.TestCase):
         request.update(overrides)
         return build_bundle(self.source, LibraryExportRequestV1.model_validate(request))
 
+    def _add_experiment(self, name: str, seed: int) -> str:
+        document = create_experiment_document(
+            name=name,
+            project=project(),
+            flow_id=self.flow_id,
+            recipe_id=self.recipe_id,
+            recipe_version=1,
+            variants=[
+                {
+                    "parameters": {"step_project_01": {"duration": 0.03}},
+                    "replicates": 1,
+                    "seed": seed,
+                }
+            ],
+            metric_id=self.metric_id,
+        )
+        self.source.save_experiment(document["experimentId"], document)
+        return document["experimentId"]
+
     def _target(self) -> WorkflowStore:
         store = WorkflowStore(self.root / "target.sqlite3")
         store.initialize()
@@ -306,6 +326,88 @@ class LibraryStoreTests(unittest.TestCase):
             "experimentIds": [self.experiment_id],
         }))
         self.assertEqual(rebuilt.bundleId, bundle.bundleId)
+
+    def test_repeated_export_is_idempotent_and_canonically_ordered(self):
+        # Same content exported twice must keep one bundle id *and* one stored
+        # createdAt. createdAt is deliberately outside the content identity.
+        request = LibraryExportRequestV1.model_validate(
+            {
+                "name": "team library",
+                "description": "P4-3 shared bundle",
+                "moduleIds": [self.module_id],
+                "definitionIds": [self.definition_id],
+                "templateIds": [self.template_id],
+                "experimentIds": [self.experiment_id],
+            }
+        )
+        first = build_bundle(self.source, request, created_at="2026-10-30T00:00:00+00:00")
+        second = build_bundle(self.source, request, created_at="2026-10-30T00:05:00+00:00")
+        self.assertEqual(first.bundleId, second.bundleId)
+        stored_first = self.source.save_library_bundle(first)
+        stored_second = self.source.save_library_bundle(second)
+        self.assertEqual(stored_first["createdAt"], "2026-10-30T00:00:00+00:00")
+        self.assertEqual(stored_second["createdAt"], stored_first["createdAt"])
+        rows = [
+            row
+            for row in self.source.list_library_bundles()
+            if row["bundleId"] == first.bundleId
+        ]
+        self.assertEqual(len(rows), 1)
+
+        # Experiment templates have no id, so their order must be derived from
+        # content rather than from the store's listing order. Two requests that
+        # select the same experiments must serialize identically.
+        second_experiment = self._add_experiment("second library experiment", 333)
+        forward = self._export(
+            experimentIds=[self.experiment_id, second_experiment]
+        )
+        backward = self._export(
+            experimentIds=[second_experiment, self.experiment_id]
+        )
+        self.assertEqual(forward.bundleId, backward.bundleId)
+        self.assertEqual(
+            [template.model_dump(mode="json") for template in forward.experimentTemplates],
+            [template.model_dump(mode="json") for template in backward.experimentTemplates],
+        )
+        self.assertEqual(
+            [template.name for template in forward.experimentTemplates],
+            [template.name for template in backward.experimentTemplates],
+        )
+
+    def test_reject_reimport_is_idempotent_when_experiment_order_changes(self):
+        second_experiment = self._add_experiment("second library experiment", 444)
+        bundle = self._export(
+            experimentIds=[self.experiment_id, second_experiment]
+        )
+        self.assertEqual(len(bundle.experimentTemplates), 2)
+
+        # A recipient may re-serialize the same content with the experiment
+        # array reversed; bundleId is content-addressed and ignores order.
+        reordered = bundle.model_copy(deep=True)
+        reordered.experimentTemplates.reverse()
+        self.assertEqual(reordered.bundleId, bundle.bundleId)
+
+        target = self._target()
+        first = import_bundle(target, bundle, "reject")
+        self.assertEqual(len(first.experimentIds), 2)
+        reordered_import = import_bundle(target, reordered, "reject")
+        self.assertEqual(reordered_import.experimentIds, [])
+        self.assertEqual(
+            sorted(
+                item.split(":", 2)[2]
+                for item in reordered_import.skipped
+                if item.startswith("experiment:")
+            ),
+            sorted(first.experimentIds),
+        )
+        imported_names = sorted(
+            target.get_experiment(experiment_id)["name"]
+            for experiment_id in first.experimentIds
+        )
+        self.assertEqual(
+            imported_names,
+            ["library experiment", "second library experiment"],
+        )
 
     def test_import_into_second_store_preserves_revisions_and_compiles(self):
         bundle = self._export()
@@ -372,6 +474,19 @@ class LibraryStoreTests(unittest.TestCase):
                 self.assertNotIn("measurementId", replicate)
                 self.assertNotIn("value", replicate)
         self.assertEqual(imported["librarySource"]["bundleId"], bundle.bundleId)
+        self.assertRegex(imported["librarySource"]["templateHash"], r"^[a-f0-9]{64}$")
+
+        # The imported experiment must be runnable from its own project
+        # snapshot: run-state and binding fields are reset, so compiling
+        # re-derives geometry instead of replaying the source binding.
+        self.assertIsNone(imported["binding"])
+        self.assertIsNone(imported["bindingId"])
+        self.assertIsNone(imported["baseCompileId"])
+        flow, _binding, compiled = adopt_project(
+            imported["project"], flow_id=imported["flowId"]
+        )
+        self.assertEqual(flow.flowId, imported["flowId"])
+        self.assertTrue(compiled.project.steps)
 
     def test_reject_conflicts_clone_renames_and_repeat_import_is_idempotent(self):
         # A later source revision must still clone from revision 1.
@@ -428,6 +543,24 @@ class LibraryStoreTests(unittest.TestCase):
         self.assertNotEqual(cloned_again.definitionIds[0], new_definition_id)
         self.assertNotEqual(cloned_again.templateIds[0], new_template_id)
         self.assertNotEqual(cloned_again.experimentIds[0], cloned.experimentIds[0])
+
+    def test_import_never_downgrades_a_newer_local_module_revision(self):
+        bundle = self._export()  # carries revisions 1 and 2
+        target = self._target()
+        for duration in (0.1, 0.2, 0.3):
+            target.save_module(module_document(self.module_id, duration))
+        self.assertEqual(target.current_module_revision(self.module_id), 3)
+
+        result = import_bundle(target, bundle, "reject")
+        self.assertEqual({row.status for row in result.modules}, {"existing"})
+        self.assertEqual(target.current_module_revision(self.module_id), 3)
+        self.assertEqual(target.get_module(self.module_id).steps[0]["duration"], 0.3)
+        # Exact revision retention still resolves the definition's pin.
+        expanded = expand_flow_definition(
+            target.get_flow_definition(self.definition_id), target.module_history()
+        )
+        self.assertEqual([step.moduleRevision for step in expanded.steps], [1])
+        self.assertEqual(expanded.steps[0].step["duration"], 0.1)
 
     def test_module_conflict_requires_identical_content_even_for_clone(self):
         bundle = self._export()
@@ -502,6 +635,38 @@ class LibraryStoreTests(unittest.TestCase):
         # Saving identical content is idempotent.
         self.source.save_library_bundle(bundle)
 
+    def test_v7_store_gains_the_library_table_on_initialize(self):
+        path = self.root / "v7.sqlite3"
+        store = WorkflowStore(path)
+        store.initialize()
+        with sqlite3.connect(path) as connection:
+            connection.execute("DROP TABLE library_bundles")
+            connection.execute(
+                "UPDATE schema_meta SET value = '7' WHERE key = 'schema_version'"
+            )
+        upgraded = WorkflowStore(path)
+        upgraded.initialize()
+        self.assertEqual(upgraded.schema_version(), "8")
+        self.assertEqual(upgraded.list_library_bundles(), [])
+
+    def test_failed_preflight_leaves_no_partial_writes(self):
+        bundle = self._export()
+        target = self._target()
+        target.register_template(
+            template_document(self.template_id).model_copy(
+                update={"name": "local only template"}
+            )
+        )
+        with self.assertRaises(WorkflowConflict) as context:
+            import_bundle(target, bundle, "reject")
+        self.assertIn(f"template:{self.template_id}", str(context.exception))
+        # Nothing from the bundle may be written before the conflict is raised.
+        self.assertFalse(target.module_revision_exists(self.module_id, 1))
+        self.assertFalse(target.module_revision_exists(self.module_id, 2))
+        with self.assertRaises(WorkflowNotFound):
+            target.current_module_revision(self.module_id)
+        self.assertEqual(target.get_template(self.template_id).name, "local only template")
+
 
 class WorkflowLibraryApiTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
@@ -565,16 +730,16 @@ class WorkflowLibraryApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_export_list_get_import_and_openapi(self):
         experiment_id = await self._seed()
+        export_payload = {
+            "name": "api team library",
+            "description": "P4-3",
+            "moduleIds": [self.module_id],
+            "definitionIds": [self.definition_id],
+            "templateIds": [self.template_id],
+            "experimentIds": [experiment_id],
+        }
         exported = await self.post(
-            "/api/v1/workflow/library/export",
-            {
-                "name": "api team library",
-                "description": "P4-3",
-                "moduleIds": [self.module_id],
-                "definitionIds": [self.definition_id],
-                "templateIds": [self.template_id],
-                "experimentIds": [experiment_id],
-            },
+            "/api/v1/workflow/library/export", export_payload
         )
         self.assertEqual(exported[0], 201, exported[2])
         bundle = json_body(exported)
@@ -597,6 +762,25 @@ class WorkflowLibraryApiTests(unittest.IsolatedAsyncioTestCase):
         fetched = await self.get(f"/api/v1/workflow/library/bundles/{bundle['bundleId']}")
         self.assertEqual(fetched[0], 200, fetched[2])
         self.assertEqual(json_body(fetched)["bundleId"], bundle["bundleId"])
+
+        # Exporting the same content again is idempotent: one catalog entry,
+        # same content id and the original createdAt.
+        re_exported = await self.post("/api/v1/workflow/library/export", export_payload)
+        self.assertEqual(re_exported[0], 201, re_exported[2])
+        self.assertEqual(json_body(re_exported)["bundleId"], bundle["bundleId"])
+        self.assertEqual(json_body(re_exported)["createdAt"], bundle["createdAt"])
+        relisted = await self.get("/api/v1/workflow/library/bundles")
+        self.assertEqual(relisted[0], 200, relisted[2])
+        self.assertEqual(
+            len(
+                [
+                    item
+                    for item in json_body(relisted)["bundles"]
+                    if item["bundleId"] == bundle["bundleId"]
+                ]
+            ),
+            1,
+        )
 
         cloned = await self.post(
             f"/api/v1/workflow/library/bundles/{bundle['bundleId']}/import",
@@ -683,6 +867,13 @@ class WorkflowLibraryApiTests(unittest.IsolatedAsyncioTestCase):
             {"bundle": mutated, "policy": "reject"},
         )
         self.assertEqual(conflict[0], 409, conflict[2])
+        # A rejected import must not register a half-imported bundle.
+        listed = await self.get("/api/v1/workflow/library/bundles")
+        self.assertEqual(listed[0], 200, listed[2])
+        self.assertNotIn(
+            mutated["bundleId"],
+            {item["bundleId"] for item in json_body(listed)["bundles"]},
+        )
 
         still_conflict = await self.post(
             f"/api/v1/workflow/library/bundles/{bundle['bundleId']}/import",

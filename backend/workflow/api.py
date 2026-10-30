@@ -1340,8 +1340,9 @@ async def export_library(request: LibraryExportRequestV1) -> LibraryBundleV1:
     def operation():
         store = get_store()
         bundle = build_bundle(store, request)
-        store.save_library_bundle(bundle)
-        return bundle
+        # Reuse the stored copy so a repeated export reports the original
+        # createdAt instead of pretending the same content is a new bundle.
+        return LibraryBundleV1.model_validate(store.save_library_bundle(bundle))
     return _call(operation)
 
 
@@ -1373,8 +1374,10 @@ async def import_library_bundle(
 async def import_library_document(request: LibraryDirectImportRequest) -> LibraryImportResultV1:
     def operation():
         store = get_store()
+        # Import first: a rejected bundle must not leave a catalog entry behind.
+        result = import_bundle(store, request.bundle, request.policy)
         store.save_library_bundle(request.bundle)
-        return import_bundle(store, request.bundle, request.policy)
+        return result
     return _call(operation)
 
 

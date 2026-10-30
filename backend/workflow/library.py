@@ -199,6 +199,18 @@ def _dump_module(entry: LibraryModuleV1) -> dict[str, Any]:
     }
 
 
+def _experiment_template_key(template: LibraryExperimentTemplateV1) -> str:
+    """Canonical ordering/identity key for a run-state-free experiment template.
+
+    Experiment templates have no id of their own, so their content hash is also
+    the bundle-local identity. Using it for ordering keeps the serialized bundle
+    canonical no matter how the source store listed its experiments, and keeps
+    reject imports idempotent when a bundle is re-serialized in another order.
+    """
+
+    return sha256_hex(template.model_dump(mode="json", exclude_none=True))
+
+
 def _bundle_id_for(
     *,
     name: str,
@@ -223,9 +235,7 @@ def _bundle_id_for(
         template.model_dump(mode="json", exclude_none=True)
         for template in experimentTemplates
     ]
-    experiment_rows.sort(
-        key=lambda row: sha256_hex(row)
-    )
+    experiment_rows.sort(key=sha256_hex)
     payload = {
         "schemaVersion": 1,
         "name": name,
@@ -386,6 +396,9 @@ def build_bundle(
             f"experiment export exceeds the {MAX_LIBRARY_EXPERIMENT_TEMPLATES} template limit"
         )
     experiment_templates = [_experiment_template(document) for document in experiment_documents]
+    # Canonical order so the same content always serializes to the same bundle,
+    # regardless of how the source store ordered its experiment listing.
+    experiment_templates.sort(key=_experiment_template_key)
 
     wanted: dict[str, set[int]] = defaultdict(set)
     pending: list[tuple[str, int]] = []
@@ -511,16 +524,32 @@ def _module_exists(store: WorkflowStore, module_id: str) -> bool:
         return False
 
 
-def _experiment_source_index(store: WorkflowStore, bundle_id: str) -> dict[int, str]:
-    found: dict[int, str] = {}
+def _experiment_source_index(
+    store: WorkflowStore, bundle_id: str
+) -> tuple[dict[str, str], dict[int, str]]:
+    """Index experiments already imported from one bundle.
+
+    The template content hash is authoritative. ``templateIndex`` is kept as a
+    fallback only for documents written before the hash was recorded: a bundle
+    may be re-serialized with its experiment templates in another order while
+    keeping the same content-addressed ``bundleId``.
+    """
+
+    by_hash: dict[str, str] = {}
+    by_index: dict[int, str] = {}
     for document in store.list_experiment_documents():
         source = document.get("librarySource") or {}
         if source.get("bundleId") != bundle_id:
             continue
+        experiment_id = str(document.get("experimentId"))
+        template_hash = source.get("templateHash")
+        if isinstance(template_hash, str):
+            by_hash[template_hash] = experiment_id
+            continue
         index = source.get("templateIndex")
         if isinstance(index, int):
-            found[index] = str(document.get("experimentId"))
-    return found
+            by_index.setdefault(index, experiment_id)
+    return by_hash, by_index
 
 
 def _new_experiment_document(
@@ -528,6 +557,7 @@ def _new_experiment_document(
     *,
     bundle_id: str,
     index: int,
+    template_hash: str,
     recipe: Any,
     metric: Any,
     now: str,
@@ -552,7 +582,9 @@ def _new_experiment_document(
                 "replicates": replicates,
             }
         )
-    flow_id = f"flow_lib_{sha256_hex([bundle_id, index, template.name])[:12]}"
+    # Derive the flow id from the template content, not its position, so the
+    # same template produces the same flow id on every workstation.
+    flow_id = f"flow_lib_{sha256_hex([bundle_id, template_hash])[:12]}"
     document: dict[str, Any] = {
         "schemaVersion": 2,
         "kind": template.kind,
@@ -579,6 +611,7 @@ def _new_experiment_document(
             "bundleId": bundle_id,
             "templateName": template.name,
             "templateIndex": index,
+            "templateHash": template_hash,
         },
     }
     if template.design is not None:
@@ -714,8 +747,10 @@ def import_bundle(
             template_plans.append((template, new_id, None))
 
     # --- experiment preflight --------------------------------------------
-    imported_sources = _experiment_source_index(store, bundle.bundleId)
-    experiment_plans: list[tuple[LibraryExperimentTemplateV1, int, Any, Any]] = []
+    imported_by_hash, imported_by_index = _experiment_source_index(store, bundle.bundleId)
+    experiment_plans: list[
+        tuple[LibraryExperimentTemplateV1, int, str, Any, Any]
+    ] = []
     experiment_skips: list[tuple[int, str]] = []
     for index, template in enumerate(bundle.experimentTemplates):
         try:
@@ -732,10 +767,15 @@ def import_bundle(
                 f"experiment template {template.name!r} requires metric "
                 f"{recipe.metricId!r}, which does not exist"
             ) from exc
-        if policy == "reject" and index in imported_sources:
-            experiment_skips.append((index, imported_sources[index]))
-            continue
-        experiment_plans.append((template, index, recipe, metric))
+        template_hash = _experiment_template_key(template)
+        if policy == "reject":
+            imported_experiment_id = imported_by_hash.get(template_hash)
+            if imported_experiment_id is None:
+                imported_experiment_id = imported_by_index.get(index)
+            if imported_experiment_id is not None:
+                experiment_skips.append((index, imported_experiment_id))
+                continue
+        experiment_plans.append((template, index, template_hash, recipe, metric))
 
     if conflicts:
         raise WorkflowConflict(
@@ -807,11 +847,12 @@ def import_bundle(
     for index, experiment_id in experiment_skips:
         result.skipped.append(f"experiment:{index}:{experiment_id}")
 
-    for template, index, recipe, metric in experiment_plans:
+    for template, index, template_hash, recipe, metric in experiment_plans:
         document = _new_experiment_document(
             template,
             bundle_id=bundle.bundleId,
             index=index,
+            template_hash=template_hash,
             recipe=recipe,
             metric=metric,
             now=now,
