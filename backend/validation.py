@@ -14,7 +14,7 @@ from pydantic import ValidationError
 from .models import Domain3D, Project, ProjectV3, ProjectV4, ProjectV5, ProjectV6, ProjectV7, parse_project
 from .materials import attach_and_reconcile_project_materials
 from .rates import has_motion, is_geometry_step, uses_flux, value as step_value
-from .specialized_models import FLUOROCARBON_MATERIAL_DEFAULTS, advanced_spec, model_spec
+from .specialized_models import FLUOROCARBON_MATERIAL_DEFAULTS, model_spec
 from .runtime_limits import available_cpu_threads
 
 
@@ -662,9 +662,15 @@ def _initial_vertical_extent(project: Any) -> float:
 
 
 def _advanced_number_issue(path: str, field: dict[str, Any], value: Any) -> FieldIssue | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return FieldIssue(path, "must be a finite JSON number")
-    if not float(field["minimum"]) <= float(value) <= float(field["maximum"]):
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return FieldIssue(path, "must be a finite JSON number")
+    if not math.isfinite(number):
+        return FieldIssue(path, "must be a finite JSON number")
+    if not float(field["minimum"]) <= number <= float(field["maximum"]):
         return FieldIssue(path, f"must be between {field['minimum']} and {field['maximum']}")
     return None
 
@@ -683,9 +689,12 @@ def _validate_advanced_parameters(prefix: str, spec: dict[str, Any], advanced: A
     blocks = spec["blocks"]
     scalars = {field["key"]: field for field in spec["scalars"]}
     maps = {row["key"]: row for row in spec["maps"]}
+    rejected = spec.get("rejectedKeys", {})
     allowed = set(blocks) | set(scalars) | set(maps)
     issues: list[FieldIssue] = []
-    if unknown := sorted(set(advanced) - allowed):
+    for name in sorted(set(advanced) & set(rejected)):
+        issues.append(FieldIssue(f"{path}.{name}", rejected[name]))
+    if unknown := sorted(set(advanced) - allowed - set(rejected)):
         issues.append(FieldIssue(path, f"unknown advanced keys {unknown}; allowed keys are {sorted(allowed)}"))
     for name, value in advanced.items():
         if name in blocks:
