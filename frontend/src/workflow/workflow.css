@@ -355,3 +355,11 @@ button, input { font: inherit; }
 .wf-table input { width: 100%; background: var(--wf-panel-2); color: var(--wf-text); border: 1px solid var(--wf-line); border-radius: 5px; padding: 4px; font-size: 10px; }
 
 .wf-stale { margin-left: auto; color: var(--wf-amber); font-size: 10px; }
+
+.wf-link { background: none; border: 0; color: var(--wf-accent); font-size: 10px; cursor: pointer; padding: 0; }
+.wf-evidence { margin-top: 10px; border: 1px solid var(--wf-line); border-radius: 9px; padding: 10px; background: rgba(18, 37, 58, 0.55); }
+.wf-evidence-head { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 8px; font-size: 11px; }
+.wf-evidence-head strong { font: 10px "IBM Plex Mono", ui-monospace, monospace; }
+.wf-evidence-grid { display: grid; grid-template-columns: 96px 1fr; gap: 4px 8px; font-size: 10px; }
+.wf-evidence-grid span { color: var(--wf-muted); }
+.wf-evidence-grid code { color: var(--wf-text); overflow-wrap: anywhere; }

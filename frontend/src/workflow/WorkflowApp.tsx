@@ -42,7 +42,23 @@ type Measurement = {
   sourceStateId: string | null;
   recipeId: string;
   recipeVersion: number;
+  method: string;
   material: string;
+  sourceSnapshotHash: string;
+  intersections: number[];
+  uncertainty: number | null;
+  uncertaintyStatus: string;
+  bindingEvidence: { methodVersion: string; verifiedAt: string } | null;
+};
+type Recipe = {
+  recipeId: string;
+  version: number;
+  metricId: string;
+  name: string;
+  dimension: number;
+  method: string;
+  material: string;
+  parameters: Record<string, unknown>;
 };
 type TemplateSummary = { templateId: string; name: string; stepCount: number };
 type Provenance = {
@@ -109,6 +125,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [branchDuration, setBranchDuration] = useState('0.02');
   const [activeRecipeId, setActiveRecipeId] = useState('');
   const [activeRecipeVersion, setActiveRecipeVersion] = useState(1);
+  const [metricDetail, setMetricDetail] = useState<{ measurement: Measurement; recipe: Recipe; provenance: Provenance } | null>(null);
   const [experimentDoc, setExperimentDoc] = useState<{ experimentId: string; name: string; status: string; variants: Array<{ ordinal: number; replicates: Array<{ status: string; value?: number | null; unit?: string; runId?: string }> }> } | null>(null);
   const [previousCompile, setPreviousCompile] = useState<CompileInfo | null>(null);
   const [compileDiff, setCompileDiff] = useState<{ addedStepIds: string[]; removedStepIds: string[]; movedStepIds: string[]; changedStepIds: string[]; affectedStepIds: string[]; details?: Array<{ stepId: string; before: Record<string, unknown>; after: Record<string, unknown> }> } | null>(null);
@@ -198,6 +215,16 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setSegment(null);
   });
 
+  const resolveTemplateSteps = (steps: Array<Record<string, unknown>>, value: number) => {
+    const replace = (item: unknown): unknown => {
+      if (Array.isArray(item)) return item.map(replace);
+      if (item && typeof item === 'object') return Object.fromEntries(Object.entries(item).map(([key, child]) => [key, replace(child)]));
+      if (typeof item === 'string' && item.trim() === '${duration}') return value;
+      return item;
+    };
+    return steps.map(step => replace(step) as Record<string, unknown>);
+  };
+
   const saveTemplate = () => run('template', async () => {
     if (!compile || !project) throw new Error('先采纳工程');
     const templateId = `tpl_${Date.now().toString(36)}`;
@@ -222,18 +249,15 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
 
   const applyTemplate = () => run('template', async () => {
     if (!project || !templateId) throw new Error('先选择模板');
+    const detail = await api<{ steps: Array<Record<string, unknown>> }>(`/api/v1/workflow/templates/${templateId}`);
+    const value = Number(templateVariable) || 0.02;
+    const resolved = resolveTemplateSteps(detail.steps, value);
     const result = await postJson<CompileInfo>('/api/v1/workflow/flows/from-template', {
-      project, templateId, flowId: compile?.flowId, variables: { duration: Number(templateVariable) || 0.02 },
+      project, templateId, flowId: compile?.flowId, variables: { duration: value },
     });
     if (compile) setPreviousCompile(compile);
     setCompile(result); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);
-    if (project) {
-      const cloned = JSON.parse(JSON.stringify(project)) as typeof project;
-      const enabled = (cloned.steps ?? []).filter(step => step.enabled);
-      const ids = new Set(enabled.slice(-2).map(step => step.id));
-      cloned.steps = (cloned.steps ?? []).map(step => ids.has(step.id) ? { ...step, duration: Number(templateVariable) || 0.02 } : step);
-      setProject(cloned);
-    }
+    setProject(previous => previous ? { ...previous, steps: resolved as typeof previous.steps } : previous);
   });
 
   const createRoute = () => run('route', async () => {
@@ -379,6 +403,14 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     throw new Error('experiment segment did not finish');
   };
 
+  const showMetricDetail = (item: Measurement) => run('metric-detail', async () => {
+    const [recipe, provenance] = await Promise.all([
+      api<Recipe>(`/api/v1/workflow/metrology-recipes/${item.recipeId}?version=${item.recipeVersion}`),
+      api<Provenance>(`/api/v1/workflow/measurements/${item.measurementId}/provenance`),
+    ]);
+    setMetricDetail({ measurement: item, recipe, provenance });
+  });
+
   const downloadReport = () => {
     const lines = [
       '<!doctype html><meta charset="utf-8"><title>P0 Workflow Report</title>',
@@ -462,7 +494,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             </button>
             <button className="wf-button ghost" disabled={!compile || !!busy} onClick={() => void saveTemplate()}>保存当前步骤为模板</button>
             <div className="wf-template-row">
-              <select value={templateId} onChange={event => setTemplateId(event.target.value)}>
+              <select aria-label="模板选择" value={templateId} onChange={event => setTemplateId(event.target.value)}>
                 <option value="">选择模板</option>
                 {templates.map(item => <option key={item.templateId} value={item.templateId}>{item.name} · {item.stepCount} 步</option>)}
               </select>
@@ -523,7 +555,22 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             <span>{measurement.value === null ? measurement.reason ?? '无值' : `${measurement.value.toFixed(4)} ${measurement.unit}`}</span>
             <span>binding: {measurement.bindingStatus} · equivalence: {measurement.equivalenceStatus}</span>
           </div>}
-          {metrics.length > 0 && <table className="wf-table"><thead><tr><th>Status</th><th>Value</th><th>Recipe / Step</th><th>Binding</th></tr></thead><tbody>{metrics.map(item => <tr key={item.measurementId}><td>{item.status}</td><td>{item.value === null ? item.reason : `${item.value.toFixed(4)} ${item.unit}`}</td><td>{item.recipeId} v{item.recipeVersion} · {item.material} · {item.sourceStepId?.slice(0, 8)}</td><td>{item.bindingStatus} / {item.equivalenceStatus}</td></tr>)}</tbody></table>}
+          {metrics.length > 0 && <table className="wf-table"><thead><tr><th>Status</th><th>Value</th><th>Recipe / Step</th><th>Binding</th><th /></tr></thead><tbody>{metrics.map(item => <tr key={item.measurementId}><td>{item.status}</td><td>{item.value === null ? item.reason : `${item.value.toFixed(4)} ${item.unit}`}</td><td>{item.recipeId} v{item.recipeVersion} · {item.method} · {item.material} · {item.sourceStepId?.slice(0, 8)}</td><td>{item.bindingStatus} / {item.equivalenceStatus}</td><td><button className="wf-link" aria-label={`查看 ${item.measurementId} 证据`} onClick={() => void showMetricDetail(item)}>详情</button></td></tr>)}</tbody></table>}
+          {metricDetail && <div className="wf-evidence">
+            <div className="wf-evidence-head"><strong>{metricDetail.measurement.measurementId}</strong><span className={`wf-status ${metricDetail.measurement.status}`}>{metricDetail.measurement.status}</span></div>
+            <div className="wf-evidence-grid">
+              <span>method</span><code>{metricDetail.recipe.method}</code>
+              <span>material</span><code>{metricDetail.recipe.material}</code>
+              <span>recipe</span><code>{metricDetail.recipe.recipeId} v{metricDetail.recipe.version}</code>
+              <span>parameters</span><code>{JSON.stringify(metricDetail.recipe.parameters)}</code>
+              <span>snapshot</span><code>{metricDetail.measurement.sourceSnapshotHash.slice(0, 16)}…</code>
+              <span>intersections</span><code>{metricDetail.measurement.intersections.join(', ') || '—'}</code>
+              <span>uncertainty</span><code>{metricDetail.measurement.uncertainty ?? '—'} ({metricDetail.measurement.uncertaintyStatus})</code>
+              <span>binding</span><code>{metricDetail.measurement.bindingStatus}{metricDetail.measurement.bindingEvidence ? ` · ${metricDetail.measurement.bindingEvidence.methodVersion}` : ''}</code>
+              <span>equivalence</span><code>{metricDetail.measurement.equivalenceStatus}</code>
+              <span>evidence records</span><code>{metricDetail.provenance.verifications.map(row => `${row.status}/${row.evidence.methodVersion}`).join(', ') || '—'}</code>
+            </div>
+          </div>}
           {provenance && <div className="wf-provenance">
             <div className="wf-muted">verification records: {provenance.verifications.length}</div>
             {provenance.verifications.map(item => <div className="wf-verify" key={item.verificationId}><span className={`wf-status ${item.status}`}>{item.status}</span><code>{item.verificationId.slice(0, 10)}…</code><span>{item.evidence.methodVersion}</span></div>)}
