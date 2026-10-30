@@ -66,6 +66,7 @@ from .modules import (
     expand_flow_definition,
     to_flow_revision,
 )
+from .project_state import ProjectWorkflowStateV1
 from .provenance import ProvenanceVerificationV1, VerificationRecordV1
 from .routes import AttemptV1, RoutePlanV1, SegmentRefV1, SegmentReuseV1, SegmentV1
 from .templates import FlowTemplateV1, resolve_template
@@ -1216,6 +1217,32 @@ async def put_project(project_id: str, request: ProjectV7) -> ProjectRecordV1:
 @router.delete("/projects/{project_id}", status_code=204)
 async def delete_project(project_id: str) -> Response:
     _call(lambda: get_store().delete_project(project_id))
+    return Response(status_code=204)
+
+
+@router.get(
+    "/projects/{project_id}/state", response_model=ProjectWorkflowStateV1
+)
+async def get_project_workflow_state(project_id: str) -> ProjectWorkflowStateV1:
+    """Return the project's 03-page state; unset state is an empty document."""
+
+    return _call(lambda: get_store().get_project_workflow_state(project_id))
+
+
+@router.put(
+    "/projects/{project_id}/state", response_model=ProjectWorkflowStateV1
+)
+async def put_project_workflow_state(
+    project_id: str, request: ProjectWorkflowStateV1
+) -> ProjectWorkflowStateV1:
+    """Save the project's 03-page state; dangling references are rejected."""
+
+    return _call(lambda: get_store().save_project_workflow_state(project_id, request))
+
+
+@router.delete("/projects/{project_id}/state", status_code=204)
+async def delete_project_workflow_state(project_id: str) -> Response:
+    _call(lambda: get_store().delete_project_workflow_state(project_id))
     return Response(status_code=204)
 
 

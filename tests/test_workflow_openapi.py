@@ -44,6 +44,7 @@ class WorkflowOpenApiTests(unittest.TestCase):
             "/api/v1/workflow/library/items/{item_id}",
             "/api/v1/workflow/projects",
             "/api/v1/workflow/projects/{project_id}",
+            "/api/v1/workflow/projects/{project_id}/state",
         ):
             self.assertIn(path, paths)
         self.assertIn("RoutePlanV1", schema["components"]["schemas"])
@@ -63,6 +64,8 @@ class WorkflowOpenApiTests(unittest.TestCase):
             "LibraryItemListResponse",
             "ProjectRecordV1",
             "ProjectListResponse",
+            "ProjectWorkflowStateV1",
+            "ProjectWorkflowSegmentRunV1",
         ):
             self.assertIn(name, schema["components"]["schemas"])
         for name in (
@@ -90,6 +93,34 @@ class WorkflowOpenApiTests(unittest.TestCase):
         for field in ("projectId", "name", "dimension", "stepCount", "updatedAt"):
             self.assertIn(field, project_record["required"])
         self.assertFalse(project_record.get("additionalProperties", False))
+        project_state = schema["components"]["schemas"]["ProjectWorkflowStateV1"]
+        self.assertFalse(project_state.get("additionalProperties", False))
+        for field in (
+            "schemaVersion",
+            "compileId",
+            "routeId",
+            "segmentRuns",
+            "measurementIds",
+            "experimentIds",
+            "updatedAt",
+        ):
+            self.assertIn(field, project_state["properties"])
+        segment_run = schema["components"]["schemas"]["ProjectWorkflowSegmentRunV1"]
+        self.assertFalse(segment_run.get("additionalProperties", False))
+        for field in ("segmentId", "runId", "measurementId"):
+            self.assertIn(field, segment_run["properties"])
+        state_path = paths["/api/v1/workflow/projects/{project_id}/state"]
+        self.assertIn("get", state_path)
+        self.assertIn("put", state_path)
+        self.assertIn("delete", state_path)
+        self.assertEqual(
+            state_path["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ProjectWorkflowStateV1",
+        )
+        self.assertEqual(
+            state_path["put"]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ProjectWorkflowStateV1",
+        )
         self.assertEqual(
             paths["/api/v1/workflow/projects"]["post"]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
             "#/components/schemas/ProjectV7",

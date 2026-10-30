@@ -23,6 +23,10 @@ from .metrology import (
 )
 from ..models import ProjectV7, parse_project
 from .models import CompiledWorkflowV1
+from .project_state import (
+    MAX_STATE_JSON_BYTES,
+    ProjectWorkflowStateV1,
+)
 from .modules import FlowDefinitionV2, ModuleV1, flow_definition_pins, module_step_pins
 from .provenance import VerificationRecordV1
 from .routes import (
@@ -37,7 +41,7 @@ from .routes import (
 from .verification import prefix_compatibility, verify_route_plan_compiles
 
 
-SCHEMA_VERSION = "10"
+SCHEMA_VERSION = "11"
 
 
 def new_project_id() -> str:
@@ -79,7 +83,9 @@ class WorkflowStore:
                     row = preflight.execute(
                         "SELECT value FROM schema_meta WHERE key = 'schema_version'"
                     ).fetchone()
-                    if row is not None and row[0] not in {"1", "2", "3", "4", "5", "6", "7", "8", "9", SCHEMA_VERSION}:
+                    if row is not None and row[0] not in {
+                        "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", SCHEMA_VERSION,
+                    }:
                         raise RuntimeError(
                             f"unsupported workflow schema version {row[0]!r}; "
                             f"expected {SCHEMA_VERSION!r}"
@@ -275,6 +281,11 @@ class WorkflowStore:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS project_workflow_state (
+                    project_id TEXT PRIMARY KEY REFERENCES projects(project_id) ON DELETE CASCADE,
+                    state_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS geometry_bindings (
                     binding_id TEXT PRIMARY KEY,
                     binding_json TEXT NOT NULL,
@@ -391,7 +402,7 @@ class WorkflowStore:
                     "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
                     (SCHEMA_VERSION,),
                 )
-            elif version_row["value"] in {"3", "4", "5", "6", "7", "8", "9"}:
+            elif version_row["value"] in {"3", "4", "5", "6", "7", "8", "9", "10"}:
                 connection.execute(
                     "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
                     (SCHEMA_VERSION,),
@@ -2439,6 +2450,177 @@ class WorkflowStore:
             )
             if cursor.rowcount == 0:
                 raise WorkflowNotFound(f"project {project_id!r} does not exist")
+
+    # ------------------------------------------------------------------
+    # Per-project workflow state (schema 11)
+    # ------------------------------------------------------------------
+
+    def get_project_workflow_state(self, project_id: str) -> ProjectWorkflowStateV1:
+        """Return the stored 03-page state, or an all-empty state when unset.
+
+        Reads never re-validate references: a compile/route/segment that GC
+        removed after the state was saved must still return the saved document
+        so the UI can decide what to do with the now-missing target.
+        """
+
+        with self._connect() as connection:
+            project = connection.execute(
+                "SELECT project_id FROM projects WHERE project_id = ?", (project_id,)
+            ).fetchone()
+            if project is None:
+                raise WorkflowNotFound(f"project {project_id!r} does not exist")
+            row = connection.execute(
+                "SELECT state_json FROM project_workflow_state WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+        if row is None:
+            return ProjectWorkflowStateV1()
+        try:
+            return ProjectWorkflowStateV1.model_validate(json.loads(row["state_json"]))
+        except (ValueError, TypeError) as exc:
+            raise WorkflowValidation(
+                f"stored workflow state for project {project_id!r} is invalid"
+            ) from exc
+
+    def save_project_workflow_state(
+        self,
+        project_id: str,
+        state: ProjectWorkflowStateV1 | Mapping[str, Any],
+    ) -> ProjectWorkflowStateV1:
+        """Replace the whole state document after checking every reference.
+
+        ``updatedAt`` is server-owned: the incoming value is ignored and the
+        stamp only moves when the content actually changes, so a repeated
+        autosave PUT is idempotent.
+        """
+
+        record = (
+            state
+            if isinstance(state, ProjectWorkflowStateV1)
+            else ProjectWorkflowStateV1.model_validate(dict(state))
+        )
+        content = record.content()
+        encoded = self._dump({**content, "updatedAt": None})
+        if len(encoded.encode("utf-8")) > MAX_STATE_JSON_BYTES:
+            raise WorkflowValidation(
+                f"workflow state JSON exceeds the {MAX_STATE_JSON_BYTES} byte limit"
+            )
+        with self._connect() as connection:
+            project = connection.execute(
+                "SELECT project_id FROM projects WHERE project_id = ?", (project_id,)
+            ).fetchone()
+            if project is None:
+                raise WorkflowNotFound(f"project {project_id!r} does not exist")
+            self._validate_workflow_state_references(connection, record)
+            existing = connection.execute(
+                "SELECT state_json FROM project_workflow_state WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            if existing is not None:
+                stored = json.loads(existing["state_json"])
+                if stored.get("updatedAt") is not None:
+                    stored_content = {
+                        key: value for key, value in stored.items() if key != "updatedAt"
+                    }
+                    if self._dump(stored_content) == self._dump(content):
+                        return ProjectWorkflowStateV1.model_validate(stored)
+            timestamp = self._now()
+            document = {**content, "updatedAt": timestamp}
+            connection.execute(
+                "INSERT INTO project_workflow_state (project_id, state_json, updated_at)"
+                " VALUES (?, ?, ?)"
+                " ON CONFLICT(project_id) DO UPDATE SET"
+                " state_json = excluded.state_json, updated_at = excluded.updated_at",
+                (project_id, self._dump(document), timestamp),
+            )
+        return ProjectWorkflowStateV1.model_validate(document)
+
+    def delete_project_workflow_state(self, project_id: str) -> None:
+        with self._connect() as connection:
+            project = connection.execute(
+                "SELECT project_id FROM projects WHERE project_id = ?", (project_id,)
+            ).fetchone()
+            if project is None:
+                raise WorkflowNotFound(f"project {project_id!r} does not exist")
+            connection.execute(
+                "DELETE FROM project_workflow_state WHERE project_id = ?", (project_id,)
+            )
+
+    @staticmethod
+    def _validate_workflow_state_references(
+        connection: sqlite3.Connection, state: ProjectWorkflowStateV1
+    ) -> None:
+        """Reject dangling references instead of persisting them."""
+
+        compile_id = state.compileId
+        route_id = state.routeId
+        if compile_id is not None:
+            row = connection.execute(
+                "SELECT 1 FROM compiles WHERE compile_id = ?", (compile_id,)
+            ).fetchone()
+            if row is None:
+                raise WorkflowValidation(f"compile {compile_id!r} does not exist")
+        if route_id is not None:
+            row = connection.execute(
+                "SELECT 1 FROM routes WHERE route_id = ?", (route_id,)
+            ).fetchone()
+            if row is None:
+                raise WorkflowValidation(f"route {route_id!r} does not exist")
+            if compile_id is not None:
+                match = connection.execute(
+                    "SELECT 1 FROM attempts WHERE route_id = ? AND compile_id = ? LIMIT 1",
+                    (route_id, compile_id),
+                ).fetchone()
+                if match is None:
+                    raise WorkflowValidation(
+                        f"route {route_id!r} does not belong to compile {compile_id!r}"
+                    )
+        if state.segmentRuns and route_id is None:
+            raise WorkflowValidation(
+                "routeId is required when segmentRuns is not empty"
+            )
+        for entry in state.segmentRuns:
+            segment = connection.execute(
+                "SELECT 1 FROM segments WHERE segment_id = ?", (entry.segmentId,)
+            ).fetchone()
+            if segment is None:
+                raise WorkflowValidation(f"segment {entry.segmentId!r} does not exist")
+            if route_id is not None:
+                belongs = connection.execute(
+                    "SELECT 1 FROM segments s"
+                    " JOIN attempts a ON a.attempt_id = s.attempt_id"
+                    " WHERE s.segment_id = ? AND a.route_id = ? LIMIT 1",
+                    (entry.segmentId, route_id),
+                ).fetchone()
+                if belongs is None:
+                    raise WorkflowValidation(
+                        f"segment {entry.segmentId!r} does not belong to route {route_id!r}"
+                    )
+            if entry.measurementId is not None:
+                measurement = connection.execute(
+                    "SELECT 1 FROM measurements WHERE measurement_id = ?",
+                    (entry.measurementId,),
+                ).fetchone()
+                if measurement is None:
+                    raise WorkflowValidation(
+                        f"measurement {entry.measurementId!r} does not exist"
+                    )
+        for measurement_id in state.measurementIds:
+            row = connection.execute(
+                "SELECT 1 FROM measurements WHERE measurement_id = ?",
+                (measurement_id,),
+            ).fetchone()
+            if row is None:
+                raise WorkflowValidation(
+                    f"measurement {measurement_id!r} does not exist"
+                )
+        for experiment_id in state.experimentIds:
+            row = connection.execute(
+                "SELECT 1 FROM experiments WHERE experiment_id = ?",
+                (experiment_id,),
+            ).fetchone()
+            if row is None:
+                raise WorkflowValidation(f"experiment {experiment_id!r} does not exist")
 
     def register_binding(self, binding) -> Any:
         payload = binding.model_dump(mode="json", exclude_none=True)
