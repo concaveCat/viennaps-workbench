@@ -254,6 +254,11 @@ def referenced_material_names(project: Any) -> set[str]:
                         found.update(str(name) for name in child if isinstance(name, str))
                     elif isinstance(child, str) and child:
                         found.add(child)
+                elif child_key == "coverMaterial" and isinstance(child, str) and child and child != "GAS":
+                    # DenseCellSet cover cells can use a registered material or
+                    # the native GAS sentinel. Keep a custom-only reference
+                    # registered, but do not invent a catalog entry for GAS.
+                    found.add(child)
                 elif child_key in {"materialRates", "stickingProbabilityByMaterial", "byMaterial"} and isinstance(child, dict):
                     found.update(str(name) for name in child)
                 else:

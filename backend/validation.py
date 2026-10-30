@@ -425,6 +425,14 @@ def _validate_materials(project: ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 |
         if name not in names: issues.append(FieldIssue(path,f"unknown or unavailable material {name!r}; choose a material from /api/materials"))
         roles.setdefault(name,set()).add(role)
     issues=list(issues_view)
+    output_settings = getattr(project, "outputSettings", None)
+    cell_set = getattr(output_settings, "cellSet", None)
+    if cell_set is not None and cell_set.enabled:
+        cover = str(cell_set.coverMaterial)
+        if cover != "GAS" and cover not in names:
+            issues.append(FieldIssue(
+                "outputSettings.cellSet.coverMaterial",
+                f"unknown or unavailable material {cover!r}; choose GAS or a material from /api/materials"))
     available_by_step = _materials_available_by_step(project)
     uniform_protection=project.schemaVersion<4 or any(step_value(step,"rateMode","uniform")=="uniform" for step in project.steps)
     if g["kind"] == "gds":

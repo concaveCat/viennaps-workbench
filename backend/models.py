@@ -10,7 +10,7 @@ from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationError, field_validator, model_validator
 from .materials import MaterialDefinition
-from .runtime_limits import available_cpu_threads
+from .runtime_limits import MAX_CELL_SET_CELLS, available_cpu_threads
 
 
 def _finite_number(value: object) -> float:
@@ -1139,6 +1139,56 @@ class ProjectV6(StrictModel):
         return self
 
 
+#: Scalar labels the installed viennacs 2.x DenseCellSet always writes.
+#: ``Domain.generateCellSet``/``DenseCellSet.fromLevelSets`` add exactly these
+#: two arrays; no broader label set exists in ViennaPS 4.6.2.
+CELL_SET_NATIVE_SCALARS = ("Material", "FillingFraction")
+
+
+class CellSetOutputV7(StrictModel):
+    """Native ``viennaps.DenseCellSet`` output for every saved step.
+
+    Native ``Domain.generateCellSet(position, coverMaterial, isAboveSurface)``
+    takes an absolute *coordinate* and a direction flag, not a periodic flag.
+    This request exposes the safe generic form only: a cell set built above the
+    surface (``isAboveSurface=true``), i.e. the level-set band plus a cover
+    region whose top is ``height`` above the highest surface point. The
+    ``periodic`` flag mirrors the domain's lateral boundary and is applied to
+    the cell set through ``DenseCellSet.setPeriodicBoundary``.
+    """
+
+    enabled: bool = False
+    #: Distance from the highest surface point to the top of the cell set.
+    #: Must span at least one grid interval: the installed viennacs crashes
+    #: for a thinner band, so the native lower bound is enforced, not hidden.
+    height: Number | None = None
+    coverMaterial: Annotated[str, Field(min_length=1, max_length=64)] = "GAS"
+    periodic: bool = False
+    format: Literal["vtu", "json", "both"] = "both"
+    #: Native scalar labels to summarise in the compact JSON document.
+    #: Omitted means every label the native cell set exposes.
+    scalarLabels: list[str] | None = None
+
+    @model_validator(mode="after")
+    def cell_set_shape(self):
+        if self.enabled and self.height is None:
+            raise ValueError("cellSet.height is required when cellSet.enabled is true")
+        if self.height is not None and float(self.height) <= 0.0:
+            raise ValueError("cellSet.height must be positive")
+        if self.scalarLabels is not None:
+            if not self.scalarLabels:
+                raise ValueError("cellSet.scalarLabels must be omitted or a non-empty list")
+            if len(set(self.scalarLabels)) != len(self.scalarLabels):
+                raise ValueError("cellSet.scalarLabels must not contain duplicates")
+            unknown = sorted(set(self.scalarLabels) - set(CELL_SET_NATIVE_SCALARS))
+            if unknown:
+                raise ValueError(
+                    "cellSet.scalarLabels contains unsupported label(s) "
+                    + ", ".join(repr(name) for name in unknown)
+                    + "; ViennaPS 4.6.2 exposes Material and FillingFraction")
+        return self
+
+
 class OutputSettingsV7(StrictModel):
     """Native result artifacts; the surface mesh remains the viewer's required result."""
 
@@ -1147,6 +1197,7 @@ class OutputSettingsV7(StrictModel):
     surfaceMeshVtk: bool = False
     volumeMesh: bool = False
     nativeMetadata: bool = False
+    cellSet: CellSetOutputV7 | None = None
 
 
 class ProjectV7(ProjectV6):
@@ -1225,6 +1276,35 @@ class ProjectV7(ProjectV6):
                 raise ValueError(f"steps[{index}].gdsMask.position exceeds the application coordinate budget")
         if self.dimension == 2 and self.outputSettings is not None and self.outputSettings.volumeMesh:
             raise ValueError("native volume mesh output is only available for 3D projects")
+        cell_set = self.outputSettings.cellSet if self.outputSettings is not None else None
+        if cell_set is not None and cell_set.enabled:
+            delta = float(self.domain.gridDelta)
+            height = float(cell_set.height)
+            if height + 1e-12 < delta:
+                raise ValueError(
+                    f"cellSet.height must span at least one grid interval ({delta:g} um); "
+                    "the installed viennacs DenseCellSet generator crashes on a thinner band")
+            if height / delta > 1_000_000:
+                raise ValueError("cellSet.height exceeds the application coordinate budget")
+            domain_periodic = (self.domain.boundaryXY == "periodic" if self.dimension == 3
+                               else self.domain.xBoundary == "periodic")
+            if bool(cell_set.periodic) != domain_periodic:
+                raise ValueError(
+                    "cellSet.periodic must match the domain lateral boundary; the cell set is "
+                    "generated from the domain's level sets and only the native neighbor topology "
+                    "can be marked periodic")
+            nx = max(1, math.ceil(float(self.domain.xExtent) / delta))
+            if self.dimension == 3:
+                ny = max(1, math.ceil(float(self.domain.yExtent) / delta))
+                lateral = (nx + 2) * (ny + 2)
+            else:
+                lateral = nx + 2
+            rows = math.ceil(height / delta) + 4
+            estimate = lateral * max(rows, 2)
+            if estimate > MAX_CELL_SET_CELLS:
+                raise ValueError(
+                    f"cellSet.height would create at least {estimate:,} cells, above the "
+                    f"{MAX_CELL_SET_CELLS:,}-cell limit; reduce cellSet.height or coarsen gridDelta")
         return self
 
 
