@@ -38,6 +38,10 @@ def _applicable_solver(project: Project | ProjectV3 | ProjectV4 | ProjectV5 | Pr
         data["advection"] = project.solver.advection.model_dump(mode="json")
         if project.solver.gpuDeviceId is not None:
             data["gpuDeviceId"] = project.solver.gpuDeviceId
+        if project.solver.gpuEngine is not None:
+            # Engine identity is part of the requested simulation input: a
+            # GPU_TRIANGLE request must never hash the same as GPU_DISK.
+            data["gpuEngine"] = project.solver.gpuEngine
     if any((uses_flux(step) if project.schemaVersion in (4, 5, 6, 7) else _step_value(step,"model")=="singleParticle" and _step_value(step,"rateMagnitude")>0) for step in project.steps if _step_value(step,"enabled")):
         data.update(
             raysPerPoint=project.solver.raysPerPoint,

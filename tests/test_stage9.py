@@ -56,7 +56,9 @@ class Stage9GpuMatrixTests(unittest.TestCase):
         matrix = json.loads((ROOT / "docs/stage9-evidence/gpu-capability-matrix.json").read_text())
         source = json.loads((ROOT / "docs/stage9-evidence/gpu-specialized/summary-gpu_disk.json").read_text())
         self.assertTrue(source["passed"])
-        self.assertEqual(len(matrix["rows"]), 558)
+        self.assertEqual(len(matrix["rows"]), 560)
+        self.assertEqual(sum(row["engine"] == "GPU_DISK" for row in matrix["rows"]), 558)
+        self.assertEqual(sum(row["engine"] == "GPU_TRIANGLE" for row in matrix["rows"]), 2)
         periodic_specialized = [row for row in matrix["rows"]
                                 if row["boundaryXY"] == "periodic" and row["model"].startswith("specialized:")]
         self.assertEqual(len(periodic_specialized), 160)
@@ -75,7 +77,7 @@ class Stage9GpuMatrixTests(unittest.TestCase):
             unique.add(key)
             self.assertEqual(row["status"], "verified")
             self.assertEqual(row["schemaVersions"], [7])
-            self.assertEqual(row["engine"], "GPU_DISK")
+            self.assertIn(row["engine"], {"GPU_DISK", "GPU_TRIANGLE"})
             self.assertTrue(row["geometryKinds"])
             self.assertTrue(row["materials"])
             self.assertIsInstance(row["materialRoles"], dict)

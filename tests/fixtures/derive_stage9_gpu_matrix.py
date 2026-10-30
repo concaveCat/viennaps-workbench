@@ -65,6 +65,7 @@ MULTIPARTICLE_VELOCITY_API_GUARD = ROOT / "docs/stage9-evidence/gpu-coverage-aud
 MULTIPARTICLE_VELOCITY_ASSIGNMENT = ROOT / "docs/stage9-evidence/gpu-coverage-audit/multiparticle-species-probe/cpu-ion-diagnostic/velocity-field-assignment.log"
 MULTIPARTICLE_VELOCITY_ASSIGNMENT_GUARD = ROOT / "docs/stage9-evidence/gpu-coverage-audit/multiparticle-species-probe/cpu-ion-diagnostic/velocity-field-assignment.guard.json"
 SPECIALIZED_GEOMETRIES = ROOT / "docs/stage9-evidence/gpu-coverage-audit/specialized-geometries"
+GPU_TRIANGLE_VARIANTS = ROOT / "docs/stage9-evidence/gpu-variants"
 PORTABLE_RUNS = ROOT / "docs/stage9-evidence/gpu-coverage-audit/legacy-products"
 OUTPUT = ROOT / "docs/stage9-evidence/gpu-capability-matrix.json"
 GEOMETRY_COVERAGE_REPORT = SPECIALIZED_GEOMETRIES / "coverage-report.json"
@@ -2046,6 +2047,68 @@ def validate_evidence_paths(rows: list[dict]) -> None:
                 raise SystemExit(f"matrix evidence path does not resolve: {field}={reference}")
 
 
+def add_gpu_triangle_rows(rows: list[dict]) -> None:
+    """Publish the measured GPU_TRIANGLE product/direct pair only.
+
+    The archived gpu-variants experiment ran the Stage 8 product worker and an
+    independent direct ViennaPS SF6/O2 etch in 2D and 3D on the same stack.
+    That is the entire measured GPU_TRIANGLE surface; no other model,
+    operation, boundary or geometry is inferred from the GPU_DISK matrix.
+    """
+    expected_uuid = "GPU-5532bb0f-735e-bc93-98ca-b7662a8ebf6d"
+    for dimension in (2, 3):
+        case_dir = GPU_TRIANGLE_VARIANTS / f"gpu-triangle-{dimension}d"
+        summary_path = case_dir / "summary-gpu_triangle.json"
+        run_path = case_dir / f"sf6o2-{dimension}d-gpu_triangle.json"
+        input_path = case_dir / f"sf6o2-{dimension}d-gpu_triangle.final.input.json"
+        direct_path = case_dir / f"sf6o2-{dimension}d-gpu_triangle.final.direct-reference.json"
+        product_guard = case_dir / f"sf6o2-{dimension}d-gpu_triangle.final.guard.json"
+        direct_guard = case_dir / f"sf6o2-{dimension}d-gpu_triangle.final.direct.guard.json"
+        for required in (summary_path, run_path, input_path, direct_path, product_guard, direct_guard):
+            if not required.is_file():
+                raise SystemExit(f"GPU_TRIANGLE evidence is missing: {required.relative_to(ROOT)}")
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        if not summary.get("passed") or len(summary.get("rows", [])) != 1:
+            raise SystemExit(f"GPU_TRIANGLE {dimension}D summary is incomplete")
+        row = summary["rows"][0]
+        if (row.get("status") != "succeeded" or row.get("engine") != "GPU_TRIANGLE"
+                or int(row.get("dimension", 0)) != dimension or row.get("model") != "sf6o2"):
+            raise SystemExit(f"GPU_TRIANGLE {dimension}D case was not a successful measured run")
+        actual = row.get("actualExecution", [])
+        if len(actual) != 1 or actual[0].get("actualEngine") != "GPU_TRIANGLE":
+            raise SystemExit(f"GPU_TRIANGLE {dimension}D product did not record its actual engine")
+        native = actual[0].get("actualParameters", {}).get("nativeModel", {})
+        if (native.get("actualEngine") != "GPU_TRIANGLE"
+                or native.get("nativeProcessEngine") != "GPU_TRIANGLE"):
+            raise SystemExit(f"GPU_TRIANGLE {dimension}D native model engine metadata differs")
+        readback = actual[0].get("actualParameters", {}).get("cudaDeviceReadback", {})
+        if (readback.get("readbackStatus") != "verified" or readback.get("uuid") != expected_uuid
+                or not readback.get("process", {}).get("processListed")):
+            raise SystemExit(f"GPU_TRIANGLE {dimension}D CUDA device readback is incomplete")
+        comparisons = row.get("directReference", {}).get("comparisons", {})
+        if set(comparisons) != {"initial", "final"} or not all(
+                all(value is True for value in result.values()) for result in comparisons.values()):
+            raise SystemExit(f"GPU_TRIANGLE {dimension}D product/direct comparison failed")
+        for guard_path in (product_guard, direct_guard):
+            guard = json.loads(guard_path.read_text(encoding="utf-8"))
+            if guard.get("returnCode") != 0 or guard.get("timedOut") or guard.get("rssLimited"):
+                raise SystemExit(f"GPU_TRIANGLE {dimension}D bounded child was not clean: {guard_path.name}")
+        project = json.loads(input_path.read_text(encoding="utf-8"))
+        step = project["steps"][0]
+        evidence = {
+            "productWorker": str(run_path.relative_to(ROOT)),
+            "productGuard": str(product_guard.relative_to(ROOT)),
+            "directReference": str(direct_path.relative_to(ROOT)),
+            "directGuard": str(direct_guard.relative_to(ROOT)),
+            "comparisons": comparisons,
+            "versions": row["versions"], "seed": actual[0].get("actualSeed"),
+            "actualEngine": "GPU_TRIANGLE", "gpuDeviceUuid": readback["uuid"],
+        }
+        gpu_row_value = gpu_row(project, step, "specialized:sf6o2", dimension, evidence)
+        gpu_row_value["engine"] = "GPU_TRIANGLE"
+        rows.append(gpu_row_value)
+
+
 def main() -> int:
     specialized = json.loads(SPECIALIZED.read_text(encoding="utf-8"))
     multiparticle = json.loads(MULTIPARTICLE.read_text(encoding="utf-8"))
@@ -2101,6 +2164,7 @@ def main() -> int:
     add_specialized_geometry_rows(rows)
     gds_specialized_failures = add_specialized_gds_rows(rows)
     add_generic_boolean_fin_rows(rows)
+    add_gpu_triangle_rows(rows)
     add_generic_masked_pattern_rows(rows)
     add_periodic_generic_geometry_rows(rows)
     material_scope_report = add_generic_material_scopes(rows)

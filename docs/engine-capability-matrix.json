@@ -2367,17 +2367,18 @@
       "classification": "exposed",
       "exposedBy": [
         "solver.enginePreference (auto|cpu|gpu)",
+        "solver.gpuEngine=GPU_TRIANGLE (schema 7; evidence-gated)",
         "engineProfile=AUTO policy"
       ],
-      "notes": "AUTO never silently falls back; unverified engines are rejected by the worker.",
+      "notes": "AUTO never silently falls back; unverified engines are rejected by the worker. GPU_TRIANGLE is exposed only for the measured specialized:sf6o2 etch/reflective stack pair in 2D and 3D; every other request is rejected rather than redirected to GPU_DISK or CPU_DISK.",
       "members": {
         "exposed": [
           "CPU_DISK",
-          "GPU_DISK"
+          "GPU_DISK",
+          "GPU_TRIANGLE"
         ],
         "notExposed": [
           "CPU_TRIANGLE",
-          "GPU_TRIANGLE",
           "GPU_LINE",
           "AUTO fallback"
         ]

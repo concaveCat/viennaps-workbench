@@ -691,11 +691,20 @@ def measure_initial_geometry(mesh: dict[str, Any], geometry: dict[str, Any], del
     right_points = [x for pair in top_segments for x in pair if x > 1e-9]
     # The initial trench has only the substrate at negative h; mask points are
     # at or above the zero datum. The returned raster contour is authoritative.
-    if not left_points or not right_points:
-        raise RuntimeError("cannot measure the initial trench opening from its top interface")
-    measured_width = min(right_points) - max(left_points)
+    # A half trench retains only x>=0, so its opening is measured from the
+    # symmetry plane at x=0 to the retained Si shoulder.
+    half_trench = bool(geometry.get("halfTrench"))
+    if half_trench:
+        if not right_points:
+            raise RuntimeError("cannot measure the initial half-trench opening from its retained top interface")
+        measured_width = min(right_points)
+        requested_width = float(geometry["width"]) / 2
+    else:
+        if not left_points or not right_points:
+            raise RuntimeError("cannot measure the initial trench opening from its top interface")
+        measured_width = min(right_points) - max(left_points)
+        requested_width = float(geometry["width"])
     measured_depth = -min(point[1] for point in points)
-    requested_width = float(geometry["width"])
     requested_depth = float(geometry["depth"])
     tolerance = 2 * delta + 1e-9
     if abs(measured_width - requested_width) > tolerance:
@@ -1764,6 +1773,19 @@ def _apply_gds_stack_mask(ps: Any, domain: Any, project: dict[str, Any], *,
     return {"nativeGeometry": native_geometry, **transform}
 
 
+def _halve_x_axis(domain: Any) -> None:
+    """Apply the native half-geometry setup before a Boolean construction.
+
+    Native MakeFin/MakeTrench call ``getSetup().halveXAxis()`` before
+    ``apply()`` rebuilds the domain. An already-allocated Domain needs the
+    halved setup re-applied, otherwise the grid keeps its full x bounds and the
+    flag is silently lost.
+    """
+    setup = domain.getSetup()
+    setup.halveXAxis()
+    domain.setup(setup)
+
+
 def _boolean_fin_2d(ps: Any, domain: Any, geometry: dict[str, Any], material: Any,
                     mask_material: Any) -> None:
     # Use the explicit 2D binding: when a 3D project is set up for extrusion,
@@ -1821,13 +1843,19 @@ def make_v3_geometry(ps: Any, domain: Any, project: dict[str,Any], *, config: di
         fallback = requested_construction != construction
         extrusion_route = construction_decision["extrusionRoute"]
         extrusion_fallback_models = construction_decision["extrusionFallbackModels"]
+        half_fin = bool(g.get("halfFin"))
         args = {"finWidth": float(g["width"]), "finHeight": float(g["height"]),
                 "finTaperAngle": float(g["taperAngle"]), "maskHeight": float(g["maskHeight"]),
-                "maskTaperAngle": float(g["maskTaperAngle"]), "halfFin": False,
+                "maskTaperAngle": float(g["maskTaperAngle"]), "halfFin": half_fin,
                 "material": material_handle(ps,g["substrateMaterial"]),
                 "maskMaterial": material_handle(ps,g["maskMaterial"])}
         if project["dimension"] == 2:
             if construction == "boolean":
+                # The native constructor halves inside MakeFin; the
+                # independently verified Boolean route must apply the same
+                # setup change explicitly so halfFin is never silently lost.
+                if half_fin:
+                    _halve_x_axis(domain)
                 _boolean_fin_2d(ps, domain, g, args["material"], args["maskMaterial"])
             else:
                 ps.d2.MakeFin(domain, **args).apply()
@@ -1849,6 +1877,8 @@ def make_v3_geometry(ps: Any, domain: Any, project: dict[str,Any], *, config: di
             y_extent = extent[1] - extent[0]
             if y_extent <= 0:
                 raise RuntimeError("Fin extrusion y extent must have positive length")
+            if half_fin:
+                _halve_x_axis(domain)
             _boolean_fin_3d(ps, domain, g, args["material"], args["maskMaterial"],
                             0.5 * (extent[0] + extent[1]), y_extent)
             return {"nativeGeometry": "viennaps.MakePlane + viennaps.d3.GeometryFactory + Domain.applyBooleanOperation (extrusion extent stencil)",
@@ -1866,6 +1896,8 @@ def make_v3_geometry(ps: Any, domain: Any, project: dict[str,Any], *, config: di
             bc = ps.BoundaryType.REFLECTIVE_BOUNDARY if project["domain"]["boundaryXY"] == "reflective" else ps.BoundaryType.PERIODIC_BOUNDARY
             input_domain = ps.d2.Domain(float(project["domain"]["gridDelta"]), float(project["domain"]["xExtent"]), bc)
             if construction == "boolean":
+                if half_fin:
+                    _halve_x_axis(input_domain)
                 _boolean_fin_2d(ps, input_domain, g, args["material"], args["maskMaterial"])
             else:
                 ps.d2.MakeFin(input_domain, **args).apply()
@@ -1892,6 +1924,8 @@ def make_v3_geometry(ps: Any, domain: Any, project: dict[str,Any], *, config: di
                     "substrateMaterial":g["substrateMaterial"],"maskMaterial":g["maskMaterial"],
                     "boundaryReadback":[str(value) for value in domain.getBoundaryConditions()]}
         if construction == "boolean":
+            if half_fin:
+                _halve_x_axis(domain)
             _boolean_fin_3d(ps, domain, g, args["material"], args["maskMaterial"],
                             0.0, float(project["domain"]["yExtent"]))
         else:
@@ -2151,10 +2185,33 @@ def make_v3_geometry(ps: Any, domain: Any, project: dict[str,Any], *, config: di
         return {"nativeGeometry": native_geometry, **transform}
     if g["kind"]=="plane":
         ps.MakePlane(domain,height=float(g["height"]),material=material_handle(ps,g["substrateMaterial"]),addToExisting=False).apply()
+        return {"nativeGeometry":"viennaps.MakePlane",
+                "arguments":{"height":float(g["height"])},
+                "substrateMaterial":g["substrateMaterial"]}
     elif g["kind"]=="trench":
-        ps.MakeTrench(domain=domain,trenchWidth=float(g["width"]),trenchDepth=float(g["depth"]),trenchTaperAngle=float(g["taperAngle"]),maskHeight=float(g["maskHeight"]),maskTaperAngle=float(g["maskTaperAngle"]),halfTrench=False,material=material_handle(ps,g["substrateMaterial"]),maskMaterial=material_handle(ps,g.get("maskMaterial","Mask"))).apply()
+        half_trench = bool(g.get("halfTrench"))
+        ps.MakeTrench(domain=domain,trenchWidth=float(g["width"]),trenchDepth=float(g["depth"]),trenchTaperAngle=float(g["taperAngle"]),maskHeight=float(g["maskHeight"]),maskTaperAngle=float(g["maskTaperAngle"]),halfTrench=half_trench,material=material_handle(ps,g["substrateMaterial"]),maskMaterial=material_handle(ps,g.get("maskMaterial","Mask"))).apply()
+        return {"nativeGeometry":"viennaps.MakeTrench",
+                "arguments":{"width":float(g["width"]),"depth":float(g["depth"]),
+                             "taperAngle":float(g["taperAngle"]),"maskHeight":float(g["maskHeight"]),
+                             "maskTaperAngle":float(g["maskTaperAngle"]),
+                             "halfTrench":half_trench},
+                "requestedHalfTrench":g.get("halfTrench"),
+                "actualHalfTrench":half_trench,
+                "substrateMaterial":g["substrateMaterial"],"maskMaterial":g.get("maskMaterial","Mask")}
     else:
-        ps.MakeHole(domain=domain,holeRadius=float(g["radius"]),holeDepth=float(g["depth"]),holeTaperAngle=float(g["taperAngle"]),maskHeight=float(g["maskHeight"]),maskTaperAngle=float(g["maskTaperAngle"]),holeShape=ps.HoleShape.FULL,material=material_handle(ps,g["substrateMaterial"]),maskMaterial=material_handle(ps,g.get("maskMaterial","Mask"))).apply()
+        hole_shape = str(g.get("holeShape") or "FULL")
+        if hole_shape not in ("FULL", "HALF", "QUARTER"):
+            raise RuntimeError(f"unsupported native HoleShape {hole_shape!r}")
+        ps.MakeHole(domain=domain,holeRadius=float(g["radius"]),holeDepth=float(g["depth"]),holeTaperAngle=float(g["taperAngle"]),maskHeight=float(g["maskHeight"]),maskTaperAngle=float(g["maskTaperAngle"]),holeShape=getattr(ps.HoleShape,hole_shape),material=material_handle(ps,g["substrateMaterial"]),maskMaterial=material_handle(ps,g.get("maskMaterial","Mask"))).apply()
+        return {"nativeGeometry":"viennaps.MakeHole",
+                "arguments":{"radius":float(g["radius"]),"depth":float(g["depth"]),
+                             "taperAngle":float(g["taperAngle"]),"maskHeight":float(g["maskHeight"]),
+                             "maskTaperAngle":float(g["maskTaperAngle"]),
+                             "holeShape":hole_shape},
+                "requestedHoleShape":g.get("holeShape"),
+                "actualHoleShape":hole_shape,
+                "substrateMaterial":g["substrateMaterial"],"maskMaterial":g.get("maskMaterial","Mask")}
     return None
 
 
@@ -2253,7 +2310,7 @@ def save_snapshot(
         else:
             measured_geometry = measure_initial_geometry(report, requested["geometry"], requested["domain"]["gridDelta"])
     if not is3d and requested["geometry"]["kind"] == "trench" and step_id == "initial":
-        if not trench_has_two_walls(report, requested["domain"]["gridDelta"], MATERIAL_IDS[requested["geometry"]["substrateMaterial"]] if v3 else 10):
+        if not requested["geometry"].get("halfTrench") and not trench_has_two_walls(report, requested["domain"]["gridDelta"], MATERIAL_IDS[requested["geometry"]["substrateMaterial"]] if v3 else 10):
             raise RuntimeError("initial trench contour is incomplete: both positive and negative Si sidewalls are required")
     vtk_name = f"{step_id}.vtk"
     snapshot_name = f"{step_id}.json"
@@ -3197,26 +3254,73 @@ def execute(input_path: Path, run_dir: Path) -> None:
     slice_result = None
     if kind == "slice":
         slice_request = config.get("sliceRequest")
-        if project["dimension"] != 3 or not isinstance(slice_request, dict) or slice_request.get("axis") != 1:
-            raise RuntimeError("native Slice requires a 3D source and the verified y-normal axis")
+        if project["dimension"] != 3 or not isinstance(slice_request, dict):
+            raise RuntimeError("native Slice requires a 3D source domain")
+        axis_label = slice_request.get("sliceAxis") or "y"
+        axis_map = {"x": 0, "y": 1, "z": 2}
+        if axis_label not in axis_map:
+            raise RuntimeError(f"native Slice axis must be x, y or z, not {axis_label!r}")
+        slice_axis = axis_map[axis_label]
+        reflect_x = bool(slice_request.get("reflectX", False))
         slice_position = float(slice_request["position"])
-        if not math.isfinite(slice_position) or abs(slice_position) > float(project["domain"]["yExtent"]) / 2:
-            raise RuntimeError("native Slice position must lie inside the 3D y domain")
+        if not math.isfinite(slice_position):
+            raise RuntimeError("native Slice position must be finite")
+        delta = float(project["domain"]["gridDelta"])
+        # Native ViennaLS maps the two remaining coordinates into the output
+        # x/h plane in ascending source-axis order:
+        #   x-normal -> (y, z), y-normal -> (x, z), z-normal -> (x, y).
+        if slice_axis == 0:
+            lateral_extent = float(project["domain"]["yExtent"])
+            lateral_axis, vertical_axis = "y", "z"
+            normal = [1.0, 0.0, 0.0]
+            if abs(slice_position) > lateral_extent / 2 + 1e-12:
+                raise RuntimeError("native Slice x position must lie inside the 3D y domain")
+        elif slice_axis == 1:
+            lateral_extent = float(project["domain"]["xExtent"])
+            lateral_axis, vertical_axis = "x", "z"
+            normal = [0.0, 1.0, 0.0]
+            if abs(slice_position) > lateral_extent / 2 + 1e-12:
+                raise RuntimeError("native Slice y position must lie inside the 3D x domain")
+        else:
+            lateral_extent = float(project["domain"]["xExtent"])
+            lateral_axis, vertical_axis = "x", "y"
+            normal = [0.0, 0.0, 1.0]
+            bounds = initial.get("surfaceBounds") or []
+            if len(bounds) == 2:
+                z_min, z_max = float(bounds[0][2]), float(bounds[1][2])
+                if slice_position < z_min - delta or slice_position > z_max + delta:
+                    raise RuntimeError(
+                        f"native Slice z position {slice_position:g} lies outside the source surface "
+                        f"z range [{z_min:g}, {z_max:g}]")
+        native_position = round(slice_position / delta) * delta
         ps.setDimension(2)
         slice_boundary = ps.BoundaryType.REFLECTIVE_BOUNDARY if project["domain"]["boundaryXY"] == "reflective" else ps.BoundaryType.PERIODIC_BOUNDARY
-        sliced_domain = ps.d2.Domain(float(project["domain"]["gridDelta"]), float(project["domain"]["xExtent"]), slice_boundary)
-        ps.Slice(domain, sliced_domain, 1, slice_position).apply()
+        sliced_domain = ps.d2.Domain(delta, lateral_extent, slice_boundary)
+        slice_operation = ps.Slice(domain, sliced_domain, slice_axis, slice_position)
+        if reflect_x:
+            slice_operation.setReflectX(True)
+        slice_operation.apply()
         if int(sliced_domain.getNumberOfLevelSets()) <= 0:
-            raise RuntimeError("ViennaPS Slice returned no level sets at the requested y position")
+            raise RuntimeError(
+                f"ViennaPS Slice returned no level sets at {axis_label}={slice_position:g}")
         slice_project = json.loads(json.dumps(project, ensure_ascii=False))
         slice_project["dimension"] = 2
-        slice_project["domain"] = {"gridDelta":float(project["domain"]["gridDelta"]),
-                                    "xExtent":float(project["domain"]["xExtent"]),
+        slice_project["domain"] = {"gridDelta":delta,
+                                    "xExtent":lateral_extent,
                                     "xBoundary":project["domain"]["boundaryXY"]}
         slice_project.pop("view3D", None)
-        slice_readback = {"nativeOperation":"viennaps.Slice", "axis":1,
-                          "axisLabel":"y-normal; output plane uses x/z coordinates mapped to x/h",
-                          "position":slice_position, "sourceDimension":3, "outputDimension":2,
+        mapped = f"{lateral_axis}/{vertical_axis} mapped to x/h"
+        slice_readback = {"nativeOperation":"viennaps.Slice", "axis":slice_axis,
+                          "axisLabel":f"{axis_label}-normal",
+                          "axisName":axis_label,
+                          "planeNormal":normal,
+                          "outputCoordinateMapping":mapped,
+                          "reflectX":reflect_x,
+                          "requestedPosition":slice_position,
+                          "position":native_position,
+                          "positionAdjustedToGrid":native_position != slice_position,
+                          "sourceDimension":3, "outputDimension":2,
+                          "outputLateralExtent":lateral_extent,
                           "viewerClipping":False, "levelSetCount":int(sliced_domain.getNumberOfLevelSets()),
                           "materialIdsByLevelSetIndex":material_map(sliced_domain)}
         slice_result = save_snapshot(ps, sliced_domain, run_dir, run_id=run_id, step_id="true-slice",

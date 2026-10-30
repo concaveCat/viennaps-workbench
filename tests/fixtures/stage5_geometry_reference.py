@@ -82,10 +82,27 @@ def build_domain(project: dict, gds_source: Path | None, run_dir: Path):
     else:
         domain = ps.Domain(float(d["gridDelta"]), float(d["xExtent"]), float(d["yExtent"]), edge)
     g = project["geometry"]
-    if g["kind"] == "fin":
+    if g["kind"] == "plane":
+        ps.MakePlane(domain, height=float(g["height"]), material=material(g["substrateMaterial"]),
+                     addToExisting=False).apply()
+    elif g["kind"] == "trench":
+        ps.MakeTrench(domain, trenchWidth=float(g["width"]), trenchDepth=float(g["depth"]),
+                      trenchTaperAngle=float(g["taperAngle"]), maskHeight=float(g["maskHeight"]),
+                      maskTaperAngle=float(g["maskTaperAngle"]), halfTrench=bool(g.get("halfTrench")),
+                      material=material(g["substrateMaterial"]),
+                      maskMaterial=material(g.get("maskMaterial", "Mask"))).apply()
+    elif g["kind"] == "hole":
+        shape = str(g.get("holeShape") or "FULL")
+        ps.MakeHole(domain, holeRadius=float(g["radius"]), holeDepth=float(g["depth"]),
+                    holeTaperAngle=float(g["taperAngle"]), maskHeight=float(g["maskHeight"]),
+                    maskTaperAngle=float(g["maskTaperAngle"]), holeShape=getattr(ps.HoleShape, shape),
+                    material=material(g["substrateMaterial"]),
+                    maskMaterial=material(g.get("maskMaterial", "Mask"))).apply()
+    elif g["kind"] == "fin":
+        half_fin = bool(g.get("halfFin"))
         args = {"finWidth": float(g["width"]), "finHeight": float(g["height"]),
                 "finTaperAngle": float(g["taperAngle"]), "maskHeight": float(g["maskHeight"]),
-                "maskTaperAngle": float(g["maskTaperAngle"]), "halfFin": False,
+                "maskTaperAngle": float(g["maskTaperAngle"]), "halfFin": half_fin,
                 "material": material(g["substrateMaterial"]), "maskMaterial": material(g["maskMaterial"])}
         if dimension == 2:
             ps.d2.MakeFin(domain, **args).apply()
@@ -210,12 +227,20 @@ def main() -> None:
         if int(project["dimension"]) != 3:
             raise ValueError("native Slice reference requires 3D source")
         slicing = request["sliceRequest"]
+        axis_label = slicing.get("sliceAxis") or "y"
+        axis = {"x": 0, "y": 1, "z": 2}[axis_label]
+        reflect = bool(slicing.get("reflectX", False))
         ps.setDimension(2)
         d = project["domain"]
-        sliced = ps.d2.Domain(float(d["gridDelta"]), float(d["xExtent"]), boundary(d["boundaryXY"]))
-        ps.Slice(domain, sliced, 1, float(slicing["position"])).apply()
+        lateral_extent = float(d["yExtent"] if axis == 0 else d["xExtent"])
+        sliced = ps.d2.Domain(float(d["gridDelta"]), lateral_extent, boundary(d["boundaryXY"]))
+        operation = ps.Slice(domain, sliced, axis, float(slicing["position"]))
+        if reflect:
+            operation.setReflectX(True)
+        operation.apply()
         result["slice"] = surface(sliced, 2)
-        result["sliceReadback"] = {"nativeOperation": "viennaps.Slice", "axis": 1,
+        result["sliceReadback"] = {"nativeOperation": "viennaps.Slice", "axis": axis,
+                                   "axisName": axis_label, "reflectX": reflect,
                                    "position": float(slicing["position"]),
                                    "materialIdsByLevelSetIndex": [int(sliced.getMaterialMap().getMaterialIdAtIdx(i))
                                                                   for i in range(sliced.getMaterialMap().size())]}

@@ -227,6 +227,16 @@ def validate_project(payload: Any, *, kind: str = "project") -> tuple[Project, l
                         (not native_engine.startswith("GPU_") and not capability_verified(
                             project.dimension, model_key, step_value(step, "operation"), boundary,
                             native_engine, schema_version=project.schemaVersion, **signature))):
+                    if (project.solver.enginePreference == "gpu"
+                            and normalized["solver"].get("gpuEngine") == "GPU_TRIANGLE"):
+                        issues.append(FieldIssue(
+                            f"steps[{i}].nativeModel",
+                            f"GPU_TRIANGLE has no direct-reference acceptance row for model "
+                            f"{model_key}, operation {step_value(step,'operation')}, boundary {boundary} "
+                            f"in {project.dimension}D; the request is rejected instead of falling back to "
+                            "GPU_DISK or CPU_DISK. Use solver.gpuEngine=GPU_DISK with a covered "
+                            "combination, or select CPU."))
+                        continue
                     if installed_model and installed_model.get("experimental") and not native_engine.startswith("GPU_"):
                         # Experimental models have native smoke tests but no
                         # archived direct-reference row yet. Only CPU_DISK (or
@@ -241,6 +251,16 @@ def validate_project(payload: Any, *, kind: str = "project") -> tuple[Project, l
                 if engine=="unavailable" or (not engine.startswith("GPU_") and not capability_verified(
                         project.dimension,step_value(step,"model"),step_value(step,"operation"),boundary,engine,
                         schema_version=project.schemaVersion, **signature)):
+                    if (project.solver.enginePreference == "gpu"
+                            and normalized["solver"].get("gpuEngine") == "GPU_TRIANGLE"):
+                        issues.append(FieldIssue(
+                            f"steps[{i}].model",
+                            f"GPU_TRIANGLE has no direct-reference acceptance row for model "
+                            f"{step_value(step,'model')}, operation {step_value(step,'operation')}, boundary "
+                            f"{boundary} in {project.dimension}D; the request is rejected instead of falling "
+                            "back to GPU_DISK or CPU_DISK. Use solver.gpuEngine=GPU_DISK with a covered "
+                            "combination, or select CPU."))
+                        continue
                     limitation = known_engine_limitation(project.dimension, step_value(step, "model"),
                                                          "GPU_DISK", step_dict)
                     if limitation and project.solver.enginePreference == "gpu":
@@ -1588,9 +1608,15 @@ def select_engine(project: dict, step: dict, *, analysis_mode: str = "process") 
     if model == "specialized":
         model = f"specialized:{step.get('nativeModel', '')}"
     if project.get("schemaVersion") in (3,4,5,6,7):
+        requested_gpu_engine = project.get("solver", {}).get("gpuEngine")
         if preference == "gpu":
-            candidates = ["GPU_DISK"]
+            # An explicit GPU engine request never falls back to another GPU
+            # backend. GPU_TRIANGLE is admitted only when its evidence row
+            # matches; otherwise the step resolves to "unavailable".
+            candidates = [requested_gpu_engine or "GPU_DISK"]
         elif preference == "auto" and project.get("schemaVersion") == 7:
+            # AUTO keeps its historical GPU_DISK/CPU_DISK policy; it never
+            # selects GPU_TRIANGLE on its own.
             candidates = ["GPU_DISK", "CPU_DISK"]
         else:
             candidates = ["CPU_DISK"]

@@ -288,7 +288,7 @@ cd frontend && npm run typecheck && npm run build
 | 启动时报 `frontend build is missing` | 在 `frontend/` 下执行 `npm ci && npm run build`。 |
 | `cannot bind configured loopback port` | 端口被其他进程占用。设置 `WORKBENCH_PORT` 或删除 `var/listen-port.json`；工作台不会杀掉未知监听进程。 |
 | `ModuleNotFoundError: viennaps` | `.venv` 未使用 `--system-site-packages`，或该 Python 未安装 ViennaPS。 |
-| GPU 运行被拒绝或 `gpuAvailable()` 为 false | 检查 `nvidia-smi`、ViennaPS 的 CUDA 构建，以及 `GET /api/gpu-devices`。仅开放 `docs/stage9-evidence/gpu-capability-matrix.json` 中记录过的 `GPU_DISK` 组合。 |
+| GPU 运行被拒绝或 `gpuAvailable()` 为 false | 检查 `nvidia-smi`、ViennaPS 的 CUDA 构建，以及 `GET /api/gpu-devices`。仅开放 `docs/stage9-evidence/gpu-capability-matrix.json` 中记录过的 `GPU_DISK` 组合；schema-7 的 `solver.gpuEngine=GPU_TRIANGLE` 只开放两条已归档 sf6o2 行，且不会回退。 |
 | `request Host must be the active loopback address` | 使用 `127.0.0.1:<端口>` 或 `localhost:<端口>`；反向代理与自定义域名会被有意拒绝。 |
 | 运行因 `run artifact size exceeded` 停止 | 单步产物超过有效上限（默认 4 GiB，可用 `WORKBENCH_MAX_ARTIFACT_MIB` 调整）；降低网格分辨率、射线数或输出频率。 |
 
@@ -318,7 +318,9 @@ var/            运行时数据（git 忽略）
 ## 已知限制
 
 - 仅在 ViennaPS 4.6.2 / ViennaLS 5.8.5 上验证，其他版本会被拒绝而不是猜测兼容。
-- GPU 仅开放覆盖组合的 `GPU_DISK`；`GPU_TRIANGLE` 与 `GPU_LINE` 不开放。
+- GPU 仅开放覆盖组合的 `GPU_DISK`；schema-7 的 `solver.gpuEngine=GPU_TRIANGLE`
+  只开放两条已归档的 2D/3D sf6o2 刻蚀/reflective stack 行，其余组合一律拒绝；
+  `GPU_LINE` 不开放。
 - 安装版 4.6.2 的 MultiParticle GPU 路径只处理单一离子种类；多离子 GPU 请求会
   明确报告为原生限制，不做静默近似。多离子 CPU 路径与单次通量策略仍可用。
 - 宿主能力证据来自一张 NVIDIA RTX 3060 Laptop GPU；多 GPU 选择已实现并有单元测试，

@@ -192,8 +192,13 @@ class Supervisor:
             if kind == "slice":
                 if project.get("schemaVersion") != 7 or project.get("dimension") != 3 or project.get("steps"):
                     raise ReplayMismatch("native Slice requires a schema-7 3D geometry project without process steps")
-                if not isinstance(slice_request, dict) or slice_request.get("axis") != 1 or not isinstance(slice_request.get("position"), (int, float)):
-                    raise ReplayMismatch("native Slice requires its verified y-normal axis and finite position")
+                from .models import SliceRequestV7
+                try:
+                    normalized_slice = SliceRequestV7.model_validate(slice_request).model_dump(
+                        mode="json", exclude_none=True)
+                except ValueError as exc:
+                    raise ReplayMismatch(f"native Slice request is invalid: {exc}") from exc
+                slice_request = normalized_slice
                 request_hash = hashlib.sha256((request_hash + json.dumps(slice_request, sort_keys=True, separators=(",", ":"), allow_nan=False)).encode("utf-8")).hexdigest()
             if kind == "simulate":
                 enabled_steps = [step for step in project["steps"] if step["enabled"]]
@@ -271,6 +276,19 @@ class Supervisor:
                     capability_model=f"specialized:{step['nativeModel']}" if step.get("model")=="specialized" else step["model"]
                     boundary=project["domain"].get("boundaryXY",project["domain"].get("xBoundary"))
                     signature=gpu_project_signature(project,step)
+                    requested_gpu_engine = project.get("solver", {}).get("gpuEngine")
+                    if requested_gpu_engine is not None and engine != requested_gpu_engine:
+                        raise ReplayMismatch(
+                            f"replay engine {engine} differs from the saved solver.gpuEngine {requested_gpu_engine}")
+                    if engine == "GPU_TRIANGLE" and not capability_verified(
+                            project["dimension"], capability_model, step["operation"], boundary, engine,
+                            schema_version=project["schemaVersion"],
+                            execution_strategy=execution_strategy,
+                            flux_strategy=flux_strategy, **signature):
+                        raise ReplayMismatch(
+                            f"GPU_TRIANGLE has no direct-reference acceptance row for {capability_model} "
+                            f"{step['operation']} on {boundary} in {project['dimension']}D; replay is refused "
+                            "instead of falling back to GPU_DISK or CPU_DISK")
                     if (not engine.startswith("GPU_")
                             and not capability_verified(project["dimension"],capability_model,step["operation"],boundary,engine,
                                                         schema_version=project["schemaVersion"],
@@ -314,7 +332,7 @@ class Supervisor:
                 if not any(item["engine"].startswith("GPU_") for item in actual_steps):
                     selected_gpu_device = None
                 elif selected_gpu_device is None:
-                    raise ReplayMismatch("GPU_DISK requires a concrete CUDA device; no implicit fallback is allowed")
+                    raise ReplayMismatch("GPU execution requires a concrete CUDA device; no implicit fallback is allowed")
                 else:
                     for item in actual_steps:
                         if item["engine"].startswith("GPU_"):
