@@ -280,6 +280,8 @@ class SurfaceDiffusionNative(unittest.TestCase):
         parameters.normalizeByLocalScale = self.PARAMS["normalizeByLocalScale"]
         parameters.normalCutoff = self.PARAMS["normalCutoff"]
 
+    @unittest.skipUnless(ald_surface_diffusion_supported(),
+                         "4.7.0 has a confirmed native ALD surface-diffusion hang")
     def test_golden_2d_and_3d_equal_the_native_reference_and_are_deterministic(self):
         for dimension in (2, 3):
             with self.subTest(dimension=dimension):
@@ -302,6 +304,8 @@ class SurfaceDiffusionNative(unittest.TestCase):
                 self.assertEqual(first["heights"], repeat["heights"])
                 self.assertEqual(first["materials"], repeat["materials"])
 
+    @unittest.skipUnless(ald_surface_diffusion_supported(),
+                         "4.7.0 has a confirmed native ALD surface-diffusion hang")
     def test_the_knob_changes_the_surface_and_preserves_materials(self):
         for dimension in (2, 3):
             with self.subTest(dimension=dimension):
