@@ -25,11 +25,13 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import sys
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+GDS_FIXTURE = ROOT / "tests" / "fixtures" / "finfet22_workbench.gds"
 sys.path.insert(0, str(ROOT / "tests" / "fixtures"))
 
 import viennaps as ps  # noqa: E402
@@ -225,6 +227,20 @@ class SpecializedValidationNegatives(unittest.TestCase):
                     validate_project(project)
                 self.assertTrue(any(key in issue.path for issue in ctx.exception.issues),
                                 [issue.path for issue in ctx.exception.issues])
+
+    def test_geometric_deposition_rejects_gds_geometry(self):
+        from unittest.mock import patch
+        project = geometric_project(2)
+        project["geometry"] = {
+            "kind": "gds", "assetId": hashlib.sha256(GDS_FIXTURE.read_bytes()).hexdigest(),
+            "fileName": GDS_FIXTURE.name, "structure": "FINFET22", "unitScale": 1.0,
+            "position": [0.0, 0.0, 0.0], "layers": [{"layer": 7, "material": "Si"}],
+        }
+        with patch("backend.storage.resolve_gds_asset", return_value=GDS_FIXTURE):
+            with self.assertRaises(ProjectInputError) as ctx:
+                validate_project(project)
+        self.assertTrue(any("GDS geometry" in issue.message for issue in ctx.exception.issues),
+                        [issue.message for issue in ctx.exception.issues])
 
     def test_geometric_deposition_must_be_the_first_enabled_step(self):
         project = geometric_project(2)
