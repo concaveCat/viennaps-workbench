@@ -8,5 +8,6 @@
 - `schema-project-union.json`、`schema-project-v*.json`、`schema-replay-v*.json`：项目和重放格式；旧格式兼容规则在 API contract 与阶段报告中。
 - `cmp-planarize-contract.md`：材质感知平坦化（按材料停止的 CMP）与每步实测去除/增加厚度。
 - `gds-boolean-contract.md`：schema 7 三维 GDS 工程的 `gdsBoolean` 步骤（版图图层作为原生布尔操作数）的坐标、语义与限制。
+- `plasma-advanced-parameters-contract.md`：四个内置等离子体模型的 `nativeParameters.advanced` 严格子参数契约、逐模型字段与原生构造路径。
 - `engine-capability-matrix.md` / `.json`：安装版 ViennaPS 4.6.2 的公开类/参数面与工作台暴露面的逐类对照、SPX-only 能力清单，以及按可验证批次拆分（含验收标准）的剩余能力计划。
 - `implementation-status.md`：早期基线历史快照，不代表当前服务端口或当前验收状态。
