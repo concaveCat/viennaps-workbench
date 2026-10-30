@@ -70,6 +70,16 @@
             "title": "Authoredsteps",
             "type": "array"
           },
+          "binding": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GeometryBindingV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "bindingId": {
             "title": "Bindingid",
             "type": "string"
@@ -762,6 +772,559 @@
         "title": "Clip3D",
         "type": "object"
       },
+      "ClipAnnotationRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "text": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Text",
+            "type": "string"
+          },
+          "x": {
+            "title": "X",
+            "type": "number"
+          },
+          "y": {
+            "title": "Y",
+            "type": "number"
+          }
+        },
+        "required": [
+          "text",
+          "x",
+          "y"
+        ],
+        "title": "ClipAnnotationRequest",
+        "type": "object"
+      },
+      "ClipAnnotationV1": {
+        "additionalProperties": false,
+        "properties": {
+          "annotationId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Annotationid"
+          },
+          "text": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Text",
+            "type": "string"
+          },
+          "x": {
+            "title": "X",
+            "type": "number"
+          },
+          "y": {
+            "title": "Y",
+            "type": "number"
+          }
+        },
+        "required": [
+          "text",
+          "x",
+          "y"
+        ],
+        "title": "ClipAnnotationV1",
+        "type": "object"
+      },
+      "ClipBoundsV1": {
+        "additionalProperties": false,
+        "properties": {
+          "x0": {
+            "title": "X0",
+            "type": "number"
+          },
+          "x1": {
+            "title": "X1",
+            "type": "number"
+          },
+          "y0": {
+            "title": "Y0",
+            "type": "number"
+          },
+          "y1": {
+            "title": "Y1",
+            "type": "number"
+          }
+        },
+        "required": [
+          "x0",
+          "y0",
+          "x1",
+          "y1"
+        ],
+        "title": "ClipBoundsV1",
+        "type": "object"
+      },
+      "ClipCompileRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "flowId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Flowid"
+          },
+          "gridDelta": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "maximum": 1.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Griddelta"
+          },
+          "project": {
+            "$ref": "#/components/schemas/ProjectV7"
+          }
+        },
+        "required": [
+          "project"
+        ],
+        "title": "ClipCompileRequest",
+        "type": "object"
+      },
+      "ClipContentBoundsV1": {
+        "additionalProperties": false,
+        "properties": {
+          "x0": {
+            "title": "X0",
+            "type": "number"
+          },
+          "x1": {
+            "title": "X1",
+            "type": "number"
+          },
+          "y0": {
+            "title": "Y0",
+            "type": "number"
+          },
+          "y1": {
+            "title": "Y1",
+            "type": "number"
+          }
+        },
+        "required": [
+          "x0",
+          "y0",
+          "x1",
+          "y1"
+        ],
+        "title": "ClipContentBoundsV1",
+        "type": "object"
+      },
+      "ClipCreateRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "annotations": {
+            "items": {
+              "$ref": "#/components/schemas/ClipAnnotationV1"
+            },
+            "title": "Annotations",
+            "type": "array"
+          },
+          "bbox": {
+            "$ref": "#/components/schemas/ClipBoundsV1"
+          },
+          "layers": {
+            "items": {
+              "$ref": "#/components/schemas/ClipLayerV1"
+            },
+            "maxItems": 32,
+            "minItems": 1,
+            "title": "Layers",
+            "type": "array"
+          },
+          "layoutId": {
+            "title": "Layoutid",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "structure": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Structure",
+            "type": "string"
+          }
+        },
+        "required": [
+          "structure",
+          "layers",
+          "bbox",
+          "layoutId",
+          "name"
+        ],
+        "title": "ClipCreateRequest",
+        "type": "object"
+      },
+      "ClipGeometrySourceV1": {
+        "additionalProperties": false,
+        "description": "Frozen provenance for a layout clip used to build one binding.",
+        "properties": {
+          "annotations": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Annotations",
+            "type": "array"
+          },
+          "bbox": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "title": "Bbox",
+            "type": "object"
+          },
+          "clipHash": {
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Cliphash",
+            "type": "string"
+          },
+          "clipId": {
+            "maxLength": 64,
+            "minLength": 8,
+            "pattern": "^[A-Za-z0-9_-]+$",
+            "title": "Clipid",
+            "type": "string"
+          },
+          "kind": {
+            "const": "layout",
+            "default": "layout",
+            "title": "Kind",
+            "type": "string"
+          },
+          "layoutId": {
+            "maxLength": 64,
+            "minLength": 8,
+            "pattern": "^[A-Za-z0-9_-]+$",
+            "title": "Layoutid",
+            "type": "string"
+          },
+          "pointCount": {
+            "minimum": 3.0,
+            "title": "Pointcount",
+            "type": "integer"
+          },
+          "polygonCount": {
+            "minimum": 1.0,
+            "title": "Polygoncount",
+            "type": "integer"
+          },
+          "structure": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Structure",
+            "type": "string"
+          }
+        },
+        "required": [
+          "layoutId",
+          "clipId",
+          "clipHash",
+          "structure",
+          "bbox",
+          "polygonCount",
+          "pointCount"
+        ],
+        "title": "ClipGeometrySourceV1",
+        "type": "object"
+      },
+      "ClipLayerV1": {
+        "additionalProperties": false,
+        "properties": {
+          "datatype": {
+            "anyOf": [
+              {
+                "maximum": 32767.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Datatype"
+          },
+          "layer": {
+            "maximum": 65535.0,
+            "minimum": 0.0,
+            "title": "Layer",
+            "type": "integer"
+          },
+          "material": {
+            "default": "Si",
+            "title": "Material",
+            "type": "string"
+          }
+        },
+        "required": [
+          "layer"
+        ],
+        "title": "ClipLayerV1",
+        "type": "object"
+      },
+      "ClipListResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "clips": {
+            "items": {
+              "$ref": "#/components/schemas/ClipV1"
+            },
+            "title": "Clips",
+            "type": "array"
+          }
+        },
+        "required": [
+          "clips"
+        ],
+        "title": "ClipListResponse",
+        "type": "object"
+      },
+      "ClipPolygonV1": {
+        "additionalProperties": false,
+        "properties": {
+          "datatype": {
+            "title": "Datatype",
+            "type": "integer"
+          },
+          "layer": {
+            "title": "Layer",
+            "type": "integer"
+          },
+          "points": {
+            "items": {
+              "items": {
+                "type": "number"
+              },
+              "type": "array"
+            },
+            "title": "Points",
+            "type": "array"
+          }
+        },
+        "required": [
+          "layer",
+          "datatype",
+          "points"
+        ],
+        "title": "ClipPolygonV1",
+        "type": "object"
+      },
+      "ClipPreviewRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "bbox": {
+            "$ref": "#/components/schemas/ClipBoundsV1"
+          },
+          "layers": {
+            "items": {
+              "$ref": "#/components/schemas/ClipLayerV1"
+            },
+            "maxItems": 32,
+            "minItems": 1,
+            "title": "Layers",
+            "type": "array"
+          },
+          "structure": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Structure",
+            "type": "string"
+          }
+        },
+        "required": [
+          "structure",
+          "layers",
+          "bbox"
+        ],
+        "title": "ClipPreviewRequest",
+        "type": "object"
+      },
+      "ClipPreviewResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "bbox": {
+            "$ref": "#/components/schemas/ClipBoundsV1"
+          },
+          "contentBounds": {
+            "$ref": "#/components/schemas/ClipContentBoundsV1"
+          },
+          "height": {
+            "title": "Height",
+            "type": "number"
+          },
+          "pointCount": {
+            "title": "Pointcount",
+            "type": "integer"
+          },
+          "polygonCount": {
+            "title": "Polygoncount",
+            "type": "integer"
+          },
+          "polygons": {
+            "items": {
+              "$ref": "#/components/schemas/ClipPolygonV1"
+            },
+            "title": "Polygons",
+            "type": "array"
+          },
+          "structure": {
+            "title": "Structure",
+            "type": "string"
+          },
+          "width": {
+            "title": "Width",
+            "type": "number"
+          }
+        },
+        "required": [
+          "structure",
+          "bbox",
+          "width",
+          "height",
+          "polygons",
+          "polygonCount",
+          "pointCount",
+          "contentBounds"
+        ],
+        "title": "ClipPreviewResponse",
+        "type": "object"
+      },
+      "ClipV1": {
+        "additionalProperties": false,
+        "properties": {
+          "annotations": {
+            "items": {
+              "$ref": "#/components/schemas/ClipAnnotationV1"
+            },
+            "title": "Annotations",
+            "type": "array"
+          },
+          "assetId": {
+            "title": "Assetid",
+            "type": "string"
+          },
+          "bbox": {
+            "$ref": "#/components/schemas/ClipBoundsV1"
+          },
+          "clipHash": {
+            "title": "Cliphash",
+            "type": "string"
+          },
+          "clipId": {
+            "title": "Clipid",
+            "type": "string"
+          },
+          "contentBounds": {
+            "$ref": "#/components/schemas/ClipContentBoundsV1"
+          },
+          "createdAt": {
+            "title": "Createdat",
+            "type": "string"
+          },
+          "gdsAssetId": {
+            "title": "Gdsassetid",
+            "type": "string"
+          },
+          "gdsFileName": {
+            "title": "Gdsfilename",
+            "type": "string"
+          },
+          "height": {
+            "title": "Height",
+            "type": "number"
+          },
+          "layers": {
+            "items": {
+              "$ref": "#/components/schemas/ClipLayerV1"
+            },
+            "title": "Layers",
+            "type": "array"
+          },
+          "layoutId": {
+            "title": "Layoutid",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "pointCount": {
+            "title": "Pointcount",
+            "type": "integer"
+          },
+          "polygonCount": {
+            "title": "Polygoncount",
+            "type": "integer"
+          },
+          "polygons": {
+            "items": {
+              "$ref": "#/components/schemas/ClipPolygonV1"
+            },
+            "title": "Polygons",
+            "type": "array"
+          },
+          "schemaVersion": {
+            "const": 1,
+            "title": "Schemaversion",
+            "type": "integer"
+          },
+          "structure": {
+            "title": "Structure",
+            "type": "string"
+          },
+          "width": {
+            "title": "Width",
+            "type": "number"
+          }
+        },
+        "required": [
+          "schemaVersion",
+          "clipId",
+          "name",
+          "layoutId",
+          "assetId",
+          "structure",
+          "layers",
+          "bbox",
+          "annotations",
+          "polygons",
+          "polygonCount",
+          "pointCount",
+          "contentBounds",
+          "width",
+          "height",
+          "clipHash",
+          "gdsAssetId",
+          "gdsFileName",
+          "createdAt"
+        ],
+        "title": "ClipV1",
+        "type": "object"
+      },
       "ComparisonProtocolV1": {
         "additionalProperties": false,
         "properties": {
@@ -1113,9 +1676,23 @@
       "CreateExperimentRequest": {
         "additionalProperties": false,
         "properties": {
+          "costPerRunUsd": {
+            "default": 0.0,
+            "maximum": 1000000.0,
+            "minimum": 0.0,
+            "title": "Costperrunusd",
+            "type": "number"
+          },
           "flowId": {
             "title": "Flowid",
             "type": "string"
+          },
+          "maxAttempts": {
+            "default": 1,
+            "maximum": 4.0,
+            "minimum": 1.0,
+            "title": "Maxattempts",
+            "type": "integer"
           },
           "name": {
             "title": "Name",
@@ -1136,7 +1713,7 @@
             "items": {
               "$ref": "#/components/schemas/ExperimentVariantSpecV1"
             },
-            "maxItems": 20,
+            "maxItems": 256,
             "minItems": 1,
             "title": "Variants",
             "type": "array"
@@ -1244,6 +1821,104 @@
           "duration"
         ],
         "title": "DirectionalStepV5",
+        "type": "object"
+      },
+      "DoeFactorV1": {
+        "additionalProperties": false,
+        "properties": {
+          "parameter": {
+            "title": "Parameter",
+            "type": "string"
+          },
+          "stepId": {
+            "title": "Stepid",
+            "type": "string"
+          },
+          "values": {
+            "items": {
+              "type": "number"
+            },
+            "maxItems": 10,
+            "minItems": 2,
+            "title": "Values",
+            "type": "array"
+          }
+        },
+        "required": [
+          "stepId",
+          "parameter",
+          "values"
+        ],
+        "title": "DoeFactorV1",
+        "type": "object"
+      },
+      "DoeRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "costPerRunUsd": {
+            "default": 0.0,
+            "maximum": 1000000.0,
+            "minimum": 0.0,
+            "title": "Costperrunusd",
+            "type": "number"
+          },
+          "factors": {
+            "items": {
+              "$ref": "#/components/schemas/DoeFactorV1"
+            },
+            "maxItems": 5,
+            "minItems": 1,
+            "title": "Factors",
+            "type": "array"
+          },
+          "flowId": {
+            "title": "Flowid",
+            "type": "string"
+          },
+          "maxAttempts": {
+            "default": 2,
+            "maximum": 4.0,
+            "minimum": 1.0,
+            "title": "Maxattempts",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "project": {
+            "$ref": "#/components/schemas/ProjectV7"
+          },
+          "recipeId": {
+            "title": "Recipeid",
+            "type": "string"
+          },
+          "recipeVersion": {
+            "title": "Recipeversion",
+            "type": "integer"
+          },
+          "replicates": {
+            "default": 3,
+            "maximum": 8.0,
+            "minimum": 1.0,
+            "title": "Replicates",
+            "type": "integer"
+          },
+          "seed": {
+            "default": 20261029,
+            "title": "Seed",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "project",
+          "flowId",
+          "recipeId",
+          "recipeVersion",
+          "factors"
+        ],
+        "title": "DoeRequest",
         "type": "object"
       },
       "Domain": {
@@ -2109,6 +2784,114 @@
         "title": "GcDryRunResponse",
         "type": "object"
       },
+      "GeometryBindingV1": {
+        "additionalProperties": false,
+        "description": "An immutable application of a geometry source to one compile.\n\n``Clip`` stays editable. This object freezes the material mapping, stack,\ndomain, grid and coordinate transform that the compiler actually consumed.",
+        "properties": {
+          "bindingId": {
+            "maxLength": 64,
+            "minLength": 8,
+            "pattern": "^[A-Za-z0-9_-]+$",
+            "title": "Bindingid",
+            "type": "string"
+          },
+          "defaultValuesVersion": {
+            "default": "1",
+            "maxLength": 32,
+            "minLength": 1,
+            "title": "Defaultvaluesversion",
+            "type": "string"
+          },
+          "dimension": {
+            "enum": [
+              2,
+              3
+            ],
+            "title": "Dimension",
+            "type": "integer"
+          },
+          "domain": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Domain"
+              },
+              {
+                "$ref": "#/components/schemas/Domain3D"
+              }
+            ],
+            "title": "Domain"
+          },
+          "geometry": {
+            "additionalProperties": true,
+            "title": "Geometry",
+            "type": "object"
+          },
+          "geometrySource": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ClipGeometrySourceV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "materialCatalogVersion": {
+            "default": "4.6.2",
+            "maxLength": 32,
+            "minLength": 1,
+            "title": "Materialcatalogversion",
+            "type": "string"
+          },
+          "materialDefinitions": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/MaterialDefinition"
+                },
+                "maxItems": 64,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Materialdefinitions"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "schemaVersion": {
+            "const": 1,
+            "title": "Schemaversion",
+            "type": "integer"
+          },
+          "schemaVersions": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Schemaversions",
+            "type": "object"
+          },
+          "units": {
+            "$ref": "#/components/schemas/Units"
+          }
+        },
+        "required": [
+          "schemaVersion",
+          "bindingId",
+          "name",
+          "dimension",
+          "units",
+          "domain",
+          "geometry"
+        ],
+        "title": "GeometryBindingV1",
+        "type": "object"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -2213,6 +2996,247 @@
           "sourcePower"
         ],
         "title": "IonParticleV7",
+        "type": "object"
+      },
+      "LayoutBoundsV1": {
+        "additionalProperties": false,
+        "properties": {
+          "x0": {
+            "title": "X0",
+            "type": "number"
+          },
+          "x1": {
+            "title": "X1",
+            "type": "number"
+          },
+          "y0": {
+            "title": "Y0",
+            "type": "number"
+          },
+          "y1": {
+            "title": "Y1",
+            "type": "number"
+          }
+        },
+        "required": [
+          "x0",
+          "y0",
+          "x1",
+          "y1"
+        ],
+        "title": "LayoutBoundsV1",
+        "type": "object"
+      },
+      "LayoutListResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "layouts": {
+            "items": {
+              "$ref": "#/components/schemas/LayoutSummaryV1"
+            },
+            "title": "Layouts",
+            "type": "array"
+          }
+        },
+        "required": [
+          "layouts"
+        ],
+        "title": "LayoutListResponse",
+        "type": "object"
+      },
+      "LayoutRegisterRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "assetId": {
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Assetid",
+            "type": "string"
+          },
+          "fileName": {
+            "maxLength": 255,
+            "minLength": 1,
+            "pattern": "^[^/\\\\]+$",
+            "title": "Filename",
+            "type": "string"
+          }
+        },
+        "required": [
+          "assetId",
+          "fileName"
+        ],
+        "title": "LayoutRegisterRequest",
+        "type": "object"
+      },
+      "LayoutStructureV1": {
+        "additionalProperties": false,
+        "properties": {
+          "bounds": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LayoutBoundsV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "layerDatatypes": {
+            "items": {
+              "items": {
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "title": "Layerdatatypes",
+            "type": "array"
+          },
+          "layers": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Layers",
+            "type": "array"
+          },
+          "maskLayerDatatypes": {
+            "items": {
+              "items": {
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "title": "Masklayerdatatypes",
+            "type": "array"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "references": {
+            "items": {
+              "type": "string"
+            },
+            "title": "References",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "layers",
+          "layerDatatypes",
+          "maskLayerDatatypes",
+          "references"
+        ],
+        "title": "LayoutStructureV1",
+        "type": "object"
+      },
+      "LayoutSummaryV1": {
+        "additionalProperties": false,
+        "properties": {
+          "createdAt": {
+            "title": "Createdat",
+            "type": "string"
+          },
+          "fileName": {
+            "title": "Filename",
+            "type": "string"
+          },
+          "layoutId": {
+            "title": "Layoutid",
+            "type": "string"
+          },
+          "structureCount": {
+            "title": "Structurecount",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "layoutId",
+          "fileName",
+          "structureCount",
+          "createdAt"
+        ],
+        "title": "LayoutSummaryV1",
+        "type": "object"
+      },
+      "LayoutUnitsV1": {
+        "additionalProperties": false,
+        "properties": {
+          "metersPerDatabaseUnit": {
+            "title": "Metersperdatabaseunit",
+            "type": "number"
+          },
+          "micrometersPerNativeUserUnit": {
+            "title": "Micrometerspernativeuserunit",
+            "type": "number"
+          },
+          "nativeOutputAssumption": {
+            "title": "Nativeoutputassumption",
+            "type": "string"
+          },
+          "userUnitsPerDatabaseUnit": {
+            "title": "Userunitsperdatabaseunit",
+            "type": "number"
+          }
+        },
+        "required": [
+          "userUnitsPerDatabaseUnit",
+          "metersPerDatabaseUnit",
+          "micrometersPerNativeUserUnit",
+          "nativeOutputAssumption"
+        ],
+        "title": "LayoutUnitsV1",
+        "type": "object"
+      },
+      "LayoutV1": {
+        "additionalProperties": false,
+        "properties": {
+          "assetId": {
+            "title": "Assetid",
+            "type": "string"
+          },
+          "createdAt": {
+            "title": "Createdat",
+            "type": "string"
+          },
+          "fileName": {
+            "title": "Filename",
+            "type": "string"
+          },
+          "layoutId": {
+            "title": "Layoutid",
+            "type": "string"
+          },
+          "schemaVersion": {
+            "const": 1,
+            "title": "Schemaversion",
+            "type": "integer"
+          },
+          "sizeBytes": {
+            "title": "Sizebytes",
+            "type": "integer"
+          },
+          "structures": {
+            "items": {
+              "$ref": "#/components/schemas/LayoutStructureV1"
+            },
+            "title": "Structures",
+            "type": "array"
+          },
+          "units": {
+            "$ref": "#/components/schemas/LayoutUnitsV1"
+          }
+        },
+        "required": [
+          "schemaVersion",
+          "layoutId",
+          "assetId",
+          "fileName",
+          "sizeBytes",
+          "units",
+          "structures",
+          "createdAt"
+        ],
+        "title": "LayoutV1",
         "type": "object"
       },
       "MaterialDefinition": {
@@ -6717,6 +7741,240 @@
         ]
       }
     },
+    "/api/v1/workflow/clips": {
+      "get": {
+        "operationId": "list_clips_api_v1_workflow_clips_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "layout_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Layout Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClipListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Clips",
+        "tags": [
+          "workflow"
+        ]
+      },
+      "post": {
+        "operationId": "create_clip_api_v1_workflow_clips_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClipCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClipV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Clip",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/clips/{clip_id}": {
+      "get": {
+        "operationId": "get_clip_api_v1_workflow_clips__clip_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "clip_id",
+            "required": true,
+            "schema": {
+              "title": "Clip Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClipV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Clip",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/clips/{clip_id}/annotations": {
+      "post": {
+        "operationId": "add_clip_annotation_api_v1_workflow_clips__clip_id__annotations_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "clip_id",
+            "required": true,
+            "schema": {
+              "title": "Clip Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClipAnnotationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClipV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Add Clip Annotation",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/clips/{clip_id}/compile": {
+      "post": {
+        "operationId": "compile_clip_api_v1_workflow_clips__clip_id__compile_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "clip_id",
+            "required": true,
+            "schema": {
+              "title": "Clip Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClipCompileRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdoptProjectResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Compile Clip",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
     "/api/v1/workflow/comparison-protocols": {
       "get": {
         "operationId": "list_protocols_api_v1_workflow_comparison_protocols_get",
@@ -7135,6 +8393,49 @@
         ]
       }
     },
+    "/api/v1/workflow/experiments/doe": {
+      "post": {
+        "operationId": "create_doe_api_v1_workflow_experiments_doe_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DoeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Doe Api V1 Workflow Experiments Doe Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Doe",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
     "/api/v1/workflow/experiments/{experiment_id}": {
       "get": {
         "operationId": "get_experiment_api_v1_workflow_experiments__experiment_id__get",
@@ -7179,6 +8480,85 @@
         ]
       }
     },
+    "/api/v1/workflow/experiments/{experiment_id}/aggregate": {
+      "get": {
+        "operationId": "get_experiment_aggregate_api_v1_workflow_experiments__experiment_id__aggregate_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "experiment_id",
+            "required": true,
+            "schema": {
+              "title": "Experiment Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Experiment Aggregate Api V1 Workflow Experiments  Experiment Id  Aggregate Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Experiment Aggregate",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/experiments/{experiment_id}/export.csv": {
+      "get": {
+        "operationId": "export_experiment_csv_api_v1_workflow_experiments__experiment_id__export_csv_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "experiment_id",
+            "required": true,
+            "schema": {
+              "title": "Experiment Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Export Experiment Csv",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
     "/api/v1/workflow/experiments/{experiment_id}/run": {
       "post": {
         "operationId": "run_experiment_api_v1_workflow_experiments__experiment_id__run_post",
@@ -7218,6 +8598,102 @@
           }
         },
         "summary": "Run Experiment",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/experiments/{experiment_id}/table": {
+      "get": {
+        "operationId": "get_experiment_table_api_v1_workflow_experiments__experiment_id__table_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "experiment_id",
+            "required": true,
+            "schema": {
+              "title": "Experiment Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "min_value",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Min Value"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_value",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Max Value"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort",
+            "required": false,
+            "schema": {
+              "default": "ordinal",
+              "title": "Sort",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "default": "asc",
+              "title": "Order",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Experiment Table Api V1 Workflow Experiments  Experiment Id  Table Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Experiment Table",
         "tags": [
           "workflow"
         ]
@@ -7364,6 +8840,160 @@
           }
         },
         "summary": "Gc Dry Run",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/layouts": {
+      "get": {
+        "operationId": "list_layouts_api_v1_workflow_layouts_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LayoutListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Layouts",
+        "tags": [
+          "workflow"
+        ]
+      },
+      "post": {
+        "operationId": "register_layout_api_v1_workflow_layouts_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LayoutRegisterRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LayoutV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Register Layout",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/layouts/{layout_id}": {
+      "get": {
+        "operationId": "get_layout_api_v1_workflow_layouts__layout_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "layout_id",
+            "required": true,
+            "schema": {
+              "title": "Layout Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LayoutV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Layout",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/layouts/{layout_id}/preview": {
+      "post": {
+        "operationId": "preview_layout_api_v1_workflow_layouts__layout_id__preview_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "layout_id",
+            "required": true,
+            "schema": {
+              "title": "Layout Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClipPreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClipPreviewResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Preview Layout",
         "tags": [
           "workflow"
         ]

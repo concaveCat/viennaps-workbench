@@ -154,6 +154,12 @@ async def lifespan(app: FastAPI):
     supervisor = Supervisor(lock_fd)
     app.state.supervisor = supervisor
     try:
+        from .workflow.api import get_store
+        from .workflow.experiments import resume_experiments
+        resume_experiments(get_store(), supervisor)
+    except Exception:
+        STARTUP_LOGGER.exception("experiment queue recovery failed")
+    try:
         yield
     finally:
         # Lifespan shutdown is already draining requests. Keeping close

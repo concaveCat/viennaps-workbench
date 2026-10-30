@@ -19,6 +19,20 @@ from ..models import (
 from .hashing import compile_record_id, full_project_hash, source_map_hash
 
 
+class ClipGeometrySourceV1(StrictModel):
+    """Frozen provenance for a layout clip used to build one binding."""
+
+    kind: Literal["layout"] = "layout"
+    layoutId: Annotated[str, Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")]
+    clipId: Annotated[str, Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")]
+    clipHash: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+    structure: Annotated[str, Field(min_length=1, max_length=512)]
+    bbox: dict[str, float]
+    polygonCount: Annotated[int, Field(ge=1)]
+    pointCount: Annotated[int, Field(ge=3)]
+    annotations: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class GeometryBindingV1(StrictModel):
     """An immutable application of a geometry source to one compile.
 
@@ -33,6 +47,7 @@ class GeometryBindingV1(StrictModel):
     units: Units
     domain: Domain | Domain3D
     geometry: dict[str, Any]
+    geometrySource: ClipGeometrySourceV1 | None = None
     materialDefinitions: Annotated[list[MaterialDefinition], Field(max_length=64)] | None = None
     materialCatalogVersion: Annotated[str, Field(min_length=1, max_length=32)] = "4.6.2"
     defaultValuesVersion: Annotated[str, Field(min_length=1, max_length=32)] = "1"

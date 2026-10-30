@@ -1,0 +1,122 @@
+/** P2 Chromium acceptance: layout clip canvas, 3 clip compiles, DOE queue and table/export. */
+import assert from 'node:assert/strict';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { chromium } from 'playwright';
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const baseUrl = (process.env.WORKBENCH_URL ?? 'http://127.0.0.1:8815').replace(/\/$/, '');
+const layoutPath = process.env.WORKFLOW_LAYOUT ?? path.resolve(here, '../../docs/stage5-evidence/two-structure-two-layer.gds');
+const projectPath = process.env.WORKFLOW_PROJECT ?? path.join(here, 'fixtures', 'workflow-2d-five.json');
+const screenshot = process.env.WORKFLOW_SCREENSHOT ?? '/tmp/workflow-p2.png';
+
+const getJson = async endpoint => {
+  const response = await fetch(`${baseUrl}${endpoint}`);
+  assert.ok(response.ok, `${endpoint} -> ${response.status}`);
+  return response.json();
+};
+
+const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
+const page = await browser.newPage({ viewport: { width: 1600, height: 1400 } });
+page.setDefaultTimeout(60000);
+const errors = [];
+page.on('pageerror', error => errors.push(error.message));
+
+try {
+  await page.goto(`${baseUrl}/`);
+  await page.getByText('本机服务已连接').waitFor();
+  await page.locator('input[type=file]').nth(0).setInputFiles(layoutPath);
+  await page.getByText(/GDS · two-structure-two-layer\.gds/).waitFor();
+  await page.locator('input[type=file]').nth(1).setInputFiles(projectPath);
+  await page.getByRole('button', { name: '采纳为 Workflow' }).click();
+  await page.getByText('Compile 已冻结').waitFor();
+
+  await page.getByRole('button', { name: '注册为 Layout' }).click();
+  await page.getByLabel('版图结构').waitFor();
+  await page.getByRole('button', { name: '预览' }).click();
+  await page.locator('.wf-clip-canvas polygon').first().waitFor();
+  assert.match(await page.locator('.wf-canvas-wrap').innerText(), /多边形/);
+
+  // Three clips: two structures and one cropped/annotated region.
+  await page.getByLabel('Clip 名称').fill('clip A');
+  await page.getByRole('button', { name: '保存 Clip' }).click();
+  await page.locator('.wf-clip-list button').filter({ hasText: 'clip A' }).waitFor();
+  await page.getByLabel('版图结构').selectOption('CELL_B');
+  await page.getByLabel('Clip 名称').fill('clip B');
+  await page.getByRole('button', { name: '保存 Clip' }).click();
+  await page.locator('.wf-clip-list button').filter({ hasText: 'clip B' }).waitFor();
+  await page.getByLabel('版图结构').selectOption('CELL_A');
+  for (const [label, value] of [['Clip x0', '0.5'], ['Clip y0', '0.2'], ['Clip x1', '1.5'], ['Clip y1', '0.8']]) {
+    await page.getByLabel(label).fill(value);
+  }
+  await page.getByRole('button', { name: '预览' }).click();
+  await page.locator('.wf-clip-canvas polygon').first().waitFor();
+  await page.getByLabel('Clip 名称').fill('clip C');
+  await page.getByRole('button', { name: '保存 Clip' }).click();
+  await page.locator('.wf-clip-list button').filter({ hasText: 'clip C' }).waitFor();
+  await page.getByLabel('标注文本').fill('center');
+  await page.getByLabel('标注 X').fill('0.5');
+  await page.getByLabel('标注 Y').fill('0.3');
+  await page.getByRole('button', { name: '添加标注' }).click();
+  await page.locator('.wf-annotation').first().waitFor();
+  const clips = (await getJson('/api/v1/workflow/clips')).clips;
+  assert.equal(clips.length, 3, JSON.stringify(clips.map(item => item.name)));
+  assert.deepEqual(clips.map(item => item.name).sort(), ['clip A', 'clip B', 'clip C']);
+  assert.equal(clips.find(item => item.name === 'clip C').annotations.length, 1);
+
+  const hashes = [];
+  for (const name of ['clip A', 'clip B', 'clip C']) {
+    await page.locator('.wf-clip-list button').filter({ hasText: name }).click();
+    const [response] = await Promise.all([
+      page.waitForResponse(item => item.url().includes('/compile') && item.request().method() === 'POST'),
+      page.getByRole('button', { name: '用此 Clip 编译' }).click(),
+    ]);
+    assert.equal(response.status(), 201, await response.text());
+    const body = await response.json();
+    assert.equal(body.binding.geometrySource.clipId, clips.find(item => item.name === name).clipId);
+    hashes.push(body.compile.compileRecord.geometryBindingHash);
+    await page.getByText('Compile 已冻结').waitFor();
+  }
+  assert.equal(new Set(hashes).size, 3, 'three clips must produce three geometry bindings');
+
+  // Run the last clip compile and take a measurement so the DOE has an active recipe.
+  await page.getByRole('button', { name: '02 流程' }).click();
+  await page.getByRole('button', { name: '创建首个 Route' }).click();
+  await page.getByRole('button', { name: '03 运行' }).click();
+  await page.getByRole('button', { name: '执行全部 Segment' }).click();
+  await page.locator('.wf-status.succeeded').first().waitFor({ timeout: 60000 });
+  await page.getByRole('button', { name: '按配方测量并绑定' }).click();
+  await page.getByText(/binding: verified/).first().waitFor();
+
+  await page.getByRole('button', { name: '04 实验' }).click();
+  const valueRows = [[0, '0.01,0.02'], [1, '0.01,0.02'], [2, '0.01,0.02']];
+  for (const [index] of valueRows) {
+    await page.getByLabel(`因子 ${index + 1} 取值`).fill('0.01,0.02');
+  }
+  await page.getByLabel('DOE 重复数').fill('1');
+  await page.getByRole('button', { name: '设计 DOE' }).click();
+  await page.getByText(/8 条件 × 1 重复 = 8 逻辑执行/).waitFor();
+  await page.getByRole('button', { name: '运行持久化实验' }).click();
+  await page.getByText('Experiment status: completed').waitFor({ timeout: 180000 });
+  assert.match(await page.locator('.wf-summary').filter({ hasText: 'Queue' }).innerText(), /8\/8 succeeded/);
+  await page.getByRole('button', { name: '筛选 / 排序' }).click();
+  await page.locator('.wf-table').last().locator('tbody tr').first().waitFor();
+  assert.equal(await page.locator('.wf-table').last().locator('tbody tr').count(), 8);
+  const csv = await page.getByRole('link', { name: '导出 CSV' }).getAttribute('href');
+  assert.match(csv ?? '', /\/experiments\/exp_[a-f0-9]+\/export\.csv$/);
+
+  const experiment = (await getJson('/api/v1/workflow/experiments')).experiments[0];
+  const document = await getJson(`/api/v1/workflow/experiments/${experiment.experimentId}`);
+  assert.equal(document.kind, 'doe');
+  assert.equal(document.design.conditionCount, 8);
+  assert.equal(document.queue.succeeded, 8);
+  assert.equal(document.aggregation.rows.length, 8);
+  await page.screenshot({ path: screenshot, fullPage: true });
+  assert.deepEqual(errors, []);
+  console.log(JSON.stringify({
+    status: 'passed', baseUrl, screenshot, errors, clipBindings: hashes,
+    doe: { conditions: document.design.conditionCount, runs: document.queue.succeeded, unit: document.unit },
+  }));
+} finally {
+  await browser.close();
+}

@@ -62,11 +62,69 @@ type Recipe = {
   parameters: Record<string, unknown>;
 };
 type TemplateSummary = { templateId: string; name: string; stepCount: number };
+type LayoutStructure = {
+  name: string;
+  layers: number[];
+  layerDatatypes: number[][];
+  maskLayerDatatypes: number[][];
+  references: string[];
+  bounds: { x0: number; y0: number; x1: number; y1: number } | null;
+};
+type LayoutDetail = {
+  layoutId: string;
+  assetId: string;
+  fileName: string;
+  sizeBytes: number;
+  structures: LayoutStructure[];
+  createdAt: string;
+};
+type ClipPolygon = { layer: number; datatype: number; points: number[][] };
+type ClipCanvas = {
+  structure: string;
+  bbox: { x0: number; y0: number; x1: number; y1: number };
+  width: number;
+  height: number;
+  polygons: ClipPolygon[];
+  polygonCount: number;
+  pointCount: number;
+  contentBounds: { x0: number; y0: number; x1: number; y1: number };
+};
+type Clip = ClipCanvas & {
+  clipId: string;
+  name: string;
+  layoutId: string;
+  layers: Array<{ layer: number; datatype: number | null; material: string }>;
+  annotations: Array<{ annotationId: string; text: string; x: number; y: number }>;
+  clipHash: string;
+  gdsAssetId: string;
+  createdAt: string;
+};
+type ExperimentDoc = {
+  experimentId: string;
+  name: string;
+  status: string;
+  kind?: string;
+  recipeVersion: number;
+  design?: { conditionCount: number; logicalRunCount: number; replicates: number };
+  queue?: { total: number; pending: number; running: number; succeeded: number; failed: number; retries: number; estimatedSecondsRemaining: number; estimatedCostUsd: number };
+  aggregation?: { rows: Array<{ ordinal: number; n: number; mean: number | null; std: number | null; ci95: number | null; unit: string; statisticalStatus: string }> };
+  variants: Array<{ ordinal: number; replicates: Array<{ status: string; value?: number | null; unit?: string; runId?: string; seed?: number; attemptCount?: number; statisticalSample?: boolean }> }>;
+  project?: { steps: Array<{ id: string }> };
+};
+type ExperimentTable = {
+  experimentId: string;
+  status: string;
+  unit: string;
+  queue?: ExperimentDoc['queue'];
+  rows: Array<{ ordinal: number; n: number; mean: number | null; std: number | null; ci95: number | null; statisticalStatus: string; parameters: Record<string, Record<string, number>> }>;
+};
 type Provenance = {
   measurementId: string;
   bindingStatus: string;
   verifications: Array<{ verificationId: string; status: string; createdAt: string; evidence: { methodVersion: string } }>;
 };
+
+const LAYER_COLORS = ['#64d2ff', '#ffd166', '#7ee787', '#ff7b72', '#d2a8ff'];
 
 const STEP_LABELS: Record<string, string> = {
   isotropic: '各向同性',
@@ -127,7 +185,31 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [activeRecipeId, setActiveRecipeId] = useState('');
   const [activeRecipeVersion, setActiveRecipeVersion] = useState(1);
   const [metricDetail, setMetricDetail] = useState<{ measurement: Measurement; recipe: Recipe; provenance: Provenance } | null>(null);
-  const [experimentDoc, setExperimentDoc] = useState<{ experimentId: string; name: string; status: string; variants: Array<{ ordinal: number; replicates: Array<{ status: string; value?: number | null; unit?: string; runId?: string }> }> } | null>(null);
+  const [experimentDoc, setExperimentDoc] = useState<ExperimentDoc | null>(null);
+  const [experimentTable, setExperimentTable] = useState<ExperimentTable | null>(null);
+  const [layouts, setLayouts] = useState<Array<{ layoutId: string; fileName: string; structureCount: number }>>([]);
+  const [activeLayout, setActiveLayout] = useState<LayoutDetail | null>(null);
+  const [layoutStructure, setLayoutStructure] = useState('');
+  const [selectedPairs, setSelectedPairs] = useState<string[]>([]);
+  const [clipBounds, setClipBounds] = useState({ x0: 0, y0: 0, x1: 2, y1: 2 });
+  const [clipName, setClipName] = useState('clip');
+  const [canvas, setCanvas] = useState<ClipCanvas | null>(null);
+  const [clips, setClips] = useState<Clip[]>([]);
+  const [activeClip, setActiveClip] = useState<Clip | null>(null);
+  const [annotationText, setAnnotationText] = useState('');
+  const [annotationX, setAnnotationX] = useState('0');
+  const [annotationY, setAnnotationY] = useState('0');
+  const [doeFactors, setDoeFactors] = useState([
+    { stepId: '', parameter: 'rateMagnitude', values: '0.01,0.02,0.03' },
+    { stepId: '', parameter: 'duration', values: '0.02,0.04,0.06' },
+    { stepId: '', parameter: 'duration', values: '0.01,0.02,0.03' },
+  ]);
+  const [doeReplicates, setDoeReplicates] = useState(3);
+  const [doeSeed, setDoeSeed] = useState('20261029');
+  const [doeCost, setDoeCost] = useState('0');
+  const [tableMin, setTableMin] = useState('');
+  const [tableMax, setTableMax] = useState('');
+  const [tableSort, setTableSort] = useState('ordinal');
   const [previousCompile, setPreviousCompile] = useState<CompileInfo | null>(null);
   const [compileDiff, setCompileDiff] = useState<{ addedStepIds: string[]; removedStepIds: string[]; movedStepIds: string[]; changedStepIds: string[]; affectedStepIds: string[]; details?: Array<{ stepId: string; before: Record<string, unknown>; after: Record<string, unknown> }> } | null>(null);
   const [templateVariable, setTemplateVariable] = useState('0.02');
@@ -145,6 +227,14 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     void api<Health>('/api/health').then(setHealth).catch(() => setHealth(null));
     void api<{ templates: TemplateSummary[] }>('/api/v1/workflow/templates').then(data => setTemplates(data.templates)).catch(() => undefined);
   }, []);
+
+  useEffect(() => {
+    const steps = (project?.steps ?? []).filter(step => step.enabled);
+    if (!steps.length) return;
+    setDoeFactors(previous => previous.map((row, index) => row.stepId
+      ? row
+      : { ...row, stepId: steps[Math.min(index, steps.length - 1)]?.id ?? '' }));
+  }, [project]);
 
   useEffect(() => {
     if (!segment || segment.status !== 'running') return;
@@ -380,6 +470,138 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     }
   });
 
+  const refreshLayouts = async () => {
+    const data = await api<{ layouts: Array<{ layoutId: string; fileName: string; structureCount: number }> }>('/api/v1/workflow/layouts');
+    setLayouts(data.layouts);
+    return data.layouts;
+  };
+
+  const selectStructure = (layout: LayoutDetail, name: string) => {
+    const structure = layout.structures.find(item => item.name === name);
+    setLayoutStructure(name);
+    setSelectedPairs((structure?.layerDatatypes ?? []).map(([layer, datatype]) => `${layer}:${datatype}`));
+    if (structure?.bounds) {
+      setClipBounds({ ...structure.bounds });
+      setCanvas(null);
+    }
+  };
+
+  const registerLayout = () => run('layout', async () => {
+    if (!gds) throw new Error('先上传 GDS');
+    const layout = await postJson<LayoutDetail>('/api/v1/workflow/layouts', {
+      assetId: gds.assetId, fileName: gds.fileName,
+    });
+    setActiveLayout(layout);
+    const first = layout.structures[0];
+    if (first) selectStructure(layout, first.name);
+    await refreshLayouts();
+    const listed = await api<{ clips: Clip[] }>(`/api/v1/workflow/clips?layout_id=${layout.layoutId}`);
+    setClips(listed.clips);
+  });
+
+  const chooseLayout = async (layoutId: string) => {
+    if (!layoutId) { setActiveLayout(null); return; }
+    const layout = await api<LayoutDetail>(`/api/v1/workflow/layouts/${layoutId}`);
+    setActiveLayout(layout);
+    const first = layout.structures[0];
+    if (first) selectStructure(layout, first.name);
+    const listed = await api<{ clips: Clip[] }>(`/api/v1/workflow/clips?layout_id=${layoutId}`);
+    setClips(listed.clips);
+  };
+
+  const previewClip = () => run('preview', async () => {
+    if (!activeLayout) throw new Error('先注册 Layout');
+    const layers = selectedPairs.map(key => {
+      const [layer, datatype] = key.split(':').map(Number);
+      return { layer, datatype, material: 'Si' };
+    });
+    if (!layers.length) throw new Error('至少选择一个层');
+    const preview = await postJson<ClipCanvas>(`/api/v1/workflow/layouts/${activeLayout.layoutId}/preview`, {
+      structure: layoutStructure, layers, bbox: clipBounds,
+    });
+    setCanvas(preview);
+    setActiveClip(null);
+  });
+
+  const saveClip = () => run('clip', async () => {
+    if (!activeLayout) throw new Error('先注册 Layout');
+    const layers = selectedPairs.map(key => {
+      const [layer, datatype] = key.split(':').map(Number);
+      return { layer, datatype, material: 'Si' };
+    });
+    const annotations = annotationText.trim()
+      ? [{ text: annotationText.trim(), x: Number(annotationX) || 0, y: Number(annotationY) || 0 }]
+      : [];
+    const clip = await postJson<Clip>('/api/v1/workflow/clips', {
+      layoutId: activeLayout.layoutId, name: clipName || `clip ${clips.length + 1}`,
+      structure: layoutStructure, layers, bbox: clipBounds, annotations,
+    });
+    setClips(previous => [clip, ...previous]);
+    setActiveClip(clip);
+    setCanvas(clip);
+    setAnnotationText('');
+  });
+
+  const selectClip = (clip: Clip) => {
+    setActiveClip(clip);
+    setCanvas(clip);
+    setClipName(clip.name);
+    if (activeLayout) selectStructure(activeLayout, clip.structure);
+    setClipBounds({ ...clip.bbox });
+  };
+
+  const addAnnotation = () => run('annotation', async () => {
+    if (!activeClip) throw new Error('先选择 Clip');
+    if (!annotationText.trim()) throw new Error('填写标注文本');
+    const updated = await postJson<Clip>(`/api/v1/workflow/clips/${activeClip.clipId}/annotations`, {
+      text: annotationText.trim(), x: Number(annotationX) || 0, y: Number(annotationY) || 0,
+    });
+    setActiveClip(updated);
+    setCanvas(updated);
+    setClips(previous => previous.map(item => item.clipId === updated.clipId ? updated : item));
+    setAnnotationText('');
+  });
+
+  const compileClip = () => run('clip-compile', async () => {
+    if (!activeClip) throw new Error('先保存或选择 Clip');
+    if (!project) throw new Error('先导入工程 JSON');
+    const result = await postJson<CompileInfo>(`/api/v1/workflow/clips/${activeClip.clipId}/compile`, {
+      project, flowId: compile?.flowId,
+    });
+    if (compile) setPreviousCompile(compile);
+    setCompile(result); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);
+  });
+
+  const createDoe = () => run('doe', async () => {
+    if (!project || !compile || !activeRecipeId) throw new Error('先完成一次测量以固定配方');
+    const factors = doeFactors
+      .map(row => ({
+        stepId: row.stepId,
+        parameter: row.parameter,
+        values: row.values.split(',').map(value => Number(value.trim())).filter(value => Number.isFinite(value)),
+      }))
+      .filter(row => row.stepId && row.values.length > 0);
+    if (!factors.length) throw new Error('至少配置一个因子');
+    const document = await postJson<ExperimentDoc>('/api/v1/workflow/experiments/doe', {
+      name: `${compile.projectName} · DOE`, project, flowId: compile.flowId,
+      recipeId: activeRecipeId, recipeVersion: activeRecipeVersion, factors,
+      replicates: doeReplicates, seed: Number(doeSeed) || 20261029,
+      maxAttempts: 2, costPerRunUsd: Number(doeCost) || 0,
+    });
+    setExperimentDoc(document);
+    setExperimentTable(null);
+  });
+
+  const loadExperimentTable = () => run('table', async () => {
+    if (!experimentDoc) throw new Error('先创建实验');
+    const query = new URLSearchParams();
+    if (tableMin.trim()) query.set('min_value', tableMin.trim());
+    if (tableMax.trim()) query.set('max_value', tableMax.trim());
+    query.set('sort', tableSort);
+    query.set('order', tableSort === 'ordinal' ? 'asc' : 'desc');
+    setExperimentTable(await api<ExperimentTable>(`/api/v1/workflow/experiments/${experimentDoc.experimentId}/table?${query.toString()}`));
+  });
+
   const sleep = (ms: number) => new Promise(resolve => window.setTimeout(resolve, ms));
 
   const waitSegment = async (segmentId: string) => {
@@ -462,6 +684,65 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             {busy === 'adopt' ? '采纳中…' : '采纳为 Workflow'}
           </button>
           {compile && <div className="wf-summary success"><strong>Compile 已冻结</strong><span>{compile.stepCount} 步 · {compile.compileId.slice(0, 12)}…</span></div>}
+          {gds && <div className="wf-clip-editor">
+            <div className="wf-card-subhead">版图 / Clip</div>
+            <div className="wf-template-row">
+              <button className="wf-button ghost" disabled={!!busy} onClick={() => void registerLayout()}>注册为 Layout</button>
+              <select aria-label="版图选择" value={activeLayout?.layoutId ?? ''} onChange={event => void chooseLayout(event.target.value)}>
+                <option value="">选择 Layout</option>
+                {layouts.map(item => <option key={item.layoutId} value={item.layoutId}>{item.fileName} · {item.structureCount} 结构</option>)}
+              </select>
+            </div>
+            {activeLayout && <>
+              <div className="wf-template-row">
+                <select aria-label="版图结构" value={layoutStructure} onChange={event => selectStructure(activeLayout, event.target.value)}>
+                  {activeLayout.structures.map(item => <option key={item.name} value={item.name}>{item.name}</option>)}
+                </select>
+                <input aria-label="Clip 名称" value={clipName} onChange={event => setClipName(event.target.value)} placeholder="Clip 名称" />
+              </div>
+              <div className="wf-layer-picks">
+                {(activeLayout.structures.find(item => item.name === layoutStructure)?.layerDatatypes ?? []).map(([layer, datatype]) => {
+                  const key = `${layer}:${datatype}`;
+                  return <label key={key}><input type="checkbox" checked={selectedPairs.includes(key)} onChange={event => setSelectedPairs(previous => event.target.checked ? [...previous, key] : previous.filter(item => item !== key))} /> L{layer}/{datatype}</label>;
+                })}
+              </div>
+              <div className="wf-bounds">
+                {(['x0', 'y0', 'x1', 'y1'] as const).map(key => <input key={key} aria-label={`Clip ${key}`} value={String(clipBounds[key])} onChange={event => setClipBounds(previous => ({ ...previous, [key]: Number(event.target.value) }))} />)}
+                <button className="wf-button ghost" disabled={!!busy} onClick={() => void previewClip()}>预览</button>
+                <button className="wf-button ghost" disabled={!!busy} onClick={() => void saveClip()}>保存 Clip</button>
+              </div>
+            </>}
+            {canvas && <div className="wf-canvas-wrap">
+              <svg viewBox={`0 0 ${canvas.width} ${canvas.height}`} className="wf-clip-canvas" role="img" aria-label="版图 Clip 画布">
+                {canvas.polygons.map((polygon, index) => <polygon
+                  key={`${polygon.layer}-${index}`}
+                  points={polygon.points.map(([x, y]) => `${x},${canvas.height - y}`).join(' ')}
+                  fill={LAYER_COLORS[polygon.layer % LAYER_COLORS.length]}
+                  fillOpacity="0.45"
+                  stroke={LAYER_COLORS[polygon.layer % LAYER_COLORS.length]}
+                  strokeWidth={Math.max(canvas.width, canvas.height) / 500}
+                />)}
+                {activeClip?.annotations.map(annotation => <g key={annotation.annotationId}>
+                  <circle cx={annotation.x} cy={activeClip.height - annotation.y} r={Math.max(canvas.width, canvas.height) / 80} className="wf-annotation" />
+                  <text x={annotation.x} y={activeClip.height - annotation.y} className="wf-annotation-text">{annotation.text}</text>
+                </g>)}
+              </svg>
+              <div className="wf-muted">{canvas.polygonCount} 多边形 · {canvas.pointCount} 点 · {canvas.width.toFixed(3)} × {canvas.height.toFixed(3)} µm</div>
+            </div>}
+            {activeClip && <div className="wf-summary"><strong>{activeClip.name}</strong><span>{activeClip.polygonCount} 多边形</span><span><code>{activeClip.clipHash.slice(0, 12)}…</code></span><span>{activeClip.annotations.length} 标注</span></div>}
+            {activeClip && <div className="wf-template-row">
+              <input aria-label="标注文本" value={annotationText} onChange={event => setAnnotationText(event.target.value)} placeholder="标注文本" />
+              <input aria-label="标注 X" value={annotationX} onChange={event => setAnnotationX(event.target.value)} />
+              <input aria-label="标注 Y" value={annotationY} onChange={event => setAnnotationY(event.target.value)} />
+              <button className="wf-button ghost" disabled={!!busy} onClick={() => void addAnnotation()}>添加标注</button>
+            </div>}
+            {clips.length > 0 && <div className="wf-clip-list">
+              {clips.map(clip => <button key={clip.clipId} type="button" className={activeClip?.clipId === clip.clipId ? 'active' : ''} onClick={() => selectClip(clip)}>{clip.name} · {clip.polygonCount}</button>)}
+            </div>}
+            {activeClip && <button className="wf-button primary" disabled={!project || !!busy} onClick={() => void compileClip()}>
+              {busy === 'clip-compile' ? '编译中…' : '用此 Clip 编译'}
+            </button>}
+          </div>}
         </section>
 
         <section className={`wf-card wf-flow ${zone === 'flow' ? '' : 'wf-hidden'}`}>
@@ -572,8 +853,43 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
           <button className="wf-button primary" disabled={!compile || !activeRecipeId || !!busy} onClick={() => void createPersistentExperiment()}>创建 10 变体实验</button>
           <button className="wf-button ghost" disabled={!experimentDoc || !!busy} onClick={() => void runPersistentExperiment()}>{busy === 'experiment' ? '实验运行中…' : '运行持久化实验'}</button>
           <table className="wf-table"><thead><tr><th>#</th><th>Duration</th><th>Reps</th><th>Seed</th></tr></thead><tbody>{experimentRows.map((row, index) => <tr key={index}><td>{index + 1}</td><td><input aria-label={`变体 ${index + 1} duration`} value={row.duration} onChange={event => setExperimentRows(previous => previous.map((item, itemIndex) => itemIndex === index ? { ...item, duration: event.target.value } : item))} /></td><td><input aria-label={`变体 ${index + 1} replicates`} type="number" min={1} max={8} value={row.replicates} onChange={event => setExperimentRows(previous => previous.map((item, itemIndex) => itemIndex === index ? { ...item, replicates: Number(event.target.value) || 1 } : item))} /></td><td><input aria-label={`变体 ${index + 1} seed`} type="number" value={row.seed} onChange={event => setExperimentRows(previous => previous.map((item, itemIndex) => itemIndex === index ? { ...item, seed: Number(event.target.value) || 0 } : item))} /></td></tr>)}</tbody></table>
-          {experimentDoc && <div className="wf-muted">Experiment status: {experimentDoc.status}</div>}
+          {experimentDoc && <div className="wf-muted">Experiment status: {experimentDoc.status}{experimentDoc.kind === 'doe' ? ' · DOE' : ''}</div>}
+          {experimentDoc?.queue && <div className="wf-summary"><strong>Queue</strong><span>{experimentDoc.queue.succeeded}/{experimentDoc.queue.total} succeeded · pending {experimentDoc.queue.pending} · running {experimentDoc.queue.running}</span><span>ETA {experimentDoc.queue.estimatedSecondsRemaining}s</span><span>cost ${experimentDoc.queue.estimatedCostUsd.toFixed(4)}</span><span>retries {experimentDoc.queue.retries}</span></div>}
           {experimentDoc && <table className="wf-table"><thead><tr><th>#</th><th>Status</th><th>Value</th><th>Run</th></tr></thead><tbody>{experimentDoc.variants.map(variant => <tr key={variant.ordinal}><td>{variant.ordinal}</td><td>{variant.replicates[0]?.status}</td><td>{variant.replicates[0]?.value ?? '—'} {variant.replicates[0]?.unit ?? ''}</td><td><code>{variant.replicates[0]?.runId?.slice(0, 8) ?? '—'}</code></td></tr>)}</tbody></table>}
+          <div className="wf-card-subhead">DOE 全因子</div>
+          {(project?.steps ?? []).filter(step => step.enabled).length === 0 && <div className="wf-muted">导入并采纳工程后可配置因子。</div>}
+          {doeFactors.map((row, index) => <div className="wf-doe-row" key={index}>
+            <select aria-label={`因子 ${index + 1} 步骤`} value={row.stepId} onChange={event => setDoeFactors(previous => previous.map((item, itemIndex) => itemIndex === index ? { ...item, stepId: event.target.value } : item))}>
+              <option value="">步骤</option>
+              {(project?.steps ?? []).filter(step => step.enabled).map(step => <option key={step.id} value={step.id}>{step.id}</option>)}
+            </select>
+            <select aria-label={`因子 ${index + 1} 参数`} value={row.parameter} onChange={event => setDoeFactors(previous => previous.map((item, itemIndex) => itemIndex === index ? { ...item, parameter: event.target.value } : item))}>
+              <option value="rateMagnitude">rateMagnitude</option>
+              <option value="duration">duration</option>
+              <option value="stickingProbability">stickingProbability</option>
+            </select>
+            <input aria-label={`因子 ${index + 1} 取值`} value={row.values} onChange={event => setDoeFactors(previous => previous.map((item, itemIndex) => itemIndex === index ? { ...item, values: event.target.value } : item))} />
+          </div>)}
+          <div className="wf-template-row">
+            <input aria-label="DOE 重复数" type="number" min={1} max={8} value={doeReplicates} onChange={event => setDoeReplicates(Number(event.target.value) || 1)} />
+            <input aria-label="DOE 种子" value={doeSeed} onChange={event => setDoeSeed(event.target.value)} />
+            <input aria-label="单次成本" value={doeCost} onChange={event => setDoeCost(event.target.value)} />
+            <button className="wf-button primary" disabled={!compile || !activeRecipeId || !!busy} onClick={() => void createDoe()}>设计 DOE</button>
+          </div>
+          {experimentDoc?.design && <div className="wf-summary"><strong>DOE</strong><span>{experimentDoc.design.conditionCount} 条件 × {experimentDoc.design.replicates} 重复 = {experimentDoc.design.logicalRunCount} 逻辑执行</span></div>}
+          {experimentDoc?.kind === 'doe' && <div className="wf-template-row">
+            <input aria-label="筛选最小均值" value={tableMin} onChange={event => setTableMin(event.target.value)} placeholder="mean ≥" />
+            <input aria-label="筛选最大均值" value={tableMax} onChange={event => setTableMax(event.target.value)} placeholder="mean ≤" />
+            <select aria-label="排序字段" value={tableSort} onChange={event => setTableSort(event.target.value)}>
+              <option value="ordinal">#</option>
+              <option value="mean">mean</option>
+              <option value="std">std</option>
+              <option value="n">n</option>
+            </select>
+            <button className="wf-button ghost" disabled={!!busy} onClick={() => void loadExperimentTable()}>筛选 / 排序</button>
+            <a className="wf-button ghost" href={`/api/v1/workflow/experiments/${experimentDoc.experimentId}/export.csv`} download>导出 CSV</a>
+          </div>}
+          {experimentTable && <table className="wf-table"><thead><tr><th>#</th><th>n</th><th>Mean</th><th>Std</th><th>CI95</th><th>Status</th></tr></thead><tbody>{experimentTable.rows.map(row => <tr key={row.ordinal}><td>{row.ordinal}</td><td>{row.n}</td><td>{row.mean === null ? '—' : row.mean.toFixed(6)}</td><td>{row.std === null ? '—' : row.std.toFixed(6)}</td><td>{row.ci95 === null ? '—' : row.ci95.toFixed(6)}</td><td>{row.statisticalStatus}</td></tr>)}</tbody></table>}
         </section>}
         {zone === 'analyze' && <section className="wf-card wf-wide">
           <div className="wf-card-head"><span>05</span><h2>Analyze</h2></div>

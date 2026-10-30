@@ -189,6 +189,20 @@ class WorkflowStore:
                     document_json TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS layout_assets (
+                    layout_id TEXT PRIMARY KEY,
+                    asset_id TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    document_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS clips (
+                    clip_id TEXT PRIMARY KEY,
+                    layout_id TEXT NOT NULL,
+                    document_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS flow_templates (
                     template_id TEXT PRIMARY KEY,
                     template_json TEXT NOT NULL,
@@ -1321,6 +1335,13 @@ class WorkflowStore:
             raise WorkflowNotFound(f"experiment {experiment_id!r} does not exist")
         return json.loads(row["document_json"])
 
+    def list_experiment_documents(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT document_json FROM experiments ORDER BY updated_at DESC, rowid DESC"
+            ).fetchall()
+        return [json.loads(row["document_json"]) for row in rows]
+
     def list_experiments(self) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute("SELECT document_json, updated_at FROM experiments ORDER BY updated_at DESC, rowid DESC").fetchall()
@@ -1330,6 +1351,79 @@ class WorkflowStore:
              "updatedAt": row["updated_at"]}
             for row in rows
         ]
+
+    def register_layout(self, layout_id: str, asset_id: str, file_name: str, document: dict[str, Any]) -> dict[str, Any]:
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT document_json FROM layout_assets WHERE layout_id = ?", (layout_id,)
+            ).fetchone()
+            if existing is not None:
+                stored = json.loads(existing["document_json"])
+                if stored.get("assetId") == asset_id and stored.get("fileName") == file_name:
+                    return stored
+                raise WorkflowConflict("layoutId already exists with different content")
+            connection.execute(
+                "INSERT INTO layout_assets (layout_id, asset_id, file_name, document_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                (layout_id, asset_id, file_name, self._dump(document), self._now()),
+            )
+        return document
+
+    def get_layout(self, layout_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute("SELECT document_json FROM layout_assets WHERE layout_id = ?", (layout_id,)).fetchone()
+        if row is None:
+            raise WorkflowNotFound(f"layout {layout_id!r} does not exist")
+        return json.loads(row["document_json"])
+
+    def list_layouts(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT document_json FROM layout_assets ORDER BY created_at DESC, rowid DESC"
+            ).fetchall()
+        return [
+            {
+                "layoutId": json.loads(row["document_json"])["layoutId"],
+                "fileName": json.loads(row["document_json"])["fileName"],
+                "structureCount": len(json.loads(row["document_json"]).get("structures") or []),
+                "createdAt": json.loads(row["document_json"])["createdAt"],
+            }
+            for row in rows
+        ]
+
+    def save_clip(self, document: dict[str, Any]) -> dict[str, Any]:
+        now = self._now()
+        with self._connect() as connection:
+            existing = connection.execute("SELECT created_at FROM clips WHERE clip_id = ?", (document["clipId"],)).fetchone()
+            if existing is None:
+                connection.execute(
+                    "INSERT INTO clips (clip_id, layout_id, document_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                    (document["clipId"], document["layoutId"], self._dump(document), document.get("createdAt", now), now),
+                )
+            else:
+                document["createdAt"] = existing["created_at"]
+                connection.execute(
+                    "UPDATE clips SET document_json = ?, updated_at = ? WHERE clip_id = ?",
+                    (self._dump(document), now, document["clipId"]),
+                )
+        return document
+
+    def get_clip(self, clip_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute("SELECT document_json FROM clips WHERE clip_id = ?", (clip_id,)).fetchone()
+        if row is None:
+            raise WorkflowNotFound(f"clip {clip_id!r} does not exist")
+        return json.loads(row["document_json"])
+
+    def list_clips(self, layout_id: str | None = None) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            if layout_id is None:
+                rows = connection.execute("SELECT document_json FROM clips ORDER BY created_at DESC, rowid DESC").fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT document_json FROM clips WHERE layout_id = ? ORDER BY created_at DESC, rowid DESC",
+                    (layout_id,),
+                ).fetchall()
+        return [json.loads(row["document_json"]) for row in rows]
 
     def register_template(self, template) -> Any:
         payload = template.model_dump(mode="json", exclude_none=True)

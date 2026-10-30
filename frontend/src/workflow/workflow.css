@@ -363,3 +363,18 @@ button, input { font: inherit; }
 .wf-evidence-grid { display: grid; grid-template-columns: 96px 1fr; gap: 4px 8px; font-size: 10px; }
 .wf-evidence-grid span { color: var(--wf-muted); }
 .wf-evidence-grid code { color: var(--wf-text); overflow-wrap: anywhere; }
+
+.wf-clip-editor { display: grid; gap: 8px; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--wf-line); }
+.wf-layer-picks { display: flex; flex-wrap: wrap; gap: 8px 12px; font-size: 10px; color: var(--wf-muted); }
+.wf-layer-picks label { display: flex; align-items: center; gap: 4px; }
+.wf-bounds { display: grid; grid-template-columns: repeat(4, 1fr) auto auto; gap: 5px; }
+.wf-bounds input, .wf-doe-row input, .wf-doe-row select { min-width: 0; background: var(--wf-panel-2); color: var(--wf-text); border: 1px solid var(--wf-line); border-radius: 6px; padding: 6px; font-size: 10px; }
+.wf-canvas-wrap { border: 1px solid var(--wf-line); border-radius: 9px; padding: 8px; background: rgba(8, 20, 33, 0.8); }
+.wf-clip-canvas { width: 100%; height: 180px; display: block; background: #07121d; border-radius: 6px; }
+.wf-annotation { fill: var(--wf-amber); stroke: #07121d; stroke-width: 2; }
+.wf-annotation-text { fill: var(--wf-amber); font-size: 3px; }
+.wf-clip-list { display: flex; flex-wrap: wrap; gap: 5px; }
+.wf-clip-list button { background: var(--wf-panel-2); color: var(--wf-muted); border: 1px solid var(--wf-line); border-radius: 999px; padding: 4px 9px; font-size: 10px; cursor: pointer; }
+.wf-clip-list button.active { color: var(--wf-text); border-color: var(--wf-accent); }
+.wf-doe-row { display: grid; grid-template-columns: 1fr 1fr 1.4fr; gap: 6px; }
+.wf-card-subhead { color: var(--wf-muted); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; margin-top: 6px; }

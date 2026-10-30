@@ -7,8 +7,10 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, HTTPException, Request
-from pydantic import Field, ValidationError, field_serializer
+from fastapi import APIRouter, HTTPException, Request, Response
+from datetime import datetime, timezone
+
+from pydantic import Field, ValidationError, field_serializer, model_validator
 
 from .. import snapshots, storage
 from ..models import ProjectV7, StepV7, StrictModel
@@ -17,8 +19,15 @@ from .adoption import adopt_project, first_route
 from .branches import create_branch
 from .equivalence import ComparisonProtocolV1, EquivalenceResultV1, compare_snapshots
 from .execution import execute_segment
-from .experiments import create_experiment_document, start_experiment
-from .models import CompileDiffV1, CompiledWorkflowV1
+from .experiments import (
+    create_doe_document,
+    create_experiment_document,
+    experiment_csv,
+    experiment_table,
+    start_experiment,
+)
+from .layouts import build_clip_gds, canonical_clip_hash, extract_clip_polygons, save_asset, structure_bounds
+from .models import CompileDiffV1, CompiledWorkflowV1, GeometryBindingV1
 from .provenance import ProvenanceVerificationV1, VerificationRecordV1
 from .routes import AttemptV1, RoutePlanV1, SegmentRefV1, SegmentReuseV1, SegmentV1
 from .templates import FlowTemplateV1, resolve_template
@@ -138,6 +147,7 @@ class AdoptProjectResponse(StrictModel):
     dimension: int
     stepCount: int
     authoredSteps: list[StepV7] = Field(default_factory=list)
+    binding: GeometryBindingV1 | None = None
     compile: CompiledWorkflowV1
 
     @field_serializer("authoredSteps")
@@ -175,7 +185,184 @@ class CreateExperimentRequest(StrictModel):
     flowId: str
     recipeId: str
     recipeVersion: int
-    variants: Annotated[list[ExperimentVariantSpecV1], Field(min_length=1, max_length=20)]
+    variants: Annotated[list[ExperimentVariantSpecV1], Field(min_length=1, max_length=256)]
+    maxAttempts: Annotated[int, Field(ge=1, le=4)] = 1
+    costPerRunUsd: Annotated[float, Field(ge=0, le=1_000_000)] = 0.0
+
+
+class DoeFactorV1(StrictModel):
+    stepId: str
+    parameter: str
+    values: Annotated[list[float], Field(min_length=2, max_length=10)]
+
+
+class DoeRequest(StrictModel):
+    name: str
+    project: ProjectV7
+    flowId: str
+    recipeId: str
+    recipeVersion: int
+    factors: Annotated[list[DoeFactorV1], Field(min_length=1, max_length=5)]
+    replicates: Annotated[int, Field(ge=1, le=8)] = 3
+    seed: int = 20261029
+    maxAttempts: Annotated[int, Field(ge=1, le=4)] = 2
+    costPerRunUsd: Annotated[float, Field(ge=0, le=1_000_000)] = 0.0
+
+
+class LayoutBoundsV1(StrictModel):
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+
+
+class LayoutStructureV1(StrictModel):
+    name: str
+    layers: list[int]
+    layerDatatypes: list[list[int]]
+    maskLayerDatatypes: list[list[int]]
+    references: list[str]
+    bounds: LayoutBoundsV1 | None = None
+
+
+class LayoutUnitsV1(StrictModel):
+    userUnitsPerDatabaseUnit: float
+    metersPerDatabaseUnit: float
+    micrometersPerNativeUserUnit: float
+    nativeOutputAssumption: str
+
+
+class LayoutV1(StrictModel):
+    schemaVersion: Literal[1]
+    layoutId: str
+    assetId: str
+    fileName: str
+    sizeBytes: int
+    units: LayoutUnitsV1
+    structures: list[LayoutStructureV1]
+    createdAt: str
+
+
+class LayoutRegisterRequest(StrictModel):
+    assetId: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+    fileName: Annotated[str, Field(min_length=1, max_length=255, pattern=r"^[^/\\]+$")]
+
+
+class LayoutSummaryV1(StrictModel):
+    layoutId: str
+    fileName: str
+    structureCount: int
+    createdAt: str
+
+
+class LayoutListResponse(StrictModel):
+    layouts: list[LayoutSummaryV1]
+
+
+class ClipBoundsV1(StrictModel):
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+
+    @model_validator(mode="after")
+    def ordered_bounds(self) -> "ClipBoundsV1":
+        if not all(abs(value) <= 1_000_000 for value in (self.x0, self.y0, self.x1, self.y1)):
+            raise ValueError("clip bounds must stay within ±1,000,000 µm")
+        if self.x1 <= self.x0 or self.y1 <= self.y0:
+            raise ValueError("clip bounds must satisfy x0 < x1 and y0 < y1")
+        return self
+
+
+class ClipLayerV1(StrictModel):
+    layer: Annotated[int, Field(ge=0, le=65535)]
+    datatype: Annotated[int, Field(ge=0, le=32767)] | None = None
+    material: str = "Si"
+
+
+class ClipAnnotationV1(StrictModel):
+    annotationId: str | None = None
+    text: Annotated[str, Field(min_length=1, max_length=200)]
+    x: float
+    y: float
+
+
+class LayoutSelectionV1(StrictModel):
+    structure: Annotated[str, Field(min_length=1, max_length=512)]
+    layers: Annotated[list[ClipLayerV1], Field(min_length=1, max_length=32)]
+    bbox: ClipBoundsV1
+
+
+class ClipPreviewRequest(LayoutSelectionV1):
+    pass
+
+
+class ClipPolygonV1(StrictModel):
+    layer: int
+    datatype: int
+    points: list[list[float]]
+
+
+class ClipContentBoundsV1(StrictModel):
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+
+
+class ClipPreviewResponse(StrictModel):
+    structure: str
+    bbox: ClipBoundsV1
+    width: float
+    height: float
+    polygons: list[ClipPolygonV1]
+    polygonCount: int
+    pointCount: int
+    contentBounds: ClipContentBoundsV1
+
+
+class ClipCreateRequest(LayoutSelectionV1):
+    layoutId: str
+    name: Annotated[str, Field(min_length=1, max_length=80)]
+    annotations: list[ClipAnnotationV1] = Field(default_factory=list)
+
+
+class ClipV1(StrictModel):
+    schemaVersion: Literal[1]
+    clipId: str
+    name: str
+    layoutId: str
+    assetId: str
+    structure: str
+    layers: list[ClipLayerV1]
+    bbox: ClipBoundsV1
+    annotations: list[ClipAnnotationV1]
+    polygons: list[ClipPolygonV1]
+    polygonCount: int
+    pointCount: int
+    contentBounds: ClipContentBoundsV1
+    width: float
+    height: float
+    clipHash: str
+    gdsAssetId: str
+    gdsFileName: str
+    createdAt: str
+
+
+class ClipListResponse(StrictModel):
+    clips: list[ClipV1]
+
+
+class ClipAnnotationRequest(StrictModel):
+    text: Annotated[str, Field(min_length=1, max_length=200)]
+    x: float
+    y: float
+
+
+class ClipCompileRequest(StrictModel):
+    project: ProjectV7
+    flowId: str | None = None
+    gridDelta: Annotated[float, Field(gt=0, le=1)] | None = None
 
 
 class TemplateSummaryV1(StrictModel):
@@ -538,6 +725,7 @@ async def adopt_project_endpoint(request: AdoptProjectRequest) -> AdoptProjectRe
             dimension=compiled.project.dimension,
             stepCount=len(compiled.project.steps),
             authoredSteps=flow.steps,
+            binding=binding,
             compile=compiled,
         )
     return _call(operation)
@@ -557,7 +745,8 @@ async def route_from_compile(request: RouteFromCompileRequest) -> RoutePlanRespo
 async def create_experiment(request: CreateExperimentRequest) -> dict:
     def operation():
         store = get_store()
-        store.get_recipe(request.recipeId, request.recipeVersion)
+        recipe = store.get_recipe(request.recipeId, request.recipeVersion)
+        metric = store.get_metric(recipe.metricId)
         document = create_experiment_document(
             name=request.name,
             project=request.project.model_dump(mode="json", exclude_none=True),
@@ -565,9 +754,65 @@ async def create_experiment(request: CreateExperimentRequest) -> dict:
             recipe_id=request.recipeId,
             recipe_version=request.recipeVersion,
             variants=[item.model_dump(mode="json") for item in request.variants],
+            metric_id=metric.metricId, unit=metric.unit,
+            max_attempts=request.maxAttempts, cost_per_run_usd=request.costPerRunUsd,
         )
         return store.save_experiment(document["experimentId"], document)
     return _call(operation)
+
+
+@router.post("/experiments/doe", response_model=dict, status_code=201)
+async def create_doe(request: DoeRequest) -> dict:
+    def operation():
+        store = get_store()
+        recipe = store.get_recipe(request.recipeId, request.recipeVersion)
+        metric = store.get_metric(recipe.metricId)
+        try:
+            document = create_doe_document(
+                name=request.name,
+                project=request.project.model_dump(mode="json", exclude_none=True),
+                flow_id=request.flowId,
+                recipe_id=request.recipeId,
+                recipe_version=request.recipeVersion,
+                factors=[item.model_dump(mode="json") for item in request.factors],
+                replicates=request.replicates,
+                seed=request.seed,
+                metric_id=metric.metricId,
+                unit=metric.unit,
+                max_attempts=request.maxAttempts,
+                cost_per_run_usd=request.costPerRunUsd,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return store.save_experiment(document["experimentId"], document)
+    return _call(operation)
+
+
+@router.get("/experiments/{experiment_id}/aggregate", response_model=dict)
+async def get_experiment_aggregate(experiment_id: str) -> dict:
+    document = _call(lambda: get_store().get_experiment(experiment_id))
+    return document.get("aggregation") or {"rows": []}
+
+
+@router.get("/experiments/{experiment_id}/table", response_model=dict)
+async def get_experiment_table(
+    experiment_id: str,
+    min_value: float | None = None,
+    max_value: float | None = None,
+    sort: str = "ordinal",
+    order: str = "asc",
+) -> dict:
+    document = _call(lambda: get_store().get_experiment(experiment_id))
+    return experiment_table(document, min_value=min_value, max_value=max_value, sort=sort, order=order)
+
+
+@router.get("/experiments/{experiment_id}/export.csv", response_class=Response)
+async def export_experiment_csv(experiment_id: str) -> Response:
+    document = _call(lambda: get_store().get_experiment(experiment_id))
+    return Response(
+        content=experiment_csv(document), media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{experiment_id}.csv"'},
+    )
 
 
 @router.get("/experiments", response_model=dict)
@@ -586,6 +831,160 @@ async def run_experiment(experiment_id: str, request: Request) -> dict:
     if supervisor is None:
         raise HTTPException(status_code=503, detail="supervisor is unavailable")
     return _call(lambda: start_experiment(get_store(), supervisor, experiment_id))
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+@router.post("/layouts", response_model=LayoutV1, status_code=201)
+async def register_layout(request: LayoutRegisterRequest) -> LayoutV1:
+    def operation():
+        path = storage.resolve_gds_asset(request.assetId)
+        from ..gds import inspect_gds
+        data = path.read_bytes()
+        info = inspect_gds(data)
+        structures = []
+        for structure in info["structures"]:
+            try:
+                bounds = structure_bounds(data, structure["name"])
+            except Exception:
+                bounds = None
+            structures.append({**structure, "bounds": bounds})
+        layout_id = f"layout_{request.assetId[:16]}"
+        document = LayoutV1(
+            schemaVersion=1, layoutId=layout_id, assetId=request.assetId,
+            fileName=request.fileName, sizeBytes=info["fileSizeBytes"],
+            units=info["units"], structures=structures, createdAt=_now_iso(),
+        ).model_dump(mode="json", exclude_none=True)
+        get_store().register_layout(layout_id, request.assetId, request.fileName, document)
+        return LayoutV1.model_validate(document)
+    return _call(operation)
+
+
+@router.get("/layouts", response_model=LayoutListResponse)
+async def list_layouts() -> LayoutListResponse:
+    rows = _call(get_store().list_layouts)
+    return LayoutListResponse(layouts=[LayoutSummaryV1.model_validate(row) for row in rows])
+
+
+@router.get("/layouts/{layout_id}", response_model=LayoutV1)
+async def get_layout(layout_id: str) -> LayoutV1:
+    return LayoutV1.model_validate(_call(lambda: get_store().get_layout(layout_id)))
+
+
+@router.post("/layouts/{layout_id}/preview", response_model=ClipPreviewResponse)
+async def preview_layout(layout_id: str, request: ClipPreviewRequest) -> ClipPreviewResponse:
+    def operation():
+        layout = get_store().get_layout(layout_id)
+        data = storage.resolve_gds_asset(layout["assetId"]).read_bytes()
+        extracted = extract_clip_polygons(
+            data,
+            structure=request.structure,
+            layers=[item.model_dump(mode="json") for item in request.layers],
+            bbox=request.bbox.model_dump(mode="json"),
+        )
+        return ClipPreviewResponse.model_validate(extracted)
+    return _call(operation)
+
+
+@router.post("/clips", response_model=ClipV1, status_code=201)
+async def create_clip(request: ClipCreateRequest) -> ClipV1:
+    def operation():
+        layout = get_store().get_layout(request.layoutId)
+        data = storage.resolve_gds_asset(layout["assetId"]).read_bytes()
+        layer_payload = [item.model_dump(mode="json") for item in request.layers]
+        extracted = extract_clip_polygons(
+            data, structure=request.structure, layers=layer_payload,
+            bbox=request.bbox.model_dump(mode="json"),
+        )
+        clip_id = f"clip_{uuid.uuid4().hex[:16]}"
+        gds = build_clip_gds(extracted["polygons"], extracted["width"], extracted["height"])
+        gds_asset_id = save_asset(gds)
+        annotations = [
+            {
+                "annotationId": item.annotationId or f"ann_{uuid.uuid4().hex[:12]}",
+                "text": item.text, "x": item.x, "y": item.y,
+            }
+            for item in request.annotations
+        ]
+        document = {
+            "schemaVersion": 1, "clipId": clip_id, "name": request.name,
+            "layoutId": request.layoutId, "assetId": layout["assetId"],
+            "structure": request.structure, "layers": layer_payload,
+            "bbox": request.bbox.model_dump(mode="json"), "annotations": annotations,
+            "polygons": extracted["polygons"], "polygonCount": extracted["polygonCount"],
+            "pointCount": extracted["pointCount"], "contentBounds": extracted["contentBounds"],
+            "width": extracted["width"], "height": extracted["height"],
+            "gdsAssetId": gds_asset_id, "gdsFileName": f"{clip_id}.gds",
+            "createdAt": _now_iso(),
+        }
+        document["clipHash"] = canonical_clip_hash(document)
+        get_store().save_clip(document)
+        return ClipV1.model_validate(document)
+    return _call(operation)
+
+
+@router.get("/clips", response_model=ClipListResponse)
+async def list_clips(layout_id: str | None = None) -> ClipListResponse:
+    rows = _call(lambda: get_store().list_clips(layout_id))
+    return ClipListResponse(clips=[ClipV1.model_validate(row) for row in rows])
+
+
+@router.get("/clips/{clip_id}", response_model=ClipV1)
+async def get_clip(clip_id: str) -> ClipV1:
+    return ClipV1.model_validate(_call(lambda: get_store().get_clip(clip_id)))
+
+
+@router.post("/clips/{clip_id}/annotations", response_model=ClipV1, status_code=201)
+async def add_clip_annotation(clip_id: str, request: ClipAnnotationRequest) -> ClipV1:
+    def operation():
+        document = get_store().get_clip(clip_id)
+        document["annotations"].append({
+            "annotationId": f"ann_{uuid.uuid4().hex[:12]}",
+            "text": request.text, "x": request.x, "y": request.y,
+        })
+        document["clipHash"] = canonical_clip_hash(document)
+        get_store().save_clip(document)
+        return ClipV1.model_validate(document)
+    return _call(operation)
+
+
+@router.post("/clips/{clip_id}/compile", response_model=AdoptProjectResponse, status_code=201)
+async def compile_clip(clip_id: str, request: ClipCompileRequest) -> AdoptProjectResponse:
+    def operation():
+        clip = get_store().get_clip(clip_id)
+        if request.project.dimension != 2:
+            raise HTTPException(status_code=422, detail="layout clips currently compile 2D projects only")
+        grid = request.gridDelta or request.project.domain.gridDelta
+        payload = request.project.model_dump(mode="json", exclude_none=True)
+        payload["geometry"] = {
+            "kind": "gds", "assetId": clip["gdsAssetId"], "fileName": clip["gdsFileName"],
+            "structure": "CLIP", "unitScale": 1, "position": [0, 0, 0],
+            "layers": [{"layer": item["layer"], "material": item["material"]} for item in clip["layers"]],
+        }
+        payload["domain"] = {
+            "gridDelta": grid,
+            "xExtent": max(float(clip["width"]) + 2 * grid, 4 * grid),
+            "xBoundary": "reflective",
+        }
+        source = {
+            "kind": "layout", "layoutId": clip["layoutId"], "clipId": clip["clipId"],
+            "clipHash": clip["clipHash"], "structure": clip["structure"], "bbox": clip["bbox"],
+            "polygonCount": clip["polygonCount"], "pointCount": clip["pointCount"],
+            "annotations": clip["annotations"],
+        }
+        flow, binding, compiled = adopt_project(
+            payload, flow_id=request.flowId, geometry_source=source,
+        )
+        get_store().register_compile(compiled)
+        return AdoptProjectResponse(
+            flowId=flow.flowId, bindingId=binding.bindingId,
+            compileId=compiled.compileRecord.compileId, projectName=compiled.project.name,
+            dimension=compiled.project.dimension, stepCount=len(compiled.project.steps),
+            authoredSteps=flow.steps, binding=binding, compile=compiled,
+        )
+    return _call(operation)
 
 
 @router.post("/templates", response_model=FlowTemplateV1, status_code=201)
@@ -628,7 +1027,7 @@ async def adopt_template(request: FromTemplateRequest) -> AdoptProjectResponse:
             flowId=flow.flowId, bindingId=binding.bindingId,
             compileId=compiled.compileRecord.compileId, projectName=compiled.project.name,
             dimension=compiled.project.dimension, stepCount=len(compiled.project.steps),
-            authoredSteps=steps, compile=compiled,
+            authoredSteps=steps, binding=binding, compile=compiled,
         )
     return _call(operation)
 
