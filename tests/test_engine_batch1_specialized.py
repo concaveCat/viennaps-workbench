@@ -226,6 +226,18 @@ class SpecializedValidationNegatives(unittest.TestCase):
                 self.assertTrue(any(key in issue.path for issue in ctx.exception.issues),
                                 [issue.path for issue in ctx.exception.issues])
 
+    def test_geometric_deposition_must_be_the_first_enabled_step(self):
+        project = geometric_project(2)
+        project["steps"].insert(0, {
+            "id": "pre_deposition", "name": "pre", "enabled": True, "operation": "deposit",
+            "model": "isotropic", "rateMagnitude": 0.1, "duration": 1.0,
+            "depositMaterial": "SiO2",
+        })
+        with self.assertRaises(ProjectInputError) as ctx:
+            validate_project(project)
+        self.assertTrue(any(issue.path == "steps[1].nativeModel" for issue in ctx.exception.issues),
+                        [issue.path for issue in ctx.exception.issues])
+
     def test_geometric_trench_depth_covers_the_initial_vertical_span(self):
         project = geometric_project(2)
         project["geometry"] = {"kind": "plane", "height": 8.0, "substrateMaterial": "Si"}
