@@ -9,6 +9,7 @@ from ..models import ProjectV7, SolverV7, parse_project
 from ..validation import ProjectInputError, validate_project
 from .compiler import compile_flow
 from .hashing import full_project_hash
+from .ids import sha256_hex
 from .models import FlowRevisionV1, GeometryBindingV1
 from .routes import AttemptV1, RoutePlanV1, RouteV1, SegmentV1
 
@@ -28,9 +29,16 @@ def adopt_project(
         raise ValueError("workflow adoption currently requires a schemaVersion 7 project")
     suffix = uuid.uuid4().hex[:12]
     flow_id = flow_id or f"flow_{suffix}"
+    binding_payload = {
+        "dimension": validated.dimension,
+        "units": validated.units.model_dump(mode="json"),
+        "domain": validated.domain.model_dump(mode="json"),
+        "geometry": validated.geometry,
+        "materialDefinitions": [item.model_dump(mode="json", exclude_none=True) for item in (validated.materialDefinitions or [])],
+    }
     binding = GeometryBindingV1(
         schemaVersion=1,
-        bindingId=f"bind_{suffix}",
+        bindingId=f"bind_{sha256_hex(binding_payload)[:16]}",
         name=f"{validated.name} · geometry",
         dimension=validated.dimension,
         units=validated.units,

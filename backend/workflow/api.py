@@ -627,9 +627,14 @@ async def compile_diff(left_id: str, right_id: str) -> CompileDiffV1:
         added = sorted(set(right_steps) - set(left_steps))
         removed = sorted(set(left_steps) - set(right_steps))
         changed = sorted(key for key in set(left_steps) & set(right_steps) if left_steps[key] != right_steps[key])
+        left_order = [step.id for step in left.project.steps]
+        right_order = [step.id for step in right.project.steps]
+        common = set(left_order) & set(right_order)
+        moved = [step_id for step_id in right_order if step_id in common and left_order.index(step_id) != right_order.index(step_id)]
+        affected = sorted(set(changed) | set(moved) | set(added))
         return CompileDiffV1(
-            addedStepIds=added, removedStepIds=removed, changedStepIds=changed,
-            affectedStepIds=changed, changedVariables=[],
+            addedStepIds=added, removedStepIds=removed, movedStepIds=moved,
+            changedStepIds=changed, affectedStepIds=affected, changedVariables=[],
         )
     return _call(operation)
 

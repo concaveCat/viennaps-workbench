@@ -34,6 +34,41 @@ class ExperimentTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.lifespan.__aexit__(None, None, None)
 
+    async def test_run_ten_variants_and_verify_replicate_seeds(self):
+        import asyncio
+        from backend import storage
+
+        p = project()
+        p["steps"][0].update({"model": "singleParticle", "rateMagnitude": 0.001, "stickingProbability": 0.1, "sourceExponent": 1.0})
+        p["solver"]["raysPerPoint"] = 16
+        variants = [{"parameters": {"step_etch_01": {"duration": 0.01}}, "replicates": 2 if index == 0 else 1, "seed": 200 + index} for index in range(10)]
+        response = await asgi_request(
+            "/api/v1/workflow/experiments", method="POST",
+            payload={"name": "run ten", "project": p, "flowId": "flow_exp_run", "recipeId": self.recipe_id, "recipeVersion": 1, "variants": variants},
+        )
+        self.assertEqual(response[0], 201, response[2])
+        document = json_body(response)
+        started = await asgi_request(f"/api/v1/workflow/experiments/{document['experimentId']}/run", method="POST", payload={})
+        self.assertEqual(started[0], 200, started[2])
+        deadline = asyncio.get_running_loop().time() + 180
+        final = None
+        while asyncio.get_running_loop().time() < deadline:
+            fetched = await asgi_request(f"/api/v1/workflow/experiments/{document['experimentId']}")
+            final = json_body(fetched)
+            if final["status"] in {"completed", "failed"}:
+                break
+            await asyncio.sleep(0.5)
+        self.assertIsNotNone(final)
+        self.assertEqual(final["status"], "completed", final)
+        self.assertEqual(len(final["variants"]), 10)
+        self.assertEqual(len(final["variants"][0]["replicates"]), 2)
+        for variant in final["variants"]:
+            for replicate in variant["replicates"]:
+                self.assertEqual(replicate["status"], "succeeded", replicate)
+                self.assertTrue(replicate.get("measurementId"))
+                manifest = storage.read_json(storage.run_path(replicate["runId"]) / "manifest.json")
+                self.assertEqual(manifest["actualSeed"], replicate["seed"])
+
     async def test_create_ten_variants_with_replicates(self):
         p = project()
         variants = [{"parameters": {"step_etch_01": {"duration": 0.01 + index * 0.001}}, "replicates": 2, "seed": 100 + index} for index in range(10)]

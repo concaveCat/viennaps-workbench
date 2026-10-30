@@ -33,6 +33,7 @@ def _monitor_experiment(store: WorkflowStore, supervisor: Any, experiment_id: st
                 continue
             try:
                 project = _apply_parameters(document["project"], variant.get("parameters") or {})
+                project.setdefault("solver", {})["random"] = {"mode": "fixed", "seed": int(replicate["seed"])}
                 flow, _binding, compiled = adopt_project(project, flow_id=document["flowId"])
                 store.register_compile(compiled)
                 plan = first_route(compiled, name=f"{document['name']} · v{variant['ordinal']}")
