@@ -353,3 +353,5 @@ button, input { font: inherit; }
 .wf-branch-row .wf-button { flex: 1; margin: 0; }
 
 .wf-table input { width: 100%; background: var(--wf-panel-2); color: var(--wf-text); border: 1px solid var(--wf-line); border-radius: 5px; padding: 4px; font-size: 10px; }
+
+.wf-stale { margin-left: auto; color: var(--wf-amber); font-size: 10px; }

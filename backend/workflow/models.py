@@ -151,4 +151,5 @@ class CompileDiffV1(StrictModel):
     changedStepIds: list[str] = Field(default_factory=list)
     changedVariables: list[str] = Field(default_factory=list)
     affectedStepIds: list[str] = Field(default_factory=list)
+    details: list[dict] = Field(default_factory=list)
     suggestedBaseCheckpoint: str | None = None

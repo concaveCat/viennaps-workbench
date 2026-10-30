@@ -846,6 +846,14 @@
             "title": "Changedvariables",
             "type": "array"
           },
+          "details": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Details",
+            "type": "array"
+          },
           "movedStepIds": {
             "items": {
               "type": "string"

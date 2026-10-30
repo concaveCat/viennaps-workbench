@@ -635,6 +635,7 @@ async def compile_diff(left_id: str, right_id: str) -> CompileDiffV1:
         return CompileDiffV1(
             addedStepIds=added, removedStepIds=removed, movedStepIds=moved,
             changedStepIds=changed, affectedStepIds=affected, changedVariables=[],
+            details=[{"stepId": key, "before": left_steps[key], "after": right_steps[key]} for key in changed],
         )
     return _call(operation)
 

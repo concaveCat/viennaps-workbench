@@ -16,6 +16,7 @@ type CompileInfo = {
 type RoutePlan = {
   route: { routeId: string; name: string; headAttemptId: string };
   stepOrder: string[];
+  reuse: Array<{ reuseId: string; attemptId: string; reusedFromSegmentId: string; fromStepId: string; toStepId: string }>;
   attempts: Array<{ attemptId: string; status: string; compileId: string; runSeed: number }>;
   segments: Array<{
     segmentId: string;
@@ -107,9 +108,10 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [metrics, setMetrics] = useState<Measurement[]>([]);
   const [branchDuration, setBranchDuration] = useState('0.02');
   const [activeRecipeId, setActiveRecipeId] = useState('');
+  const [activeRecipeVersion, setActiveRecipeVersion] = useState(1);
   const [experimentDoc, setExperimentDoc] = useState<{ experimentId: string; name: string; status: string; variants: Array<{ ordinal: number; replicates: Array<{ status: string; value?: number | null; unit?: string; runId?: string }> }> } | null>(null);
   const [previousCompile, setPreviousCompile] = useState<CompileInfo | null>(null);
-  const [compileDiff, setCompileDiff] = useState<{ addedStepIds: string[]; removedStepIds: string[]; movedStepIds: string[]; changedStepIds: string[]; affectedStepIds: string[] } | null>(null);
+  const [compileDiff, setCompileDiff] = useState<{ addedStepIds: string[]; removedStepIds: string[]; movedStepIds: string[]; changedStepIds: string[]; affectedStepIds: string[]; details?: Array<{ stepId: string; before: Record<string, unknown>; after: Record<string, unknown> }> } | null>(null);
   const [templateVariable, setTemplateVariable] = useState('0.02');
   const [experimentRows, setExperimentRows] = useState(Array.from({ length: 10 }, (_, index) => ({
     duration: (0.01 + index * 0.001).toFixed(4), replicates: index === 0 ? 2 : 1, seed: 20261029 + index,
@@ -197,13 +199,15 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   });
 
   const saveTemplate = () => run('template', async () => {
-    if (!compile) throw new Error('先采纳工程');
+    if (!compile || !project) throw new Error('先采纳工程');
     const templateId = `tpl_${Date.now().toString(36)}`;
-    const steps = compile.compile.project.steps.filter(step => step.enabled).slice(-2).map(step => ({ ...step, duration: '${duration}' }));
-    const allSteps = compile.compile.project.steps.map(step => steps.find(item => item.id === step.id) ?? step);
+    const sourceSteps = (project.steps ?? []) as Array<Record<string, unknown>>;
+    const enabled = sourceSteps.filter(step => step.enabled);
+    const variableIds = new Set(enabled.slice(-2).map(step => step.id));
+    const steps = sourceSteps.map(step => variableIds.has(step.id) ? { ...step, duration: '${duration}' } : step);
     await postJson('/api/v1/workflow/templates', {
       schemaVersion: 1, templateId, name: `${compile.projectName} · duration variable`, description: '',
-      steps: allSteps, variables: [{ name: 'duration', value: Number(templateVariable) || 0.02, unit: 's' }],
+      steps, variables: [{ name: 'duration', value: Number(templateVariable) || 0.02, unit: 's' }],
     });
     const data = await api<{ templates: TemplateSummary[] }>('/api/v1/workflow/templates');
     setTemplates(data.templates);
@@ -223,6 +227,13 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     });
     if (compile) setPreviousCompile(compile);
     setCompile(result); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);
+    if (project) {
+      const cloned = JSON.parse(JSON.stringify(project)) as typeof project;
+      const enabled = (cloned.steps ?? []).filter(step => step.enabled);
+      const ids = new Set(enabled.slice(-2).map(step => step.id));
+      cloned.steps = (cloned.steps ?? []).map(step => ids.has(step.id) ? { ...step, duration: Number(templateVariable) || 0.02 } : step);
+      setProject(cloned);
+    }
   });
 
   const createRoute = () => run('route', async () => {
@@ -289,6 +300,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     const listed = await api<{ measurements: Measurement[] }>(`/api/v1/workflow/measurements?run_id=${segment.runId}`);
     setMetrics(listed.measurements);
     setActiveRecipeId(recipeId);
+    setActiveRecipeVersion(recipeVersion);
   });
 
 
@@ -300,7 +312,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       );
       setSegment(started.segment);
       setRoute(previous => previous ? { ...previous, segments: previous.segments.map(row => row.segmentId === started.segment.segmentId ? started.segment : row) } : previous);
-      await waitSegment(item.segmentId);
+      const done = await waitSegment(item.segmentId);
+      setSegment(done);
+      setRoute(previous => previous ? { ...previous, segments: previous.segments.map(row => row.segmentId === done.segmentId ? done : row) } : previous);
     }
   });
 
@@ -337,7 +351,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     }));
     const doc = await postJson<typeof experimentDoc>('/api/v1/workflow/experiments', {
       name: `${compile.projectName} · 10 variants`, project, flowId: compile.flowId,
-      recipeId: activeRecipeId, recipeVersion: 1, variants,
+      recipeId: activeRecipeId, recipeVersion: activeRecipeVersion, variants,
     });
     setExperimentDoc(doc);
   });
@@ -458,7 +472,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               <input aria-label="模板变量值" value={templateVariable} onChange={event => setTemplateVariable(event.target.value)} />
               <button className="wf-button ghost" disabled={!compile || !!busy} onClick={() => void compareCompile()}>比较上一版</button>
             </div>
-            {compileDiff && <div className="wf-summary"><strong>Compile diff</strong><span>+{compileDiff.addedStepIds.length} / -{compileDiff.removedStepIds.length} / moved {compileDiff.movedStepIds.length} / changed {compileDiff.changedStepIds.length}</span><span>affected: {compileDiff.affectedStepIds.map(id => id.slice(0, 8)).join(', ') || '—'}</span></div>}
+            {compileDiff && <div className="wf-summary"><strong>Compile diff</strong><span>+{compileDiff.addedStepIds.length} / -{compileDiff.removedStepIds.length} / moved {compileDiff.movedStepIds.length} / changed {compileDiff.changedStepIds.length}</span><span>affected: {compileDiff.affectedStepIds.map(id => id.slice(0, 8)).join(', ') || '—'}</span>{compileDiff.details?.slice(0, 3).map(item => <span key={item.stepId}>{item.stepId.slice(0, 8)}: {String(item.before.duration ?? '—')} → {String(item.after.duration ?? '—')}</span>)}</div>}
           </>}
           {route && <div className="wf-summary"><strong>{route.route.name}</strong><span>{route.segments.length} Segment · {route.stepOrder.length} Step · head {route.route.headAttemptId.slice(0, 10)}…</span></div>}
         </section>
@@ -471,7 +485,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             {route && <div className="wf-route-tree">
               {route.attempts.map(attempt => <div key={attempt.attemptId} className="wf-attempt">
                 <div className="wf-attempt-title"><strong>{attempt.attemptId.slice(0, 10)}…</strong><span>{attempt.status}</span></div>
-                {route.segments.filter(item => item.attemptId === attempt.attemptId).map(item => <div key={item.segmentId} className="wf-segment-row"><span className={`wf-status ${item.status}`}>{item.status}</span><code>{item.startAfterStepId ? 'after ' + item.startAfterStepId.slice(0, 8) : 'start'} → {item.throughStepId.slice(0, 8)}</code></div>)}
+                {route.reuse.filter(item => item.attemptId === attempt.attemptId).map(item => <div key={item.reuseId} className="wf-segment-row"><span className="wf-status verified">reuse</span><code>{item.reusedFromSegmentId.slice(0, 8)} · {item.fromStepId.slice(0, 6)} → {item.toStepId.slice(0, 6)}</code></div>)}
+                {route.segments.filter(item => item.attemptId === attempt.attemptId).map(item => <div key={item.segmentId} className="wf-segment-row"><span className={`wf-status ${item.status}`}>{item.status}</span><code>{item.startAfterStepId ? 'after ' + item.startAfterStepId.slice(0, 8) : 'start'} → {item.throughStepId.slice(0, 8)}</code>{item.status === 'planned' && <span className="wf-stale">待重跑</span>}</div>)}
               </div>)}
             </div>}
             <div className="wf-muted">steps {segment.startAfterStepId ?? 'start'} → {segment.throughStepId}</div>
@@ -508,7 +523,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             <span>{measurement.value === null ? measurement.reason ?? '无值' : `${measurement.value.toFixed(4)} ${measurement.unit}`}</span>
             <span>binding: {measurement.bindingStatus} · equivalence: {measurement.equivalenceStatus}</span>
           </div>}
-          {metrics.length > 0 && <table className="wf-table"><thead><tr><th>Status</th><th>Value</th><th>Recipe / Step</th><th>Binding</th></tr></thead><tbody>{metrics.map(item => <tr key={item.measurementId}><td>{item.status}</td><td>{item.value === null ? item.reason : `${item.value.toFixed(4)} ${item.unit}`}</td><td>{item.recipeId} v{item.recipeVersion} · {item.sourceStepId?.slice(0, 8)}</td><td>{item.bindingStatus} / {item.equivalenceStatus}</td></tr>)}</tbody></table>}
+          {metrics.length > 0 && <table className="wf-table"><thead><tr><th>Status</th><th>Value</th><th>Recipe / Step</th><th>Binding</th></tr></thead><tbody>{metrics.map(item => <tr key={item.measurementId}><td>{item.status}</td><td>{item.value === null ? item.reason : `${item.value.toFixed(4)} ${item.unit}`}</td><td>{item.recipeId} v{item.recipeVersion} · {item.material} · {item.sourceStepId?.slice(0, 8)}</td><td>{item.bindingStatus} / {item.equivalenceStatus}</td></tr>)}</tbody></table>}
           {provenance && <div className="wf-provenance">
             <div className="wf-muted">verification records: {provenance.verifications.length}</div>
             {provenance.verifications.map(item => <div className="wf-verify" key={item.verificationId}><span className={`wf-status ${item.status}`}>{item.status}</span><code>{item.verificationId.slice(0, 10)}…</code><span>{item.evidence.methodVersion}</span></div>)}
@@ -520,6 +535,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
           <button className="wf-button primary" disabled={!compile || !activeRecipeId || !!busy} onClick={() => void createPersistentExperiment()}>创建 10 变体实验</button>
           <button className="wf-button ghost" disabled={!experimentDoc || !!busy} onClick={() => void runPersistentExperiment()}>{busy === 'experiment' ? '实验运行中…' : '运行持久化实验'}</button>
           <table className="wf-table"><thead><tr><th>#</th><th>Duration</th><th>Reps</th><th>Seed</th></tr></thead><tbody>{experimentRows.map((row, index) => <tr key={index}><td>{index + 1}</td><td><input aria-label={`变体 ${index + 1} duration`} value={row.duration} onChange={event => setExperimentRows(previous => previous.map((item, itemIndex) => itemIndex === index ? { ...item, duration: event.target.value } : item))} /></td><td><input aria-label={`变体 ${index + 1} replicates`} type="number" min={1} max={8} value={row.replicates} onChange={event => setExperimentRows(previous => previous.map((item, itemIndex) => itemIndex === index ? { ...item, replicates: Number(event.target.value) || 1 } : item))} /></td><td><input aria-label={`变体 ${index + 1} seed`} type="number" value={row.seed} onChange={event => setExperimentRows(previous => previous.map((item, itemIndex) => itemIndex === index ? { ...item, seed: Number(event.target.value) || 0 } : item))} /></td></tr>)}</tbody></table>
+          {experimentDoc && <div className="wf-muted">Experiment status: {experimentDoc.status}</div>}
           {experimentDoc && <table className="wf-table"><thead><tr><th>#</th><th>Status</th><th>Value</th><th>Run</th></tr></thead><tbody>{experimentDoc.variants.map(variant => <tr key={variant.ordinal}><td>{variant.ordinal}</td><td>{variant.replicates[0]?.status}</td><td>{variant.replicates[0]?.value ?? '—'} {variant.replicates[0]?.unit ?? ''}</td><td><code>{variant.replicates[0]?.runId?.slice(0, 8) ?? '—'}</code></td></tr>)}</tbody></table>}
         </section>}
         {zone === 'analyze' && <section className="wf-card wf-wide">
