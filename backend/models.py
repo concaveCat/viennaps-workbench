@@ -851,7 +851,48 @@ class GdsBooleanStepV7(StrictModel):
     applyToAll: bool = True
 
 
-StepV7 = Annotated[Union[StepV5, MultiParticleStepV7, SpecializedStepV7, GdsBooleanStepV7], Field(discriminator="model")]
+class CsvProcessStepV7(StrictModel):
+    """Native ``ps.CSVFileProcess`` with an uploaded ``RateGrid`` table.
+
+    ``operation`` is ``native`` because the installed model has no etch/deposit
+    flag: the sign of every CSV rate chooses the direction of material motion
+    for the selected direction vector (negative rates etch, positive rates
+    deposit for a downward direction). ``interpolationMode`` is mandatory.
+    ``CUSTOM`` and ``setCustomInterpolator`` are deliberately not expressible.
+    """
+
+    id: Annotated[str, Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")]
+    name: Annotated[str, Field(min_length=1, max_length=80)]
+    enabled: bool
+    operation: Literal["native"]
+    model: Literal["csvProcess"]
+    duration: Annotated[Number, Field(ge=0.01, le=600)]
+    assetId: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+    fileName: Annotated[str, Field(min_length=1, max_length=255, pattern=r"^[^/\\]+$")]
+    direction: DirectionVector3
+    offset: Vector2
+    isotropicComponent: Annotated[Number, Field(ge=0, le=100)] = 0.0
+    directionalComponent: Annotated[Number, Field(ge=0, le=100)] = 1.0
+    interpolationMode: Literal["LINEAR", "IDW"]
+    idwNeighbors: Annotated[Integer, Field(ge=1, le=64)] | None = None
+    calculateVisibility: bool = True
+
+    @model_validator(mode="after")
+    def check_csv_process_fields(self) -> "CsvProcessStepV7":
+        if math.sqrt(sum(float(value) ** 2 for value in self.direction)) <= 1e-12:
+            raise ValueError("csvProcess requires a nonzero direction vector")
+        if any(abs(float(value)) > 1e6 for value in self.offset):
+            raise ValueError("csvProcess offset must stay within ±1,000,000 um")
+        if float(self.isotropicComponent) == 0.0 and float(self.directionalComponent) == 0.0:
+            raise ValueError("csvProcess requires a nonzero isotropicComponent or directionalComponent")
+        if self.interpolationMode == "IDW" and self.idwNeighbors is None:
+            raise ValueError("csvProcess IDW interpolation requires idwNeighbors")
+        if self.interpolationMode == "LINEAR" and self.idwNeighbors is not None:
+            raise ValueError("idwNeighbors applies only to IDW interpolation")
+        return self
+
+
+StepV7 = Annotated[Union[StepV5, MultiParticleStepV7, SpecializedStepV7, GdsBooleanStepV7, CsvProcessStepV7], Field(discriminator="model")]
 
 
 class DomainStateRef(StrictModel):
@@ -930,6 +971,15 @@ class ProjectV6(StrictModel):
                     raise ValueError(f"2D boolean step {index} requires position [x, h, 0] and no depth")
                 if self.dimension == 3 and step.depth is None:
                     raise ValueError(f"3D boolean step {index} requires depth")
+            if isinstance(step, CsvProcessStepV7) and self.dimension == 2:
+                # ``ps.CSVFileProcess`` normalizes a 3-component direction in
+                # both dimensions, but the 2D RateGrid/visibility path only has
+                # an x/h plane; a nonzero third component has no native meaning.
+                if abs(step.direction[2]) > 1e-12:
+                    raise ValueError(f"2D csvProcess step {index} must use direction [x, h, 0]")
+                # RateGrid::interpolateLinear/IDW use only offset[0] when D == 2.
+                if abs(step.offset[1]) > 1e-12:
+                    raise ValueError(f"2D csvProcess step {index} must use offset [x, 0]; the native 2D RateGrid has no second offset axis")
         state = self.continuationState
         if state is not None:
             boundary = self.domain.xBoundary if self.dimension == 2 else self.domain.boundaryXY

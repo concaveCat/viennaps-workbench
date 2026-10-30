@@ -215,6 +215,7 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .step-symbol.etch { color: #a65b4b; background: #f7ebe8; }
 .step-symbol.deposit { color: #27846f; background: #e6f4ef; }
 .step-symbol.geometry { color: #5965a3; background: #eceefa; }
+.step-symbol.native { color: #7a5c2e; background: #f6efe2; }
 .step-title { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .step-title strong { display: block; color: #39495b; font-size: 12px; font-weight: 680; line-height: 1.35; overflow-wrap: anywhere; }
 .step-title small { color: #708193; font-size: 10px; line-height: 1.4; white-space: normal; }

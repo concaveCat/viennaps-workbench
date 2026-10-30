@@ -43,13 +43,15 @@ type MultiParticleRateCoefficients = { defaultBySpecies: Record<string, number>;
 type SpecializedField = { key: string; label: string; kind: 'number' | 'boolean' | 'enum' | 'vector3' | 'material' | 'materialOptional' | 'text' | 'materialRates' | 'fluorocarbonMaterials'; default: unknown; minimum?: number; maximum?: number; step?: number; nativeUnit?: string | null; options?: { value: string; label: string }[]; defaults?: Record<string, number> };
 type SpecializedModel = { id: string; label: string; nativeClass: string; operation: 'etch' | 'deposit' | 'native'; usesFlux: boolean; dimensions?: number[]; depositMaterial?: string; depositMaterialSelectable?: boolean; fields: SpecializedField[] };
 type SpecializedCatalog = { schemaVersion: number; engineVersion: string; unitsNote: string; models: SpecializedModel[] };
+type CsvRateAsset = { assetId: string; fileName: string; dimension: 2 | 3; columns: string[]; rowCount: number; x: { min: number; max: number; count: number }; y?: { min: number; max: number; count: number }; rate: { min: number; max: number; sign: string }; linearCompatible: boolean; sizeBytes: number };
 type Step = {
-  id: string; name: string; enabled: boolean; operation?: 'etch' | 'deposit' | 'native'; model: 'isotropic' | 'singleParticle' | 'multiParticle' | 'directional' | 'specialized' | 'removeMaterial' | 'planarize' | 'boolean' | 'gdsBoolean';
+  id: string; name: string; enabled: boolean; operation?: 'etch' | 'deposit' | 'native'; model: 'isotropic' | 'singleParticle' | 'multiParticle' | 'directional' | 'specialized' | 'csvProcess' | 'removeMaterial' | 'planarize' | 'boolean' | 'gdsBoolean';
   rateMagnitude?: number; directionalRateMagnitude?: number; isotropicRateMagnitude?: number; direction?: [number, number, number]; calculateVisibility?: boolean;
   duration?: number; depositMaterial?: string; stickingProbability?: number; sourceExponent?: number;
   rateMode?: 'uniform' | 'material'; materialRates?: Record<string, number>; selectivityReference?: string;
   species?: ParticleSpecies[]; rateCoefficients?: MultiParticleRateCoefficients;
   nativeModel?: string; nativeParameters?: Record<string, unknown>;
+  assetId?: string; fileName?: string; offset?: [number, number]; isotropicComponent?: number; directionalComponent?: number; interpolationMode?: 'LINEAR' | 'IDW'; idwNeighbors?: number;
   material?: string; cutoffHeight?: number; stopMaterial?: string; overPolish?: number; booleanOperation?: 'union' | 'intersection' | 'difference'; position?: [number, number, number]; width?: number; height?: number; depth?: number; angle?: number; applyToAll?: boolean;
   gdsMask?: { layer: number; datatype: number; unitScale: number; position: [number, number, number]; baseHeight: number; height: number; retainedRegion: 'inside' | 'outside' };
 };
@@ -209,7 +211,7 @@ const MIN_DOMAIN_EXTENT_3D = 0.1;
 const minThreeDExtent = (gridDelta: number) => Math.max(MIN_DOMAIN_EXTENT_3D, 2 * gridDelta);
 function hasMotion(step: Step): boolean {
   if (isGeometryStep(step)) return false;
-  if (step.model === 'specialized') return true;
+  if (step.model === 'specialized' || step.model === 'csvProcess') return true;
   if (step.model === 'directional') return (step.directionalRateMagnitude ?? 0) > 0 || (step.isotropicRateMagnitude ?? 0) > 0;
   if (step.model === 'multiParticle') {
     const table = step.rateCoefficients;
@@ -234,6 +236,7 @@ function stepKindLabel(step: Step): string {
   if (step.model === 'boolean') return `布尔几何 · ${{ union: '并集', intersection: '交集', difference: '差集' }[step.booleanOperation ?? 'difference']}`;
   if (step.model === 'gdsBoolean') return `GDS 布尔 · layer ${step.gdsMask?.layer ?? '—'}/${step.gdsMask?.datatype ?? 0} · ${{ union: '并集', intersection: '交集', difference: '差集' }[step.booleanOperation ?? 'difference']}`;
   if (step.model === 'specialized') return `ViennaPS 专用模型 · ${step.nativeModel ?? '未选择'}`;
+  if (step.model === 'csvProcess') return `CSV 速率表 · ${step.fileName ?? '未选择文件'} · ${step.interpolationMode ?? '未设置插值'}`;
   return `${step.operation === 'etch' ? '刻蚀' : '沉积'} · ${step.model === 'isotropic' ? '各向同性' : step.model === 'singleParticle' ? '单粒子' : step.model === 'multiParticle' ? '多粒子' : '定向过程'}${hasMotion(step) ? '' : ' · 零速率'}`;
 }
 function geometryMaterialNames(geometry: Geometry): string[] {
@@ -268,7 +271,7 @@ function promoteProjectToV5(source: Project): Project {
   return {
     ...source,
     schemaVersion: source.schemaVersion >= 7 ? 7 : source.schemaVersion === 6 ? 6 : 5,
-    steps: source.steps.map(step => step.model === 'directional' || step.model === 'multiParticle' || step.model === 'specialized' || isGeometryStep(step) ? step : { ...step, rateMode: step.rateMode ?? 'uniform' }),
+    steps: source.steps.map(step => step.model === 'directional' || step.model === 'multiParticle' || step.model === 'specialized' || step.model === 'csvProcess' || isGeometryStep(step) ? step : { ...step, rateMode: step.rateMode ?? 'uniform' }),
     solver: { ...source.solver, enginePreference: 'cpu' },
   };
 }
@@ -277,7 +280,7 @@ function promoteProjectToV7(source: Project): Project {
   return {
     ...source,
     schemaVersion: 7,
-    steps: source.steps.map(step => step.model === 'directional' || step.model === 'multiParticle' || step.model === 'specialized' || isGeometryStep(step) ? step : { ...step, rateMode: step.rateMode ?? 'uniform' }),
+    steps: source.steps.map(step => step.model === 'directional' || step.model === 'multiParticle' || step.model === 'specialized' || step.model === 'csvProcess' || isGeometryStep(step) ? step : { ...step, rateMode: step.rateMode ?? 'uniform' }),
     solver: { ...source.solver, enginePreference: 'auto', advection: { ...defaults.advection!, ...source.solver.advection }, rayTracing: { ...defaults.rayTracing!, ...source.solver.rayTracing } },
     outputSettings: source.outputSettings ?? { ...structuredClone(defaultProject.outputSettings!), volumeMesh: source.dimension === 3 },
   };
@@ -741,6 +744,8 @@ export default function App() {
   const [deleteMaterialCandidate, setDeleteMaterialCandidate] = useState<MaterialCatalogItem | null>(null);
   const [deleteMaterialError, setDeleteMaterialError] = useState('');
   const [gdsAsset, setGdsAsset] = useState<GDSAsset | null>(null);
+  const [csvAsset, setCsvAsset] = useState<CsvRateAsset | null>(null);
+  const [csvUploadMode, setCsvUploadMode] = useState<'new' | 'replace'>('new');
   const [gdsInspection, setGdsInspection] = useState<Record<string, unknown> | null>(null);
   const [gdsImportOpen, setGdsImportOpen] = useState(false);
   const [gdsImportPosition, setGdsImportPosition] = useState<{ top: number; left: number; side: 'right' | 'left' } | null>(null);
@@ -797,6 +802,7 @@ export default function App() {
   const panelResizeRef = useRef<{ panel: ResizablePanel; pointerX: number; width: number } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const gdsInputRef = useRef<HTMLInputElement>(null);
+  const csvInputRef = useRef<HTMLInputElement>(null);
   const gdsImportButtonRef = useRef<HTMLButtonElement>(null);
   const gdsImportCardRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
@@ -1623,6 +1629,51 @@ export default function App() {
       ...(model === 'singleParticle' ? { stickingProbability: 0.5, sourceExponent: 1 } : {}) };
     updateProject(previous => ({ ...previous, steps: [...previous.steps, step] })); setSelectedStep(id);
   };
+  const addCsvStep = (asset: CsvRateAsset) => {
+    const id = newStepId();
+    const step: Step = {
+      id, name: `步骤 ${project.steps.length + 1}`, enabled: true, operation: 'native', model: 'csvProcess',
+      duration: 0.2, assetId: asset.assetId, fileName: asset.fileName,
+      direction: defaultDirection(project.dimension), offset: [0, 0],
+      isotropicComponent: 0, directionalComponent: 1,
+      interpolationMode: asset.linearCompatible ? 'LINEAR' : 'IDW',
+      ...(asset.linearCompatible ? {} : { idwNeighbors: Math.min(4, asset.rowCount) }),
+      calculateVisibility: true,
+    };
+    setProject(previous => {
+      const promoted = promoteProjectToV7(previous);
+      return { ...promoted, steps: [...promoted.steps, step] };
+    });
+    setSelectedStep(id);
+  };
+  const uploadCsvFile = async (file: File, mode: 'new' | 'replace') => {
+    setLoading(true); setNotice('');
+    try {
+      const response = await fetch(`/api/csv-assets?file_name=${encodeURIComponent(file.name)}&dimension=${project.dimension}`, {
+        method: 'POST', headers: { 'Content-Type': 'text/csv' }, body: file,
+      });
+      const result = await response.json() as CsvRateAsset | { detail?: unknown };
+      if (!response.ok) {
+        const detail = 'detail' in result ? result.detail : undefined;
+        throw new Error(typeof detail === 'string' ? detail : `CSV 上传失败：HTTP ${response.status}`);
+      }
+      const asset = result as CsvRateAsset;
+      setCsvAsset(asset);
+      if (mode === 'replace' && selectedStep) {
+        setProject(previous => ({ ...previous, steps: previous.steps.map(step => {
+          if (step.id !== selectedStep || step.model !== 'csvProcess') return step;
+          const nextMode = asset.linearCompatible ? step.interpolationMode ?? 'LINEAR' : step.interpolationMode === 'LINEAR' ? 'IDW' : step.interpolationMode ?? 'IDW';
+          return { ...step, assetId: asset.assetId, fileName: asset.fileName, interpolationMode: nextMode,
+            ...(nextMode === 'IDW' ? { idwNeighbors: Math.min(step.idwNeighbors ?? 4, asset.rowCount) } : { idwNeighbors: undefined }) };
+        }) }));
+        setNotice(`已替换为 ${asset.fileName}（${asset.rowCount} 行，${asset.linearCompatible ? '支持 LINEAR' : '仅 IDW'}）。`);
+      } else {
+        addCsvStep(asset);
+        setNotice(`已上传 ${asset.fileName}（${asset.dimension}D，${asset.rowCount} 行）。`);
+      }
+    } catch (error) { setNotice(prettyError(error)); }
+    finally { setLoading(false); if (csvInputRef.current) csvInputRef.current.value = ''; }
+  };
   const changeSpecializedModel = (stepId: string, nativeModel: string) => {
     const spec = specializedCatalog?.models.find(row => row.id === nativeModel);
     if (!spec) return;
@@ -2325,6 +2376,7 @@ export default function App() {
               >导入 GDS</button>
             </div>
             <input ref={gdsInputRef} type="file" accept=".gds,.gdsii,application/octet-stream" hidden onChange={event => { const file = event.target.files?.[0]; if (file) void uploadGdsFile(file); }} />
+            <input ref={csvInputRef} type="file" accept=".csv,text/csv" hidden onChange={event => { const file = event.target.files?.[0]; if (file) void uploadCsvFile(file, csvUploadMode); }} />
             {gdsImportOpen && gdsImportPosition && createPortal(
               <div
                 ref={gdsImportCardRef}
@@ -2560,6 +2612,10 @@ export default function App() {
                 <button className="button add-step" onClick={() => addStep('directional')}>＋ 添加定向步骤</button>
               </div></div>
               <div className="add-step-group"><strong>ViennaPS 专用模型</strong><div className="specialized-add-row"><select aria-label="选择 ViennaPS 专用模型" value={availableSpecializedModels.some(spec => spec.id === newSpecializedModel) ? newSpecializedModel : availableSpecializedModels[0]?.id ?? ''} onChange={event => setNewSpecializedModel(event.target.value)}>{availableSpecializedModels.map(spec => <option key={spec.id} value={spec.id}>{spec.label}</option>)}</select><button className="button add-step" disabled={!specializedCatalog} onClick={() => addStep('specialized')}>＋ 添加专用模型步骤</button></div></div>
+              <div className="add-step-group"><strong>CSV 速率表</strong><div className="specialized-add-row">
+                <button className="button add-step" disabled={loading} onClick={() => { setCsvUploadMode('new'); csvInputRef.current?.click(); }}>＋ 上传 CSV 并添加步骤</button>
+                <span className="inline-note">{csvAsset ? `已上传 ${csvAsset.fileName}（${csvAsset.dimension}D，${csvAsset.rowCount} 行，${csvAsset.linearCompatible ? 'LINEAR 可用' : '仅 IDW'}）` : `${project.dimension === 2 ? 'x,rate' : 'x,y,rate'} · ≤16 MiB`}</span>
+              </div></div>
               <div className="add-step-group"><strong>几何操作</strong><div className="add-step-row">
                 <button className="button add-step" onClick={() => addGeometryStep('removeMaterial')}>＋ 移除材料</button>
                 <button className="button add-step" onClick={() => addGeometryStep('planarize')}>＋ 平坦化</button>
@@ -2574,7 +2630,7 @@ export default function App() {
             {project.steps.map((step, index) => <div key={step.id} className={`step-card ${selectedStep === step.id ? 'selected' : ''} ${!step.enabled ? 'disabled-step' : ''}`}>
               <button className="step-main" onClick={() => { setSelectedStep(step.id); setSelection({ kind: 'step', id: step.id }); setActivity('recipe'); setInspectorOpen(true); setMobilePanel('settings'); }}>
                 <span className="step-number">{String(index + 1).padStart(2, '0')}</span>
-                <span className={`step-symbol ${isGeometryStep(step) ? 'geometry' : step.operation}`}>{isGeometryStep(step) ? '◇' : step.operation === 'etch' ? '−' : '+'}</span>
+                <span className={`step-symbol ${isGeometryStep(step) ? 'geometry' : step.model === 'csvProcess' ? 'native' : step.operation}`}>{isGeometryStep(step) ? '◇' : step.model === 'csvProcess' ? '≈' : step.operation === 'etch' ? '−' : '+'}</span>
                 <span className="step-title"><strong>{step.name}</strong><small>{stepKindLabel(step)}</small></span>
               </button>
               <label className="toggle" aria-label="启用步骤"><input type="checkbox" checked={step.enabled} onChange={event => editStep(step.id, value => ({ ...value, enabled: event.target.checked }))} /><span /></label>
@@ -2833,15 +2889,15 @@ export default function App() {
               </div>
               {!isGeometryStep(selectedStepObject) ? <>
               <div className="step-tab-panel" data-step-tab-panel="basic">
-              {selectedStepObject.model !== 'specialized' && <SelectField label="工艺操作" value={selectedStepObject.operation ?? 'etch'} options={[{ value: 'etch', label: '刻蚀' }, { value: 'deposit', label: '沉积' }]} onChange={value => editStep(selectedStepObject.id, step => {
+              {selectedStepObject.model !== 'specialized' && selectedStepObject.model !== 'csvProcess' && <SelectField label="工艺操作" value={selectedStepObject.operation ?? 'etch'} options={[{ value: 'etch', label: '刻蚀' }, { value: 'deposit', label: '沉积' }]} onChange={value => editStep(selectedStepObject.id, step => {
                 const next = { ...step, operation: value as Step['operation'] };
                 if (next.operation === 'deposit') next.depositMaterial = materials.find(m => m.name === 'SiO2')?.name ?? 'SiO2'; else delete next.depositMaterial;
                 delete next.materialRates; delete next.selectivityReference;
                 if (next.model !== 'directional' && next.model !== 'multiParticle' && project.schemaVersion >= 4) next.rateMode = 'uniform'; else delete next.rateMode;
                 return next;
               })} />}
-              {selectedStepObject.model !== 'specialized' && <SelectField label="过程模型" value={selectedStepObject.model} options={[{ value: 'isotropic', label: '各向同性过程' }, { value: 'singleParticle', label: '单粒子过程' }, { value: 'multiParticle', label: '多粒子过程' }, { value: 'directional', label: '定向过程' }]} onChange={value => changeStepModel(selectedStepObject.id, value as Step['model'])} />}
-              {selectedStepObject.model !== 'specialized' && selectedStepObject.operation === 'deposit' && <SelectField label="沉积材料" value={selectedStepObject.depositMaterial ?? materials[0]?.name ?? 'SiO2'} options={materials.map(m => ({ value: m.name, label: m.name }))} onChange={value => editStep(selectedStepObject.id, step => ({ ...step, depositMaterial: value }))} hint="材料不改变通用全局速率" />}
+              {selectedStepObject.model !== 'specialized' && selectedStepObject.model !== 'csvProcess' && <SelectField label="过程模型" value={selectedStepObject.model} options={[{ value: 'isotropic', label: '各向同性过程' }, { value: 'singleParticle', label: '单粒子过程' }, { value: 'multiParticle', label: '多粒子过程' }, { value: 'directional', label: '定向过程' }]} onChange={value => changeStepModel(selectedStepObject.id, value as Step['model'])} />}
+              {selectedStepObject.model !== 'specialized' && selectedStepObject.model !== 'csvProcess' && selectedStepObject.operation === 'deposit' && <SelectField label="沉积材料" value={selectedStepObject.depositMaterial ?? materials[0]?.name ?? 'SiO2'} options={materials.map(m => ({ value: m.name, label: m.name }))} onChange={value => editStep(selectedStepObject.id, step => ({ ...step, depositMaterial: value }))} hint="材料不改变通用全局速率" />}
               {selectedStepObject.model === 'specialized' && <SelectField label="ViennaPS 4.6.2 专用模型" value={selectedStepObject.nativeModel ?? ''} options={availableSpecializedModels.map(item => ({ value: item.id, label: item.label }))} onChange={value => changeSpecializedModel(selectedStepObject.id, value)} />}
               </div>
               {selectedStepObject.model === 'specialized' ? <div className="step-tab-panel" data-step-tab-panel="native">
@@ -2877,6 +2933,45 @@ export default function App() {
                     {spec.id !== 'oxidation' && <NumericField label="持续时间" unit="s" value={selectedStepObject.duration ?? 0.2} min={0.01} max={600} step="0.01" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, duration: value }))} />}
                     {spec.id === 'oxidation' && <div className="not-applicable"><strong>时间输入</strong><span>使用原生参数中的小时数与时间步；不再添加通用过程持续时间。</span></div>}
                     {spec.usesFlux && <div className="inline-note">此模型使用真实 ViennaPS 射线/通量路径。引擎、随机种子与线程会记录在本次运行历史中。</div>}
+                  </>;
+                })()}
+              </div> : selectedStepObject.model === 'csvProcess' ? <div className="step-tab-panel" data-step-tab-panel="native">
+                {(() => {
+                  const asset = csvAsset && csvAsset.assetId === selectedStepObject.assetId ? csvAsset : null;
+                  const direction = selectedStepObject.direction ?? defaultDirection(project.dimension);
+                  const offset = selectedStepObject.offset ?? [0, 0];
+                  return <>
+                    <div className="inline-note">原生 ps.CSVFileProcess + RateGrid。{project.dimension === 2 ? '二维表格为 x,rate' : '三维表格为 x,y,rate'}，没有 z 列：速率只随横向坐标变化。上传时已检查有限数值、列数和行结构；缺失或不兼容的表现在会被验证拒绝。</div>
+                    <div className="not-applicable"><strong>速率表</strong><span>{selectedStepObject.fileName ?? '未选择'} · {selectedStepObject.assetId?.slice(0, 12) ?? '—'}…{asset ? ` · ${asset.rowCount} 行 · ${asset.linearCompatible ? 'LINEAR 可用' : '仅 IDW'}` : ''}</span></div>
+                    <button className="button" disabled={loading} onClick={() => { setCsvUploadMode('replace'); csvInputRef.current?.click(); }}>重新上传并替换速率表</button>
+                    <div className="inline-note warning">操作固定为原生：正速率配合向下方向使表面外移（沉积），负速率刻蚀。原生模型没有独立的 etch/deposit 参数，因此不显示工艺操作选择。自定义 Python 插值器不可达。</div>
+                    <SelectField label="插值模式（必填）" value={selectedStepObject.interpolationMode ?? 'LINEAR'} options={[{ value: 'LINEAR', label: 'LINEAR · 原生线性/双线性' }, { value: 'IDW', label: 'IDW · 反距离权重' }]} onChange={value => editStep(selectedStepObject.id, step => {
+                      const next = { ...step, interpolationMode: value as 'LINEAR' | 'IDW' };
+                      if (value === 'IDW') next.idwNeighbors = step.idwNeighbors ?? Math.min(4, asset?.rowCount ?? 4); else delete next.idwNeighbors;
+                      return next;
+                    })} />
+                    {selectedStepObject.interpolationMode === 'IDW' && <NumericField label="IDW 邻居数" value={selectedStepObject.idwNeighbors ?? 4} min={1} max={64} step="1" hint="必须不超过表行数；原生 setIDWNeighbors" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, idwNeighbors: Math.round(value) }))} />}
+                    <div className="directional-axis-fields">
+                      {(project.dimension === 2 ? [0, 1] as const : [0, 1, 2] as const).map(axis => {
+                        const label = project.dimension === 2 ? (axis === 0 ? '方向 x 分量' : '方向 h 分量') : ['方向 x 分量', '方向 y 分量', '方向 z 分量'][axis];
+                        return <NumericField key={label} label={label} value={direction[axis]} min={-1} max={1} step="0.05" onChange={value => editStep(selectedStepObject.id, step => {
+                          const next: [number, number, number] = [...(step.direction ?? defaultDirection(project.dimension))];
+                          next[axis] = value;
+                          if (project.dimension === 2) next[2] = 0;
+                          return { ...step, direction: next };
+                        })} />;
+                      })}
+                    </div>
+                    <NumericField label="速率表 offset x" unit="µm" value={offset[0]} min={-1000000} max={1000000} step="0.05" hint="原生在 coordinate+offset 处查表" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, offset: [value, (step.offset ?? [0, 0])[1]] }))} />
+                    {project.dimension === 3 && <NumericField label="速率表 offset y" unit="µm" value={offset[1]} min={-1000000} max={1000000} step="0.05" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, offset: [(step.offset ?? [0, 0])[0], value] }))} />}
+                    <NumericField label="各向同性分量" value={selectedStepObject.isotropicComponent ?? 0} min={0} max={100} step="0.01" hint="原生 isotropicComponent；沿法向的速率倍数" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, isotropicComponent: value }))} />
+                    <NumericField label="定向分量" value={selectedStepObject.directionalComponent ?? 1} min={0} max={100} step="0.01" hint="原生 directionalComponent；沿方向向量的速率倍数" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, directionalComponent: value }))} />
+                    <label className="visibility-option">
+                      <input type="checkbox" aria-label="计算方向可见性" checked={selectedStepObject.calculateVisibility ?? true}
+                        onChange={event => editStep(selectedStepObject.id, step => ({ ...step, calculateVisibility: event.target.checked }))} />
+                      <span><strong>计算遮挡可见性</strong><small>原生 calculateVisibility；关闭后不计算方向遮挡</small></span>
+                    </label>
+                    <NumericField label="持续时间" unit="s" value={selectedStepObject.duration ?? 0.2} min={0.01} max={600} step="0.01" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, duration: value }))} />
                   </>;
                 })()}
               </div> : selectedStepObject.model === 'directional' ? <div className="step-tab-panel" data-step-tab-panel="physics">

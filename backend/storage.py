@@ -23,6 +23,7 @@ PROJECTS = VAR / "projects"
 RUNS = VAR / "runs"
 DOMAIN_STATES = VAR / "domain-states"
 GDS_ASSETS = VAR / "gds-assets"
+CSV_ASSETS = VAR / "csv-assets"
 LOCK_PATH = VAR / "workbench.lock"
 ID_RE = re.compile(r"^[a-f0-9]{24}$")
 
@@ -50,7 +51,7 @@ def read_json(path: Path) -> Any:
 
 
 def initialize() -> None:
-    for path in (PROJECTS, RUNS, DOMAIN_STATES, GDS_ASSETS):
+    for path in (PROJECTS, RUNS, DOMAIN_STATES, GDS_ASSETS, CSV_ASSETS):
         path.mkdir(parents=True, exist_ok=True)
         (path / ".keep").touch(exist_ok=True)
     VAR.mkdir(parents=True, exist_ok=True)
@@ -100,6 +101,25 @@ def resolve_gds_asset(asset_id: str) -> Path:
     path = gds_asset_path(asset_id)
     if not path.is_file() or file_sha256(path) != asset_id:
         raise FileNotFoundError("GDS asset is unavailable or its SHA-256 does not match")
+    return path
+
+
+def csv_asset_path(asset_id: str) -> Path:
+    if not re.fullmatch(r"[a-f0-9]{64}", asset_id):
+        raise FileNotFoundError("invalid CSV rate asset ID")
+    return CSV_ASSETS / f"{asset_id}.csv"
+
+
+def csv_asset_metadata_path(asset_id: str) -> Path:
+    if not re.fullmatch(r"[a-f0-9]{64}", asset_id):
+        raise FileNotFoundError("invalid CSV rate asset ID")
+    return CSV_ASSETS / f"{asset_id}.json"
+
+
+def resolve_csv_asset(asset_id: str) -> Path:
+    path = csv_asset_path(asset_id)
+    if not path.is_file() or file_sha256(path) != asset_id:
+        raise FileNotFoundError("CSV rate asset is unavailable or its SHA-256 does not match")
     return path
 
 
@@ -203,7 +223,7 @@ def directory_bytes(path: Path) -> int:
 
 
 def app_storage_bytes() -> int:
-    return directory_bytes(PROJECTS) + directory_bytes(RUNS) + directory_bytes(DOMAIN_STATES) + directory_bytes(GDS_ASSETS)
+    return directory_bytes(PROJECTS) + directory_bytes(RUNS) + directory_bytes(DOMAIN_STATES) + directory_bytes(GDS_ASSETS) + directory_bytes(CSV_ASSETS)
 
 
 def check_disk_preflight(*, projected_bytes: int = 0) -> None:
