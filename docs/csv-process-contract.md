@@ -40,7 +40,7 @@ ViennaPS 4.6.2 的真实绑定、`ps.RateGrid` 的直接探测，以及
 | 数据行内的内联 `#` | 422（原生会把它当数值解析） |
 | `nan`/`inf`/十六进制/下划线/非有限值 | 422 |
 | 下溢为 0 的非零字面量（如 `1e-400`） | 422；显式 `0` 仍接受 |
-| 非零 subnormal（\|value\| < `sys.float_info.min`，如 `1e-308`/`5e-324`） | 422；原生 reader 拒绝 subnormal，IDW 会静默不动、LINEAR 可能崩溃。`1e-307`（最小 normal）可用 |
+| 非零 subnormal（\|value\| < `sys.float_info.min`，如 `1e-308`/`5e-324`） | 422；原生 reader 拒绝 subnormal，IDW 会静默不动、LINEAR 可能崩溃。`1e-307` 是 normal；最小 normal 约为 `2.2250738585072014e-308`，低于它的非零值仍会被拒绝 |
 | 数值格式 | 用 Python 最短往返十进制重新输出（如 `1.0e-7`、`0.5`、`-2.0`） |
 | 行尾 | 规范为 LF，末尾单个换行 |
 
