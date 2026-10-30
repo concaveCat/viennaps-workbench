@@ -93,7 +93,12 @@ if any value is invalid the worker raises instead of dropping it.
 
 `actualExecution[].actualParameters.nativeModel.advancedOxidation` records:
 
-- `requested`: the validated JSON object exactly as submitted;
+- `normalizedInput`: the normalized project object. The schema materialises
+  every default, so submitting only `{"cflFactor": 0.05}` appears here with all
+  four fields. The raw submitted key subset is not recoverable after
+  normalization without changing the request hash or adding replay-only state;
+  `inputSource` states this explicitly. This field was called `requested` in the
+  first checkpoint and is renamed to avoid claiming raw-key fidelity.
 - `defaults`: the installed native defaults;
 - `effective`: every field after defaults and validation, i.e. the values passed
   to native setters;
@@ -188,6 +193,10 @@ cd /root/wb-engine-oxidation
 .venv/bin/python -m unittest tests.test_oxidation_advanced -v
 ```
 
+Both native proof helpers pin `ps.FluxEngineType.CPU_DISK` before
+`Process.apply()`, exactly like `worker/simulate.py`, so the evidence does not
+depend on CUDA autodetection.
+
 Controlled 2D configuration: `gridDelta=0.01` µm, `xExtent=1.0` µm, SiO₂
 thickness 0.05 µm, 1000 °C dry, `timeHours=0.166`, `timeStepHours=0.03`.
 Surface hashes are SHA-256 over rounded surface points plus `MaterialIds`.
@@ -232,7 +241,9 @@ cannot provide directly.
   oxidation base hashes are asserted in
   `tests/test_oxidation_advanced.py` (`a0beb0…5688` and `c9581e…b6f3b`).
 - When the block is present, the request hash changes by design (new input) and
-  the run records the requested/effective/readback object.
+  the run records the normalized-input/effective/readback object. `requested`
+  is intentionally not used as a field name because the normalized project has
+  already materialised schema defaults.
 - Snapshot JSON and supervisor manifest gain an `oxidation` object only when the
   block is present; deferred materialisation reproduces it.
 - No existing oxidation schema field, default or API route changes.

@@ -140,6 +140,9 @@ def main() -> int:
         ps, domain, normalized, step,
         lambda name: getattr(ps.Material, name), {})
     process = ps.Process(domain, model, duration)
+    # Match worker/simulate.py: pin CPU_DISK before apply() so the native
+    # Process does not attempt CUDA autodetection on a CPU-only evidence run.
+    process.setFluxEngineType(ps.FluxEngineType.CPU_DISK)
     advection = ps.AdvectionParameters()
     advection.timeStepRatio = 0.25
     process.setParameters(advection)
@@ -162,6 +165,8 @@ def main() -> int:
         "dimension": args.dimension,
         "orientation": args.orientation,
         "pointCount": len(points),
+        "topology": "triangles" if args.dimension == 3 else "lines",
+        "cellCount": len(mesh.getTriangles()) if args.dimension == 3 else len(mesh.getLines()),
         "surfaceHash": digest,
         "advancedOxidation": actual.get("advancedOxidation"),
     }, sort_keys=True))
