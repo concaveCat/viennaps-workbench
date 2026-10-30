@@ -42,6 +42,13 @@ from .experiments import (
     start_experiment,
 )
 from .layouts import build_clip_gds, canonical_clip_hash, extract_clip_polygons, save_asset, structure_bounds
+from .library import (
+    LibraryBundleV1,
+    LibraryExportRequestV1,
+    LibraryImportResultV1,
+    build_bundle,
+    import_bundle,
+)
 from .models import CompileDiffV1, CompiledWorkflowV1, GeometryBindingV1
 from .modules import (
     ExpandedFlowV1,
@@ -425,6 +432,30 @@ class FlowDefinitionSummaryV1(StrictModel):
 
 class FlowDefinitionListResponse(StrictModel):
     definitions: list[FlowDefinitionSummaryV1]
+
+
+class LibraryBundleSummaryV1(StrictModel):
+    bundleId: str
+    name: str
+    description: str = ""
+    createdAt: str
+    moduleCount: Annotated[int, Field(ge=0)]
+    definitionCount: Annotated[int, Field(ge=0)]
+    templateCount: Annotated[int, Field(ge=0)]
+    experimentTemplateCount: Annotated[int, Field(ge=0)]
+
+
+class LibraryBundleListResponse(StrictModel):
+    bundles: list[LibraryBundleSummaryV1]
+
+
+class LibraryBundleImportRequest(StrictModel):
+    policy: Literal["reject", "clone"] = "reject"
+
+
+class LibraryDirectImportRequest(StrictModel):
+    bundle: LibraryBundleV1
+    policy: Literal["reject", "clone"] = "reject"
 
 
 class ExpandFlowDefinitionRequest(StrictModel):
@@ -1302,6 +1333,49 @@ async def list_flow_definitions() -> FlowDefinitionListResponse:
 @router.get("/flows/definitions/{definition_id}", response_model=FlowDefinitionV2)
 async def get_flow_definition(definition_id: str) -> FlowDefinitionV2:
     return _call(lambda: get_store().get_flow_definition(definition_id))
+
+
+@router.post("/library/export", response_model=LibraryBundleV1, response_model_exclude_none=True, status_code=201)
+async def export_library(request: LibraryExportRequestV1) -> LibraryBundleV1:
+    def operation():
+        store = get_store()
+        bundle = build_bundle(store, request)
+        store.save_library_bundle(bundle)
+        return bundle
+    return _call(operation)
+
+
+@router.get("/library/bundles", response_model=LibraryBundleListResponse)
+async def list_library_bundles() -> LibraryBundleListResponse:
+    rows = _call(get_store().list_library_bundles)
+    return LibraryBundleListResponse(
+        bundles=[LibraryBundleSummaryV1.model_validate(row) for row in rows]
+    )
+
+
+@router.get("/library/bundles/{bundle_id}", response_model=LibraryBundleV1, response_model_exclude_none=True)
+async def get_library_bundle(bundle_id: str) -> LibraryBundleV1:
+    return _call(lambda: LibraryBundleV1.model_validate(get_store().get_library_bundle(bundle_id)))
+
+
+@router.post("/library/bundles/{bundle_id}/import", response_model=LibraryImportResultV1)
+async def import_library_bundle(
+    bundle_id: str, request: LibraryBundleImportRequest
+) -> LibraryImportResultV1:
+    def operation():
+        store = get_store()
+        bundle = LibraryBundleV1.model_validate(store.get_library_bundle(bundle_id))
+        return import_bundle(store, bundle, request.policy)
+    return _call(operation)
+
+
+@router.post("/library/import", response_model=LibraryImportResultV1)
+async def import_library_document(request: LibraryDirectImportRequest) -> LibraryImportResultV1:
+    def operation():
+        store = get_store()
+        store.save_library_bundle(request.bundle)
+        return import_bundle(store, request.bundle, request.policy)
+    return _call(operation)
 
 
 @router.post("/flows/definitions/{definition_id}/expand", response_model=ExpandedFlowV1)

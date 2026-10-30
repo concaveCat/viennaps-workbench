@@ -4316,6 +4316,619 @@
         "title": "LayoutV1",
         "type": "object"
       },
+      "LibraryBundleImportRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "policy": {
+            "default": "reject",
+            "enum": [
+              "reject",
+              "clone"
+            ],
+            "title": "Policy",
+            "type": "string"
+          }
+        },
+        "title": "LibraryBundleImportRequest",
+        "type": "object"
+      },
+      "LibraryBundleListResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "bundles": {
+            "items": {
+              "$ref": "#/components/schemas/LibraryBundleSummaryV1"
+            },
+            "title": "Bundles",
+            "type": "array"
+          }
+        },
+        "required": [
+          "bundles"
+        ],
+        "title": "LibraryBundleListResponse",
+        "type": "object"
+      },
+      "LibraryBundleSummaryV1": {
+        "additionalProperties": false,
+        "properties": {
+          "bundleId": {
+            "title": "Bundleid",
+            "type": "string"
+          },
+          "createdAt": {
+            "title": "Createdat",
+            "type": "string"
+          },
+          "definitionCount": {
+            "minimum": 0.0,
+            "title": "Definitioncount",
+            "type": "integer"
+          },
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "experimentTemplateCount": {
+            "minimum": 0.0,
+            "title": "Experimenttemplatecount",
+            "type": "integer"
+          },
+          "moduleCount": {
+            "minimum": 0.0,
+            "title": "Modulecount",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "templateCount": {
+            "minimum": 0.0,
+            "title": "Templatecount",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "bundleId",
+          "name",
+          "createdAt",
+          "moduleCount",
+          "definitionCount",
+          "templateCount",
+          "experimentTemplateCount"
+        ],
+        "title": "LibraryBundleSummaryV1",
+        "type": "object"
+      },
+      "LibraryBundleV1-Input": {
+        "additionalProperties": false,
+        "description": "A portable, content-addressed snapshot of the local team library.",
+        "properties": {
+          "bundleId": {
+            "pattern": "^lib_[a-f0-9]{24}$",
+            "title": "Bundleid",
+            "type": "string"
+          },
+          "createdAt": {
+            "title": "Createdat",
+            "type": "string"
+          },
+          "definitions": {
+            "items": {
+              "$ref": "#/components/schemas/FlowDefinitionV2-Input"
+            },
+            "maxItems": 100,
+            "title": "Definitions",
+            "type": "array"
+          },
+          "description": {
+            "default": "",
+            "maxLength": 2000,
+            "title": "Description",
+            "type": "string"
+          },
+          "experimentTemplates": {
+            "items": {
+              "$ref": "#/components/schemas/LibraryExperimentTemplateV1"
+            },
+            "maxItems": 200,
+            "title": "Experimenttemplates",
+            "type": "array"
+          },
+          "modules": {
+            "items": {
+              "$ref": "#/components/schemas/LibraryModuleV1"
+            },
+            "maxItems": 300,
+            "title": "Modules",
+            "type": "array"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "schemaVersion": {
+            "const": 1,
+            "default": 1,
+            "title": "Schemaversion",
+            "type": "integer"
+          },
+          "templates": {
+            "items": {
+              "$ref": "#/components/schemas/FlowTemplateV1"
+            },
+            "maxItems": 200,
+            "title": "Templates",
+            "type": "array"
+          }
+        },
+        "required": [
+          "bundleId",
+          "name",
+          "createdAt"
+        ],
+        "title": "LibraryBundleV1",
+        "type": "object"
+      },
+      "LibraryBundleV1-Output": {
+        "additionalProperties": false,
+        "description": "A portable, content-addressed snapshot of the local team library.",
+        "properties": {
+          "bundleId": {
+            "pattern": "^lib_[a-f0-9]{24}$",
+            "title": "Bundleid",
+            "type": "string"
+          },
+          "createdAt": {
+            "title": "Createdat",
+            "type": "string"
+          },
+          "definitions": {
+            "items": {
+              "$ref": "#/components/schemas/FlowDefinitionV2-Output"
+            },
+            "maxItems": 100,
+            "title": "Definitions",
+            "type": "array"
+          },
+          "description": {
+            "default": "",
+            "maxLength": 2000,
+            "title": "Description",
+            "type": "string"
+          },
+          "experimentTemplates": {
+            "items": {
+              "$ref": "#/components/schemas/LibraryExperimentTemplateV1"
+            },
+            "maxItems": 200,
+            "title": "Experimenttemplates",
+            "type": "array"
+          },
+          "modules": {
+            "items": {
+              "$ref": "#/components/schemas/LibraryModuleV1"
+            },
+            "maxItems": 300,
+            "title": "Modules",
+            "type": "array"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "schemaVersion": {
+            "const": 1,
+            "default": 1,
+            "title": "Schemaversion",
+            "type": "integer"
+          },
+          "templates": {
+            "items": {
+              "$ref": "#/components/schemas/FlowTemplateV1"
+            },
+            "maxItems": 200,
+            "title": "Templates",
+            "type": "array"
+          }
+        },
+        "required": [
+          "bundleId",
+          "name",
+          "createdAt"
+        ],
+        "title": "LibraryBundleV1",
+        "type": "object"
+      },
+      "LibraryDirectImportRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "bundle": {
+            "$ref": "#/components/schemas/LibraryBundleV1-Input"
+          },
+          "policy": {
+            "default": "reject",
+            "enum": [
+              "reject",
+              "clone"
+            ],
+            "title": "Policy",
+            "type": "string"
+          }
+        },
+        "required": [
+          "bundle"
+        ],
+        "title": "LibraryDirectImportRequest",
+        "type": "object"
+      },
+      "LibraryExperimentTemplateV1": {
+        "additionalProperties": false,
+        "description": "A re-plannable experiment: conditions and seeds only, never results.",
+        "properties": {
+          "description": {
+            "default": "",
+            "maxLength": 2000,
+            "title": "Description",
+            "type": "string"
+          },
+          "design": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Design"
+          },
+          "kind": {
+            "enum": [
+              "manual",
+              "doe"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "project": {
+            "$ref": "#/components/schemas/ProjectV7"
+          },
+          "recipeId": {
+            "maxLength": 64,
+            "minLength": 3,
+            "pattern": "^[A-Za-z0-9_-]+$",
+            "title": "Recipeid",
+            "type": "string"
+          },
+          "recipeVersion": {
+            "minimum": 1.0,
+            "title": "Recipeversion",
+            "type": "integer"
+          },
+          "variants": {
+            "items": {
+              "$ref": "#/components/schemas/LibraryExperimentVariantV1"
+            },
+            "maxItems": 256,
+            "minItems": 1,
+            "title": "Variants",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "project",
+          "recipeId",
+          "recipeVersion",
+          "kind",
+          "variants"
+        ],
+        "title": "LibraryExperimentTemplateV1",
+        "type": "object"
+      },
+      "LibraryExperimentVariantV1": {
+        "additionalProperties": false,
+        "properties": {
+          "parameters": {
+            "additionalProperties": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Parameters",
+            "type": "object"
+          },
+          "replicates": {
+            "items": {
+              "$ref": "#/components/schemas/LibraryReplicateV1"
+            },
+            "maxItems": 64,
+            "minItems": 1,
+            "title": "Replicates",
+            "type": "array"
+          }
+        },
+        "required": [
+          "replicates"
+        ],
+        "title": "LibraryExperimentVariantV1",
+        "type": "object"
+      },
+      "LibraryExportRequestV1": {
+        "additionalProperties": false,
+        "description": "Selectors omitted (``None``) export every local object of that kind.",
+        "properties": {
+          "definitionIds": {
+            "anyOf": [
+              {
+                "items": {
+                  "maxLength": 64,
+                  "minLength": 3,
+                  "pattern": "^[A-Za-z][A-Za-z0-9_-]*$",
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Definitionids"
+          },
+          "description": {
+            "default": "",
+            "maxLength": 2000,
+            "title": "Description",
+            "type": "string"
+          },
+          "experimentIds": {
+            "anyOf": [
+              {
+                "items": {
+                  "maxLength": 64,
+                  "minLength": 3,
+                  "pattern": "^[A-Za-z0-9_-]+$",
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Experimentids"
+          },
+          "moduleIds": {
+            "anyOf": [
+              {
+                "items": {
+                  "maxLength": 64,
+                  "minLength": 3,
+                  "pattern": "^[A-Za-z][A-Za-z0-9_-]*$",
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Moduleids"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "templateIds": {
+            "anyOf": [
+              {
+                "items": {
+                  "maxLength": 64,
+                  "minLength": 3,
+                  "pattern": "^[A-Za-z0-9_-]+$",
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Templateids"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "LibraryExportRequestV1",
+        "type": "object"
+      },
+      "LibraryImportResultV1": {
+        "additionalProperties": false,
+        "properties": {
+          "bundleId": {
+            "pattern": "^lib_[a-f0-9]{24}$",
+            "title": "Bundleid",
+            "type": "string"
+          },
+          "conflicts": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Conflicts",
+            "type": "array"
+          },
+          "definitionIds": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Definitionids",
+            "type": "array"
+          },
+          "experimentIds": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Experimentids",
+            "type": "array"
+          },
+          "modules": {
+            "items": {
+              "$ref": "#/components/schemas/LibraryModuleImportV1"
+            },
+            "title": "Modules",
+            "type": "array"
+          },
+          "policy": {
+            "enum": [
+              "reject",
+              "clone"
+            ],
+            "title": "Policy",
+            "type": "string"
+          },
+          "renames": {
+            "items": {
+              "$ref": "#/components/schemas/LibraryRenameV1"
+            },
+            "title": "Renames",
+            "type": "array"
+          },
+          "schemaVersion": {
+            "const": 1,
+            "default": 1,
+            "title": "Schemaversion",
+            "type": "integer"
+          },
+          "skipped": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Skipped",
+            "type": "array"
+          },
+          "templateIds": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Templateids",
+            "type": "array"
+          }
+        },
+        "required": [
+          "bundleId",
+          "policy"
+        ],
+        "title": "LibraryImportResultV1",
+        "type": "object"
+      },
+      "LibraryModuleImportV1": {
+        "additionalProperties": false,
+        "properties": {
+          "moduleId": {
+            "title": "Moduleid",
+            "type": "string"
+          },
+          "revision": {
+            "minimum": 1.0,
+            "title": "Revision",
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "imported",
+              "existing"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "moduleId",
+          "revision",
+          "status"
+        ],
+        "title": "LibraryModuleImportV1",
+        "type": "object"
+      },
+      "LibraryModuleV1": {
+        "additionalProperties": false,
+        "description": "One exact retained module revision.",
+        "properties": {
+          "module": {
+            "$ref": "#/components/schemas/ModuleV1"
+          },
+          "revision": {
+            "minimum": 1.0,
+            "title": "Revision",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "module",
+          "revision"
+        ],
+        "title": "LibraryModuleV1",
+        "type": "object"
+      },
+      "LibraryRenameV1": {
+        "additionalProperties": false,
+        "properties": {
+          "importedId": {
+            "title": "Importedid",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "definition",
+              "template"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "previousId": {
+            "title": "Previousid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "previousId",
+          "importedId"
+        ],
+        "title": "LibraryRenameV1",
+        "type": "object"
+      },
+      "LibraryReplicateV1": {
+        "additionalProperties": false,
+        "description": "A reusable replicate condition. Runtime fields are intentionally absent.",
+        "properties": {
+          "seed": {
+            "title": "Seed",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "seed"
+        ],
+        "title": "LibraryReplicateV1",
+        "type": "object"
+      },
       "MaterialDefinition": {
         "additionalProperties": false,
         "properties": {
@@ -11856,6 +12469,203 @@
           }
         },
         "summary": "Preview Layout",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/library/bundles": {
+      "get": {
+        "operationId": "list_library_bundles_api_v1_workflow_library_bundles_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LibraryBundleListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Library Bundles",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/library/bundles/{bundle_id}": {
+      "get": {
+        "operationId": "get_library_bundle_api_v1_workflow_library_bundles__bundle_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "bundle_id",
+            "required": true,
+            "schema": {
+              "title": "Bundle Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LibraryBundleV1-Output"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Library Bundle",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/library/bundles/{bundle_id}/import": {
+      "post": {
+        "operationId": "import_library_bundle_api_v1_workflow_library_bundles__bundle_id__import_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "bundle_id",
+            "required": true,
+            "schema": {
+              "title": "Bundle Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LibraryBundleImportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LibraryImportResultV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Import Library Bundle",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/library/export": {
+      "post": {
+        "operationId": "export_library_api_v1_workflow_library_export_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LibraryExportRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LibraryBundleV1-Output"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Export Library",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/library/import": {
+      "post": {
+        "operationId": "import_library_document_api_v1_workflow_library_import_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LibraryDirectImportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LibraryImportResultV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Import Library Document",
         "tags": [
           "workflow"
         ]

@@ -110,6 +110,38 @@ type Recipe = {
   parameters: Record<string, unknown>;
 };
 type TemplateSummary = { templateId: string; name: string; stepCount: number };
+type LibraryBundleSummary = {
+  bundleId: string;
+  name: string;
+  description: string;
+  createdAt: string;
+  moduleCount: number;
+  definitionCount: number;
+  templateCount: number;
+  experimentTemplateCount: number;
+};
+type LibraryBundle = {
+  schemaVersion: number;
+  bundleId: string;
+  name: string;
+  description: string;
+  createdAt: string;
+  modules: Array<{ module: { moduleId: string; name: string }; revision: number }>;
+  definitions: Array<{ definitionId: string }>;
+  templates: Array<{ templateId: string }>;
+  experimentTemplates: Array<{ name: string }>;
+};
+type LibraryImportResult = {
+  bundleId: string;
+  policy: 'reject' | 'clone';
+  modules: Array<{ moduleId: string; revision: number; status: string }>;
+  definitionIds: string[];
+  templateIds: string[];
+  experimentIds: string[];
+  skipped: string[];
+  conflicts: string[];
+  renames: Array<{ kind: string; previousId: string; importedId: string }>;
+};
 type LayoutStructure = {
   name: string;
   layers: number[];
@@ -353,6 +385,14 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [measurement, setMeasurement] = useState<Measurement | null>(null);
   const [templates, setTemplates] = useState<TemplateSummary[]>([]);
   const [templateId, setTemplateId] = useState('');
+  const [libraryName, setLibraryName] = useState('团队共享流程');
+  const [libraryDescription, setLibraryDescription] = useState('');
+  const [libraryPolicy, setLibraryPolicy] = useState<'reject' | 'clone'>('reject');
+  const [libraryBundles, setLibraryBundles] = useState<LibraryBundleSummary[]>([]);
+  const [libraryBundleId, setLibraryBundleId] = useState('');
+  const [libraryBundleJson, setLibraryBundleJson] = useState('');
+  const [libraryResult, setLibraryResult] = useState<LibraryImportResult | null>(null);
+  const [libraryStatus, setLibraryStatus] = useState('');
   const [recipeMethod, setRecipeMethod] = useState<'cd_at_height' | 'etch_depth'>('etch_depth');
   const [recipeMaterial, setRecipeMaterial] = useState('Si');
   const [recipeHeight, setRecipeHeight] = useState('0');
@@ -435,6 +475,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   useEffect(() => {
     void api<Health>('/api/health').then(setHealth).catch(() => setHealth(null));
     void api<{ templates: TemplateSummary[] }>('/api/v1/workflow/templates').then(data => setTemplates(data.templates)).catch(() => undefined);
+    void api<{ bundles: LibraryBundleSummary[] }>('/api/v1/workflow/library/bundles')
+      .then(data => setLibraryBundles(data.bundles)).catch(() => undefined);
   }, []);
 
   useEffect(() => {
@@ -967,6 +1009,62 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setModuleStatus(`模块化流程已编译 · ${result.stepCount} 步`);
   });
 
+  const refreshLibraryBundles = async () => {
+    const data = await api<{ bundles: LibraryBundleSummary[] }>('/api/v1/workflow/library/bundles');
+    setLibraryBundles(data.bundles);
+    return data.bundles;
+  };
+
+  const describeLibraryResult = (result: LibraryImportResult) => {
+    const parts = [
+      `${result.modules.filter(item => item.status === 'imported').length} 模块修订`,
+      `${result.definitionIds.length} 定义`,
+      `${result.templateIds.length} 模板`,
+      `${result.experimentIds.length} 实验模板`,
+    ];
+    const skipped = result.skipped.length ? ` · 跳过 ${result.skipped.length}` : '';
+    const renamed = result.renames.length ? ` · 新 ID ${result.renames.length}` : '';
+    return `导入 ${result.bundleId} (${result.policy}): ${parts.join(' / ')}${skipped}${renamed}`;
+  };
+
+  const exportLibrary = () => run('library', async () => {
+    if (!libraryName.trim()) throw new Error('先填写共享库名称');
+    const bundle = await postJson<LibraryBundle>('/api/v1/workflow/library/export', {
+      name: libraryName.trim(),
+      description: libraryDescription,
+      experimentIds: experimentDoc ? [experimentDoc.experimentId] : [],
+    });
+    setLibraryBundleJson(JSON.stringify(bundle, null, 2));
+    setLibraryBundleId(bundle.bundleId);
+    setLibraryResult(null);
+    setLibraryStatus(
+      `已导出 ${bundle.bundleId} · ${bundle.modules.length} 模块修订 / ${bundle.definitions.length} 定义 / ${bundle.templates.length} 模板 / ${bundle.experimentTemplates.length} 实验模板`,
+    );
+    await refreshLibraryBundles();
+  });
+
+  const importLibraryBundle = () => run('library', async () => {
+    if (!libraryBundleId) throw new Error('先选择共享库 bundle');
+    const result = await postJson<LibraryImportResult>(
+      `/api/v1/workflow/library/bundles/${libraryBundleId}/import`,
+      { policy: libraryPolicy },
+    );
+    setLibraryResult(result);
+    setLibraryStatus(describeLibraryResult(result));
+    await refreshLibraryBundles();
+  });
+
+  const importLibraryJson = () => run('library', async () => {
+    const bundle = parseJsonObject('共享库 JSON', libraryBundleJson);
+    const result = await postJson<LibraryImportResult>('/api/v1/workflow/library/import', {
+      bundle, policy: libraryPolicy,
+    });
+    setLibraryBundleId(result.bundleId);
+    setLibraryResult(result);
+    setLibraryStatus(describeLibraryResult(result));
+    await refreshLibraryBundles();
+  });
+
   const createDoe = () => run('doe', async () => {
     if (!project || !compile || !activeRecipeId) throw new Error('先完成一次测量以固定配方');
     const factors = doeFactors
@@ -1321,6 +1419,49 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               </tbody>
             </table>
           </>}
+          <div className="wf-card-subhead">共享流程库</div>
+          <p className="wf-muted">导出全部模块、流程定义、模板与当前实验的可复用条件；导入时明确 reject/clone 冲突策略。实验只保留条件、重复数与 seed，不带运行状态。</p>
+          <div className="wf-template-row">
+            <input aria-label="共享库名称" value={libraryName} onChange={event => setLibraryName(event.target.value)} placeholder="共享库名称" />
+            <input aria-label="共享库描述" value={libraryDescription} onChange={event => setLibraryDescription(event.target.value)} placeholder="描述（可选）" />
+            <button className="wf-button ghost" aria-label="导出共享库" disabled={!!busy} onClick={() => void exportLibrary()}>{busy === 'library' ? '处理中…' : '导出共享库'}</button>
+          </div>
+          <div className="wf-template-row">
+            <select aria-label="共享库 bundle 选择" value={libraryBundleId} onChange={event => setLibraryBundleId(event.target.value)}>
+              <option value="">选择 bundle</option>
+              {libraryBundles.map(item => <option key={item.bundleId} value={item.bundleId}>{item.name} · {item.bundleId.slice(0, 12)}…</option>)}
+            </select>
+            <select aria-label="共享库导入策略" value={libraryPolicy} onChange={event => setLibraryPolicy(event.target.value as 'reject' | 'clone')}>
+              <option value="reject">reject · 冲突即失败</option>
+              <option value="clone">clone · 生成新 ID</option>
+            </select>
+            <button className="wf-button primary" aria-label="导入共享库" disabled={!libraryBundleId || !!busy} onClick={() => void importLibraryBundle()}>{busy === 'library' ? '处理中…' : '导入共享库'}</button>
+          </div>
+          {libraryStatus && <div className="wf-summary" role="status"><strong>{libraryStatus}</strong><span>{libraryBundles.length} 个本地 bundle</span></div>}
+          {libraryBundles.length > 0 && <table className="wf-table" aria-label="共享库列表">
+            <thead><tr><th>Bundle</th><th>内容</th><th>创建时间</th></tr></thead>
+            <tbody>
+              {libraryBundles.slice(0, 8).map(item => <tr key={item.bundleId}>
+                <td><code>{item.bundleId}</code><div className="wf-muted">{item.name}</div></td>
+                <td>{item.moduleCount} 模块修订 · {item.definitionCount} 定义 · {item.templateCount} 模板 · {item.experimentTemplateCount} 实验模板</td>
+                <td>{item.createdAt}</td>
+              </tr>)}
+            </tbody>
+          </table>}
+          <textarea aria-label="共享库 JSON" value={libraryBundleJson} onChange={event => setLibraryBundleJson(event.target.value)} placeholder="粘贴 bundle JSON 以便跨机器交换" />
+          <div className="wf-template-row">
+            <button className="wf-button ghost" aria-label="从 JSON 导入共享库" disabled={!libraryBundleJson.trim() || !!busy} onClick={() => void importLibraryJson()}>{busy === 'library' ? '处理中…' : '从 JSON 导入'}</button>
+            <span className="wf-muted">bundleId 由内容 hash 生成；reject 保留原 ID，clone 为定义/模板/实验生成新 ID。</span>
+          </div>
+          {libraryResult && <div className="wf-summary" aria-label="共享库导入结果">
+            <strong>{libraryResult.bundleId}</strong>
+            <span>定义: {libraryResult.definitionIds.join(', ') || '—'}</span>
+            <span>模板: {libraryResult.templateIds.join(', ') || '—'}</span>
+            <span>实验: {libraryResult.experimentIds.join(', ') || '—'}</span>
+            {libraryResult.renames.length > 0 && <span>新 ID: {libraryResult.renames.map(item => `${item.previousId} → ${item.importedId}`).join(' · ')}</span>}
+            {libraryResult.skipped.length > 0 && <span>跳过: {libraryResult.skipped.join(' · ')}</span>}
+            {libraryResult.conflicts.length > 0 && <span>冲突: {libraryResult.conflicts.join(' · ')}</span>}
+          </div>}
         </section>
 
         <section className={`wf-card wf-run ${zone === 'run' ? '' : 'wf-hidden'}`}>

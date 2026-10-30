@@ -35,6 +35,11 @@ class WorkflowOpenApiTests(unittest.TestCase):
             "/api/v1/workflow/flows/definitions/{definition_id}",
             "/api/v1/workflow/flows/definitions/{definition_id}/expand",
             "/api/v1/workflow/flows/definitions/{definition_id}/compile",
+            "/api/v1/workflow/library/export",
+            "/api/v1/workflow/library/bundles",
+            "/api/v1/workflow/library/bundles/{bundle_id}",
+            "/api/v1/workflow/library/bundles/{bundle_id}/import",
+            "/api/v1/workflow/library/import",
         ):
             self.assertIn(path, paths)
         self.assertIn("RoutePlanV1", schema["components"]["schemas"])
@@ -45,6 +50,9 @@ class WorkflowOpenApiTests(unittest.TestCase):
             "FlowDefinitionV2-Output",
             "ExpandedFlowV1",
             "ExpandFlowDefinitionRequest",
+            "LibraryBundleV1-Input",
+            "LibraryBundleV1-Output",
+            "LibraryImportResultV1",
         ):
             self.assertIn(name, schema["components"]["schemas"])
         for name in (

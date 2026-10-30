@@ -887,7 +887,7 @@ class MeasurementDecisionMigrationTests(unittest.TestCase):
         path = storage.VAR / f"test-workflow-decisions-{suffix}.sqlite3"
         store = WorkflowStore(path)
         store.initialize()
-        self.assertEqual(store.schema_version(), "7")
+        self.assertEqual(store.schema_version(), SCHEMA_VERSION)
         with sqlite3.connect(path) as connection:
             connection.execute("DROP TABLE measurement_decisions")
             connection.execute(
@@ -904,7 +904,7 @@ class MeasurementDecisionMigrationTests(unittest.TestCase):
                 "SELECT value FROM schema_meta WHERE key = 'schema_version'"
             ).fetchone()
         self.assertIsNotNone(table)
-        self.assertEqual(version[0], "7")
+        self.assertEqual(version[0], SCHEMA_VERSION)
 
 
 if __name__ == "__main__":

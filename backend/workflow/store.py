@@ -34,7 +34,7 @@ from .routes import (
 from .verification import prefix_compatibility, verify_route_plan_compiles
 
 
-SCHEMA_VERSION = "7"
+SCHEMA_VERSION = "8"
 
 
 class WorkflowError(Exception):
@@ -70,7 +70,7 @@ class WorkflowStore:
                     row = preflight.execute(
                         "SELECT value FROM schema_meta WHERE key = 'schema_version'"
                     ).fetchone()
-                    if row is not None and row[0] not in {"1", "2", "3", "4", "5", "6", SCHEMA_VERSION}:
+                    if row is not None and row[0] not in {"1", "2", "3", "4", "5", "6", "7", SCHEMA_VERSION}:
                         raise RuntimeError(
                             f"unsupported workflow schema version {row[0]!r}; "
                             f"expected {SCHEMA_VERSION!r}"
@@ -236,6 +236,11 @@ class WorkflowStore:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY (module_id, revision)
                 );
+                CREATE TABLE IF NOT EXISTS library_bundles (
+                    bundle_id TEXT PRIMARY KEY,
+                    document_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS flow_definitions (
                     definition_id TEXT PRIMARY KEY,
                     flow_id TEXT NOT NULL,
@@ -359,7 +364,7 @@ class WorkflowStore:
                     "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
                     (SCHEMA_VERSION,),
                 )
-            elif version_row["value"] in {"3", "4", "5", "6"}:
+            elif version_row["value"] in {"3", "4", "5", "6", "7"}:
                 connection.execute(
                     "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
                     (SCHEMA_VERSION,),
@@ -1794,6 +1799,131 @@ class WorkflowStore:
                 continue
             summaries.append(
                 self._module_summary(module, revision=row["revision"], updated_at=row["updated_at"])
+            )
+        return summaries
+
+    def current_module_revision(self, module_id: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT revision FROM modules WHERE module_id = ?", (module_id,)
+            ).fetchone()
+        if row is None:
+            raise WorkflowNotFound(f"module {module_id!r} does not exist")
+        return int(row["revision"])
+
+    def module_revision_exists(self, module_id: str, revision: int) -> bool:
+        with self._connect() as connection:
+            return self._module_revision_row(connection, module_id, revision) is not None
+
+    def import_module_revision(
+        self, module: ModuleV1, revision: int, *, make_current: bool = False
+    ) -> str:
+        """Write one exact retained revision without renumbering it.
+
+        Content is immutable per ``(moduleId, revision)``. The current pointer is
+        advanced only when requested and never downgraded, so importing an old
+        bundle cannot hide newer local revisions.
+        """
+
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+            raise WorkflowValidation("imported module revision must be a positive integer")
+        payload = module.model_dump(mode="json", exclude_none=True)
+        digest = sha256_hex(payload)
+        now = self._now()
+        with self._connect() as connection:
+            existing = self._module_revision_row(connection, module.moduleId, revision)
+            if existing is not None:
+                if sha256_hex(json.loads(existing["module_json"])) != digest:
+                    raise WorkflowConflict(
+                        f"module {module.moduleId!r} revision {revision} already exists "
+                        "with different content"
+                    )
+                status = "existing"
+            else:
+                self._insert_module_revision(
+                    connection, module.moduleId, revision, payload, digest, now
+                )
+                status = "imported"
+            if make_current:
+                row = connection.execute(
+                    "SELECT * FROM modules WHERE module_id = ?", (module.moduleId,)
+                ).fetchone()
+                if row is None:
+                    connection.execute(
+                        "INSERT INTO modules"
+                        " (module_id, module_json, content_hash, revision, created_at, updated_at)"
+                        " VALUES (?, ?, ?, ?, ?, ?)",
+                        (module.moduleId, self._dump(payload), digest, revision, now, now),
+                    )
+                elif revision > int(row["revision"]):
+                    connection.execute(
+                        "UPDATE modules SET module_json = ?, content_hash = ?, revision = ?,"
+                        " updated_at = ? WHERE module_id = ?",
+                        (self._dump(payload), digest, revision, now, module.moduleId),
+                    )
+                elif revision == int(row["revision"]) and row["content_hash"] != digest:
+                    raise WorkflowConflict(
+                        f"module {module.moduleId!r} current revision {revision} "
+                        "already exists with different content"
+                    )
+        return status
+
+    def save_library_bundle(self, bundle: Any) -> dict[str, Any]:
+        payload = bundle.model_dump(mode="json", exclude_none=True) if hasattr(bundle, "model_dump") else dict(bundle)
+        digest = sha256_hex(payload)
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT document_json FROM library_bundles WHERE bundle_id = ?",
+                (payload["bundleId"],),
+            ).fetchone()
+            if existing is not None:
+                if sha256_hex(json.loads(existing["document_json"])) != digest:
+                    raise WorkflowConflict(
+                        f"library bundle {payload['bundleId']} already exists with different content"
+                    )
+                return json.loads(existing["document_json"])
+            connection.execute(
+                "INSERT INTO library_bundles (bundle_id, document_json, created_at) VALUES (?, ?, ?)",
+                (
+                    payload["bundleId"],
+                    self._dump(payload),
+                    payload.get("createdAt") or self._now(),
+                ),
+            )
+        return payload
+
+    def get_library_bundle(self, bundle_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT document_json FROM library_bundles WHERE bundle_id = ?", (bundle_id,)
+            ).fetchone()
+        if row is None:
+            raise WorkflowNotFound(f"library bundle {bundle_id!r} does not exist")
+        return json.loads(row["document_json"])
+
+    def list_library_bundles(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT bundle_id, document_json, created_at FROM library_bundles"
+                " ORDER BY created_at DESC, rowid DESC"
+            ).fetchall()
+        summaries = []
+        for row in rows:
+            try:
+                document = json.loads(row["document_json"])
+            except ValueError:
+                continue
+            summaries.append(
+                {
+                    "bundleId": row["bundle_id"],
+                    "name": document.get("name"),
+                    "description": document.get("description") or "",
+                    "createdAt": row["created_at"],
+                    "moduleCount": len(document.get("modules") or []),
+                    "definitionCount": len(document.get("definitions") or []),
+                    "templateCount": len(document.get("templates") or []),
+                    "experimentTemplateCount": len(document.get("experimentTemplates") or []),
+                }
             )
         return summaries
 
