@@ -177,7 +177,14 @@ try {
   assert.equal(await page.locator('.spx-left input[type=checkbox]').count(), 0);
   const treeText = await page.locator('.spx-left').innerText();
   assert.doesNotMatch(treeText, /[0-9a-f]{12,}/i, 'left tree must not show ids');
-  assert.match(treeText, /Run · (成功|待执行|运行中|失败)/);
+  const runRow = page.locator('.spx-left .spx-tree-item').filter({ hasText: 'Run' }).first();
+  const runText = await runRow.innerText();
+  assert.match(runText, /(成功|待执行|运行中|失败)/);
+  const runStatus = await runRow.locator('.spx-tree-status').innerText();
+  assert.equal(runText.split(runStatus).length - 1, 1, 'the run row shows its status once, in the badge');
+  const compileRow = page.locator('.spx-left .spx-tree-item').filter({ hasText: '编译' }).first();
+  assert.equal(((await compileRow.innerText()).match(/已编译|未编译|需重新编译/g) ?? []).length, 1,
+    'the compile row shows its status once, in the badge');
   assert.ok((await page.locator('.spx-left .spx-tree-status').count()) >= 3);
   assert.match(treeText, /状态图例|待执行\/未创建/);
 

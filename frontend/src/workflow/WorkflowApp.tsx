@@ -38,6 +38,23 @@ type ProjectRecord = {
   createdAt: string;
   updatedAt: string;
 };
+/** Per-project 03 page state, mirroring backend `ProjectWorkflowStateV1`. */
+type ProjectWorkflowState = {
+  schemaVersion: 1;
+  compileId: string | null;
+  routeId: string | null;
+  segmentRuns: Array<{ segmentId: string; runId: string; measurementId: string | null }>;
+  measurementIds: string[];
+  experimentIds: string[];
+  updatedAt?: string | null;
+};
+
+type CompiledEnvelope = {
+  project: { name: string; dimension: number; steps: ProjectStep[] };
+  sourceMap: Array<{ stepId: string; authoredStepId: string }>;
+  compileRecord: { compileId: string; flowId: string; geometryBindingId: string };
+};
+
 type LibraryCategory = 'material' | 'process' | 'flow' | 'experiment';
 type LibraryItem = {
   schemaVersion: number;
@@ -527,6 +544,74 @@ const LIBRARY_CATEGORY_LABELS: Record<LibraryCategory, string> = {
   experiment: '实验库',
 };
 
+/** Empty `ProjectWorkflowStateV1`; unset server state reads exactly like this. */
+function emptyWorkflowState(): ProjectWorkflowState {
+  return { schemaVersion: 1, compileId: null, routeId: null, segmentRuns: [], measurementIds: [], experimentIds: [] };
+}
+
+/** Strip server-owned timestamps so a re-save of identical content stays a no-op. */
+function workflowStatePayload(state: ProjectWorkflowState) {
+  return {
+    schemaVersion: 1 as const,
+    compileId: state.compileId,
+    routeId: state.routeId,
+    segmentRuns: state.segmentRuns,
+    measurementIds: state.measurementIds,
+    experimentIds: state.experimentIds,
+  };
+}
+
+function compileInfoFromEnvelope(envelope: CompiledEnvelope): CompileInfo {
+  return {
+    flowId: envelope.compileRecord.flowId,
+    bindingId: envelope.compileRecord.geometryBindingId,
+    compileId: envelope.compileRecord.compileId,
+    projectName: envelope.project.name,
+    dimension: envelope.project.dimension,
+    stepCount: envelope.project.steps.length,
+    compile: { project: envelope.project, sourceMap: envelope.sourceMap },
+  };
+}
+
+/** ProjectV7 geometry binding for one saved Clip (same shape the server stores). */
+function clipGeometryBinding(clip: Clip) {
+  return {
+    kind: 'gds', assetId: clip.gdsAssetId, fileName: clip.gdsFileName,
+    structure: 'CLIP', unitScale: 1, position: [0, 0, 0],
+    layers: clip.layers.map(item => ({ layer: item.layer, material: item.material || 'Si' })),
+  };
+}
+
+/** Default parametric geometry for a dimension/kind switch inside 01. */
+function defaultParametricGeometry(dimension: number, kind: string, previous: Record<string, unknown>): Record<string, unknown> {
+  const substrateMaterial = typeof previous.substrateMaterial === 'string' ? previous.substrateMaterial : 'Si';
+  const maskMaterial = typeof previous.maskMaterial === 'string' ? previous.maskMaterial : 'Mask';
+  if (kind === 'trench') {
+    return {
+      kind: 'trench', width: Number(previous.width) || 1, depth: Number(previous.depth) || 2,
+      taperAngle: Number(previous.taperAngle) || 0, maskHeight: Number(previous.maskHeight) || 0,
+      maskTaperAngle: 0, substrateMaterial, maskMaterial,
+    };
+  }
+  if (kind === 'hole') {
+    return {
+      kind: 'hole', radius: Number(previous.radius) || 1, depth: Number(previous.depth) || 2,
+      taperAngle: Number(previous.taperAngle) || 0, maskHeight: Number(previous.maskHeight) || 0,
+      maskTaperAngle: 0, substrateMaterial, maskMaterial,
+    };
+  }
+  if (kind === 'fin') {
+    return {
+      kind: 'fin', width: Number(previous.width) || 1, height: Number(previous.finHeight ?? previous.height) || 1.2,
+      taperAngle: Number(previous.taperAngle) || 0, maskHeight: Number(previous.maskHeight) || 0,
+      maskTaperAngle: 0, substrateMaterial, maskMaterial, construction: 'native',
+    };
+  }
+  return dimension === 2
+    ? { kind: 'plane', height: Number(previous.height) || 0, substrateMaterial }
+    : { kind: 'fin', width: 1, height: 1.2, taperAngle: 0, maskHeight: 0, maskTaperAngle: 0, substrateMaterial, maskMaterial, construction: 'native' };
+}
+
 function isHexColor(value: string): boolean {
   return /^#[0-9a-fA-F]{6}$/.test(value.trim());
 }
@@ -688,7 +773,11 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const text = await response.text();
   let payload: unknown = text;
   try { payload = text ? JSON.parse(text) : {}; } catch { /* keep text */ }
-  if (!response.ok) throw new Error(errorText(payload));
+  if (!response.ok) {
+    const error = new Error(errorText(payload)) as Error & { status?: number };
+    error.status = response.status;
+    throw error;
+  }
   return payload as T;
 }
 
@@ -1067,10 +1156,78 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     engine: 'cpu', seed: 7, timeout: 60, raysPerPoint: 16, cpuThreads: 1,
   });
   const [aboutOpen, setAboutOpen] = useState(false);
+  const [projectState, setProjectState] = useState<ProjectWorkflowState>(emptyWorkflowState);
+  const [stateNotice, setStateNotice] = useState('');
+  const [restoreNotice, setRestoreNotice] = useState('');
+  const [stateSaving, setStateSaving] = useState(false);
   const gdsInput = useRef<HTMLInputElement>(null);
   const projectInput = useRef<HTMLInputElement>(null);
+  const parametricGeometryRef = useRef<Record<string, unknown> | null>(null);
+  const stateSaveTimer = useRef<number | null>(null);
+  const lastStateJson = useRef('');
+  const restorePending = useRef(false);
 
   const projectDirty = !!project && JSON.stringify(project) !== savedProjectJson;
+
+  const geometrySaveBlock = (() => {
+    if (!project || projectGeometrySource.kind !== 'layout' || projectGeometrySource.clipId) return '';
+    const geometry = (project.geometry ?? {}) as Record<string, unknown>;
+    if (geometry.kind === 'gds') return '';
+    return '先选择或保存一个 Clip 作为工程几何';
+  })();
+
+  // Field-level validation shared by the 01 editor and every save entry point
+  // (top bar, Ctrl/Cmd+S, File menu). Values match backend ProjectV7 bounds.
+  const projectFormErrors = useMemo(() => {
+    const errors: Record<string, string> = {};
+    if (!project) return errors;
+    const domain = (project.domain ?? {}) as Record<string, unknown>;
+    const geometry = (project.geometry ?? {}) as Record<string, unknown>;
+    const solver = (project.solver ?? {}) as Record<string, unknown>;
+    const gridDelta = Number(domain.gridDelta);
+    const xExtent = Number(domain.xExtent);
+    if (!Number.isFinite(gridDelta) || gridDelta <= 0 || gridDelta > 0.5) errors['domain.gridDelta'] = 'gridDelta 必须 > 0 且 ≤ 0.5 µm';
+    if (!Number.isFinite(xExtent) || xExtent < 1 || xExtent > 40) errors['domain.xExtent'] = 'xExtent 必须在 1–40 µm';
+    if (project.dimension === 3) {
+      const yExtent = Number(domain.yExtent);
+      if (!Number.isFinite(yExtent) || yExtent < 1 || yExtent > 40) errors['domain.yExtent'] = 'yExtent 必须在 1–40 µm';
+      if (Number.isFinite(gridDelta) && gridDelta > 0) {
+        const minimum = 2 * gridDelta;
+        if (xExtent < minimum) errors['domain.xExtent'] = `3D xExtent 至少为 2×gridDelta（${minimum} µm）`;
+        if (yExtent < minimum) errors['domain.yExtent'] = `3D yExtent 至少为 2×gridDelta（${minimum} µm）`;
+      }
+    }
+    const kind = String(geometry.kind ?? '');
+    const positiveFields: Array<[string, string]> = kind === 'trench'
+      ? [['width', '宽度'], ['depth', '深度']]
+      : kind === 'hole' ? [['radius', '半径'], ['depth', '深度']]
+        : kind === 'fin' ? [['width', '宽度'], ['height', '高度']] : [];
+    for (const [key, label] of positiveFields) {
+      const value = Number(geometry[key]);
+      if (!Number.isFinite(value) || value <= 0) errors[`geometry.${key}`] = `${label}必须 > 0 µm`;
+    }
+    if (['trench', 'hole', 'fin'].includes(kind)) {
+      const taper = Number(geometry.taperAngle ?? 0);
+      if (!Number.isFinite(taper) || taper < -45 || taper > 45) errors['geometry.taperAngle'] = 'taperAngle 必须在 -45–45°';
+      const maskHeight = Number(geometry.maskHeight ?? 0);
+      if (!Number.isFinite(maskHeight) || maskHeight < 0) errors['geometry.maskHeight'] = 'maskHeight 必须 ≥ 0 µm';
+    }
+    if (kind === 'fin' && Number.isFinite(gridDelta) && gridDelta > 0) {
+      const minimum = 2 * gridDelta;
+      if (Number(geometry.width) < minimum) errors['geometry.width'] = `Fin 宽度至少为 2×gridDelta（${minimum} µm）`;
+      if (Number(geometry.height) < minimum) errors['geometry.height'] = `Fin 高度至少为 2×gridDelta（${minimum} µm）`;
+    }
+    const rays = Number(solver.raysPerPoint);
+    if (!Number.isInteger(rays) || rays < 16 || rays > 4096) errors['solver.raysPerPoint'] = 'raysPerPoint 必须是 16–4096 的整数';
+    const threads = Number(solver.cpuThreads);
+    if (!Number.isInteger(threads) || threads < 1) errors['solver.cpuThreads'] = 'cpuThreads 必须是 ≥ 1 的整数';
+    const timeout = Number(solver.timeoutSeconds ?? 0);
+    if (!Number.isInteger(timeout) || timeout < 0 || timeout > 600) errors['solver.timeoutSeconds'] = 'timeoutSeconds 必须是 0–600 的整数';
+    const seed = Number(((solver.random ?? {}) as Record<string, unknown>).seed ?? 0);
+    if (!Number.isInteger(seed) || seed < 0 || seed > 4294967295) errors['solver.seed'] = 'seed 必须是 0–4294967295 的整数';
+    if (geometrySaveBlock) errors['geometry.source'] = geometrySaveBlock;
+    return errors;
+  }, [project, geometrySaveBlock]);
 
   const refreshProjects = async (): Promise<ProjectRecord[]> => {
     try {
@@ -1086,12 +1243,14 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const applyLoadedProject = (document: ProjectDoc, record?: ProjectRecord) => {
     setProject(document);
     setProjectId(record?.projectId ?? '');
+    restorePending.current = !!record?.projectId;
     setSavedProjectJson(record ? JSON.stringify(document) : '');
     setProjectSavedAt(record?.updatedAt ?? '');
     setProjectNotice(record
       ? `已打开 · ${record.name} · ${formatDateTime(record.updatedAt)}`
       : '草稿（未保存）');
     const geometry = (document.geometry ?? {}) as Record<string, unknown>;
+    if (geometry.kind !== 'gds') parametricGeometryRef.current = geometry;
     setProjectGeometrySource(geometry.kind === 'gds'
       ? { kind: 'layout', clipName: typeof geometry.fileName === 'string' ? geometry.fileName : 'GDS Clip' }
       : { kind: 'parametric' });
@@ -1101,8 +1260,201 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setMeasurement(null);
     setProvenance(null);
     setCompileStale(true);
+    setProjectState(emptyWorkflowState());
+    lastStateJson.current = '';
+    setStateNotice('');
+    setRestoreNotice('');
     setSetupMode('project');
   };
+
+  /**
+   * Recover the saved 01 geometry binding. The project only stores the clip's
+   * generated GDS asset, so the clip record is looked up by asset/file name;
+   * a deleted clip degrades to a named-but-unbound source instead of flipping
+   * the page back to "parametric".
+   */
+  const resolveClipBinding = async (document: ProjectDoc): Promise<ProjectGeometrySource | null> => {
+    const geometry = (document.geometry ?? {}) as Record<string, unknown>;
+    if (geometry.kind !== 'gds') return null;
+    const assetId = typeof geometry.assetId === 'string' ? geometry.assetId : '';
+    const fileName = typeof geometry.fileName === 'string' ? geometry.fileName : '';
+    try {
+      const data = await api<{ clips: Clip[] }>('/api/v1/workflow/clips');
+      const clip = data.clips.find(item => item.gdsAssetId === assetId
+        || item.gdsFileName === fileName
+        || item.clipId === fileName.replace(/\.gds$/i, ''));
+      if (clip) {
+        return { kind: 'layout', clipId: clip.clipId, clipName: clip.name, layoutId: clip.layoutId, clipHash: clip.clipHash };
+      }
+    } catch { /* the clip list is best effort */ }
+    return { kind: 'layout', clipName: fileName || 'GDS Clip' };
+  };
+
+  /**
+   * Load the project's 03 pointer document. Every reference is restored on its
+   * own: one 404 clears only that pointer and adds a closable notice, so a
+   * collected compile never blanks the whole page.
+   */
+  const restoreWorkflowState = async (id: string) => {
+    let stored: ProjectWorkflowState;
+    try {
+      stored = await api<ProjectWorkflowState>(`/api/v1/workflow/projects/${id}/state`);
+    } catch {
+      restorePending.current = false;
+      return;
+    }
+    const notices: string[] = [];
+    const next: ProjectWorkflowState = {
+      ...emptyWorkflowState(),
+      compileId: stored.compileId ?? null,
+      routeId: stored.routeId ?? null,
+      segmentRuns: stored.segmentRuns ?? [],
+      measurementIds: stored.measurementIds ?? [],
+      experimentIds: stored.experimentIds ?? [],
+    };
+    if (next.compileId) {
+      try {
+        const envelope = await api<CompiledEnvelope>(`/api/v1/workflow/compiles/${next.compileId}`);
+        setCompile(compileInfoFromEnvelope(envelope));
+        setCompileStale(false);
+      } catch (exc) {
+        if ((exc as { status?: number }).status === 404) {
+          next.compileId = null;
+          notices.push('上次编译记录已不可用，已清空编译状态。');
+        } else {
+          notices.push(`编译记录恢复失败：${exc instanceof Error ? exc.message : String(exc)}`);
+        }
+      }
+    }
+    if (next.routeId) {
+      try {
+        const data = await api<{ plan: RoutePlan }>(`/api/v1/workflow/routes/${next.routeId}`);
+        setRoute(data.plan);
+        const executed = data.plan.segments.filter(item => item.runId && !item.runId.startsWith('pending_'));
+        const current = [...executed].reverse().find(item => next.segmentRuns.some(row => row.segmentId === item.segmentId))
+          ?? executed[executed.length - 1]
+          ?? data.plan.segments[data.plan.segments.length - 1]
+          ?? null;
+        setSegment(current);
+      } catch (exc) {
+        if ((exc as { status?: number }).status === 404) {
+          next.routeId = null;
+          next.segmentRuns = [];
+          notices.push('上次 Route 已不可用，已清空 Route 状态。');
+        } else {
+          notices.push(`Route 恢复失败：${exc instanceof Error ? exc.message : String(exc)}`);
+        }
+      }
+    }
+    if (next.measurementIds.length) {
+      const rows = await Promise.all(next.measurementIds.map(async measurementId => {
+        try { return await api<Measurement>(`/api/v1/workflow/measurements/${measurementId}`); } catch { return null; }
+      }));
+      const found = rows.filter((row): row is Measurement => !!row);
+      if (found.length !== next.measurementIds.length) notices.push('部分测量记录已不可用，已保留其余测量。');
+      if (found.length) {
+        setMetrics(found);
+        const latest = found[found.length - 1];
+        setMeasurement(latest);
+        if (latest.recipeId) {
+          setActiveRecipeId(latest.recipeId);
+          setActiveRecipeVersion(latest.recipeVersion);
+          try {
+            const recipe = await api<Recipe>(`/api/v1/workflow/metrology-recipes/${latest.recipeId}?version=${latest.recipeVersion}`);
+            const parameters = (recipe.parameters ?? {}) as Record<string, unknown>;
+            const markValue = latest.method === 'cd_at_height' ? Number(parameters.height ?? 0) : Number(parameters.x ?? 0);
+            setMeasurementMark(latest.method === 'cd_at_height'
+              ? { orientation: 'horizontal', value: markValue, label: `测量 CD 高度 ${markValue} µm` }
+              : { orientation: 'vertical', value: markValue, label: `测量 X ${markValue} µm` });
+          } catch { /* the marker is optional */ }
+        }
+      } else {
+        next.measurementIds = [];
+      }
+    }
+    setProjectState(next);
+    lastStateJson.current = notices.length ? '' : JSON.stringify(workflowStatePayload(next));
+    restorePending.current = false;
+    setRestoreNotice(notices.join(' '));
+    if (notices.length) {
+      setActivityLog(previous => [...previous.slice(-79), `${clockTime()}  工程状态部分恢复：${notices.join(' ')}`]);
+    }
+  };
+
+  /** Replace the 03 pointer set after a compile/route/segment/measurement change. */
+  const recordCompile = (compileId: string) => {
+    setProjectState(previous => ({
+      ...previous, compileId, routeId: null, segmentRuns: [],
+    }));
+  };
+
+  const recordRoute = (plan: RoutePlan) => {
+    setProjectState(previous => {
+      const known = new Map(previous.segmentRuns.map(row => [row.segmentId, row]));
+      const segmentRuns = plan.segments
+        .filter(item => item.runId && !item.runId.startsWith('pending_'))
+        .map(item => ({
+          segmentId: item.segmentId,
+          runId: item.runId as string,
+          measurementId: known.get(item.segmentId)?.measurementId ?? null,
+        }));
+      return { ...previous, routeId: plan.route.routeId, segmentRuns };
+    });
+  };
+
+  const recordMeasurement = (measurementId: string, segmentId?: string | null) => {
+    setProjectState(previous => ({
+      ...previous,
+      measurementIds: previous.measurementIds.includes(measurementId)
+        ? previous.measurementIds
+        : [...previous.measurementIds, measurementId],
+      segmentRuns: segmentId
+        ? previous.segmentRuns.map(row => row.segmentId === segmentId ? { ...row, measurementId } : row)
+        : previous.segmentRuns,
+    }));
+  };
+
+  const recordExperiment = (experimentId: string) => {
+    setProjectState(previous => ({
+      ...previous,
+      experimentIds: previous.experimentIds.includes(experimentId)
+        ? previous.experimentIds
+        : [...previous.experimentIds, experimentId],
+    }));
+  };
+
+  /** 300 ms debounce: every pointer change writes one PUT, not one per render. */
+  useEffect(() => {
+    if (!projectId) return;
+    if (restorePending.current) return;
+    const payload = workflowStatePayload(projectState);
+    const serialized = JSON.stringify(payload);
+    if (serialized === lastStateJson.current) return;
+    if (stateSaveTimer.current) window.clearTimeout(stateSaveTimer.current);
+    stateSaveTimer.current = window.setTimeout(() => {
+      stateSaveTimer.current = null;
+      void (async () => {
+        setStateSaving(true);
+        try {
+          const saved = await api<ProjectWorkflowState>(`/api/v1/workflow/projects/${projectId}/state`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: serialized,
+          });
+          lastStateJson.current = serialized;
+          setStateNotice('');
+          setProjectState(previous => ({ ...previous, updatedAt: saved.updatedAt ?? null }));
+        } catch (exc) {
+          setStateNotice(`工作流状态未能保存：${exc instanceof Error ? exc.message : String(exc)}`);
+        } finally {
+          setStateSaving(false);
+        }
+      })();
+    }, 300);
+    return () => {
+      if (stateSaveTimer.current) { window.clearTimeout(stateSaveTimer.current); stateSaveTimer.current = null; }
+    };
+  }, [projectId, projectState]);
 
   const applySavedRecord = async (record: ProjectRecord, document: ProjectDoc) => {
     setProjectId(record.projectId);
@@ -1113,15 +1465,34 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     await refreshProjects();
   };
 
+  /** The document that actually goes to the server: geometry follows the 01 source tab. */
+  const projectDocumentForSave = (): ProjectDoc => {
+    if (!project) throw new Error('没有可保存的工程');
+    if (projectGeometrySource.kind !== 'layout') return project;
+    const clip = (activeClip && activeClip.clipId === projectGeometrySource.clipId ? activeClip : null)
+      ?? clips.find(item => item.clipId === projectGeometrySource.clipId)
+      ?? null;
+    if (clip) return { ...project, geometry: clipGeometryBinding(clip) };
+    const geometry = (project.geometry ?? {}) as Record<string, unknown>;
+    if (geometry.kind !== 'gds') throw new Error('先选择或保存一个 Clip 作为工程几何');
+    return project;
+  };
+
   const saveProject = () => run('project-save', async () => {
     if (!project) throw new Error('没有可保存的工程');
-    const document = project;
+    const invalid = Object.values(projectFormErrors);
+    if (invalid.length) throw new Error(`工程参数有误：${invalid[0]}`);
+    const document = projectDocumentForSave();
     setOverwriteArmed(null);
     try {
       const record = projectId
         ? await projectRequest(`/api/v1/workflow/projects/${projectId}`, 'PUT', document)
         : await projectRequest('/api/v1/workflow/projects', 'POST', document);
+      setProject(document);
       await applySavedRecord(record, document);
+      // A new projectId (or a just-created draft) still needs its state PUT.
+      lastStateJson.current = '';
+      setProjectState(previous => ({ ...previous }));
     } catch (exc) {
       if ((exc as { status?: number }).status === 409) {
         const listed = await refreshProjects();
@@ -1136,17 +1507,25 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
 
   const overwriteProject = () => run('project-save', async () => {
     if (!project || !overwriteArmed) return;
-    const document = project;
+    const invalid = Object.values(projectFormErrors);
+    if (invalid.length) throw new Error(`工程参数有误：${invalid[0]}`);
+    const document = projectDocumentForSave();
     const record = await projectRequest(`/api/v1/workflow/projects/${overwriteArmed.projectId}`, 'PUT', document);
     setOverwriteArmed(null);
+    setProject(document);
     await applySavedRecord(record, document);
+    lastStateJson.current = '';
+    setProjectState(previous => ({ ...previous }));
   });
 
   const openProject = (record: ProjectRecord) => run('project-open', async () => {
     const document = await api<ProjectDoc>(`/api/v1/workflow/projects/${record.projectId}`);
     applyLoadedProject(document, record);
+    const binding = await resolveClipBinding(document);
+    if (binding) setProjectGeometrySource(binding);
     window.localStorage.setItem(PROJECT_STORAGE_KEY, record.projectId);
     setActivityLog(previous => [...previous.slice(-79), `${clockTime()}  已打开工程 ${record.name}`]);
+    await restoreWorkflowState(record.projectId);
   });
 
   const deleteProjectRecord = (record: ProjectRecord) => run('project-delete', async () => {
@@ -1158,6 +1537,10 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       setSavedProjectJson('');
       setProjectSavedAt('');
       setProjectNotice('');
+      setProjectState(emptyWorkflowState());
+      lastStateJson.current = '';
+      setRestoreNotice('');
+      setStateNotice('');
       window.localStorage.removeItem(PROJECT_STORAGE_KEY);
       setSetupMode('home');
     }
@@ -1190,7 +1573,13 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setCompile(null); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);
     setCompileStale(true);
     setProjectGeometrySource({ kind: 'parametric' });
+    setProjectState(emptyWorkflowState());
+    lastStateJson.current = '';
+    setStateNotice('');
+    setRestoreNotice('');
+    parametricGeometryRef.current = null;
     setSetupMode('home');
+    void refreshProjects();
   };
 
   const closeProject = () => {
@@ -1209,6 +1598,20 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [openMenu, aboutOpen]);
 
+  // Ctrl/Cmd+S saves the current project instead of opening the browser's
+  // "save page" dialog; every zone shares the same save entry point.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 's') return;
+      event.preventDefault();
+      if (!project) { navigateZone('setup'); return; }
+      if (busy === 'project-save') return;
+      void saveProject();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [project, projectId, busy, projectFormErrors, projectGeometrySource, activeClip, clips]);
+
   useEffect(() => {
     const stored = window.localStorage.getItem(PROJECT_STORAGE_KEY);
     void (async () => {
@@ -1222,7 +1625,10 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
           dimension: document.dimension ?? 2, stepCount: document.steps?.length ?? 0,
           createdAt: '', updatedAt: '',
         });
+        const binding = await resolveClipBinding(document);
+        if (binding) setProjectGeometrySource(binding);
         window.localStorage.setItem(PROJECT_STORAGE_KEY, stored);
+        await restoreWorkflowState(stored);
       } catch {
         window.localStorage.removeItem(PROJECT_STORAGE_KEY);
       }
@@ -1580,8 +1986,18 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       setSavedProjectJson('');
       setProjectSavedAt('');
       setProjectNotice('草稿（未保存）· 导入的工程尚未写入服务端');
-      setProjectGeometrySource({ kind: 'parametric' });
+      const geometry = (parsed.geometry ?? {}) as Record<string, unknown>;
+      if (geometry.kind !== 'gds') parametricGeometryRef.current = geometry;
+      setProjectGeometrySource(geometry.kind === 'gds'
+        ? { kind: 'layout', clipName: typeof geometry.fileName === 'string' ? geometry.fileName : 'GDS Clip' }
+        : { kind: 'parametric' });
+      const binding = await resolveClipBinding(parsed);
+      if (binding) setProjectGeometrySource(binding);
       setCompileStale(true);
+      setProjectState(emptyWorkflowState());
+      lastStateJson.current = '';
+      setRestoreNotice('');
+      setStateNotice('');
       setSetupMode('project');
       setActivityLog(previous => [...previous.slice(-79), `${clockTime()}  已导入工程: ${parsed.name ?? '未命名'}`]);
     } catch {
@@ -1599,6 +2015,11 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setCompileStale(true);
     setProjectGeometrySource({ kind: 'parametric' });
     setNewProjectArmed(false);
+    setProjectState(emptyWorkflowState());
+    lastStateJson.current = '';
+    setRestoreNotice('');
+    setStateNotice('');
+    parametricGeometryRef.current = null;
     setSetupMode('new');
     setDraft(previous => ({ ...previous, name: 'New Project' }));
     window.localStorage.removeItem(PROJECT_STORAGE_KEY);
@@ -1622,6 +2043,11 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setProjectGeometrySource({ kind: 'parametric' });
     setCompileStale(true);
     setCompile(null); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);
+    setProjectState(emptyWorkflowState());
+    lastStateJson.current = '';
+    setRestoreNotice('');
+    setStateNotice('');
+    parametricGeometryRef.current = (sample.geometry ?? null) as Record<string, unknown> | null;
     setSetupMode('project');
     setActivityLog(previous => [...previous.slice(-79), `${clockTime()}  已载入示例: ${label}`]);
   };
@@ -1716,19 +2142,21 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     const steps = project.steps ?? [];
     if (!steps.length) throw new Error('流程还没有步骤，先在 02 插入或添加步骤');
     const source = projectGeometrySource;
+    const document = projectDocumentForSave();
     let result: CompileInfo;
     if (source.kind === 'layout' && source.clipId) {
       result = await postJson<CompileInfo>(`/api/v1/workflow/clips/${source.clipId}/compile`, {
-        project, flowId: compile?.flowId,
+        project: document, flowId: compile?.flowId,
       });
     } else {
       result = await postJson<CompileInfo>('/api/v1/workflow/flows/from-project', {
-        project, flowId: compile?.flowId,
+        project: document, flowId: compile?.flowId,
       });
     }
     if (compile) setPreviousCompile(compile);
     setCompile(result);
     setCompileStale(false);
+    recordCompile(result.compileId);
     setProject(previous => previous
       ? { ...previous, steps: (result.authoredSteps ?? previous.steps ?? []) as ProjectStep[] }
       : previous);
@@ -1770,6 +2198,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     });
     if (compile) setPreviousCompile(compile);
     setCompile(result); setCompileStale(false); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);
+    recordCompile(result.compileId);
     setProject(previous => previous ? { ...previous, steps: (result.authoredSteps ?? previous.steps ?? []) as ProjectStep[] } : previous);
   });
 
@@ -1788,6 +2217,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setSegment(result.plan.segments[0] ?? null);
     setMeasurement(null);
     setProvenance(null);
+    recordRoute(result.plan);
     setRebuildRouteArmed(false);
     navigateZone('run');
     setActivityLog(previous => [...previous.slice(-79), `${clockTime()}  Route 已创建 · ${result.plan.segments.length} Segment`]);
@@ -1804,7 +2234,10 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       `/api/v1/workflow/segments/${segment.segmentId}/execute`, {},
     );
     setSegment(result.segment);
-    setRoute(previous => previous ? { ...previous, segments: previous.segments.map(item => item.segmentId === result.segment.segmentId ? result.segment : item) } : previous);
+    const nextPlan = route
+      ? { ...route, segments: route.segments.map(item => item.segmentId === result.segment.segmentId ? result.segment : item) }
+      : null;
+    if (nextPlan) { setRoute(nextPlan); recordRoute(nextPlan); }
   });
 
   const ensureRecipe = async (): Promise<{ recipeId: string; recipeVersion: number; metricId: string }> => {
@@ -1851,6 +2284,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setProvenance(await api<Provenance>(`/api/v1/workflow/measurements/${result.measurementId}/provenance`));
     const listed = await api<{ measurements: Measurement[] }>(`/api/v1/workflow/measurements?run_id=${segment.runId}`);
     setMetrics(listed.measurements);
+    recordMeasurement(result.measurementId, segment.segmentId);
     setActiveRecipeId(recipeId);
     setActiveRecipeVersion(recipeVersion);
     const markValue = recipeMethod === 'cd_at_height' ? (Number(recipeHeight) || 0) : (Number(recipeX) || 0);
@@ -1891,6 +2325,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setSegment(result.plan.segments.find(item => item.segmentId === result.decision.branchSegmentId) ?? null);
     setDecisions(previous => [...previous, result.decision]);
     setMeasurement(result.measurement);
+    recordRoute(result.plan);
+    recordMeasurement(result.measurement.measurementId, result.decision.branchSegmentId);
     setActiveRecipeId(recipe.recipeId);
     setActiveRecipeVersion(recipe.recipeVersion);
     setProvenance(null);
@@ -1905,20 +2341,27 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setSegment(result.plan.segments.find(item => item.segmentId === result.decision.branchSegmentId) ?? null);
     setDecisions(previous => [...previous, result.decision]);
     setMeasurement(result.measurement);
+    recordRoute(result.plan);
+    recordMeasurement(result.measurement.measurementId, result.decision.branchSegmentId);
   });
 
 
   const executeAll = () => run('execute', async () => {
     if (!route) throw new Error('先创建 Route');
+    let working = route;
     for (const item of route.segments.filter(segmentItem => segmentItem.status === 'planned')) {
       const started = await postJson<{ segment: RoutePlan['segments'][number]; runId: string }>(
         `/api/v1/workflow/segments/${item.segmentId}/execute`, {},
       );
       setSegment(started.segment);
-      setRoute(previous => previous ? { ...previous, segments: previous.segments.map(row => row.segmentId === started.segment.segmentId ? started.segment : row) } : previous);
+      working = { ...working, segments: working.segments.map(row => row.segmentId === started.segment.segmentId ? started.segment : row) };
+      setRoute(working);
+      recordRoute(working);
       const done = await waitSegment(item.segmentId);
       setSegment(done);
-      setRoute(previous => previous ? { ...previous, segments: previous.segments.map(row => row.segmentId === done.segmentId ? done : row) } : previous);
+      working = { ...working, segments: working.segments.map(row => row.segmentId === done.segmentId ? done : row) };
+      setRoute(working);
+      recordRoute(working);
     }
   });
 
@@ -1936,12 +2379,14 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     const adopted = await postJson<CompileInfo>('/api/v1/workflow/flows/from-project', { project: cloned, flowId: compile.flowId });
     setCompile(adopted);
     setCompileStale(false);
+    setProjectState(previous => ({ ...previous, compileId: adopted.compileId }));
     const result = await postJson<{ plan: RoutePlan }>(`/api/v1/workflow/routes/${route.route.routeId}/branches`, {
       compileId: adopted.compileId, startAfterStepId: prefix.id, changedStepIds: [tail.id],
     });
     setRoute(result.plan);
     const tailSegment = result.plan.segments[result.plan.segments.length - 1];
     setSegment(tailSegment);
+    recordRoute(result.plan);
     setMeasurement(null); setProvenance(null); setMetrics([]);
   });
 
@@ -2013,6 +2458,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setComparison(null);
     setCandidateViews({});
     setAutoAnalysisId('');
+    recordExperiment(doc.experimentId);
     await refreshExperimentList();
   });
 
@@ -2159,6 +2605,38 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       .map(([key, value]) => [key, previous[key] ?? value])));
   };
 
+  /** 01 project tab: selecting a clip only binds the source; save writes geometry. */
+  const chooseClipForProject = (clip: Clip) => {
+    selectClip(clip);
+    if (project?.dimension === 3) return;
+    setProjectGeometrySource({ kind: 'layout', clipId: clip.clipId, clipName: clip.name, layoutId: clip.layoutId, clipHash: clip.clipHash });
+    setCompileStale(true);
+  };
+
+  // The 01 GDS tab must list saved layouts/clips without requiring a fresh upload.
+  useEffect(() => {
+    if (!project || projectGeometrySource.kind !== 'layout') return;
+    void (async () => {
+      try {
+        const [clipList, layoutList] = await Promise.all([
+          api<{ clips: Clip[] }>('/api/v1/workflow/clips'),
+          api<{ layouts: Array<{ layoutId: string; fileName: string; structureCount: number }> }>('/api/v1/workflow/layouts'),
+        ]);
+        setClips(clipList.clips);
+        setLayouts(layoutList.layouts);
+        const layoutId = projectGeometrySource.layoutId
+          ?? clipList.clips.find(item => item.clipId === projectGeometrySource.clipId)?.layoutId;
+        if (layoutId && !activeLayout) {
+          const layout = await api<LayoutDetail>(`/api/v1/workflow/layouts/${layoutId}`);
+          setActiveLayout(layout);
+          const bound = clipList.clips.find(item => item.clipId === projectGeometrySource.clipId);
+          if (bound) selectStructure(layout, bound.structure);
+        }
+      } catch { /* the tab still works with the upload path */ }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project?.name, projectGeometrySource.kind, projectGeometrySource.clipId]);
+
   const addAnnotation = () => run('annotation', async () => {
     if (!activeClip) throw new Error('先选择 Clip');
     if (!annotationText.trim()) throw new Error('填写标注文本');
@@ -2196,6 +2674,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     });
     if (compile) setPreviousCompile(compile);
     setCompile(result); setCompileStale(false); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);
+    recordCompile(result.compileId);
     setProject(previous => previous
       ? { ...previous, steps: (result.authoredSteps ?? previous.steps ?? []) as ProjectStep[] }
       : previous);
@@ -2259,6 +2738,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     );
     if (compile) setPreviousCompile(compile);
     setCompile(result); setCompileStale(false); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);
+    recordCompile(result.compileId);
     setModuleStatus(`模块化流程已编译 · ${result.stepCount} 步`);
   });
 
@@ -2538,9 +3018,121 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       if (!previous) return previous;
       const geometry = { ...(previous.geometry ?? {}) } as Record<string, unknown>;
       if (geometry.kind === 'gds') return previous;
+      // A plane has no mask layer; writing maskMaterial would be rejected by ProjectV7.
+      if (geometry.kind === 'plane' && key === 'maskMaterial') return previous;
       geometry[key] = value;
       return { ...previous, geometry };
     });
+    setCompileStale(true);
+  };
+
+  /** 01 editor: domain / geometry / solver fields write straight into ProjectV7. */
+  const updateProjectDomain = (patch: Record<string, unknown>) => {
+    setProject(previous => previous
+      ? { ...previous, domain: { ...(previous.domain ?? {}), ...patch } }
+      : previous);
+    setCompileStale(true);
+  };
+
+  const updateProjectSolver = (patch: Record<string, unknown>) => {
+    setProject(previous => {
+      if (!previous) return previous;
+      const solver = { ...(previous.solver ?? {}) } as Record<string, unknown>;
+      const random = { ...((solver.random ?? {}) as Record<string, unknown>) };
+      const { seed, ...rest } = patch;
+      if (seed !== undefined) {
+        random.mode = 'fixed';
+        random.seed = seed;
+      }
+      return { ...previous, solver: { ...solver, ...rest, random } };
+    });
+    setCompileStale(true);
+  };
+
+  const updateProjectGeometryField = (patch: Record<string, unknown>) => {
+    setProject(previous => {
+      if (!previous) return previous;
+      const geometry = { ...(previous.geometry ?? {}) } as Record<string, unknown>;
+      if (geometry.kind === 'gds') return previous;
+      const next = { ...geometry, ...patch };
+      parametricGeometryRef.current = next;
+      return { ...previous, geometry: next };
+    });
+    setCompileStale(true);
+  };
+
+  const changeProjectGeometryKind = (kind: string) => {
+    setProject(previous => {
+      if (!previous) return previous;
+      const geometry = defaultParametricGeometry(previous.dimension ?? 2, kind, (previous.geometry ?? {}) as Record<string, unknown>);
+      parametricGeometryRef.current = geometry;
+      return { ...previous, geometry };
+    });
+    setCompileStale(true);
+  };
+
+  /** Switch 01 back to parametric geometry and drop the Clip-only fields. */
+  const chooseParametricGeometry = () => {
+    setProject(previous => {
+      if (!previous) return previous;
+      const current = (previous.geometry ?? {}) as Record<string, unknown>;
+      if (current.kind !== 'gds') {
+        parametricGeometryRef.current = current;
+        return previous;
+      }
+      const fallback = parametricGeometryRef.current
+        ?? defaultParametricGeometry(previous.dimension ?? 2, previous.dimension === 3 ? 'hole' : 'plane', {});
+      return { ...previous, geometry: fallback };
+    });
+    setProjectGeometrySource({ kind: 'parametric' });
+    setCompileStale(true);
+  };
+
+  const chooseLayoutGeometry = () => {
+    if (!project || project.dimension === 3) return;
+    const clip = activeClip ?? clips.find(item => item.clipId === projectGeometrySource.clipId) ?? null;
+    setProjectGeometrySource(clip
+      ? { kind: 'layout', clipId: clip.clipId, clipName: clip.name, layoutId: clip.layoutId, clipHash: clip.clipHash }
+      : { kind: 'layout', clipName: projectGeometrySource.clipName });
+    setCompileStale(true);
+  };
+
+  /** 2D ↔ 3D switch: domain, geometry and view fields must move together. */
+  const changeProjectDimension = (dimension: 2 | 3) => {
+    if (!project || project.dimension === dimension) return;
+    setProject(previous => {
+      if (!previous) return previous;
+      const domain = (previous.domain ?? {}) as Record<string, unknown>;
+      const gridDelta = Math.min(0.5, Math.max(0.01, Number(domain.gridDelta) || 0.2));
+      const xExtent = Math.max(1, Number(domain.xExtent) || 4);
+      const yExtent = Math.max(2 * gridDelta, Number(domain.yExtent) || xExtent);
+      const boundary = String(domain.xBoundary ?? domain.boundaryXY ?? 'reflective');
+      const currentGeometry = (previous.geometry ?? {}) as Record<string, unknown>;
+      const geometry = dimension === 3 && currentGeometry.kind === 'gds'
+        ? defaultParametricGeometry(3, 'hole', {})
+        : currentGeometry;
+      if (geometry.kind !== 'gds') parametricGeometryRef.current = geometry;
+      return {
+        ...previous,
+        dimension,
+        domain: dimension === 3
+          ? { gridDelta, xExtent, yExtent, boundaryXY: boundary === 'periodic' ? 'periodic' : 'reflective' }
+          : { gridDelta, xExtent, xBoundary: boundary === 'periodic' ? 'periodic' : 'reflective' },
+        geometry,
+        view: dimension === 2
+          ? (previous.view ?? { panX: 0, panH: 0, zoom: 1, showGrid: true })
+          : undefined,
+        view3D: dimension === 3
+          ? (previous.view3D ?? {
+            projection: 'parallel', camera: null, displayMode: 'surface',
+            visibleMaterialIds: [], opacityByMaterial: {},
+            clip: { enabled: false, axis: 'x', position: 0.0, keep: 'positive' },
+            section: { enabled: false, axis: 'y', position: 0.0 },
+          })
+          : undefined,
+      };
+    });
+    if (dimension === 3) setProjectGeometrySource({ kind: 'parametric' });
     setCompileStale(true);
   };
 
@@ -2670,6 +3262,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setComparison(null);
     setCandidateViews({});
     setAutoAnalysisId('');
+    recordExperiment(document.experimentId);
     await refreshExperimentList();
   });
 
@@ -2958,6 +3551,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const renderFlowBar = () => (
     <div className="spx-flow-bar">
       <div className="spx-flow-actions">
+        <button type="button" className="wf-button ghost spx-flow-save" disabled={!project || busy === 'project-save'}
+          title={project ? '保存当前工程（Ctrl/Cmd+S）' : '先打开工程'}
+          onClick={() => void saveProject()}>{busy === 'project-save' ? '保存中…' : '保存工程'}</button>
         <span className={`spx-compile-badge${compile ? (compileStale ? ' stale' : ' ok') : ''}`}
           title={compile ? `Compile ${compile.compileId}` : '尚未编译流程'}>
           {compile ? (compileStale ? '需重新编译' : '已编译') : '未编译'}
@@ -3295,17 +3891,81 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   );
 
   const currentSection = ZONES.find(item => item.id === zone) ?? ZONES[0];
-  const propertyRows: Array<[string, string]> = [
-    ['工程', project?.name ?? '—'],
-    ['维度', project ? `${project.dimension ?? '?'}D` : '—'],
-    ['编译', compile ? `${compile.compileId.slice(0, 18)}…` : '—'],
-    ['绑定 (binding)', compile?.bindingId ? `${compile.bindingId.slice(0, 18)}…` : '—'],
-    ['Route', route?.route.name ?? '—'],
-    ['Segment', segment ? `${statusLabel(segment.status)} · ${segment.segmentId.slice(0, 12)}…` : '—'],
-    ['Run', segment?.runId ? `${segment.runId.slice(0, 16)}…` : '—'],
-    ['测量', measurement ? `${measurement.value === null ? '—' : formatNumber(measurement.value)} ${displayUnit(measurement.unit)}` : '—'],
-    ['引擎', health ? `ViennaPS ${health.viennaps ?? '—'}` : '—'],
+  const projectDomain = (project?.domain ?? {}) as Record<string, unknown>;
+  const projectGeometry = (project?.geometry ?? {}) as Record<string, unknown>;
+  const projectSolver = (project?.solver ?? {}) as Record<string, unknown>;
+  const projectRandom = (projectSolver.random ?? {}) as Record<string, unknown>;
+  const projectGeometryKind = String(projectGeometry.kind ?? '');
+  const projectParametricKinds = project?.dimension === 3 ? ['hole', 'fin'] : ['plane', 'trench'];
+  const projectFormInvalid = Object.keys(projectFormErrors).length > 0;
+  const geometrySourceLabel = projectGeometrySource.kind === 'layout'
+    ? `Clip · ${projectGeometrySource.clipName ?? '未选择'}`
+    : '参数化';
+  const saveLabel = busy === 'project-save'
+    ? '保存中…'
+    : !project
+      ? '未打开工程'
+      : !projectId
+        ? '草稿（未保存）· 保存'
+        : projectDirty
+          ? '有未保存更改 · 保存'
+          : `已保存${projectSavedAt ? ` · ${formatDateTime(projectSavedAt)}` : ''}`;
+  const propertyRows: Array<{ label: string; value: string; title?: string }> = [
+    { label: '工程', value: project?.name ?? '—' },
+    { label: '维度', value: project ? `${project.dimension ?? '?'}D` : '—' },
+    { label: '编译', value: compile ? (compileStale ? '需重新编译' : '已编译') : '—', title: compile?.compileId },
+    { label: '绑定 (binding)', value: compile?.bindingId ? '已记录' : '—', title: compile?.bindingId },
+    { label: 'Route', value: route?.route.name ?? '—', title: route?.route.routeId },
+    { label: 'Segment', value: segment ? statusLabel(segment.status) : '—', title: segment?.segmentId },
+    { label: 'Run', value: segment?.runId ? '已记录' : '—', title: segment?.runId ?? undefined },
+    { label: '测量', value: measurement ? `${measurement.value === null ? '—' : formatNumber(measurement.value)} ${displayUnit(measurement.unit)}` : '—', title: measurement?.measurementId },
+    { label: '引擎', value: health ? `ViennaPS ${health.viennaps ?? '—'}` : '—' },
   ];
+
+  const renderDomainField = (label: string, key: 'gridDelta' | 'xExtent' | 'yExtent', step = '0.01') => {
+    const error = projectFormErrors[`domain.${key}`];
+    return <label className={`spx-field${error ? ' invalid' : ''}`} key={key}>
+      <span>{label}</span>
+      <input aria-label={`工程 ${key}`} type="number" step={step} value={String(projectDomain[key] ?? '')}
+        aria-invalid={!!error}
+        onChange={event => updateProjectDomain({ [key]: Number(event.target.value) })} />
+      {error && <em className="spx-field-error">{error}</em>}
+    </label>;
+  };
+
+  const renderGeometryField = (label: string, key: 'height' | 'width' | 'depth' | 'radius' | 'taperAngle' | 'maskHeight', step = '0.01') => {
+    const error = projectFormErrors[`geometry.${key}`];
+    return <label className={`spx-field${error ? ' invalid' : ''}`} key={key}>
+      <span>{label}</span>
+      <input aria-label={`工程几何 ${key}`} type="number" step={step} value={String(projectGeometry[key] ?? '')}
+        aria-invalid={!!error}
+        onChange={event => updateProjectGeometryField({ [key]: Number(event.target.value) })} />
+      {error && <em className="spx-field-error">{error}</em>}
+    </label>;
+  };
+
+  const renderSolverField = (label: string, key: 'enginePreference' | 'seed' | 'timeoutSeconds' | 'raysPerPoint' | 'cpuThreads') => {
+    const error = projectFormErrors[`solver.${key}`];
+    const value = key === 'seed' ? projectRandom.seed : projectSolver[key];
+    if (key === 'enginePreference') {
+      return <label className="spx-field" key={key}>
+        <span>{label}</span>
+        <select aria-label="工程引擎" value={String(value ?? 'cpu')}
+          onChange={event => updateProjectSolver({ enginePreference: event.target.value })}>
+          <option value="cpu">CPU</option>
+          <option value="gpu">GPU</option>
+          <option value="auto">Auto</option>
+        </select>
+      </label>;
+    }
+    return <label className={`spx-field${error ? ' invalid' : ''}`} key={key}>
+      <span>{label}</span>
+      <input aria-label={`工程 ${key}`} type="number" step="1" value={String(value ?? '')}
+        aria-invalid={!!error}
+        onChange={event => updateProjectSolver({ [key]: Number(event.target.value) })} />
+      {error && <em className="spx-field-error">{error}</em>}
+    </label>;
+  };
 
   return (
     <div className="spx-app">
@@ -3394,7 +4054,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 {
                   label: '编译',
                   target: 'flow' as const,
-                  value: compile ? `${compile.stepCount} 步` : '未编译',
+                  value: compile ? `${compile.stepCount} 步` : '—',
                   badge: compile ? (compileStale ? '需重新编译' : '已编译') : '未编译',
                   badgeClass: compile ? (compileStale ? 'stale' : 'succeeded') : 'planned',
                   title: compile ? `Compile ${compile.compileId}` : '尚未编译流程',
@@ -3402,16 +4062,16 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 {
                   label: 'Route',
                   target: 'run' as const,
-                  value: route ? `${route.segments.length} Segment` : '未创建',
+                  value: route ? `${route.segments.length} Segment` : '—',
                   badge: route ? '已创建' : '未创建',
                   badgeClass: route ? 'succeeded' : 'planned',
                   title: route ? `Route ${route.route.routeId}` : '尚未创建 Route',
                 },
                 {
-                  label: `Run · ${segment ? statusLabel(segment.status) : '未运行'}`,
+                  label: 'Run',
                   target: 'run' as const,
                   value: segment ? `第 ${Math.max(1, (route?.segments.findIndex(item => item.segmentId === segment.segmentId) ?? 0) + 1)} 个 Segment` : '—',
-                  badge: segment?.status === 'succeeded' ? '成功' : segment ? statusLabel(segment.status) : '',
+                  badge: segment ? statusLabel(segment.status) : '未运行',
                   badgeClass: segment?.status === 'succeeded' ? 'succeeded' : segment?.status === 'running' ? 'running' : segment?.status === 'failed' ? 'failed' : 'planned',
                   title: segment?.runId ? `Run ${segment.runId}` : '尚未执行 Segment',
                 },
@@ -3442,7 +4102,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 {
                   label: '报告',
                   target: 'report' as const,
-                  value: reportDocument ? `已生成 · ${formatDateTime(reportDocument.createdAt)}` : '未生成',
+                  value: reportDocument ? formatDateTime(reportDocument.createdAt) : '—',
                   badge: reportDocument ? '已生成' : '未生成',
                   badgeClass: reportDocument ? 'succeeded' : 'planned',
                   title: reportDocument ? `${reportDocument.title} · ${formatDateTime(reportDocument.createdAt)}` : '尚未生成报告',
@@ -3510,10 +4170,24 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               <p>{currentSection.desc}</p>
             </div>
             <div className="spx-doc-state">
-              <span className="spx-state-pill">{project ? `${project.dimension ?? '?'}D · ${projectGeometrySource.kind === 'layout' ? 'GDS Clip' : '参数化'}` : '未打开工程'}</span>
-              {project && <span className={projectDirty ? 'spx-state-pill' : 'spx-state-pill ok'}>{projectId ? (projectDirty ? '有未保存更改' : '已保存') : '草稿（未保存）'}</span>}
+              <span className="spx-state-pill">{project ? `${project.dimension ?? '?'}D · ${geometrySourceLabel}` : '未打开工程'}</span>
+              <button
+                type="button"
+                className={`spx-state-pill spx-save-button${projectId && !projectDirty && project ? ' ok' : ''}`}
+                disabled={busy === 'project-save'}
+                title={project ? '保存当前工程（Ctrl/Cmd+S）' : '未打开工程：先在 01 新建或打开工程'}
+                onClick={() => {
+                  if (!project) { navigateZone('setup'); setSetupMode('home'); return; }
+                  void saveProject();
+                }}
+              >{saveLabel}</button>
+              {stateSaving && <span className="spx-sync-hint">同步状态…</span>}
             </div>
           </div>
+          {(restoreNotice || stateNotice) && <div className="spx-banner spx-inline-notice" role="status">
+            <span className="spx-banner-text">{[restoreNotice, stateNotice].filter(Boolean).join(' ')}</span>
+            <BannerClose onClose={() => { setRestoreNotice(''); setStateNotice(''); }} />
+          </div>}
 
           <main className="wf-grid spx-doc-body">
         <section className={`spx-page wf-setup ${zone === 'setup' ? '' : 'wf-hidden'}`}>
@@ -3555,6 +4229,11 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                   <strong>{record.name}</strong>
                   <span>{record.dimension}D · {record.stepCount} 步 · {formatDateTime(record.updatedAt)}</span>
                 </button>
+                <button type="button" className="wf-button ghost"
+                  aria-label={`打开工程 ${record.name}`}
+                  disabled={!!busy}
+                  onClick={() => void openProject(record)}
+                >打开</button>
                 <button type="button" className="wf-button ghost"
                   onClick={() => setDeleteArmedId(deleteArmedId === record.projectId ? '' : record.projectId)}
                 >{deleteArmedId === record.projectId ? '取消' : '删除'}</button>
@@ -3739,18 +4418,23 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             </div>
             <div className="spx-summary-grid">
               <div><span>维度</span><strong>{project.dimension ?? '—'}D</strong></div>
-              <div><span>几何来源</span><strong>{projectGeometrySource.kind === 'layout' ? `Clip · ${projectGeometrySource.clipName ?? '未选择'}` : '参数化'}</strong></div>
+              <div><span>几何来源</span><strong>{geometrySourceLabel}</strong></div>
               <div><span>步骤</span><strong>{project.steps?.length ?? 0}</strong></div>
-              <div><span>求解器</span><strong>{ENGINE_LABELS[String((project.solver as Record<string, unknown> | undefined)?.enginePreference ?? '')] ?? '—'}</strong></div>
+              <div><span>求解器</span><strong>{ENGINE_LABELS[String(projectSolver.enginePreference ?? '')] ?? '—'}</strong></div>
             </div>
             <div className="spx-sheet-actions">
-              <button type="button" className="wf-button primary" disabled={!!busy} onClick={() => void saveProject()}>
+              <button type="button" className="wf-button primary" disabled={!!busy || projectFormInvalid}
+                title={projectFormInvalid ? Object.values(projectFormErrors)[0] : '保存工程定义与步骤'}
+                onClick={() => void saveProject()}>
                 {busy === 'project-save' ? '保存中…' : projectId ? '保存更改' : '保存工程'}
               </button>
               <button type="button" className="wf-button" disabled={!!busy} onClick={exportProjectJson}>导出工程 JSON</button>
               <button type="button" className="wf-button" onClick={() => navigateZone('flow')}>去 02 定义流程</button>
               <button type="button" className="wf-button" onClick={closeProject}>关闭工程</button>
             </div>
+            {projectFormInvalid && <div className="spx-field-error-summary" role="alert" aria-label="工程参数错误">
+              参数有误：{Object.values(projectFormErrors).join('；')}
+            </div>}
             {overwriteArmed && <div className="spx-rebuild" role="alert">
               <span>已存在同名工程「{overwriteArmed.name}」。覆盖已有工程？会替换它的步骤（当前编辑 {project.steps?.length ?? 0} 步）。</span>
               <button type="button" className="wf-button" onClick={() => { setOverwriteArmed(null); setProjectNotice('已取消覆盖，当前编辑保留。'); }}>取消</button>
@@ -3763,24 +4447,103 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             </div>}
             {compile && <div className={compileStale ? 'wf-summary' : 'wf-summary success'}>
               <strong>{compileStale ? '流程已修改，需要重新编译' : '流程已编译'}</strong>
-              <span>{compile.stepCount} 步 · Compile {compile.compileId.slice(0, 16)}… · 绑定 {compile.bindingId.slice(0, 16)}…</span>
+              <span>{compile.stepCount} 步 · {compile.dimension}D · {compile.projectName}</span>
+              <details className="spx-compile-details">
+                <summary>编译详情</summary>
+                <dl>
+                  <dt>Compile ID</dt><dd>{compile.compileId}</dd>
+                  <dt>绑定 (binding)</dt><dd>{compile.bindingId}</dd>
+                  <dt>Flow</dt><dd>{compile.flowId}</dd>
+                </dl>
+              </details>
             </div>}
+
+            <div className="spx-inline-section" aria-label="编辑计算域">
+              <div className="spx-form-title">编辑参数 · 计算域 / 网格</div>
+              <div className="spx-field-grid">
+                <div className="spx-field"><span>维度</span>
+                  <div className="spx-segment">
+                    <button type="button" className={project.dimension === 2 ? 'active' : ''} onClick={() => changeProjectDimension(2)}>2D</button>
+                    <button type="button" className={project.dimension === 3 ? 'active' : ''} onClick={() => changeProjectDimension(3)}>3D</button>
+                  </div>
+                </div>
+                {renderDomainField('gridDelta (µm)', 'gridDelta')}
+                {renderDomainField('X extent (µm)', 'xExtent')}
+                {project.dimension === 3 && renderDomainField('Y extent (µm)', 'yExtent')}
+                <label className="spx-field"><span>{project.dimension === 3 ? '边界 XY' : '边界 X'}</span>
+                  <select aria-label="工程边界类型"
+                    value={String((project.dimension === 3 ? projectDomain.boundaryXY : projectDomain.xBoundary) ?? 'reflective')}
+                    onChange={event => updateProjectDomain(project.dimension === 3
+                      ? { boundaryXY: event.target.value }
+                      : { xBoundary: event.target.value })}>
+                    <option value="reflective">reflective · 反射</option>
+                    <option value="periodic">periodic · 周期</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+
+            <div className="spx-inline-section" aria-label="编辑几何">
+              <div className="spx-form-title">编辑参数 · 几何</div>
+              {projectGeometrySource.kind === 'layout'
+                ? <p className="spx-help">当前几何来自 GDS Clip「{projectGeometrySource.clipName ?? '未选择'}」；几何字段由 Clip 的图层→材料映射决定。</p>
+                : <>
+                  <div className="spx-geometry-picks">
+                    {projectParametricKinds.map(kind => <button type="button" key={kind}
+                      className={projectGeometryKind === kind ? 'active' : ''}
+                      onClick={() => changeProjectGeometryKind(kind)}
+                    >{kind === 'plane' ? 'Plane' : kind === 'trench' ? 'Trench' : kind === 'hole' ? 'Hole' : 'Fin'}</button>)}
+                  </div>
+                  <div className="spx-field-grid">
+                    {projectGeometryKind === 'plane' && renderGeometryField('Plane height (µm)', 'height')}
+                    {projectGeometryKind === 'trench' && <>
+                      {renderGeometryField('Trench width (µm)', 'width')}
+                      {renderGeometryField('Trench depth (µm)', 'depth')}
+                    </>}
+                    {projectGeometryKind === 'hole' && <>
+                      {renderGeometryField('Hole radius (µm)', 'radius')}
+                      {renderGeometryField('Hole depth (µm)', 'depth')}
+                    </>}
+                    {projectGeometryKind === 'fin' && <>
+                      {renderGeometryField('Fin width (µm)', 'width')}
+                      {renderGeometryField('Fin height (µm)', 'height')}
+                    </>}
+                    {['trench', 'hole', 'fin'].includes(projectGeometryKind) && <>
+                      {renderGeometryField('Taper angle (deg)', 'taperAngle')}
+                      {renderGeometryField('Mask height (µm)', 'maskHeight')}
+                    </>}
+                  </div>
+                </>}
+              {geometrySaveBlock && <p className="spx-field-error" role="alert">{geometrySaveBlock}</p>}
+            </div>
+
+            <div className="spx-inline-section" aria-label="编辑求解器">
+              <div className="spx-form-title">编辑参数 · 求解器</div>
+              <div className="spx-field-grid">
+                {renderSolverField('Engine', 'enginePreference')}
+                {renderSolverField('Seed', 'seed')}
+                {renderSolverField('Timeout (s)', 'timeoutSeconds')}
+                {renderSolverField('Rays per point', 'raysPerPoint')}
+                {renderSolverField('CPU threads', 'cpuThreads')}
+              </div>
+            </div>
+
             <div className="spx-inline-section">
               <div className="spx-form-title">材料</div>
-              {(project.geometry as Record<string, unknown> | undefined)?.kind === 'gds' && <p className="spx-help">GDS 工程的基底材料由图层→材料映射决定，请在下方 Clip 编辑器设置。</p>}
-              <div className="spx-field-grid" hidden={(project.geometry as Record<string, unknown> | undefined)?.kind === 'gds'}>
+              {projectGeometryKind === 'gds' && <p className="spx-help">GDS 工程的基底材料由图层→材料映射决定，请在下方 Clip 编辑器设置。</p>}
+              <div className="spx-field-grid" hidden={projectGeometryKind === 'gds'}>
                 <label className="spx-field"><span>基底材料 substrateMaterial</span>
-                  <select aria-label="工程基底材料" value={String((project.geometry as Record<string, unknown> | undefined)?.substrateMaterial ?? 'Si')}
+                  <select aria-label="工程基底材料" value={String(projectGeometry.substrateMaterial ?? 'Si')}
                     onChange={event => updateProjectMaterial('substrateMaterial', event.target.value)}>
                     {materialCatalog.map(row => <option key={row.name} value={row.name}>{row.name} · {row.category ?? 'Generic'}</option>)}
                   </select>
                 </label>
-                <label className="spx-field"><span>掩膜材料 maskMaterial</span>
-                  <select aria-label="工程掩膜材料" value={String((project.geometry as Record<string, unknown> | undefined)?.maskMaterial ?? 'Mask')}
+                {projectGeometryKind !== 'plane' && <label className="spx-field"><span>掩膜材料 maskMaterial</span>
+                  <select aria-label="工程掩膜材料" value={String(projectGeometry.maskMaterial ?? 'Mask')}
                     onChange={event => updateProjectMaterial('maskMaterial', event.target.value)}>
                     {materialCatalog.map(row => <option key={row.name} value={row.name}>{row.name} · {row.category ?? 'Generic'}</option>)}
                   </select>
-                </label>
+                </label>}
               </div>
               <p className="spx-help">材料来源 /api/materials，直接写入 ProjectV7 的 geometry 字段。</p>
             </div>
@@ -3788,15 +4551,28 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               <div className="spx-form-title">几何来源</div>
               <div className="spx-segment spx-source-pick">
                 <button type="button" className={projectGeometrySource.kind === 'parametric' ? 'active' : ''}
-                  onClick={() => { setProjectGeometrySource({ kind: 'parametric' }); setCompileStale(true); }}>参数化</button>
+                  onClick={chooseParametricGeometry}>参数化</button>
                 <button type="button" className={projectGeometrySource.kind === 'layout' ? 'active' : ''} disabled={project.dimension === 3}
                   title={project.dimension === 3 ? 'GDS 版图几何仅支持 2D 工程' : '使用 GDS 版图 Clip 作为工程几何'}
-                  onClick={() => { setProjectGeometrySource({ kind: 'layout', clipId: activeClip?.clipId, clipName: activeClip?.name }); setCompileStale(true); }}>{project.dimension === 3 ? '🔒 ' : ''}GDS / Layout</button>
+                  onClick={chooseLayoutGeometry}>{project.dimension === 3 ? '🔒 ' : ''}GDS / Layout</button>
               </div>
               {project.dimension === 3 && <p className="spx-lock-note">3D 工程不支持 GDS 版图几何，图层材料映射仅用于 2D。</p>}
               {projectGeometrySource.kind === 'parametric'
-                ? <div className="wf-muted">几何类型：{String((project.geometry as Record<string, unknown> | undefined)?.kind ?? '—')}</div>
-                : renderClipEditor('project')}
+                ? <div className="wf-muted">几何类型：{projectGeometryKind || '—'}</div>
+                : <>
+                  {!projectGeometrySource.clipId && <p className="spx-field-error" role="alert">先选择或保存一个 Clip 作为工程几何</p>}
+                  {clips.length > 0 && <div className="spx-clip-summary-list" aria-label="已有 Clip">
+                    {clips.map(clip => <button key={clip.clipId} type="button"
+                      className={projectGeometrySource.clipId === clip.clipId ? 'active' : ''}
+                      onClick={() => chooseClipForProject(clip)}
+                    >
+                      <strong>{clipLabel(clip)}</strong>
+                      <span>{clip.layers.length} 层 · {clip.polygonCount} 多边形</span>
+                      <span>x {clip.bbox.x0}…{clip.bbox.x1} · y {clip.bbox.y0}…{clip.bbox.y1} µm</span>
+                    </button>)}
+                  </div>}
+                  {renderClipEditor('project', false)}
+                </>}
             </div>
           </div>}
 
@@ -4193,11 +4969,11 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                     <span className="wf-muted">步骤</span>
                     <strong>{structureSelection.label}</strong>
                     <code>{structureSelection.stepId}</code>
-                    <span className="wf-muted">Segment {structureSelection.segmentIndex + 1} · Run {structureSelection.runId.slice(0, 12)}…</span>
+                    <span className="wf-muted" title={structureSelection.runId}>Segment {structureSelection.segmentIndex + 1} · Run 已记录</span>
                   </div>
                   {measurement && <div className="wf-structure-info">
                     <span className="wf-muted">测量值</span>
-                    <strong>{measurement.value === null ? measurement.reason ?? '无值' : `${measurement.value.toFixed(4)} ${measurement.unit}`}</strong>
+                    <strong>{measurement.value === null ? measurement.reason ?? '无值' : `${measurement.value.toFixed(4)} ${displayUnit(measurement.unit)}`}</strong>
                     <span className="wf-muted">测量位置在 2D 视图显示</span>
                   </div>}
                   {!measurement && <div className="wf-muted">测量后在 2D 视图显示位置</div>}
@@ -4259,7 +5035,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
           {segment && <>
             <div className="wf-status-row">
               <span className={`wf-status ${segment.status}`}>{statusLabel(segment.status)}</span>
-              <code title={segment.runId ?? ''}>{segment.runId ? `Run ${segment.runId.slice(0, 14)}…` : '尚未运行'}</code>
+              <code title={segment.runId ?? ''}>{segment.runId ? 'Run 已记录' : '尚未运行'}</code>
             </div>
             {route && <div className="wf-route-tree">
               {route.attempts.map((attempt, attemptIndex) => {
@@ -4325,10 +5101,10 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             {segment.status === 'running' && <div className="wf-progress"><i /></div>}
             {measurement && <div className="wf-summary">
               <strong>测量 · {statusLabel(measurement.status)}</strong>
-              <span>{measurement.value === null ? measurement.reason ?? '无值' : `${measurement.value.toFixed(4)} ${measurement.unit}`}</span>
+              <span>{measurement.value === null ? measurement.reason ?? '无值' : `${measurement.value.toFixed(4)} ${displayUnit(measurement.unit)}`}</span>
               <span>绑定 (binding)：{bindingLabel(measurement.bindingStatus)} · 等价 (equivalence)：{bindingLabel(measurement.equivalenceStatus)}</span>
             </div>}
-            {metrics.length > 0 && <table className="wf-table"><thead><tr><th>状态</th><th>数值</th><th>配方 / 步骤</th><th>绑定 / 等价</th><th /></tr></thead><tbody>{metrics.map(item => <tr key={item.measurementId}><td>{statusLabel(item.status)}</td><td>{item.value === null ? item.reason : `${item.value.toFixed(4)} ${item.unit}`}</td><td>{item.recipeId} v{item.recipeVersion} · {item.method} · {item.material} · {stepDisplayName(item.sourceStepId ?? '')}</td><td>{bindingLabel(item.bindingStatus)} / {bindingLabel(item.equivalenceStatus)}</td><td><button className="wf-link" aria-label={`查看 ${item.measurementId} 证据`} onClick={() => void showMetricDetail(item)}>详情</button></td></tr>)}</tbody></table>}
+            {metrics.length > 0 && <table className="wf-table"><thead><tr><th>状态</th><th>数值</th><th>配方 / 步骤</th><th>绑定 / 等价</th><th /></tr></thead><tbody>{metrics.map(item => <tr key={item.measurementId}><td>{statusLabel(item.status)}</td><td>{item.value === null ? item.reason : `${item.value.toFixed(4)} ${displayUnit(item.unit)}`}</td><td>{item.recipeId} v{item.recipeVersion} · {item.method} · {item.material} · {stepDisplayName(item.sourceStepId ?? '')}</td><td>{bindingLabel(item.bindingStatus)} / {bindingLabel(item.equivalenceStatus)}</td><td><button className="wf-link" aria-label={`查看 ${item.measurementId} 证据`} onClick={() => void showMetricDetail(item)}>详情</button></td></tr>)}</tbody></table>}
             {metricDetail && <div className="wf-evidence">
               <div className="wf-evidence-head"><strong>{metricDetail.measurement.measurementId}</strong><span className={`wf-status ${metricDetail.measurement.status}`}>{statusLabel(metricDetail.measurement.status)}</span></div>
               <div className="wf-evidence-grid">
@@ -4412,7 +5188,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 {decisions.length > 0 && <table className="wf-table" aria-label="测量决策列表">
                   <thead><tr><th>测量</th><th>条件</th><th>结果</th><th>分支 / 解析参数</th><th>Workflow run</th><th /></tr></thead>
                   <tbody>{decisions.map(item => <tr key={item.decisionId}>
-                    <td>{item.measuredValue.toFixed(4)} {item.unit}<br /><code className="wf-mono">{item.measurementId.slice(0, 12)}</code><br /><span className="wf-muted">绑定 {bindingLabel(item.measurementBindingStatus)}</span></td>
+                    <td>{item.measuredValue.toFixed(4)} {displayUnit(item.unit)}<br /><code className="wf-mono">{item.measurementId.slice(0, 12)}</code><br /><span className="wf-muted">绑定 {bindingLabel(item.measurementBindingStatus)}</span></td>
                     <td><code className="wf-mono">{item.operator} {item.threshold}</code><br /><span className="wf-muted">{item.recipeId} v{item.recipeVersion}</span></td>
                     <td><span className={`wf-status ${item.result ? 'succeeded' : 'failed'}`}>{item.result ? 'true' : 'false'}</span><br />{item.chosenBranch}</td>
                     <td><code className="wf-mono">{JSON.stringify(item.resolvedParameters)}</code><br /><span className="wf-muted">止于 {authoredByCompiled.get(item.branchThroughStepId ?? '') ?? item.branchThroughStepId?.slice(0, 10) ?? '—'}</span>{item.replayOf && <><br /><span className="wf-muted">replay of {item.replayOf.slice(0, 12)}</span></>}</td>
@@ -4874,11 +5650,11 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         <aside className="spx-right">
           <div className="spx-panel-title"><span>属性</span></div>
           <div className="spx-props">
-            {propertyRows.map(([label, value]) => <div className="spx-prop" key={label}><span>{label}</span><code>{value}</code></div>)}
+            {propertyRows.map(row => <div className="spx-prop" key={row.label} title={row.title}><span>{row.label}</span><code>{row.value}</code></div>)}
           </div>
           <div className="spx-panel-title"><span>工作流</span></div>
           <div className="spx-props">
-            <div className="spx-prop"><span>活动运行</span><code>{health?.activeRunId ? `${health.activeRunId.slice(0, 14)}…` : '—'}</code></div>
+            <div className="spx-prop" title={health?.activeRunId ?? undefined}><span>活动运行</span><code>{health?.activeRunId ? '已记录' : '—'}</code></div>
             <div className="spx-prop"><span>ViennaPS</span><code>{health?.viennaps ?? '—'}</code></div>
             <div className="spx-prop"><span>ViennaLS</span><code>{health?.viennals ?? '—'}</code></div>
           </div>
@@ -4888,8 +5664,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       <footer className="spx-statusbar">
         <span>ViennaPS Workbench</span>
         <span>ViennaPS {health?.viennaps ?? '—'}</span>
-        <span>Compile {compile ? compile.compileId.slice(0, 16) + '…' : '—'}</span>
-        <span>Run {segment?.runId ? segment.runId.slice(0, 16) + '…' : '—'}</span>
+        <span title={compile?.compileId ?? undefined}>Compile {compile ? (compileStale ? '需重新编译' : '已编译') : '—'}</span>
+        <span title={segment?.runId ?? undefined}>Run {segment?.runId ? statusLabel(segment.status) : '—'}</span>
         <span className="spx-status-right">{busy ? `${busy} running…` : 'localhost'}</span>
       </footer>
       {aboutOpen && <div className="spx-modal-backdrop" onClick={() => setAboutOpen(false)}>

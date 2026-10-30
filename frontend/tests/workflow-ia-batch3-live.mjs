@@ -157,8 +157,10 @@ try {
   assert.ok((await frame.locator('svg.report-svg').count()) >= 1, 'report must embed the structure view');
   assert.match(reportText, /均值|mean/, 'report must contain the experiment result table');
 
-  const treeText = await page.locator('.spx-tree-item').filter({ hasText: '报告' }).first().innerText();
-  assert.match(treeText, /已生成 · \d{4}-\d{2}-\d{2} \d{2}:\d{2}/);
+  const reportRow = page.locator('.spx-tree-item').filter({ hasText: '报告' }).first();
+  const treeText = await reportRow.innerText();
+  assert.match(treeText, /\d{4}-\d{2}-\d{2} \d{2}:\d{2}/);
+  assert.equal((treeText.match(/已生成/g) ?? []).length, 1, 'report status appears once, in the badge');
   assert.doesNotMatch(treeText, /report_[a-f0-9]{8,}/, 'left tree must not lead with a report id');
 
   const downloadPromise = page.waitForEvent('download');
