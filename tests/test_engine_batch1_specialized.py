@@ -34,15 +34,19 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import shutil
 import sys
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 GDS_FIXTURE = ROOT / "tests" / "fixtures" / "finfet22_workbench.gds"
+GDS_MASK_FIXTURE = ROOT / "docs" / "gds-mask-diagnosis" / "fixtures" / "multi-layer.gds"
 sys.path.insert(0, str(ROOT / "tests" / "fixtures"))
+sys.path.insert(0, str(ROOT / "worker"))
 
 import viennaps as ps  # noqa: E402
+import mesh3d  # noqa: E402
 
 from backend import storage  # noqa: E402
 from backend.main import app  # noqa: E402
@@ -53,7 +57,7 @@ from backend.validation import ProjectInputError, select_engine, validate_projec
 from stage8_project_factory import make_project  # noqa: E402
 from tests.test_api_integration import asgi_request, json_body  # noqa: E402
 from worker.specialized import build_specialized_model  # noqa: E402
-from worker.simulate import configure_rays  # noqa: E402
+from worker.simulate import MATERIAL_ROWS, configure_rays, make_v3_geometry  # noqa: E402
 
 FARADAY_FIELDS = {
     "cageAngle", "meanEnergy", "sigmaEnergy", "thresholdEnergy", "thetaRMin", "thetaRMax",
@@ -101,6 +105,33 @@ def geometric_plane_project(dimension: int) -> dict:
     project = make_project("geometricTrenchDeposition", dimension)
     project["geometry"] = {"kind": "plane", "height": 0.0, "substrateMaterial": "Si"}
     project["steps"][0]["depositMaterial"] = "Al2O3"
+    return project
+
+
+def gds_stack_project(depth: float) -> dict:
+    """Stack + legacy GDS overlay mask whose top is at z=1.6 um."""
+    project = make_project("geometricTrenchDeposition", 3)
+    project["domain"].update({"gridDelta": 0.2, "xExtent": 2.0, "yExtent": 2.0})
+    project["geometry"] = {
+        "kind": "stack", "substrateMaterial": "Si", "baseHeight": 0.0,
+        "layers": [
+            {"id": "oxide", "name": "Oxide", "material": "SiO2", "thickness": 0.4, "role": "film"},
+            {"id": "nitride", "name": "Nitride", "material": "Si3N4", "thickness": 0.4, "role": "film"},
+        ],
+        "pattern": {"kind": "none"},
+        "gdsMask": {
+            "name": "GDS Mask",
+            "assetId": hashlib.sha256(GDS_MASK_FIXTURE.read_bytes()).hexdigest(),
+            "fileName": GDS_MASK_FIXTURE.name, "structure": "MULTI",
+            "layer": 2, "datatype": 0, "unitScale": 1.0,
+            "position": [0.0, 0.0, 0.0], "baseHeight": 0.8, "height": 0.8,
+            "material": "Mask", "retainedRegion": "inside", "protectsEtch": True,
+        },
+    }
+    project["steps"][0]["depositMaterial"] = "Al2O3"
+    project["steps"][0]["nativeParameters"].update({
+        "trenchWidth": 1.0, "trenchDepth": depth, "depositionRate": 0.5,
+        "bottomMed": 0.2, "a": 0.3, "b": 0.1, "n": 1.0})
     return project
 
 
@@ -391,6 +422,21 @@ class SpecializedValidationNegatives(unittest.TestCase):
         self.assertTrue(messages, [(issue.path, issue.message) for issue in ctx.exception.issues])
         self.assertIn("1.6", messages[0])
 
+    def test_geometric_stack_gds_mask_participates_in_the_vertical_bound(self):
+        # The legacy overlay mask is a separate body above the stack: its top is
+        # baseHeight + position[2] + height = 1.6 um, while the stack itself is
+        # only 0.8 um. A native depth of 0.8 used to pass and SIGSEGV.
+        from unittest.mock import patch
+        with patch("backend.storage.resolve_gds_asset", return_value=GDS_MASK_FIXTURE):
+            with self.assertRaises(ProjectInputError) as ctx:
+                validate_project(gds_stack_project(0.8))
+            messages = [issue.message for issue in ctx.exception.issues
+                        if issue.path == "steps[0].nativeParameters.trenchDepth"]
+            self.assertTrue(messages, [(issue.path, issue.message) for issue in ctx.exception.issues])
+            self.assertIn("1.6", messages[0])
+            parsed, _warnings = validate_project(gds_stack_project(1.6))
+        self.assertEqual(parsed.steps[0].nativeParameters["trenchDepth"], 1.6)
+
     def test_geometric_rejects_zero_radius_and_sub_grid_width_depth(self):
         cases = (
             ("a", 0.0, "a+b and bottomMed"),
@@ -505,6 +551,14 @@ class WorkerSafetyPreflight(unittest.TestCase):
         self.assertIn("GeometricTrenchDeposition rejected", message)
         self.assertIn("native radius", message)
 
+    def test_direct_worker_rejects_stack_gds_mask_depth_0_8(self):
+        normalized, step = self.normalized(gds_stack_project(0.8))
+        with self.assertRaises(RuntimeError) as ctx:
+            build_specialized_model(ps, None, normalized, step, material_handle, {})
+        message = str(ctx.exception)
+        self.assertIn("GeometricTrenchDeposition rejected", message)
+        self.assertIn("1.6", message)
+
     def test_direct_worker_rejects_negative_coverage_tolerance(self):
         for value in (-1.0, 1.5, float("nan")):
             with self.subTest(value=value):
@@ -589,6 +643,44 @@ class NativeGeometricTrenchDeposition(unittest.TestCase):
         self.assertEqual(type(model).__module__, "viennaps.d3")
         self.assertAlmostEqual(after - before, 0.4, delta=0.02)
         self.assertEqual(actual["nativeGeometricAdvection"]["depositMaterial"], "Al2O3")
+
+    def test_stack_gds_mask_depth_1_6_runs_non_empty(self):
+        from unittest.mock import patch
+        project = gds_stack_project(1.6)
+        with patch("backend.storage.resolve_gds_asset", return_value=GDS_MASK_FIXTURE):
+            parsed, _warnings = validate_project(project)
+        normalized = parsed.model_dump(mode="json", exclude_none=True)
+        run_dir = ROOT / "var" / "test-gds-gtd"
+        shutil.rmtree(run_dir, ignore_errors=True)
+        run_dir.mkdir(parents=True)
+        asset = run_dir / "mask.gds"
+        shutil.copyfile(GDS_MASK_FIXTURE, asset)
+        try:
+            ps.setDimension(3)
+            ps.setNumThreads(1)
+            ps.Length.setUnit("um")
+            ps.Time.setUnit("s")
+            mesh3d.configure_material_catalog(MATERIAL_ROWS)
+            domain = mesh3d.make_domain(ps, normalized)
+            make_v3_geometry(ps, domain, normalized,
+                             config={"gdsAssetPath": str(asset)}, run_dir=run_dir)
+            domain.duplicateTopLevelSet(ps.Material.Al2O3)
+            before = surface_top(domain, 3)
+            model, extra, _actual, duration = build_specialized_model(
+                ps, domain, normalized, normalized["steps"][0], material_handle, {})
+            process = ps.Process(domain, model, duration)
+            process.setFluxEngineType(ps.FluxEngineType.CPU_DISK)
+            advection = ps.AdvectionParameters()
+            advection.timeStepRatio = 0.25
+            process.setParameters(advection)
+            for item in extra:
+                process.setParameters(item)
+            process.apply()
+            counts = [int(level_set.getNumberOfPoints()) for level_set in domain.getLevelSets()]
+            self.assertTrue(counts and all(count > 0 for count in counts), counts)
+            self.assertGreater(surface_top(domain, 3), before + 1e-6)
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
 
     def test_reach_guard_boundary_rate_equals_radius_is_non_empty(self):
         # rate == max(a+b, bottomMed) == 0.4 is the conservative guard boundary.

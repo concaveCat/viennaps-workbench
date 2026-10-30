@@ -135,14 +135,19 @@ cannot bypass it:
 * `trenchWidth >= gridDelta` (the native kernel ignores this value, so a
   sub-grid width would only misdescribe the geometry);
 * `trenchDepth >= max(initial |z|, gridDelta)`; the vertical extent uses
-  `finHeight + maskHeight` for a fin (the mask sits above the fin), and
+  `finHeight + maskHeight` for a fin (the mask sits above the fin),
   `max(depth, maskHeight)` for trench/hole (the mask and opening are on
-  opposite sides of z=0). Taper changes lateral width only;
+  opposite sides of z=0), and for a stack the maximum of
+  `baseHeight + layers` and `gdsMask.baseHeight + gdsMask.position[2] +
+  gdsMask.height`. Taper changes lateral width only;
 * `n` integer in `[1, 100]` (fractional `n` can make the native radius NaN);
 * `a+b > 0` (the duplicated top level set must have a positive radius);
 * `depositionRate >= max(a+b, bottomMed)`.
 
-GDS geometry, continuation states, and non-first enabled GTD steps keep their
+`geometry.gdsMask` exists only on `stack` in schema 7 (`StackV7.gdsMask`);
+`GdsBooleanStepV7.gdsMask` is a step operand, and a GTD step cannot follow any
+earlier enabled step. GDS geometry, continuation states, and non-first enabled
+GTD steps keep their
 422. The model remains `experimental` because no archived Stage 8/9
 direct-reference row exists for it.
 

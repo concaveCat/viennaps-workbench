@@ -160,8 +160,21 @@ def geometric_trench_vertical_extent(geometry: dict[str, Any]) -> float:
                 + abs(float(geometry.get("maskHeight", 0.0))))
     if kind == "stack":
         base = float(geometry.get("baseHeight", 0.0))
-        return max(abs(base), abs(base) + sum(abs(float(row.get("thickness", 0.0)))
-                                                for row in geometry.get("layers", [])))
+        top = base + sum(abs(float(row.get("thickness", 0.0)))
+                         for row in geometry.get("layers", []))
+        bottom = base
+        # A legacy/overlay GDS mask is a separate finite body above the stack.
+        # Its absolute z is baseHeight + position[2], independent of the stack
+        # baseHeight; ignore it and the native radius formula can be evaluated
+        # beyond its valid range (SIGSEGV / emptied level sets).
+        mask = geometry.get("gdsMask")
+        if isinstance(mask, dict):
+            position = mask.get("position") or [0.0, 0.0, 0.0]
+            mask_bottom = float(mask.get("baseHeight", 0.0)) + float(position[2])
+            mask_top = mask_bottom + float(mask.get("height", 0.0))
+            bottom = min(bottom, mask_bottom)
+            top = max(top, mask_top)
+        return max(abs(bottom), abs(top))
     return 0.0
 
 
