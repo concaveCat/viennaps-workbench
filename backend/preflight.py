@@ -118,7 +118,7 @@ SNAPSHOT_GEOMETRY_FACTOR = {
     "hole": 1.2,
     "plane": 1.0,
 }
-GEOMETRY_ONLY_MODELS = {"removeMaterial", "planarize", "boolean"}
+GEOMETRY_ONLY_MODELS = {"removeMaterial", "planarize", "boolean", "particleShape"}
 MODEL_WEIGHTS = {
     "isotropic": 0.9,
     "singleParticle": 1.0,

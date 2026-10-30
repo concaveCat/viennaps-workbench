@@ -14,6 +14,7 @@ import math
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -2347,11 +2348,219 @@ def _gds_boolean_operand(ps: Any, domain: Any, project: dict[str, Any], step: di
     return operand, transform
 
 
+def surface_state(domain: Any, dimension: int) -> dict[str, Any]:
+    """Return surface bounds plus an exact digest of the exposed surface mesh.
+
+    A particle-shape step is a no-op only when the surface really did not
+    change. Axis-aligned bounds are not enough: a masked sphere etch on a
+    patterned stack moved the opening floor while the protected mask top and
+    the substrate pinned every axis bound, so the bounds stayed identical and a
+    bounds-only check rejected a real etch (measured 48 -> 50 surface nodes in
+    2D and 816 -> 850 in 3D). The digest therefore covers every node
+    coordinate, the line/triangle topology, the per-cell material IDs and the
+    domain material map; an unchanged surface hashes identically, any changed
+    node, cell, material or level-set material mapping does not.
+    """
+    mesh = domain.getSurfaceMesh(addInterfaces=True, sharpCorners=False, minNodeDistanceFactor=0.01)
+    points = mesh.getNodes()
+    if not points:
+        raise RuntimeError("the native surface mesh is empty; the particle-shape offset removed every point")
+    cells = mesh.getLines() if dimension == 2 else mesh.getTriangles()
+    mapping = domain.getMaterialMap()
+    material_map = [int(mapping.getMaterialIdAtIdx(index)) for index in range(mapping.size())]
+    cell_data = mesh.getCellData()
+    labels: list[str] = []
+    material_ids: list[int] = []
+    for index in range(cell_data.getScalarDataSize()):
+        label = str(cell_data.getScalarDataLabel(index))
+        labels.append(label)
+        if label == "MaterialIds":
+            material_ids = [int(value) for value in cell_data.getScalarData(index)]
+    digest = hashlib.sha256()
+    digest.update(struct.pack("<I", int(dimension)))
+    digest.update(struct.pack("<Q", len(points)))
+    for point in points:
+        # ``+ 0.0`` folds -0.0 into 0.0 so an unchanged coordinate cannot flip
+        # the digest through a signed zero.
+        digest.update(struct.pack("<" + "d" * dimension,
+                                  *(float(point[axis]) + 0.0 for axis in range(dimension))))
+    digest.update(struct.pack("<Q", len(cells)))
+    for cell in cells:
+        digest.update(struct.pack("<Q", len(cell)))
+        for node in cell:
+            digest.update(struct.pack("<Q", int(node)))
+    digest.update(struct.pack("<Q", len(material_ids)))
+    for value in material_ids:
+        digest.update(struct.pack("<q", value))
+    digest.update(struct.pack("<Q", len(material_map)))
+    for value in material_map:
+        digest.update(struct.pack("<q", value))
+    digest.update("\x00".join(labels).encode("utf-8"))
+    return {
+        "bounds": [[float(min(point[axis] for point in points)),
+                    float(max(point[axis] for point in points))]
+                   for axis in range(dimension)],
+        "pointCount": len(points),
+        "cellCount": len(cells),
+        "digest": digest.hexdigest(),
+    }
+
+
+def apply_particle_shape(ps: Any, domain: Any, project: dict[str, Any], step: dict[str, Any]) -> dict[str, Any]:
+    """Run the native Box/Sphere geometric-advection distribution.
+
+    Measured 4.6.2/4.7.0 behaviour (one bounded subprocess per case, see
+    docs/particle-shape-distribution-contract.md):
+
+    * negative (etch) displacement plus ``addMaskMaterial`` is the officially
+      supported combination: ``GeometricProcessStrategy`` builds the mask from
+      the material level set exactly like the native FinFET example, and the
+      protected material does not move;
+    * positive (deposit) displacement plus any non-empty mask SIGSEGVs in 2D
+      and 3D, regardless of the mask construction or whether the mask overlaps
+      the surface. ViennaLS 5.8.5/5.10.0 even carries the comment "There are
+      still issues with positive box distributions if there is a mask used!".
+
+    The step therefore applies the project's native mask materials for etches
+    and records the mask it really passed. A deposition is always constructed
+    with the no-mask overload and records the omitted mask materials and the
+    crash-backed reason instead of pretending the mask was honoured.
+    """
+    dimension = int(project["dimension"])
+    grid_delta = float(project["domain"]["gridDelta"])
+    shape = str(step["shape"])
+    sign = -1.0 if step["operation"] == "etch" else 1.0
+    requested_masks = protected_material_names(project, step)
+    applied_masks: list[tuple[str, Any]] = []
+    omitted_masks: list[str] = []
+    if sign > 0.0:
+        omitted_masks = list(requested_masks)
+    else:
+        for name in requested_masks:
+            handle = material_handle(ps, name)
+            material_level_set = domain.getMaterialLevelSet(handle)
+            if material_level_set is None or int(material_level_set.getNumberOfPoints()) == 0:
+                # The geometry declared the material but the domain does not
+                # carry it (e.g. maskHeight 0). Passing it would make the
+                # native strategy log "not found" and silently stay maskless.
+                omitted_masks.append(name)
+                continue
+            applied_masks.append((name, handle))
+    requested: dict[str, Any]
+    if shape == "box":
+        axes = [float(value) for value in step["halfAxes"]]
+        if len(axes) != dimension:
+            raise RuntimeError(f"particleShape box needs {dimension} half-axes, got {axes}")
+        for axis in axes:
+            if not math.isfinite(axis) or axis <= 0.0 or axis < grid_delta - 1e-12:
+                raise RuntimeError(
+                    f"particleShape half-axis {axis} must be finite and at least one grid interval "
+                    f"({grid_delta} um); native geometric advection is unsafe below that")
+        signed = [sign * value for value in axes]
+        # The native binding always takes a fixed-size 3 array; 2D consumes
+        # only the first two entries, so the third stays outside the project
+        # surface and cannot silently select a 3D shape.
+        native_half_axes = signed + [0.0] if dimension == 2 else signed
+        model = ps.BoxDistribution(native_half_axes)
+        requested = {"halfAxes": axes}
+        native_class = "BoxDistribution"
+        expected_offset = max(axes)
+    else:
+        radius = float(step["radius"])
+        if not math.isfinite(radius) or radius <= 0.0 or radius < grid_delta - 1e-12:
+            raise RuntimeError(
+                f"particleShape radius {radius} must be finite and at least one grid interval "
+                f"({grid_delta} um); native geometric advection is unsafe below that")
+        signed_radius = sign * radius
+        model = ps.SphereDistribution(signed_radius)
+        requested = {"radius": radius}
+        native_class = "SphereDistribution"
+        native_half_axes = None
+        expected_offset = radius
+    before_state = surface_state(domain, dimension)
+    before = before_state["bounds"]
+    counts_before = [int(level_set.getNumberOfPoints()) for level_set in domain.getLevelSets()]
+    for _name, handle in applied_masks:
+        model.addMaskMaterial(handle)
+    # The geometric process strategy ignores the duration entirely; measure it
+    # as zero so the run record never implies a rate. The 4.6.2/4.7.0 Process
+    # default is AUTO, which resolves and initialises a flux engine even for a
+    # pure geometric distribution (`cuInit`); pin CPU_DISK like the other
+    # non-particle steps so a CPU-only run never touches CUDA.
+    process = ps.Process(domain, model, 0.0)
+    process.setFluxEngineType(ps.FluxEngineType.CPU_DISK)
+    process.apply()
+    after_state = surface_state(domain, dimension)
+    after = after_state["bounds"]
+    if before_state["digest"] == after_state["digest"]:
+        raise RuntimeError(
+            "native particle-shape distribution left the surface unchanged; refusing to record a "
+            "silent no-op (check that the magnitude exceeds the grid resolution"
+            + (f", and that the mask {[name for name, _ in applied_masks]} does not cover the whole "
+               "exposed surface" if applied_masks else "") + ")")
+    mapping = domain.getMaterialMap()
+    return {
+        "geometryOperation": "particleShape",
+        "nativeClass": native_class,
+        "nativeConstructor": (f"viennaps.d{dimension}.{native_class}("
+                              + ("halfAxes" if shape == "box" else "radius") + ")"),
+        "nativeMaskConstructor": ("addMaskMaterial" if applied_masks else None),
+        "dimension": dimension,
+        "operation": step["operation"],
+        "shape": shape,
+        **requested,
+        **({"nativeSignedHalfAxesUm": signed} if shape == "box" else {"nativeSignedRadiusUm": signed_radius}),
+        **({"nativeHalfAxesUm": native_half_axes} if shape == "box" else {}),
+        "expectedOffsetUm": expected_offset,
+        "surfaceBoundsBeforeUm": before,
+        "surfaceBoundsAfterUm": after,
+        "surfaceSignatureBefore": before_state["digest"],
+        "surfaceSignatureAfter": after_state["digest"],
+        "surfacePointCountBefore": before_state["pointCount"],
+        "surfacePointCountAfter": after_state["pointCount"],
+        "surfaceCellCountBefore": before_state["cellCount"],
+        "surfaceCellCountAfter": after_state["cellCount"],
+        "nativeProcessBackend": "CPU_DISK pinned; geometric distribution has no stochastic flux engine",
+        "levelSetPointCountsBefore": counts_before,
+        "levelSetPointCountsAfter": [int(level_set.getNumberOfPoints()) for level_set in domain.getLevelSets()],
+        "materialIdsByLevelSetIndex": [int(mapping.getMaterialIdAtIdx(i)) for i in range(mapping.size())],
+        "gridDeltaUm": grid_delta,
+        "nativeMask": {
+            "mode": "material" if applied_masks else "none",
+            "applied": bool(applied_masks),
+            "materials": [name for name, _ in applied_masks],
+            "omittedMaterials": omitted_masks,
+            "reason": (
+                "the etch protects the project's native mask materials through addMaskMaterial; "
+                "GeometricProcessStrategy builds the mask from their material level sets"
+                if applied_masks else
+                "ViennaPS 4.6.2/4.7.0 SIGSEGV on every non-empty mask with positive geometric "
+                "advection (2D and 3D, material and raw viennals masks, overlapping or far away), so "
+                "a deposition is always constructed with the no-mask overload and every exposed "
+                "surface, including the mask material, grows"
+                if sign > 0.0 else
+                "the etch declares mask materials but none of them is present in the domain, so the "
+                "native no-mask overload is used"
+                if omitted_masks else
+                "the project geometry declares no native mask material, so the no-mask overload is used"
+            ),
+        },
+        "nativeProcessDurationSeconds": 0.0,
+        "nativeDurationIgnored": ("the process duration is ignored: GeometricProcessStrategy calls "
+                                  "GeometricAdvect without consulting it, so the displacement equals the "
+                                  "radius/half-axes"),
+        "scopedSurface": ("the top/exposed level set only; deposition grows the top level-set material and "
+                          "etch intersects every lower level set with the new surface"),
+    }
+
+
 def apply_geometry_operation(ps: Any, domain: Any, project: dict[str, Any], step: dict[str, Any],
                              previous_tops: dict[str, Any] | None = None, *,
                              config: dict[str, Any] | None = None,
                              run_dir: Path | None = None) -> dict[str, Any]:
     model = step["model"]
+    if model == "particleShape":
+        return apply_particle_shape(ps, domain, project, step)
     if model == "removeMaterial":
         material = material_handle(ps, step["material"])
         domain.removeMaterial(material)

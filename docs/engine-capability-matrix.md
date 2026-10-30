@@ -27,7 +27,9 @@ behaviour changed.
 
 `dimensions` in the JSON always means *the domain dimension the class was actually exercised on*, not
 what the docstring implies. Empty `dimensions` means the class never sees a domain (`Logger`,
-`MetaDataLevel`).
+`MetaDataLevel`). The counts are the 2026-10-30 audit snapshot; later batches move individual rows
+(for example A4 moved `BoxDistribution`/`SphereDistribution` to the exposed surface as the
+`particleShape` step, no-mask deposit and geometry-mask etch) without rewriting the snapshot counts.
 
 ## 2. What the Workbench exposes today
 
@@ -88,10 +90,14 @@ Fields shared with flat inputs use the flat catalog defaults (for example
 
 ### Geometry, output and material surface
 
-(62 `exposed` rows in the matrix overall, including the 18 models above.)
+(62 `exposed` rows in the matrix overall, including the 18 models above;
+the schema-7 `particleShape` step is a post-audit addition.)
 
 `MakePlane`, `MakeTrench`, `MakeHole` (`FULL` only), `MakeFin` (native + boolean construction),
-multi-layer `stack` (composed from `MakePlane` + `GeometryFactory`), `GeometryFactory`,
+multi-layer `stack` (composed from `MakePlane` + `GeometryFactory`),
+the `particleShape` geometry step (`BoxDistribution` / `SphereDistribution`, schema 7;
+no-mask deposition, geometry-mask etch — see
+[`particle-shape-distribution-contract.md`](particle-shape-distribution-contract.md)), `GeometryFactory`,
 `GDSGeometry`, `GDSReader`, `Extrude`, `Slice` (y-normal only), `Planarize` (cutoff or measured
 `stopMaterial`), `Domain`, `Process`; outputs are surface mesh VTK, snapshot JSON, native state,
 intermediate VTP/VTU, the optional generic `DenseCellSet` VTU/JSON export from
@@ -112,8 +118,7 @@ custom material catalog.
 | `FaradayCageEtching` + `FaradayCageParameters` | 3 only | Ion-beam etch with a Faraday-cage angular filter: `cageAngle` plus a full `IBEParameters` | Probe: 3D finishes in <0.1 s; the identical call on a 2D domain did not return within 40 s (plane-only and trench, with and without `planeWaferRate`) → **engine-side 2D hang**, must be rejected at validation |
 | `GeometricTrenchDeposition` | 2 only | Closed-form analytic trench fill (`trenchWidth, trenchDepth, depositionRate, bottomMed, a, b, n`), no flux engine | Probe: 3D **SIGSEGV** right after “Applying geometric model” → 2D only |
 | `CSVFileProcess` + `RateGrid` | 2/3 | Rate interpolated from a CSV grid with directional + isotropic components | Needs a new uploaded asset kind and an explicit interpolation mode: the engine only logs `Interpolation mode not set.` and continues. `setCustomInterpolator` is arbitrary Python |
-| `BoxDistribution` / `SphereDistribution` | 2/3 | Particle-shape distributions applied as geometric models | The mask overload requires a raw **`viennals` Domain**, not `viennaps.Domain`; without a mask the probe produced no surface change |
-| `CustomSphereDistribution` | none | Multi-radius sphere distribution | Probe: aborts in 2D and 3D with `terminate called recursively` without a mask → experimental, keep out until a bounded probe passes |
+| `CustomSphereDistribution` | none | Multi-radius sphere distribution | **Blocked (A4).** Re-probe with and without a mask aborts in 2D and 3D (`returnCode -6`): `terminate called after throwing an instance of 'std::runtime_error'` / `what(): Point ID 3 is out of bounds for CustomSphereDistribution with 3 radii!`. It indexes one radius per surface point, so no bounded project-derived parameterization exists. See [`particle-shape-distribution-contract.md`](particle-shape-distribution-contract.md) |
 
 ### 3.2 Advanced parameters and outputs (batch B)
 
@@ -194,15 +199,28 @@ hashes when unused.
   4. the request hash changes with CSV content and an old hash fails replay explicitly;
   5. no API field can reach `setCustomInterpolator`.
 
-### Batch A4 — particle shape distributions
+### Batch A4 — particle shape distributions (implemented: no-mask deposit, masked etch)
 
 - These are geometry sources, not process steps (the native mask is a `viennals` Domain).
+- Implemented as schema-7 geometry step `particleShape`: `BoxDistribution` / `SphereDistribution`,
+  no duration, positive radii/half-axes with `operation` selecting the sign.
+  Contract and raw probe record: [`particle-shape-distribution-contract.md`](particle-shape-distribution-contract.md).
+- Masks are not a step field: they are the project geometry's native mask materials
+  (`protected_material_names`, the same rule as the flux/CSV steps). `operation: etch` passes
+  them through `addMaskMaterial`; `operation: deposit` cannot, because any non-empty mask with
+  positive displacement SIGSEGVs in 2D/3D on 4.6.2 and 4.7.0. The run record lists the applied
+  and omitted mask materials.
 - Acceptance:
   1. design note proves the `viennals` mask is derived from the existing project domain, with no second
-     geometry source of truth;
-  2. `Box`/`Sphere` surfaces equal direct native references;
-  3. count and magnitude of radii/half-axes are bounded;
-  4. `CustomSphereDistribution` is catalogued only after a passing 2D **and** 3D probe is archived.
+     geometry source of truth (`addMaskMaterial` over `getMaterialLevelSet`). **Masked etch is safe
+     (2D/3D, material/raw mask, `applyToSingleMaterial`); masked deposition is a native `-11` and is
+     never constructed** — the note records the whole matrix, including the upstream ViennaLS TODO;
+  2. `Box`/`Sphere` surfaces equal direct native references (2D/3D, plane/trench, deposit/etch, masked
+     etch, replay);
+  3. count and magnitude of radii/half-axes are bounded (`> 0`, `≤ 2 µm`, `≥ gridDelta`, 2 axes in 2D,
+     3 in 3D); zero/mixed-sign parameters are unreachable;
+  4. `CustomSphereDistribution` stays unexposed: it aborts in 2D **and** 3D even without a mask, because it
+     indexes one radius per surface point.
 
 ### Batch B1 — full plasma sub-parameter families (implemented backend/API)
 

@@ -6,7 +6,7 @@ import math
 from typing import Any
 
 
-GEOMETRY_MODELS = {"removeMaterial", "planarize", "boolean", "gdsBoolean"}
+GEOMETRY_MODELS = {"removeMaterial", "planarize", "boolean", "gdsBoolean", "particleShape"}
 
 
 def value(step: Any, key: str, default: Any = None) -> Any:

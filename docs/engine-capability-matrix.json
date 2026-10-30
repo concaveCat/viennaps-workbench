@@ -25,8 +25,8 @@
     3
   ],
   "summary": {
-    "advanced-parameter-or-output-not-exposed": 9,
-    "engine-model-not-exposed": 7,
+    "advanced-parameter-or-output-not-exposed": 11,
+    "engine-model-not-exposed": 5,
     "exposed": 62,
     "internal-or-not-user-facing": 18
   },
@@ -680,15 +680,18 @@
       ],
       "constructor": "BoxDistribution(halfAxes, mask: viennals.d2.Domain) | BoxDistribution(halfAxes)",
       "docSummary": "Rectangular particle-shape distribution applied as a geometric model.",
-      "classification": "engine-model-not-exposed",
-      "exposedBy": [],
-      "notes": "Probe 2026-10-30: both dimensions complete, but the bare overload changes nothing (21/121 unchanged mesh points), and the mask overload only accepts a raw viennals Domain, not viennaps.Domain.",
+      "classification": "advanced-parameter-or-output-not-exposed",
+      "exposedBy": [
+        "step model:particleShape, shape:box (schema 7; no-mask deposit, geometry-mask etch)"
+      ],
+      "notes": "Probe 2026-10-30 (A4 mask re-run): the no-mask overload moves the exposed surface by the L-infinity half-axis and ignores the process duration in 2D and 3D. addMaskMaterial is safe for negative (etch) displacement in 2D/3D: the mask is built from the project material level sets exactly like the native FinFET example, and the protected material does not move. Every non-empty mask with positive (deposition) displacement SIGSEGVs (returnCode -11) regardless of mask construction (material mask, raw viennals mask, applyToSingleMaterial, insertMask) and regardless of overlap (near, far, full-domain); ViennaLS 5.8.5 and 5.10.0 both keep the upstream TODO 'There are still issues with positive box distributions if there is a mask used!'. So the workbench passes addMaskMaterial only for etches and records the omitted mask materials for depositions.",
       "members": {
-        "exposed": [],
-        "notExposed": [
+        "exposed": [
           "halfAxes",
+          "addMaskMaterial (etch only)"
+        ],
+        "notExposed": [
           "mask",
-          "addMaskMaterial",
           "applyToSingleMaterial"
         ]
       }
@@ -703,15 +706,18 @@
       ],
       "constructor": "SphereDistribution(radius, mask: viennals.d2.Domain) | SphereDistribution(radius)",
       "docSummary": "Spherical particle-shape distribution applied as a geometric model.",
-      "classification": "engine-model-not-exposed",
-      "exposedBy": [],
-      "notes": "Same mask/typing constraint as BoxDistribution; probe produced no visible surface change without a mask.",
+      "classification": "advanced-parameter-or-output-not-exposed",
+      "exposedBy": [
+        "step model:particleShape, shape:sphere (schema 7; no-mask deposit, geometry-mask etch)"
+      ],
+      "notes": "Probe 2026-10-30 (A4 mask re-run): the no-mask overload moves the exposed surface by the radius and ignores the process duration in 2D and 3D. addMaskMaterial is safe for negative (etch) displacement in 2D/3D (the native FinFET pattern); masked deposition SIGSEGVs (returnCode -11) for material masks, raw viennals masks, applyToSingleMaterial and insertMask, whether the mask is near, far or covers the whole domain. ViennaPS 4.7.0 / ViennaLS 5.10.0 still crash identically. So radius plus etch-only addMaskMaterial are exposed; the raw mask argument is not.",
       "members": {
-        "exposed": [],
-        "notExposed": [
+        "exposed": [
           "radius",
+          "addMaskMaterial (etch only)"
+        ],
+        "notExposed": [
           "mask",
-          "addMaskMaterial",
           "applyToSingleMaterial"
         ]
       }
@@ -728,7 +734,7 @@
       "docSummary": "Multi-radius sphere distribution.",
       "classification": "engine-model-not-exposed",
       "exposedBy": [],
-      "notes": "Probe 2026-10-30: aborts in 2D and 3D with 'terminate called recursively' when constructed and applied without a mask. Not shippable without a bounded, mask-backed experiment.",
+      "notes": "Probe 2026-10-30 (re-run for A4): aborts in 2D and 3D with returnCode -6, 'terminate called after throwing an instance of std::runtime_error' / 'what(): Point ID 3 is out of bounds for CustomSphereDistribution with 3 radii!', with and without a mask. It indexes one radius per surface point, so no bounded project-derived parameterization exists; stays unexposed.",
       "members": {
         "exposed": [],
         "notExposed": [
@@ -2672,17 +2678,18 @@
     {
       "id": "A4",
       "title": "Particle shape distributions (Box/Sphere/CustomSphere)",
-      "classification": "engine-model-not-exposed",
+      "classification": "advanced-parameter-or-output-not-exposed",
+      "status": "implemented-masked-etch",
       "items": [
         "BoxDistribution",
         "SphereDistribution",
         "CustomSphereDistribution"
       ],
       "risk": "high",
-      "notes": "The native mask argument is a raw viennals Domain, not a viennaps Domain, so this is a geometry-source feature rather than a process step. CustomSphereDistribution aborted ('terminate called recursively') in both dimensions without a mask, so it stays experimental until a bounded probe passes.",
+      "notes": "Implemented as schema-7 geometry step particleShape (BoxDistribution/SphereDistribution, no duration). Masks come from the project geometry's native mask materials via addMaskMaterial, which is the officially supported combination for negative (etch) displacement: 2D/3D probes keep the protected material in place while the exposed surface shrinks, and the official FinFET example uses the same call. Positive (deposition) displacement with any non-empty mask SIGSEGVs in 2D/3D (material mask, raw viennals mask from getMaterialLevelSet, applyToSingleMaterial, insertMask; near, far or full-domain mask), so depositions stay maskless and the run record lists the omitted mask materials. ViennaPS 4.7.0 / ViennaLS 5.10.0 still crash identically and the upstream source still carries the positive-box-with-mask TODO. CustomSphereDistribution aborts in 2D and 3D even without a mask (returnCode -6, 'Point ID 3 is out of bounds for CustomSphereDistribution with 3 radii!'), so it stays unexposed. Evidence: docs/particle-shape-distribution-contract.md.",
       "acceptanceCriteria": [
-        "Design note proves how the viennals mask is built from an existing project domain without a second geometry source of truth.",
-        "Box and Sphere produce a geometry whose surface mesh equals a direct native reference.",
+        "Design note proves how the viennals mask is built from an existing project domain without a second geometry source of truth: addMaskMaterial over the project's native mask material level sets, the same rule the flux and CSV steps use.",
+        "Box and Sphere produce a geometry whose surface mesh equals a direct native reference (no-mask deposit, masked etch, 2D and 3D).",
         "Radii/half-axes are bounded (count and magnitude) and rejected outside range.",
         "CustomSphereDistribution is only exposed after a passing 2D and 3D probe is archived; otherwise it stays out of the catalog."
       ]
