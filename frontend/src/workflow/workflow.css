@@ -1123,3 +1123,30 @@ body {
 .wf-report-preview { min-height: 520px; }
 .wf-report-tech { margin: 6px 0; }
 .wf-report-tech .wf-evidence-grid { padding: 4px 8px; }
+
+/* ---------------------------------------------------------------------------
+   Round-4 close-out: entry/example separation, library breadcrumb, variant
+   duration conflicts and the calibration CSV format reference.
+--------------------------------------------------------------------------- */
+.spx-examples { margin-top: 10px; }
+.spx-examples .spx-samples { padding: 9px 10px; }
+.spx-library-note {
+  padding: 3px 7px; border-bottom: 1px solid var(--spx-line-soft);
+  background: #fbfcfd; color: var(--spx-muted); font-size: 9px;
+}
+.spx-breadcrumb {
+  display: flex; align-items: center; gap: 6px; padding: 5px 8px;
+  border-bottom: 1px solid var(--spx-line); background: #fbfcfd;
+  color: var(--spx-muted); font-size: 10px;
+}
+.spx-breadcrumb .spx-link { font-size: 10px; }
+.wf-variant-table tr.has-error td { background: #fffafa; }
+.wf-variant-table tr.has-error input[aria-invalid="true"] {
+  border-color: #c0392b; background: #fdf1f0;
+}
+.wf-code-block {
+  margin: 6px 8px; padding: 7px 9px; border: 1px solid var(--spx-line);
+  background: #f7f9fb; color: #26313a;
+  font: 11px/1.5 "Consolas", monospace; white-space: pre-wrap;
+}
+.wf-csv-format { margin-top: 6px; }

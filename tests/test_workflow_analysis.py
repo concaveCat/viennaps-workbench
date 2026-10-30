@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 import unittest
 import uuid
@@ -144,8 +145,20 @@ class AnalysisTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(text, html)
         self.assertRegex(html, r"实际种子|种子（请求值）")
         self.assertIn("种子策略", html)
+        self.assertIn("共享运行种子", html)
+        self.assertNotIn("shared-run-seed", html)
+        self.assertNotIn("not-applicable", html)
         self.assertIn("各向同性模型不使用射线通量引擎", html)
         self.assertNotIn("isotropic model does not use a ray flux engine", html)
+        # The report timestamp is local wall-clock time, never an ISO UTC string.
+        self.assertRegex(html, r"生成时间 \d{4}-\d{2}-\d{2} \d{2}:\d{2} \S+")
+        self.assertNotRegex(html, r"生成时间 \d{4}-\d{2}-\d{2}T")
+        # IDs/hashes live in the technical-details folds, not in the body tables.
+        main_body = re.sub(r"<details.*?</details>", "", html, flags=re.S)
+        self.assertNotIn(self.measurement_id, main_body)
+        self.assertNotIn("depth</td><td>um", main_body)
+        self.assertIn("µm", html)
+        self.assertNotIn(" um", main_body)
         for stale in ("not recorded", "candidate 1", "No compile envelope selected.",
                       "No run manifest selected.", "No measurement selected.",
                       "Process window", "CI method", "actual seed", "report hash"):

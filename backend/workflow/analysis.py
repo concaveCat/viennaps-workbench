@@ -23,6 +23,18 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _report_time() -> str:
+    """Human-facing report timestamp in the local timezone.
+
+    The report used to print an ISO UTC string (`2026-10-31T05:40:00+00:00`).
+    A reader expects wall-clock time with a timezone suffix, for example
+    `2026-10-31 13:40 CST`.
+    """
+
+    local = datetime.now(timezone.utc).astimezone()
+    return local.strftime("%Y-%m-%d %H:%M %Z").strip()
+
+
 def _number(value: Any) -> float | None:
     if isinstance(value, (int, float)) and math.isfinite(float(value)):
         return float(value)
@@ -371,6 +383,31 @@ def _display(value: Any, empty: str = "未记录") -> str:
     if isinstance(value, (list, tuple, dict, set)) and not value:
         return empty
     return _escape(value)
+
+
+def _unit_text(value: Any) -> str:
+    """Report units use the micro sign; the wire format keeps plain ``um``."""
+
+    text = _display(value, "")
+    return "µm" if text in {"um", "µm"} else text
+
+
+# Raw API tokens that used to leak into the report body. Status codes keep
+# their own labels in ``STATUS_LABELS``; these are seed policies, engine
+# markers and uncertainty values.
+_TOKEN_LABELS = {
+    "not-applicable": "不适用",
+    "not_applicable": "不适用",
+    "shared-run-seed": "共享运行种子",
+    "ambiguous": "有歧义",
+}
+
+
+def _token_label(value: Any, empty: str = "未记录") -> str:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return empty
+    text = str(value)
+    return _TOKEN_LABELS.get(text, STATUS_LABELS.get(text, _escape(text)))
 
 
 def _fmt_number(value: Any) -> str:
@@ -1076,13 +1113,18 @@ def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
     sections.append("<h2>流程与编译</h2>")
     if compile:
         record = compile.compileRecord.model_dump(mode="json", exclude_none=True)
+        # The main table carries names/status only; IDs and hashes stay in the
+        # technical-details fold so the body stays readable.
         sections.append(_kv_table([
+            ("流程", _display(record.get("flowId"))),
+            ("种子策略", _token_label(record.get("seedPolicy"))),
+        ]))
+        sections.append(_details([
             ("编译 ID", _code(record.get("compileId"))),
-            ("流程 / 修订", "%s / %s" % (_display(record.get("flowId")), _code(record.get("flowRevisionId")))),
+            ("流程修订", _code(record.get("flowRevisionId"))),
             ("流程哈希", _code(record.get("flowRevisionHash"))),
             ("变量", _code(json.dumps(record.get("variableSet") or [], sort_keys=True))),
-            ("种子策略", _display(record.get("seedPolicy"))),
-        ]))
+        ], summary="编译技术详情"))
         factors = ((experiment or {}).get("design") or {}).get("factors") or []
         if factors:
             sections.append("<h3>实验因子</h3>")
@@ -1093,11 +1135,15 @@ def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
             ))
         sections.append("<h3>步骤</h3>")
         sections.append(_table(
-            ["编号", "步骤", "作者步骤", "路径"],
-            [[str(index + 1), "%s<br>%s" % (_escape(_step_label(entry.stepId, step_names)), _code(entry.stepId)),
-              _code(entry.authoredStepId), _escape(entry.flowPath)]
+            ["编号", "步骤", "路径"],
+            [[str(index + 1), _escape(_step_label(entry.stepId, step_names)), _escape(entry.flowPath)]
              for index, entry in enumerate(compile.sourceMap)],
         ))
+        sections.append(_details([
+            ("步骤 ID / 作者步骤 ID", "<br>".join(
+                "%s → %s" % (_code(entry.stepId), _code(entry.authoredStepId))
+                for entry in compile.sourceMap) or "未记录"),
+        ], summary="步骤 ID 技术详情"))
         sections.append(_details([
             ("编译版本", _display(record.get("compilerVersion"))),
             ("几何绑定哈希", _code(record.get("geometryBindingHash"))),
@@ -1117,11 +1163,11 @@ def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
         geometry = binding.get("geometry") or {}
         source_text = json.dumps(source, sort_keys=True) if source else "参数化几何"
         sections.append(_kv_table([
-            ("绑定", _code(binding.get("bindingId"))),
             ("几何类型", _display(geometry.get("kind"))),
             ("来源", _escape(source_text)),
         ]))
         sections.append(_details([
+            ("绑定 ID", _code(binding.get("bindingId"))),
             ("来源结构", _display(source.get("structure"), "未提供")),
             ("多边形数量", _fmt_number(source.get("polygonCount"))),
             ("点数", _fmt_number(source.get("pointCount"))),
@@ -1150,21 +1196,21 @@ def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
             _display(versions.get("viennaps"), "未记录"), _display(versions.get("viennals"), "未记录"))
         sections.append(_kv_table([
             ("引擎", engine_text),
-            ("请求引擎", _display(solver.get("enginePreference"))),
+            ("请求引擎", _token_label(solver.get("enginePreference"))),
             (seed_label, seed_value),
-            ("种子策略", _display(manifest.get("seedPolicy") or seed_mode)),
-            ("请求输入哈希", _code(manifest.get("requestedInputHash"))),
-            ("执行哈希", _code(manifest.get("executionHash"))),
+            ("种子策略", _token_label(manifest.get("seedPolicy") or seed_mode)),
         ]))
         actual = manifest.get("actualExecution") or []
         if actual:
             sections.append("<h3>步骤引擎选择</h3>")
             sections.append(_table(
                 ["步骤", "步骤引擎", "原因"],
-                [[_escape(_step_label(row.get("stepId"), step_names)), _display(row.get("actualEngine")),
+                [[_escape(_step_label(row.get("stepId"), step_names)), _token_label(row.get("actualEngine")),
                   _escape(_engine_reason_text(row.get("engineSelectionReason")))] for row in actual[:40]],
             ))
         sections.append(_details([
+            ("请求输入哈希", _code(manifest.get("requestedInputHash"))),
+            ("执行哈希", _code(manifest.get("executionHash"))),
             ("运行模式", _display(manifest.get("runMode"))),
             ("维度", _fmt_number(manifest.get("dimension"))),
             ("应用版本", _display(versions.get("application"))),
@@ -1206,7 +1252,7 @@ def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
         metric_label = metric_name or measurement.metricId
         has_value = _measurement_has_value(measurement)
         value_text = _fmt_number(measurement.value) if has_value else "未记录"
-        unit_text = _display(measurement.unit, "") if has_value else ""
+        unit_text = _unit_text(measurement.unit) if has_value else ""
         status_text = _status_label(measurement.status)
         reason_text = _reason_text(measurement.reason)
         headline = "测量 %s · 数值 %s%s · %s" % (
@@ -1215,7 +1261,6 @@ def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
             headline += " · 说明 %s" % _escape(reason_text)
         sections.append("<p>%s</p>" % headline)
         rows: list[tuple[str, str]] = [
-            ("测量", _code(measurement.measurementId)),
             ("指标", _escape(metric_label)),
             ("配方", "%s v%s" % (_escape(measurement.recipeId), _display(measurement.recipeVersion, ""))),
             ("方法", "%s · %s" % (_display(measurement.method), _display(measurement.material))),
@@ -1227,13 +1272,14 @@ def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
         if not has_value:
             rows.append(("说明", _escape(reason_text)))
         rows.extend([
-            ("来源快照", _code(measurement.sourceSnapshotHash)),
             ("绑定状态", _status_label(measurement.bindingStatus)),
             ("等价状态", _status_label(measurement.equivalenceStatus)),
         ])
         sections.append(_kv_table(rows))
         raw_reason = _reason_detail(measurement.reason)
         sections.append(_details([
+            ("测量 ID", _code(measurement.measurementId)),
+            ("来源快照", _code(measurement.sourceSnapshotHash)),
             ("算法版本", _display(measurement.algorithmVersion)),
             ("来源运行 ID", _code(measurement.sourceRunId)),
             ("来源步骤 ID", _code(measurement.sourceStepId)),
@@ -1283,7 +1329,7 @@ def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
             ))
             sections.append(_details([
                 ("CI 方法", _display(aggregation.get("ciMethod"))),
-                ("单位", _display(aggregation.get("unit"))),
+                ("单位", _unit_text(aggregation.get("unit"))),
                 ("假设", _display(json.dumps(aggregation.get("assumptions") or [], ensure_ascii=False))),
                 ("样本来源", _display(aggregation.get("sampleSource"))),
             ]))
@@ -1292,7 +1338,7 @@ def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
             unit = window.get("unit") or ""
             sections.append("<h3>工艺窗口</h3>")
             sections.append(_kv_table([
-                ("工艺窗口", "%s – %s %s" % (_fmt_number(window.get("lower")), _fmt_number(window.get("upper")), _display(unit, ""))),
+                ("工艺窗口", "%s – %s %s" % (_fmt_number(window.get("lower")), _fmt_number(window.get("upper")), _unit_text(unit))),
                 ("候选", "%s 个" % _fmt_number(len(window.get("candidates") or []))),
             ]))
             sections.append("<p>通过 %s · 超出 %s · 不确定 %s · 未评估 %s</p>" % (
@@ -1358,7 +1404,8 @@ def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
         sections.append('<p><span class="muted">未填写</span></p>')
 
     body = "".join(sections)
-    timestamp = _now()
+    created_at = _now()
+    timestamp = _report_time()
     body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
     summary_parts = []
     if run_id:
@@ -1379,4 +1426,4 @@ def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
 </table></details>
 <button onclick="window.print()">打印 / 保存为 PDF</button>{body}</body></html>"""
     digest = hashlib.sha256(document.encode("utf-8")).hexdigest()
-    return {"reportId": f"report_{digest[:16]}", "title": title, "html": document, "sha256": digest, "createdAt": timestamp}
+    return {"reportId": f"report_{digest[:16]}", "title": title, "html": document, "sha256": digest, "createdAt": created_at}

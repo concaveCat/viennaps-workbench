@@ -53,6 +53,12 @@ export type ParsedMesh = {
   lines: Uint32Array;
   /** Colour index into `materials`, one per line, empty for 3D. */
   lineColor: Float32Array;
+  /**
+   * Per-vertex normals (xyz), computed once in the parse worker. Lighting is
+   * Gouraud/Phong, so a curved surface shows real shading instead of a flat
+   * material fill. Empty for 2D meshes.
+   */
+  normals: Float32Array;
   pointCount: number;
   triangleCount: number;
   lineCount: number;

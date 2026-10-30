@@ -228,11 +228,11 @@ const openZone = async name => {
   await page.getByRole('button', { name, exact: true }).click();
 };
 const openProject = async name => {
-  if (await page.locator('.spx-recent-projects').count() === 0) {
-    await page.getByRole('button', { name: 'File', exact: true }).click();
+  if (await page.locator('.spx-command').count() === 0) {
+    await page.getByRole('button', { name: '文件', exact: true }).click();
     await page.getByRole('menuitem', { name: '关闭工程 / 返回开始页' }).click();
     await page.getByRole('button', { name: '01 工程', exact: true }).click();
-    await page.locator('.spx-recent-projects').waitFor();
+    await page.locator('[aria-label="最近工程列表"]').waitFor();
   }
   const open = page.getByRole('button', { name: `打开工程 ${name}`, exact: true });
   await open.waitFor({ timeout: 30000 });
@@ -243,8 +243,34 @@ const openProject = async name => {
 try {
   await page.goto(`${baseUrl}/`);
 
+  // ---- Round-4 close-out: Chinese chrome, entry cards and the start page --
+  const menubarText = await page.locator('.spx-menubar').innerText();
+  for (const label of ['文件', '编辑', '视图', '工程', '运行', '工具', '帮助']) {
+    assert.ok(menubarText.includes(label), `top menu must be Chinese, missing ${label}: ${menubarText}`);
+  }
+  assert.doesNotMatch(menubarText, /\b(File|Edit|View|Project|Run|Tools|Help)\b/);
+  assert.equal(await page.locator('.spx-command').count(), 3, 'the start page shows the three entry cards');
+  assert.equal((await page.locator('.spx-doc-state').innerText()).match(/未打开工程/g)?.length, 1,
+    'only the dimension pill may say 未打开工程');
+  assert.equal(await page.locator('.spx-save-button').count(), 0, 'no save pill without a project');
+  assert.equal(await page.locator('.spx-sheet-title').filter({ hasText: '最近工程' }).count(), 1);
+  assert.equal(await page.locator('.spx-sheet-title').filter({ hasText: '示例工程' }).count(), 1);
+  assert.equal(await page.locator('#spx-examples .spx-sample').count(), 3, 'examples live in their own block');
+  await page.locator('.spx-command').filter({ hasText: '新建工程' }).click();
+  const newForm = await page.locator('.spx-sheet').filter({ hasText: '新建工程' }).last().innerText();
+  assert.doesNotMatch(newForm, /Domain & Grid|Solver|Engine|Rays per point|CPU threads|Plane height|X extent|gridDelta|Timeout \(s\)|\bSeed\b/, newForm);
+  for (const label of ['计算域与网格', '求解器', '引擎', '每点射线数', 'CPU 线程', '网格步长', 'X 范围', '随机种子', '超时（s）']) {
+    assert.ok(newForm.includes(label), `01 form must label ${label}: ${newForm}`);
+  }
+  await page.getByRole('button', { name: '取消', exact: true }).click();
+
   // ---- N1: project A restores with the ambiguous measurement --------------
   await openProject(fixtureName);
+  assert.equal(await page.locator('.spx-command').count(), 0, 'entry cards hide while a project is open');
+  assert.equal(await page.locator('.spx-save-button').count(), 1, 'the save pill appears with a project');
+  const projectStatusText = await page.locator('.spx-project-status').innerText();
+  assert.doesNotMatch(projectStatusText, /proj_/, `the project header must not show the raw id: ${projectStatusText}`);
+  assert.match(await page.locator('.spx-project-status').getAttribute('title') ?? '', /proj_/, 'the project id stays in title');
   await openZone('03 运行');
   await page.locator('.wf-summary[aria-label="当前测量"]').waitFor({ timeout: 30000 });
   const measurementSummary = await page.locator('.wf-summary[aria-label="当前测量"]').innerText();
@@ -258,6 +284,9 @@ try {
   const markerLabel = await page.locator('.wf-marker text').first().textContent();
   assert.match(markerLabel, /测量位置（无有效值）/, markerLabel);
   await page.screenshot({ path: path.join(shotDir, 'round4-03-ambiguous.png'), fullPage: true });
+  const statusRow = await page.locator('.wf-status-row').innerText();
+  assert.match(statusRow, /第 \d+ 段 · 成功/, `03 names the segment instead of the raw id: ${statusRow}`);
+  assert.match(statusRow, /第 \d+ 段 · 测量有歧义/, `03 separates the measurement row: ${statusRow}`);
 
   // ---- N1: 04 separates run success from metric validity ------------------
   await openZone('04 实验');
@@ -269,6 +298,18 @@ try {
   assert.match(resultTable, /测量有歧义/, resultTable);
   assert.match(resultTable, /说明：测量位置 X 处有多条材料界面相交/, resultTable);
   assert.doesNotMatch(resultTable, /multiple selected-material surfaces/, 'English reasons stay out of the table');
+  const variantInputs = page.locator('details.wf-experiment-inputs');
+  if (!await variantInputs.evaluate(element => element.open)) await variantInputs.locator('summary').click();
+  const firstDuration = await page.getByLabel('变体 1 duration').inputValue();
+  await page.getByLabel('变体 2 duration').fill(firstDuration);
+  const duplicateRow = page.locator('.wf-variant-table tr.has-error');
+  await duplicateRow.waitFor();
+  assert.match(await duplicateRow.innerText(), /与 V1 重复/);
+  assert.equal(await page.getByRole('button', { name: '创建实验' }).isDisabled(), true,
+    'a duplicate variant duration blocks experiment creation');
+  await page.getByLabel('变体 2 duration').fill('0.02');
+  await page.waitForTimeout(150);
+  assert.equal(await page.locator('.wf-variant-table tr.has-error').count(), 0);
   await page.screenshot({ path: path.join(shotDir, 'round4-04-metric-invalid.png'), fullPage: true });
 
   // ---- N1: 05 keeps numbers and reasons in separate columns ---------------
@@ -286,7 +327,26 @@ try {
   }
   assert.match(rows[0], /测量有歧义/);
   assert.match(rows[0], /测量位置 X 处有多条材料界面相交/);
-  await page.screenshot({ path: path.join(shotDir, 'round4-05-metric-columns.png'), fullPage: true });
+  const analysisAdvanced = page.locator('details.wf-analysis-advanced');
+  if (!await analysisAdvanced.evaluate(element => element.open)) await analysisAdvanced.locator('summary').first().click();
+  const csvFormat = page.locator('.wf-csv-format');
+  if (!await csvFormat.evaluate(element => element.open)) await csvFormat.locator('summary').click();
+  const csvText = await csvFormat.innerText();
+  for (const column of ['measured', 'simulated', 'weight(可选)', 'label(可选)', '0.0120']) {
+    assert.ok(csvText.includes(column), `CSV format reference must document ${column}: ${csvText}`);
+  }
+  const analysisText = await page.locator('.wf-card.wf-wide').innerText();
+  assert.doesNotMatch(analysisText, /Choose File|No file chosen/, 'no native English file input');
+  assert.ok(analysisText.includes('选择文件'));
+  assert.ok(analysisText.includes('未选择文件'));
+  await page.getByLabel('窗口下限').fill('0.5');
+  await page.getByLabel('窗口上限').fill('0.1');
+  const windowError = page.locator('[aria-label="窗口校验错误"]');
+  await windowError.waitFor();
+  assert.match(await windowError.innerText(), /窗口下限必须小于上限/);
+  await page.getByLabel('窗口下限').fill('');
+  await page.getByLabel('窗口上限').fill('');
+  await page.screenshot({ path: path.join(shotDir, 'round4-05-csv-window.png'), fullPage: true });
 
   // ---- N1/N3/N9: report ---------------------------------------------------
   await openZone('06 报告');
@@ -301,6 +361,10 @@ try {
   assert.doesNotMatch(reportText, /multiple selected-material surfaces/, 'the report shows Chinese reasons');
   assert.match(reportText, /种子（请求值）/);
   assert.match(reportText, /种子策略/);
+  assert.match(reportText, /生成时间 \d{4}-\d{2}-\d{2} \d{2}:\d{2} \S+/, reportText);
+  assert.doesNotMatch(reportText, /生成时间[^\n]*\d{4}-\d{2}-\d{2}T/, 'report time must not be ISO UTC');
+  assert.doesNotMatch(reportText, /shared-run-seed|not-applicable/, 'raw tokens stay out of the report body');
+  assert.match(reportText, /共享运行种子/);
   const reportHtml = await page.locator('.wf-report-preview').evaluate(frame => frame.contentDocument.documentElement.outerHTML);
   assert.match(reportHtml, /种子（请求值）<\/th><td>7</, 'fixed seed 7 must be shown');
   assert.ok((reportHtml.match(/<polygon/g) ?? []).length > 0, '2D report SVG must fill materials');
@@ -314,11 +378,29 @@ try {
   await page.waitForTimeout(400);
   await page.locator('.wf-report-preview').screenshot({ path: path.join(shotDir, 'round4-06-report-2d-structure.png') });
 
+  // ---- Library breadcrumb + Output log -----------------------------------
+  await page.locator('.spx-left .spx-tree-item').filter({ hasText: '材料' }).first().click();
+  await page.locator('.spx-library-view').waitFor();
+  const breadcrumb = await page.locator('.spx-breadcrumb').innerText();
+  assert.match(breadcrumb, /02 流程/);
+  assert.match(breadcrumb, /材料库/);
+  const libraryHead = await page.locator('.spx-library-category-head').first().innerText();
+  assert.match(libraryHead, /材料库 · \d+ 条/, `one separator only: ${libraryHead}`);
+  assert.doesNotMatch(libraryHead, /材料库 · ·/);
+  await page.screenshot({ path: path.join(shotDir, 'round4-02-library-breadcrumb.png'), fullPage: true });
+  await page.locator('.spx-breadcrumb').getByRole('button', { name: '返回流程' }).click();
+  await page.locator('.spx-library-view').waitFor({ state: 'detached' });
+  await page.getByRole('button', { name: /^(重新编译|编译流程)$/ }).click();
+  await page.locator('.spx-log').filter({ hasText: '已编译流程' }).waitFor({ timeout: 60000 });
+  const outputText = await page.locator('.spx-output-body').innerText();
+  assert.doesNotMatch(outputText, /project-delete|compile-flow|library-insert/, outputText);
+  assert.doesNotMatch(outputText, /[a-z]+-[a-z]+ …/, 'the log must not print internal handler ids');
+
   // ---- N8: reopening the GDS project keeps its file/layout ---------------
   await openZone('01 工程');
   await page.getByRole('button', { name: 'GDS / Layout' }).click();
   await page.locator('.spx-file-name').filter({ hasText: 'two-structure-two-layer.gds' }).first().waitFor({ timeout: 30000 });
-  assert.match(await page.locator('.spx-sheet').innerText(), /来自已注册 Layout/);
+  assert.match(await page.locator('.spx-sheet').filter({ hasText: '工程定义' }).innerText(), /来自已注册 Layout/);
   const registered = page.getByRole('button', { name: '已注册 Layout' });
   await registered.waitFor();
   assert.equal(await registered.isDisabled(), true, 'an existing Layout keeps the register button disabled');
@@ -350,6 +432,9 @@ try {
   assert.equal(await page.locator('.wf-result-table').count(), 0);
   await openZone('05 分析');
   assert.equal(await page.locator('[aria-label="测量指标表"]').count(), 0, '05 must not keep the previous metrics');
+  const refreshCandidates = page.getByRole('button', { name: '刷新候选' });
+  assert.equal(await refreshCandidates.isDisabled(), true);
+  assert.match(await page.locator('[aria-label="刷新候选禁用原因"]').innerText(), /当前工程还没有已完成的实验\/运行/);
   await openZone('06 报告');
   const reportSummary = await page.locator('.wf-report-summary').innerText();
   assert.match(reportSummary, /实验[\s\S]*?未提供/, reportSummary);
@@ -371,7 +456,7 @@ try {
   await openZone('01 工程');
   await page.getByLabel('工程 gridDelta').fill('0.1');
   await page.keyboard.press('Control+s');
-  await page.getByText(/已保存/).first().waitFor({ timeout: 30000 });
+  await page.locator('.spx-save-button').filter({ hasText: '已保存' }).waitFor({ timeout: 30000 });
   await page.waitForTimeout(500);
   dialogs.length = 0;
   await page.reload().catch(() => undefined);

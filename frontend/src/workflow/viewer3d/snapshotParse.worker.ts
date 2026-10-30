@@ -354,8 +354,45 @@ function buildSplitGeometry(
   return { positions: outPositions, polys, pointColor };
 }
 
-function validateIndices(indices: Uint32Array, pointCount: number, label: string): void {
-  for (let i = 0; i < indices.length; i++) {
+/**
+ * Area-weighted vertex normals for the split geometry, computed once here (in
+ * the worker) so the render loop never walks the mesh. Vertices are split by
+ * material, so the accumulation stays inside one material and shading cannot
+ * bleed across a material boundary.
+ */
+function computeNormals(positions: Float32Array, polys: Uint32Array): Float32Array {
+  const normals = new Float32Array(positions.length);
+  for (let t = 0; t + 3 < polys.length; t += 4) {
+    const i0 = polys[t + 1] * 3;
+    const i1 = polys[t + 2] * 3;
+    const i2 = polys[t + 3] * 3;
+    const ax = positions[i1] - positions[i0];
+    const ay = positions[i1 + 1] - positions[i0 + 1];
+    const az = positions[i1 + 2] - positions[i0 + 2];
+    const bx = positions[i2] - positions[i0];
+    const by = positions[i2 + 1] - positions[i0 + 1];
+    const bz = positions[i2 + 2] - positions[i0 + 2];
+    const nx = ay * bz - az * by;
+    const ny = az * bx - ax * bz;
+    const nz = ax * by - ay * bx;
+    normals[i0] += nx; normals[i0 + 1] += ny; normals[i0 + 2] += nz;
+    normals[i1] += nx; normals[i1 + 1] += ny; normals[i1 + 2] += nz;
+    normals[i2] += nx; normals[i2 + 1] += ny; normals[i2 + 2] += nz;
+  }
+  for (let i = 0; i < normals.length; i += 3) {
+    const length = Math.hypot(normals[i], normals[i + 1], normals[i + 2]);
+    if (length > 1e-12) {
+      normals[i] /= length;
+      normals[i + 1] /= length;
+      normals[i + 2] /= length;
+    } else {
+      normals[i + 2] = 1;
+    }
+  }
+  return normals;
+}
+
+function validateIndices(indices: Uint32Array, pointCount: number, label: string): void {  for (let i = 0; i < indices.length; i++) {
     if (indices[i] >= pointCount) {
       throw new ParseFailure(`${label}索引 ${indices[i]} 超出点数量 ${pointCount}，快照几何不一致`);
     }
@@ -408,6 +445,7 @@ function parseDocument(request: ParseRequest, doc: SnapshotDoc, options: ParseOp
         pointColor: new Float32Array(0),
         lines: new Uint32Array(0),
         lineColor: new Float32Array(0),
+        normals: new Float32Array(0),
         pointCount,
         triangleCount: 0,
         lineCount: 0,
@@ -450,6 +488,7 @@ function parseDocument(request: ParseRequest, doc: SnapshotDoc, options: ParseOp
       pointColor: split.pointColor,
       lines: new Uint32Array(0),
       lineColor: new Float32Array(0),
+      normals: computeNormals(split.positions, split.polys),
       pointCount: split.positions.length / 3,
       triangleCount,
       lineCount: 0,
@@ -482,6 +521,7 @@ function parseDocument(request: ParseRequest, doc: SnapshotDoc, options: ParseOp
     pointColor: new Float32Array(0),
     lines,
     lineColor: mapIds(lineIds, indexOf),
+    normals: new Float32Array(0),
     pointCount,
     triangleCount: 0,
     lineCount,
@@ -505,6 +545,7 @@ function transferables(mesh: ParsedMesh): Transferable[] {
     mesh.pointColor.buffer,
     mesh.lines.buffer,
     mesh.lineColor.buffer,
+    mesh.normals.buffer,
   ];
 }
 

@@ -143,6 +143,12 @@ export async function createVtkScene(container: HTMLElement): Promise<VtkScene> 
     values: new Float32Array(0),
   });
   data.getPointData().setScalars(scalars);
+  const normalsData: vtkDataArray = dataArrayModule.default.newInstance({
+    name: 'normals',
+    numberOfComponents: 3,
+    values: new Float32Array(0),
+  });
+  data.getPointData().setNormals(normalsData);
   const mapper: vtkMapper = mapperModule.default.newInstance();
   mapper.setInputData(data);
   mapper.setLookupTable(lookupTable);
@@ -153,10 +159,14 @@ export async function createVtkScene(container: HTMLElement): Promise<VtkScene> 
   mapper.setScalarVisibility(true);
   const actor: vtkActor = actorModule.default.newInstance();
   actor.setMapper(mapper);
-  actor.getProperty().setInterpolationToFlat();
+  // Real lighting: Gouraud shading over the worker-computed vertex normals,
+  // so a curved surface is readable while the base colour still comes from
+  // the material LUT.
+  actor.getProperty().setInterpolationToGouraud();
   actor.getProperty().setAmbient(0.25);
-  actor.getProperty().setDiffuse(0.85);
-  actor.getProperty().setSpecular(0.08);
+  actor.getProperty().setDiffuse(0.75);
+  actor.getProperty().setSpecular(0.15);
+  actor.getProperty().setSpecularPower(24);
   renderer.addActor(actor);
 
   const plane: vtkPlane = planeModule.default.newInstance();
@@ -547,6 +557,16 @@ export async function createVtkScene(container: HTMLElement): Promise<VtkScene> 
     data.getPolys().setData(filterGeometry(mesh, hiddenMaterials));
     scalars.setData(mesh.pointColor, 1);
     data.getPointData().setScalars(scalars);
+    // Normals arrive precomputed from the parse worker. A mesh without them
+    // (an old cache entry) gets a neutral normal once, never per frame.
+    let normals = mesh.normals;
+    if (normals.length !== mesh.positions.length) {
+      normals = new Float32Array(mesh.positions.length);
+      for (let i = 2; i < normals.length; i += 3) normals[i] = 1;
+      mesh.normals = normals;
+    }
+    normalsData.setData(normals, 3);
+    data.getPointData().setNormals(normalsData);
     applyMaterials(mesh);
     data.modified();
     mapper.modified();
@@ -675,6 +695,7 @@ export async function createVtkScene(container: HTMLElement): Promise<VtkScene> 
     actor.delete();
     mapper.delete();
     scalars.delete();
+    normalsData.delete();
     data.delete();
     lookupTable.delete();
     const style = interactor.getInteractorStyle();

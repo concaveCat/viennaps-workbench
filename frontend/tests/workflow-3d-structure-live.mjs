@@ -106,14 +106,47 @@ function analyzePng(buffer) {
   const [br, bg, bb] = backgroundKey.split(',').map(Number);
   let painted = 0;
   const quantized = new Set();
+  // Group painted pixels by hue so a single material's brightness spread can
+  // be measured. Real lighting makes one material brighter where its normal
+  // faces the light and darker elsewhere; a flat fill has zero spread.
+  const hueBuckets = new Map();
   for (let i = 0; i < width * height; i += 1) {
     const r = pixels[i * channels];
     const g = pixels[i * channels + 1];
     const b = pixels[i * channels + 2];
     if (Math.abs(r - br) + Math.abs(g - bg) + Math.abs(b - bb) > 18) painted += 1;
     quantized.add(`${r >> 4},${g >> 4},${b >> 4}`);
+    if (Math.abs(r - br) + Math.abs(g - bg) + Math.abs(b - bb) <= 18) continue;
+    const max = Math.max(r, g, b);
+    const min = Math.min(r, g, b);
+    const saturation = max === 0 ? 0 : (max - min) / max;
+    if (saturation < 0.18 || max < 30) continue;
+    let hue;
+    const delta = max - min;
+    if (max === r) hue = ((g - b) / delta) % 6;
+    else if (max === g) hue = (b - r) / delta + 2;
+    else hue = (r - g) / delta + 4;
+    hue = (hue * 60 + 360) % 360;
+    const bucket = Math.round(hue / 12);
+    const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    if (!hueBuckets.has(bucket)) hueBuckets.set(bucket, []);
+    hueBuckets.get(bucket).push(luminance);
   }
-  return { width, height, painted, uniqueColors: quantized.size, backgroundKey };
+  let lighting = null;
+  for (const [bucket, values] of hueBuckets) {
+    if (!lighting || values.length > lighting.count) {
+      const mean = values.reduce((total, value) => total + value, 0) / values.length;
+      const variance = values.reduce((total, value) => total + (value - mean) ** 2, 0) / values.length;
+      lighting = {
+        hueBucket: bucket,
+        count: values.length,
+        mean: Number(mean.toFixed(2)),
+        std: Number(Math.sqrt(variance).toFixed(2)),
+        spread: Number((Math.max(...values) - Math.min(...values)).toFixed(2)),
+      };
+    }
+  }
+  return { width, height, painted, uniqueColors: quantized.size, backgroundKey, lighting };
 }
 
 /**
@@ -196,12 +229,22 @@ try {
 
   const stepChipId = await page.locator('.wf-step-chip.active').first().getAttribute('data-step-id');
   assert.ok(stepChipId && stepChipId !== 'initial', `default selection should be the executed step, got ${stepChipId}`);
+  assert.equal(await page.locator('.wf-structure-info code').count(), 0, 'the current step shows its name, not the raw s_... id');
+  assert.match(await page.locator('.wf-structure-side').innerText(), /第 \d+ 段 · Run 已记录/);
 
   await page.locator('.wb-viewer3d__stage').screenshot({ path: screenshot.replace(/\.png$/, '-canvas.png') });
   const canvasPng = await page.locator('.wb-viewer3d__stage').screenshot();
   const canvasPixels = analyzePng(canvasPng);
   assert.ok(canvasPixels.painted > 500, `3D canvas looks blank (${canvasPixels.painted} painted pixels)`);
   assert.ok(canvasPixels.uniqueColors > 8, `3D canvas is flat (${canvasPixels.uniqueColors} quantized colours)`);
+  // Lighting: the dominant material must not be one flat fill. Its pixels span
+  // different orientations, so brightness has to vary measurably.
+  assert.ok(canvasPixels.lighting && canvasPixels.lighting.count > 500,
+    `lighting sample missing: ${JSON.stringify(canvasPixels.lighting)}`);
+  assert.ok(canvasPixels.lighting.spread > 15,
+    `same-material pixels must differ in brightness (${JSON.stringify(canvasPixels.lighting)})`);
+  assert.ok(canvasPixels.lighting.std > 3,
+    `same-material brightness must vary with orientation (${JSON.stringify(canvasPixels.lighting)})`);
 
   // ---- N6/N16: standard views fit the visible geometry --------------------
   await page.getByLabel('标准视角').selectOption('xz');

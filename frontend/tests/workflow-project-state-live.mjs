@@ -76,7 +76,7 @@ try {
   // --- B2: a draft is saved from the global top-bar action -----------------
   await page.locator('input[type=file]').nth(1).setInputFiles(projectPath);
   await page.locator('.spx-save-button').click();
-  await page.getByText(/已保存/).first().waitFor();
+  await page.locator('.spx-save-button').filter({ hasText: '已保存' }).waitFor();
   const projectId = await page.evaluate(() => window.localStorage.getItem('viennaps.workflow.projectId'));
   assert.ok(projectId && projectId.startsWith('proj_'), `project id must be persisted, got ${projectId}`);
 
@@ -122,7 +122,7 @@ try {
   await page.locator('.wf-summary').filter({ hasText: 'Route 已创建' }).waitFor();
   await page.locator('.wf-structure-timeline').waitFor({ timeout: 30000 });
   assert.ok(await page.locator('.wf-step-chip').count() >= chipsBeforeReload, 'reload must rebuild the structure timeline');
-  assert.match(await page.locator('.wf-status-row').innerText(), /Run 已记录/);
+  assert.match(await page.locator('.wf-status-row').innerText(), /第 \d+ 段 · 成功/);
   const treeAfterReload = await page.locator('.spx-tree').first().innerText();
   assert.match(treeAfterReload, /已编译/);
   assert.match(treeAfterReload, /已创建/);
@@ -152,7 +152,7 @@ try {
   await page.getByLabel('工程引擎').selectOption('auto');
   await page.getByLabel('工程 seed').fill('123');
   await page.locator('.spx-save-button').click();
-  await page.getByText(/已保存/).first().waitFor();
+  await page.locator('.spx-save-button').filter({ hasText: '已保存' }).waitFor();
   await page.waitForTimeout(500);
   await page.reload();
   await page.getByText('ViennaPS Workbench').first().waitFor();
@@ -168,19 +168,19 @@ try {
   await openZone('01 工程');
   await page.getByLabel('工程 gridDelta').fill('0.9');
   await page.locator('.spx-field-error').filter({ hasText: 'gridDelta 必须 > 0 且 ≤ 0.5 µm' }).first().waitFor();
-  assert.equal(await page.locator('.spx-sheet').getByRole('button', { name: /保存更改|保存工程/ }).isDisabled(), true);
+  assert.equal(await page.locator('.spx-sheet').filter({ hasText: '工程定义' }).getByRole('button', { name: /保存更改|保存工程/ }).isDisabled(), true);
   await page.getByLabel('工程 gridDelta').fill('0.1');
 
   // --- D: GDS tab blocks a save until an existing Clip is selected --------
   await page.getByRole('button', { name: 'GDS / Layout' }).click();
   await page.getByText('先选择或保存一个 Clip 作为工程几何').first().waitFor();
-  assert.equal(await page.locator('.spx-sheet').getByRole('button', { name: /保存更改|保存工程/ }).isDisabled(), true,
+  assert.equal(await page.locator('.spx-sheet').filter({ hasText: '工程定义' }).getByRole('button', { name: /保存更改|保存工程/ }).isDisabled(), true,
     'saving must be blocked while the GDS tab has no clip');
   const clipButton = page.locator('[aria-label="已有 Clip"] button').filter({ hasText: clip.name }).first();
   await clipButton.waitFor({ timeout: 30000 });
   await clipButton.click();
-  await page.locator('.spx-sheet').getByRole('button', { name: /保存更改|保存工程/ }).click();
-  await page.getByText(/已保存/).first().waitFor();
+  await page.locator('.spx-sheet').filter({ hasText: '工程定义' }).getByRole('button', { name: /保存更改|保存工程/ }).click();
+  await page.locator('.spx-save-button').filter({ hasText: '已保存' }).waitFor();
   await page.waitForTimeout(500);
 
   await page.reload();
@@ -193,7 +193,7 @@ try {
 
   // --- E: recent projects offer an explicit 打开 action -------------------
   await page.locator('.spx-save-button').click();
-  await page.getByText(/已保存/).first().waitFor();
+  await page.locator('.spx-save-button').filter({ hasText: '已保存' }).waitFor();
   await page.getByRole('button', { name: '关闭工程' }).click();
   await page.locator('.spx-recent-projects').waitFor();
   const recentRow = page.locator('.spx-project-row').filter({ hasText: 'P1 2D five-step fixture' }).first();

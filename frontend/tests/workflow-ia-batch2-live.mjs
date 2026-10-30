@@ -81,6 +81,8 @@ try {
   assert.equal(exported.name, savedName);
 
   // ---- Same-name conflict needs an explicit overwrite confirmation.
+  // Entry cards are hidden while a project is open: close it first.
+  await page.getByRole('button', { name: '关闭工程', exact: true }).click();
   await page.locator('.spx-command').filter({ hasText: '新建工程' }).click();
   await page.getByLabel('新工程名称').fill(savedName);
   await page.getByRole('button', { name: '3D', exact: true }).click();

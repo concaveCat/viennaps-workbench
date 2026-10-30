@@ -427,17 +427,22 @@ const DEFAULT_DEFINITION_JSON = JSON.stringify({
   },
 }, null, 2);
 
+/**
+ * Output log verbs. Only the completed action is printed (never the internal
+ * handler id), so the log stays a single Chinese result line per action.
+ */
 const ACTION_LABELS: Record<string, string> = {
   'compile-flow': '编译流程',
-  'template': '模板操作',
+  'template': '保存模板',
   'diff': '比较编译版本',
   'route': '创建 Route',
   'execute': '执行 Segment',
   'measure': '测量',
-  'decision': '测量决策',
+  'decision': '生成测量决策',
   'decision-replay': '重放决策',
-  'branch': '分支',
-  'experiment': '实验',
+  'branch': '创建分支',
+  'experiment': '运行实验',
+  'experiment-open': '打开实验',
   'layout': '注册版图',
   'preview': '预览 Clip',
   'clip': '保存 Clip',
@@ -447,24 +452,27 @@ const ACTION_LABELS: Record<string, string> = {
   'definition': '保存流程定义',
   'expand': '展开流程定义',
   'definition-compile': '编译模块化流程',
-  'library': '共享库',
+  'library': '更新共享库',
   'library-save': '保存库条目',
   'library-delete': '删除库条目',
   'library-insert': '插入库条目',
   'doe': '设计 DOE',
-  'retention': '保留策略',
-  'table': '实验表格',
-  'metric-detail': '测量证据',
-  'compare': '候选比较',
-  'window': 'Process Window',
+  'retention': '更新保留策略',
+  'table': '更新实验表格',
+  'metric-detail': '载入测量证据',
+  'compare': '比较候选',
+  'window': '计算工艺窗口',
   'report': '生成报告',
-  'calibration': '标定',
+  'calibration': '更新标定',
   'gds': '上传 GDS',
-  'project': '工程',
+  'project': '更新工程',
+  'project-delete': '删除工程',
+  'project-open': '打开工程',
+  'project-save': '保存工程',
 };
 
 function actionLabel(name: string): string {
-  return ACTION_LABELS[name] ?? name;
+  return ACTION_LABELS[name] ?? '操作';
 }
 
 const ZONES = [
@@ -501,7 +509,23 @@ const STATUS_LABELS: Record<string, string> = {
   pass: '通过',
   fail: '失败',
   uncertain: '不确定',
+  'not-applicable': '不适用',
+  not_applicable: '不适用',
+  'shared-run-seed': '共享运行种子',
 };
+
+/** Uncertainty uses its own wording: `ambiguous` here means "有歧义", not a status pill. */
+const UNCERTAINTY_LABELS: Record<string, string> = {
+  ambiguous: '有歧义',
+  'not-applicable': '不适用',
+  not_applicable: '不适用',
+  measured: '已确定',
+};
+
+function uncertaintyLabel(value: string | null | undefined): string {
+  if (!value) return '—';
+  return UNCERTAINTY_LABELS[value] ?? STATUS_LABELS[value] ?? value;
+}
 
 const ENGINE_LABELS: Record<string, string> = { cpu: 'CPU', gpu: 'GPU', auto: 'Auto' };
 
@@ -1416,6 +1440,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [reportDocument, setReportDocument] = useState<ReportDocument | null>(null);
   const reportFrameRef = useRef<HTMLIFrameElement>(null);
   const [calibrationCsv, setCalibrationCsv] = useState('');
+  const [calibrationFileName, setCalibrationFileName] = useState('');
+  const calibrationInput = useRef<HTMLInputElement>(null);
   const [calibrationName, setCalibrationName] = useState('calibration');
   const [calibrationModel, setCalibrationModel] = useState('scale_offset');
   const [calibrationMethod, setCalibrationMethod] = useState<'least-squares' | 'nelder-mead'>('least-squares');
@@ -1958,7 +1984,6 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     applyLoadedProject(document, record);
     await activateClipBinding(await resolveClipBinding(document));
     window.localStorage.setItem(PROJECT_STORAGE_KEY, record.projectId);
-    setActivityLog(previous => [...previous.slice(-79), `${clockTime()}  已打开工程 ${record.name}`]);
     await restoreWorkflowState(record.projectId);
   });
 
@@ -1980,7 +2005,6 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       setSetupMode('home');
     }
     await refreshProjects();
-    setActivityLog(previous => [...previous.slice(-79), `${clockTime()}  已删除工程 ${record.name}`]);
   });
 
   const exportProjectJson = () => {
@@ -2288,6 +2312,21 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             : '';
   const analysisReady = !!project && !!compile && (experimentRunCount > 0 || !!measurement);
   const reportReady = hasExecutedRun || !!measurement || experimentRunCount > 0;
+  /** Row index -> index of the earlier variant with the same duration. */
+  const duplicateVariantDurations = useMemo(() => {
+    const firstIndex = new Map<string, number>();
+    const duplicates = new Map<number, number>();
+    experimentRows.forEach((row, index) => {
+      const value = Number(row.duration);
+      if (!row.duration.trim() || !Number.isFinite(value)) return;
+      const key = value.toFixed(6);
+      const first = firstIndex.get(key);
+      if (first === undefined) firstIndex.set(key, index);
+      else duplicates.set(index, first);
+    });
+    return duplicates;
+  }, [experimentRows]);
+  const variantDurationConflict = duplicateVariantDurations.size > 0;
   const routeStale = !!route && !!compile && route.attempts.some(attempt => attempt.compileId !== compile.compileId);
 
   const stepDisplayName = useCallback((stepId: string): string => {
@@ -2373,6 +2412,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   }, [runStructureSteps]);
 
   const structureSelection = runStructureSteps.find(row => `${row.runId}:${row.stepId}` === structurePick) ?? null;
+  const segmentIndex = segment && route ? route.segments.findIndex(item => item.segmentId === segment.segmentId) : -1;
+  const segmentNumber = segmentIndex >= 0 ? segmentIndex + 1 : 1;
   const structureRunId = structureSelection?.runId ?? null;
   const structureStepId = structureSelection?.stepId ?? '';
   const structureStepIds = useMemo(
@@ -2461,16 +2502,17 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
 
   const run = async (name: string, task: () => Promise<void>) => {
     const label = actionLabel(name);
-    setActivityLog(previous => [...previous.slice(-79), `${clockTime()}  ${label} …`]);
     setBusy(name);
     setError('');
     try {
       await task();
-      setActivityLog(previous => [...previous.slice(-79), `${clockTime()}  ${label} 完成`]);
+      // One result line only: the start of an action is not printed, so the
+      // Output panel never shows internal handler ids or a bare ellipsis.
+      setActivityLog(previous => [...previous.slice(-79), `${clockTime()}  已${label}`]);
     } catch (exc) {
       const raw = exc instanceof Error ? exc.message : String(exc);
       setError(translateBackendError(raw));
-      setActivityLog(previous => [...previous.slice(-79), `${clockTime()}  ${label} 失败: ${translateBackendError(raw)}${raw !== translateBackendError(raw) ? `（${raw}）` : ''}`]);
+      setActivityLog(previous => [...previous.slice(-79), `${clockTime()}  ${label}失败：${translateBackendError(raw)}${raw !== translateBackendError(raw) ? `（${raw}）` : ''}`]);
     } finally { setBusy(null); }
   };
 
@@ -2517,7 +2559,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       setRestoreNotice('');
       setStateNotice('');
       setSetupMode('project');
-      setActivityLog(previous => [...previous.slice(-79), `${clockTime()}  已导入工程: ${parsed.name ?? '未命名'}`]);
+      setActivityLog(previous => [...previous.slice(-79), `${clockTime()}  已导入工程 ${parsed.name ?? '未命名'}`]);
     } catch {
       setError('项目 JSON 无法解析');
     }
@@ -4110,11 +4152,34 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     : experimentRunCount === 0
       ? '先完成实验或测量：实验尚未运行。'
       : '';
+  const refreshCandidatesBlockedReason = !experimentDoc || experimentRunCount === 0
+    ? '当前工程还没有已完成的实验/运行'
+    : busy
+      ? '正在执行其他操作，完成后再刷新候选'
+      : '';
+
+  /** Validate the two bounds together so lower > upper is reported in place. */
+  const windowBoundsError = (lowerText: string, upperText: string): string => {
+    if (!lowerText.trim() || !upperText.trim()) return '';
+    const lower = Number(lowerText);
+    const upper = Number(upperText);
+    if (!Number.isFinite(lower) || !Number.isFinite(upper)) return '填写有效的窗口上下限（数字）';
+    return lower >= upper ? '窗口下限必须小于上限' : '';
+  };
+
+  const updateWindowBound = (kind: 'lower' | 'upper', value: string) => {
+    const nextLower = kind === 'lower' ? value : windowLower;
+    const nextUpper = kind === 'upper' ? value : windowUpper;
+    if (kind === 'lower') setWindowLower(value);
+    else setWindowUpper(value);
+    setWindowError(windowBoundsError(nextLower, nextUpper));
+  };
 
   const computeProcessWindow = () => {
     const lower = Number(windowLower);
     const upper = Number(windowUpper);
-    const problem = windowBlockedReason
+    const problem = windowBoundsError(windowLower, windowUpper)
+      || windowBlockedReason
       || (!windowLower.trim() || !windowUpper.trim() || !Number.isFinite(lower) || !Number.isFinite(upper)
         ? '填写有效的窗口上下限（数字）'
         : lower >= upper ? '窗口下限必须小于上限' : '');
@@ -4196,6 +4261,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
 
   const loadCalibrationFile = async (file: File) => {
     setCalibrationCsv(await file.text());
+    setCalibrationFileName(file.name);
     setCalibrationName(file.name.replace(/\.[^.]+$/, ''));
     setCalibrationDataset(null);
     setCalibrationFit(null);
@@ -4338,11 +4404,17 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
 
   const renderLibraryManager = () => (
     <div className="spx-library-view" aria-label="库管理">
+      <nav className="spx-breadcrumb" aria-label="面包屑">
+        <button type="button" className="spx-link" aria-label="返回流程" onClick={() => navigateZone('flow')}>02 流程</button>
+        <span aria-hidden="true">/</span>
+        <span>{LIBRARY_CATEGORY_LABELS[managerCategory]}</span>
+      </nav>
       <div className="spx-library-category-head">
-        <strong>{LIBRARY_CATEGORY_LABELS[managerCategory]}</strong>
-        <span className={managerError ? 'spx-library-load-error' : 'wf-muted'}>
-          {managerLoading ? '加载中…' : managerError ? `加载失败：${managerError}` : `· ${managerItems.length} 条`}
-        </span>
+        <strong>{managerLoading
+          ? LIBRARY_CATEGORY_LABELS[managerCategory]
+          : `${LIBRARY_CATEGORY_LABELS[managerCategory]} · ${managerItems.length} 条`}</strong>
+        {managerLoading && <span className="wf-muted">加载中…</span>}
+        {managerError && <span className="spx-library-load-error">{`加载失败：${managerError}`}</span>}
         {managerError && <button type="button" className="wf-button ghost" onClick={() => void loadManagerCategory(managerCategory)}>重试</button>}
       </div>
       <div className="spx-library-manager-body">
@@ -4373,7 +4445,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               <i style={{ background: color }} aria-hidden="true" />
               <strong>{item.name}</strong>
               <span>{managerRowMeta(item)}</span>
-              {duplicate && <span className="spx-library-row-id">#{item.itemId.slice(-6)}</span>}
+              {duplicate && <span className="spx-library-row-id">重名</span>}
             </button>;
           })}
         </div>
@@ -4528,13 +4600,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     return (key ? layerMaterials[key] : '') || activeClip?.layers.find(item => item.layer === layer)?.material || 'Si';
   };
 
-  const duplicateClipNames = new Set(clips
-    .map(clip => clip.name)
-    .filter((name, index, list) => list.indexOf(name) !== index));
-
-  const clipLabel = (clip: Clip) => duplicateClipNames.has(clip.name)
-    ? `${clip.name} #${clip.clipId.slice(-6)}`
-    : clip.name;
+  const clipLabel = (clip: Clip) => clip.name;
 
   const renderClipCanvas = (source: ClipCanvas) => {
     const unit = 'µm';
@@ -4624,7 +4690,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         <button type="button" className="wf-button ghost spx-browse" disabled={!!busy} onClick={() => gdsInput.current?.click()}>{gdsDisplayName ? '更换 GDS' : '上传 GDS'}</button>
       </div>
       {gds
-        ? <div className="spx-form-note">asset {gds.assetId.slice(0, 20)}…</div>
+        ? <div className="spx-form-note" title={gds.assetId}>已上传 GDS{activeLayout ? ` · ${activeLayout.fileName}` : ''}</div>
         : gdsFromRegisteredLayout
           ? <div className="spx-form-note">来自已注册 Layout{activeLayout ? ` · ${activeLayout.fileName}` : ''}（无需重新上传）</div>
           : null}
@@ -4679,7 +4745,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         <button className="wf-button ghost" disabled={!!busy} onClick={() => void addAnnotation()}>添加标注</button>
       </div>}
       {showList && clips.length > 0 && <div className="spx-clip-summary-list" aria-label="Clip 列表">
-        {clips.map(clip => <button key={clip.clipId} type="button" className={activeClip?.clipId === clip.clipId ? 'active' : ''} onClick={() => selectClip(clip)}>
+        {clips.map(clip => <button key={clip.clipId} type="button" title={`${clip.clipId} · ${clip.gdsFileName}`} className={activeClip?.clipId === clip.clipId ? 'active' : ''} onClick={() => selectClip(clip)}>
           <strong>{clipLabel(clip)}</strong>
           <span>{clip.layers.length} 层 · {clip.polygonCount} 多边形</span>
           <span>x {clip.bbox.x0}…{clip.bbox.x1} · y {clip.bbox.y0}…{clip.bbox.y1} µm</span>
@@ -4727,10 +4793,10 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     { label: '引擎', value: health ? `ViennaPS ${health.viennaps ?? '—'}` : '—' },
   ];
 
-  const renderDomainField = (label: string, key: 'gridDelta' | 'xExtent' | 'yExtent', step = '0.01') => {
+  const renderDomainField = (label: string, key: 'gridDelta' | 'xExtent' | 'yExtent', step = '0.01', title?: string) => {
     const error = projectFormErrors[`domain.${key}`];
     return <label className={`spx-field${error ? ' invalid' : ''}`} key={key}>
-      <span>{label}</span>
+      <span title={title ?? key}>{label}</span>
       <input aria-label={`工程 ${key}`} type="number" step={step} value={String(projectDomain[key] ?? '')}
         aria-invalid={!!error}
         onChange={event => updateProjectDomain({ [key]: Number(event.target.value) })} />
@@ -4738,10 +4804,10 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     </label>;
   };
 
-  const renderGeometryField = (label: string, key: 'height' | 'width' | 'depth' | 'radius' | 'taperAngle' | 'maskHeight', step = '0.01') => {
+  const renderGeometryField = (label: string, key: 'height' | 'width' | 'depth' | 'radius' | 'taperAngle' | 'maskHeight', step = '0.01', title?: string) => {
     const error = projectFormErrors[`geometry.${key}`];
     return <label className={`spx-field${error ? ' invalid' : ''}`} key={key}>
-      <span>{label}</span>
+      <span title={title ?? key}>{label}</span>
       <input aria-label={`工程几何 ${key}`} type="number" step={step} value={String(projectGeometry[key] ?? '')}
         aria-invalid={!!error}
         onChange={event => updateProjectGeometryField({ [key]: Number(event.target.value) })} />
@@ -4749,12 +4815,12 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     </label>;
   };
 
-  const renderSolverField = (label: string, key: 'enginePreference' | 'seed' | 'timeoutSeconds' | 'raysPerPoint' | 'cpuThreads') => {
+  const renderSolverField = (label: string, key: 'enginePreference' | 'seed' | 'timeoutSeconds' | 'raysPerPoint' | 'cpuThreads', title?: string) => {
     const error = projectFormErrors[`solver.${key}`];
     const value = key === 'seed' ? projectRandom.seed : projectSolver[key];
     if (key === 'enginePreference') {
       return <label className="spx-field" key={key}>
-        <span>{label}</span>
+        <span title={title ?? key}>{label}</span>
         <select aria-label="工程引擎" value={String(value ?? 'cpu')}
           onChange={event => updateProjectSolver({ enginePreference: event.target.value })}>
           <option value="cpu">CPU</option>
@@ -4764,7 +4830,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       </label>;
     }
     return <label className={`spx-field${error ? ' invalid' : ''}`} key={key}>
-      <span>{label}</span>
+      <span title={title ?? key}>{label}</span>
       <input aria-label={`工程 ${key}`} type="number" step="1" value={String(value ?? '')}
         aria-invalid={!!error}
         onChange={event => updateProjectSolver({ [key]: Number(event.target.value) })} />
@@ -4785,8 +4851,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         <div className="spx-menubar">
           {openMenu && <div className="spx-menu-scrim" onClick={() => setOpenMenu(null)} />}
           {[
-            ['file', 'File'], ['edit', 'Edit'], ['view', 'View'], ['project', 'Project'],
-            ['run', 'Run'], ['tools', 'Tools'], ['help', 'Help'],
+            ['file', '文件'], ['edit', '编辑'], ['view', '视图'], ['project', '工程'],
+            ['run', '运行'], ['tools', '工具'], ['help', '帮助'],
           ].map(([id, label]) => <div className="spx-menu" key={id}>
             <button type="button" className={openMenu === id ? 'spx-menu-button active' : 'spx-menu-button'} aria-expanded={openMenu === id} onClick={() => setOpenMenu(openMenu === id ? null : id)}>{label}</button>
             {openMenu === id && <div className="spx-menu-popover" role="menu">
@@ -4877,18 +4943,18 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 {
                   label: 'Run',
                   target: 'run' as const,
-                  value: segment ? `第 ${Math.max(1, (route?.segments.findIndex(item => item.segmentId === segment.segmentId) ?? 0) + 1)} 个 Segment` : '—',
+                  value: segment ? `第 ${segmentNumber} 段` : '—',
                   badge: segment ? statusLabel(segment.status) : '未运行',
                   badgeClass: segment?.status === 'succeeded' ? 'succeeded' : segment?.status === 'running' ? 'running' : segment?.status === 'failed' ? 'failed' : 'planned',
-                  title: segment?.runId ? `Run ${segment.runId}` : '尚未执行 Segment',
+                  title: segment ? `第 ${segmentNumber} 段 · Run ${segment.runId ?? '未记录'} · Segment ${segment.segmentId}` : '尚未执行 Segment',
                 },
                 {
                   label: '测量',
                   target: 'run' as const,
-                  value: measurement ? measurementValueText(measurement) : '—',
+                  value: measurement ? `第 ${segmentNumber} 段 · ${measurementHasValue(measurement) ? '已测量' : statusLabel(measurement.status)}` : '—',
                   badge: measurement ? (measurementHasValue(measurement) ? '已测量' : statusLabel(measurement.status)) : '未测量',
                   badgeClass: measurement ? (measurementHasValue(measurement) ? 'measured' : measurement.status) : 'planned',
-                  title: measurement ? `Measurement ${measurement.measurementId}` : '尚未测量',
+                  title: measurement ? `${measurementValueText(measurement)} · Measurement ${measurement.measurementId}` : '尚未测量',
                 },
                 {
                   label: '实验',
@@ -4978,16 +5044,13 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             </div>
             <div className="spx-doc-state">
               <span className="spx-state-pill">{project ? `${project.dimension ?? '?'}D · ${geometrySourceLabel}` : '未打开工程'}</span>
-              <button
+              {project && <button
                 type="button"
-                className={`spx-state-pill spx-save-button${projectId && !projectDirty && project ? ' ok' : ''}`}
+                className={`spx-state-pill spx-save-button${projectId && !projectDirty ? ' ok' : ''}`}
                 disabled={busy === 'project-save'}
-                title={project ? '保存当前工程（Ctrl/Cmd+S）' : '未打开工程：先在 01 新建或打开工程'}
-                onClick={() => {
-                  if (!project) { navigateZone('setup'); setSetupMode('home'); return; }
-                  void saveProject();
-                }}
-              >{saveLabel}</button>
+                title="保存当前工程（Ctrl/Cmd+S）"
+                onClick={() => void saveProject()}
+              >{saveLabel}</button>}
               {stateSaving && <span className="spx-sync-hint">同步状态…</span>}
             </div>
           </div>
@@ -4998,13 +5061,16 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
 
           <main className="wf-grid spx-doc-body">
         <section className={`spx-page wf-setup ${zone === 'setup' ? '' : 'wf-hidden'}`}>
-          <div className="spx-command-row">
+          {!project && <div className="spx-command-row">
             <button type="button" className={setupMode === 'new' ? 'spx-command active' : 'spx-command'} onClick={startNewProject}>
               <span className="spx-command-icon">＋</span>
               <strong>新建工程</strong>
               <span>定义名称、维度与几何来源</span>
             </button>
-            <button type="button" className={setupMode === 'examples' ? 'spx-command active' : 'spx-command'} onClick={() => setSetupMode('examples')}>
+            <button type="button" className={setupMode === 'examples' ? 'spx-command active' : 'spx-command'} onClick={() => {
+              setSetupMode('examples');
+              document.getElementById('spx-examples')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }}>
               <span className="spx-command-icon">▦</span>
               <strong>从示例开始</strong>
               <span>载入 2D / 3D starter project</span>
@@ -5014,7 +5080,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               <strong>导入 JSON</strong>
               <span>高级：导入现有 ProjectV7</span>
             </button>
-          </div>
+          </div>}
 
           {newProjectArmed && <div className="spx-rebuild" role="alert">
             <span>当前工程「{project?.name ?? '未命名'}」有未保存更改。新建工程会清空当前编辑，未保存内容将丢失。</span>
@@ -5022,7 +5088,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             <button type="button" className="wf-button primary" onClick={beginNewProjectDraft}>确认新建</button>
           </div>}
 
-          {!project && <div className="spx-sheet spx-recent-projects">
+          <div className="spx-sheet spx-recent-projects">
             <div className="spx-sheet-title">最近工程</div>
             <div className="spx-layout-list" aria-label="最近工程列表">
               {projects.length === 0 && <div className="wf-empty spx-library-empty">
@@ -5054,6 +5120,21 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 if (record) void deleteProjectRecord(record);
               }}>确认删除</button>
             </div>}
+          </div>
+
+          {!project && <div className="spx-sheet spx-examples" id="spx-examples">
+            <div className="spx-sheet-title">示例工程</div>
+            <div className="spx-samples">
+              {[
+                { label: '2D 平面刻蚀', sample: SAMPLE_2D_PLANE, meta: '2D · plane · 1 step' },
+                { label: '2D Trench', sample: SAMPLE_2D_TRENCH, meta: '2D · trench · 1 step' },
+                { label: '3D 孔刻蚀', sample: SAMPLE_3D_HOLE, meta: '3D · hole · 1 step' },
+              ].map(item => <button type="button" className="spx-sample" key={item.label} onClick={() => loadSample(item.sample, item.label)}>
+                <strong>{item.label}</strong>
+                <span>{item.meta}</span>
+                <em>载入示例</em>
+              </button>)}
+            </div>
           </div>}
 
           {(project || gds) && <div className="spx-attached-row">
@@ -5105,22 +5186,22 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                     >{kind === 'plane' ? 'Plane' : kind === 'trench' ? 'Trench' : kind === 'hole' ? 'Hole' : 'Fin'}</button>)}
                   </div>
                   <div className="spx-field-grid">
-                    {draft.geometry === 'plane' && <label className="spx-field"><span>Plane height (µm)</span><input aria-label="新工程高度" type="number" value={draft.height} onChange={event => setDraftField('height', Number(event.target.value))} /></label>}
+                    {draft.geometry === 'plane' && <label className="spx-field"><span title="height">平面高度 (µm)</span><input aria-label="新工程高度" type="number" value={draft.height} onChange={event => setDraftField('height', Number(event.target.value))} /></label>}
                     {draft.geometry === 'trench' && <>
-                      <label className="spx-field"><span>Trench width (µm)</span><input aria-label="新工程 Trench 宽度" type="number" value={draft.width} onChange={event => setDraftField('width', Number(event.target.value))} /></label>
-                      <label className="spx-field"><span>Trench depth (µm)</span><input aria-label="新工程 Trench 深度" type="number" value={draft.depth} onChange={event => setDraftField('depth', Number(event.target.value))} /></label>
+                      <label className="spx-field"><span title="width">沟槽宽度 (µm)</span><input aria-label="新工程 Trench 宽度" type="number" value={draft.width} onChange={event => setDraftField('width', Number(event.target.value))} /></label>
+                      <label className="spx-field"><span title="depth">沟槽深度 (µm)</span><input aria-label="新工程 Trench 深度" type="number" value={draft.depth} onChange={event => setDraftField('depth', Number(event.target.value))} /></label>
                     </>}
                     {draft.geometry === 'hole' && <>
-                      <label className="spx-field"><span>Hole radius (µm)</span><input aria-label="新工程孔半径" type="number" value={draft.radius} onChange={event => setDraftField('radius', Number(event.target.value))} /></label>
-                      <label className="spx-field"><span>Hole depth (µm)</span><input aria-label="新工程孔深度" type="number" value={draft.depth} onChange={event => setDraftField('depth', Number(event.target.value))} /></label>
+                      <label className="spx-field"><span title="radius">孔半径 (µm)</span><input aria-label="新工程孔半径" type="number" value={draft.radius} onChange={event => setDraftField('radius', Number(event.target.value))} /></label>
+                      <label className="spx-field"><span title="depth">孔深度 (µm)</span><input aria-label="新工程孔深度" type="number" value={draft.depth} onChange={event => setDraftField('depth', Number(event.target.value))} /></label>
                     </>}
                     {draft.geometry === 'fin' && <>
-                      <label className="spx-field"><span>Fin width (µm)</span><input aria-label="新工程 Fin 宽度" type="number" value={draft.width} onChange={event => setDraftField('width', Number(event.target.value))} /></label>
-                      <label className="spx-field"><span>Fin height (µm)</span><input aria-label="新工程 Fin 高度" type="number" value={draft.finHeight} onChange={event => setDraftField('finHeight', Number(event.target.value))} /></label>
+                      <label className="spx-field"><span title="width">Fin 宽度 (µm)</span><input aria-label="新工程 Fin 宽度" type="number" value={draft.width} onChange={event => setDraftField('width', Number(event.target.value))} /></label>
+                      <label className="spx-field"><span title="finHeight">Fin 高度 (µm)</span><input aria-label="新工程 Fin 高度" type="number" value={draft.finHeight} onChange={event => setDraftField('finHeight', Number(event.target.value))} /></label>
                     </>}
                     {draft.geometry !== 'plane' && <>
-                      <label className="spx-field"><span>Taper angle (deg)</span><input aria-label="新工程 taper" type="number" value={draft.taperAngle} onChange={event => setDraftField('taperAngle', Number(event.target.value))} /></label>
-                      <label className="spx-field"><span>Mask height (µm)</span><input aria-label="新工程 maskHeight" type="number" value={draft.maskHeight} onChange={event => setDraftField('maskHeight', Number(event.target.value))} /></label>
+                      <label className="spx-field"><span title="taperAngle">侧壁角 (deg)</span><input aria-label="新工程 taper" type="number" value={draft.taperAngle} onChange={event => setDraftField('taperAngle', Number(event.target.value))} /></label>
+                      <label className="spx-field"><span title="maskHeight">掩膜高度 (µm)</span><input aria-label="新工程 maskHeight" type="number" value={draft.maskHeight} onChange={event => setDraftField('maskHeight', Number(event.target.value))} /></label>
                     </>}
                   </div>
                 </>}
@@ -5130,28 +5211,28 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               </section>
 
               <section className="spx-field-group">
-                <div className="spx-group-title">Domain &amp; Grid</div>
+                <div className="spx-group-title" title="Domain &amp; Grid">计算域与网格</div>
                 <div className="spx-field-grid">
-                  <label className="spx-field"><span>gridDelta (µm)</span><input aria-label="新工程 gridDelta" type="number" value={draft.gridDelta} onChange={event => setDraftField('gridDelta', Number(event.target.value))} /></label>
-                  <label className="spx-field"><span>X extent (µm)</span><input aria-label="新工程 xExtent" type="number" value={draft.xExtent} onChange={event => setDraftField('xExtent', Number(event.target.value))} /></label>
-                  {draft.dimension === 3 && <label className="spx-field"><span>Y extent (µm)</span><input aria-label="新工程 yExtent" type="number" value={draft.yExtent} onChange={event => setDraftField('yExtent', Number(event.target.value))} /></label>}
+                  <label className="spx-field"><span title="gridDelta">网格步长 (µm)</span><input aria-label="新工程 gridDelta" type="number" value={draft.gridDelta} onChange={event => setDraftField('gridDelta', Number(event.target.value))} /></label>
+                  <label className="spx-field"><span title="xExtent">X 范围 (µm)</span><input aria-label="新工程 xExtent" type="number" value={draft.xExtent} onChange={event => setDraftField('xExtent', Number(event.target.value))} /></label>
+                  {draft.dimension === 3 && <label className="spx-field"><span title="yExtent">Y 范围 (µm)</span><input aria-label="新工程 yExtent" type="number" value={draft.yExtent} onChange={event => setDraftField('yExtent', Number(event.target.value))} /></label>}
                 </div>
               </section>
 
               <section className="spx-field-group">
-                <div className="spx-group-title">Solver</div>
+                <div className="spx-group-title" title="Solver">求解器</div>
                 <div className="spx-field-grid">
-                  <label className="spx-field"><span>Engine</span>
+                  <label className="spx-field"><span title="enginePreference">引擎</span>
                     <select aria-label="新工程引擎" value={draft.engine} onChange={event => setDraftField('engine', event.target.value)}>
                       <option value="cpu">CPU</option>
                       <option value="gpu">GPU</option>
                       <option value="auto">Auto</option>
                     </select>
                   </label>
-                  <label className="spx-field"><span>Seed</span><input aria-label="新工程 seed" type="number" value={draft.seed} onChange={event => setDraftField('seed', Number(event.target.value))} /></label>
-                  <label className="spx-field"><span>Timeout (s)</span><input aria-label="新工程 timeout" type="number" value={draft.timeout} onChange={event => setDraftField('timeout', Number(event.target.value))} /></label>
-                  <label className="spx-field"><span>Rays per point</span><input aria-label="新工程 rays" type="number" value={draft.raysPerPoint} onChange={event => setDraftField('raysPerPoint', Number(event.target.value))} /></label>
-                  <label className="spx-field"><span>CPU threads</span><input aria-label="新工程线程" type="number" value={draft.cpuThreads} onChange={event => setDraftField('cpuThreads', Number(event.target.value))} /></label>
+                  <label className="spx-field"><span title="random.seed">随机种子</span><input aria-label="新工程 seed" type="number" value={draft.seed} onChange={event => setDraftField('seed', Number(event.target.value))} /></label>
+                  <label className="spx-field"><span title="timeoutSeconds">超时（s）</span><input aria-label="新工程 timeout" type="number" value={draft.timeout} onChange={event => setDraftField('timeout', Number(event.target.value))} /></label>
+                  <label className="spx-field"><span title="raysPerPoint">每点射线数</span><input aria-label="新工程 rays" type="number" value={draft.raysPerPoint} onChange={event => setDraftField('raysPerPoint', Number(event.target.value))} /></label>
+                  <label className="spx-field"><span title="cpuThreads">CPU 线程</span><input aria-label="新工程线程" type="number" value={draft.cpuThreads} onChange={event => setDraftField('cpuThreads', Number(event.target.value))} /></label>
                 </div>
               </section>
             </div>
@@ -5189,7 +5270,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               {clips.length === 0
                 ? <div className="wf-empty spx-library-empty">该 Layout 还没有 Clip。选择结构、图层材料与范围后保存 Clip，即可作为 2D 工程几何。</div>
                 : <div className="spx-clip-summary-list" aria-label="Clip 列表">
-                  {clips.map(clip => <button key={clip.clipId} type="button"
+                  {clips.map(clip => <button key={clip.clipId} type="button" title={`${clip.clipId} · ${clip.gdsFileName}`}
                     className={activeClip?.clipId === clip.clipId ? 'active' : ''}
                     onClick={() => selectClip(clip)}
                   >
@@ -5203,23 +5284,11 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             <p className="spx-form-note">版图/Clip 只作为几何来源，不会覆盖当前工程；需要时在工程页把 Clip 设为几何。</p>
           </div>}
 
-          {setupMode === 'examples' && <div className="spx-samples">
-            {[
-              { label: '2D 平面刻蚀', sample: SAMPLE_2D_PLANE, meta: '2D · plane · 1 step' },
-              { label: '2D Trench', sample: SAMPLE_2D_TRENCH, meta: '2D · trench · 1 step' },
-              { label: '3D 孔刻蚀', sample: SAMPLE_3D_HOLE, meta: '3D · hole · 1 step' },
-            ].map(item => <button type="button" className="spx-sample" key={item.label} onClick={() => loadSample(item.sample, item.label)}>
-              <strong>{item.label}</strong>
-              <span>{item.meta}</span>
-              <em>载入示例</em>
-            </button>)}
-          </div>}
-
           {setupMode === 'project' && project && <div className="spx-sheet">
             <div className="spx-sheet-title">工程定义 / {project.name ?? '未命名工程'}</div>
-            <div className="spx-project-status" role="status">
+            <div className="spx-project-status" role="status" title={projectId ? `工程 ${projectId}` : undefined}>
               <strong className={projectId && !projectDirty ? 'ok' : ''}>{projectId ? (projectDirty ? '有未保存更改' : '已保存') : '草稿（未保存）'}</strong>
-              <span>{projectId ? `工程 ${projectId}` : '尚未写入服务端'}</span>
+              <span>{projectId ? '已写入服务端' : '尚未写入服务端'}</span>
               {projectSavedAt && <span>更新于 {formatDateTime(projectSavedAt)}</span>}
               {projectNotice && <span className="spx-project-notice spx-banner-inline">{projectNotice}<BannerClose onClose={() => setProjectNotice('')} /></span>}
             </div>
@@ -5274,9 +5343,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                     <button type="button" className={project.dimension === 3 ? 'active' : ''} onClick={() => changeProjectDimension(3)}>3D</button>
                   </div>
                 </div>
-                {renderDomainField('gridDelta (µm)', 'gridDelta')}
-                {renderDomainField('X extent (µm)', 'xExtent')}
-                {project.dimension === 3 && renderDomainField('Y extent (µm)', 'yExtent')}
+                {renderDomainField('网格步长 (µm)', 'gridDelta', '0.01', 'gridDelta')}
+                {renderDomainField('X 范围 (µm)', 'xExtent', '0.01', 'xExtent')}
+                {project.dimension === 3 && renderDomainField('Y 范围 (µm)', 'yExtent', '0.01', 'yExtent')}
                 <label className="spx-field"><span>{project.dimension === 3 ? '边界 XY' : '边界 X'}</span>
                   <select aria-label="工程边界类型"
                     value={String((project.dimension === 3 ? projectDomain.boundaryXY : projectDomain.xBoundary) ?? 'reflective')}
@@ -5302,22 +5371,22 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                     >{kind === 'plane' ? 'Plane' : kind === 'trench' ? 'Trench' : kind === 'hole' ? 'Hole' : 'Fin'}</button>)}
                   </div>
                   <div className="spx-field-grid">
-                    {projectGeometryKind === 'plane' && renderGeometryField('Plane height (µm)', 'height')}
+                    {projectGeometryKind === 'plane' && renderGeometryField('平面高度 (µm)', 'height')}
                     {projectGeometryKind === 'trench' && <>
-                      {renderGeometryField('Trench width (µm)', 'width')}
-                      {renderGeometryField('Trench depth (µm)', 'depth')}
+                      {renderGeometryField('沟槽宽度 (µm)', 'width')}
+                      {renderGeometryField('沟槽深度 (µm)', 'depth')}
                     </>}
                     {projectGeometryKind === 'hole' && <>
-                      {renderGeometryField('Hole radius (µm)', 'radius')}
-                      {renderGeometryField('Hole depth (µm)', 'depth')}
+                      {renderGeometryField('孔半径 (µm)', 'radius')}
+                      {renderGeometryField('孔深度 (µm)', 'depth')}
                     </>}
                     {projectGeometryKind === 'fin' && <>
-                      {renderGeometryField('Fin width (µm)', 'width')}
-                      {renderGeometryField('Fin height (µm)', 'height')}
+                      {renderGeometryField('Fin 宽度 (µm)', 'width')}
+                      {renderGeometryField('Fin 高度 (µm)', 'height')}
                     </>}
                     {['trench', 'hole', 'fin'].includes(projectGeometryKind) && <>
-                      {renderGeometryField('Taper angle (deg)', 'taperAngle')}
-                      {renderGeometryField('Mask height (µm)', 'maskHeight')}
+                      {renderGeometryField('侧壁角 (deg)', 'taperAngle')}
+                      {renderGeometryField('掩膜高度 (µm)', 'maskHeight')}
                     </>}
                   </div>
                 </>}
@@ -5327,11 +5396,11 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             <div className="spx-inline-section" aria-label="编辑求解器">
               <div className="spx-form-title">编辑参数 · 求解器</div>
               <div className="spx-field-grid">
-                {renderSolverField('Engine', 'enginePreference')}
-                {renderSolverField('Seed', 'seed')}
-                {renderSolverField('Timeout (s)', 'timeoutSeconds')}
-                {renderSolverField('Rays per point', 'raysPerPoint')}
-                {renderSolverField('CPU threads', 'cpuThreads')}
+                {renderSolverField('引擎', 'enginePreference', 'enginePreference')}
+                {renderSolverField('随机种子', 'seed', 'random.seed')}
+                {renderSolverField('超时（s）', 'timeoutSeconds', 'timeoutSeconds')}
+                {renderSolverField('每点射线数', 'raysPerPoint', 'raysPerPoint')}
+                {renderSolverField('CPU 线程', 'cpuThreads', 'cpuThreads')}
               </div>
             </div>
 
@@ -5369,7 +5438,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 : <>
                   {!projectGeometrySource.clipId && <p className="spx-field-error" role="alert">先选择或保存一个 Clip 作为工程几何</p>}
                   {clips.length > 0 && <div className="spx-clip-summary-list" aria-label="已有 Clip">
-                    {clips.map(clip => <button key={clip.clipId} type="button"
+                    {clips.map(clip => <button key={clip.clipId} type="button" title={`${clip.clipId} · ${clip.gdsFileName}`}
                       className={projectGeometrySource.clipId === clip.clipId ? 'active' : ''}
                       onClick={() => chooseClipForProject(clip)}
                     >
@@ -5425,8 +5494,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             <div className="spx-flow-editor">
               <div className="spx-library-browser">
                 <div className="spx-library-head">
-                  <span>库</span>
+                  <span>插入源</span>
                 </div>
+                <div className="spx-library-note">管理库请用左侧库树</div>
                 <div className="spx-library-tabs">
                   {([
                     ['material', 'Materials'],
@@ -5467,11 +5537,12 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                     return <div
                       key={item.itemId}
                       className="spx-library-item"
+                      title={item.itemId}
                       draggable={!blocked}
                       onDragStart={event => { event.dataTransfer.setData('text/plain', item.itemId); event.dataTransfer.effectAllowed = 'copy'; }}
                     >
                       <div className="spx-library-item-main">
-                        <strong>{swatch && <i className="spx-library-swatch" style={{ background: swatch }} aria-hidden="true" />}{item.name}{libraryDuplicateNames.has(item.name) ? ` #${item.itemId.slice(-4)}` : ''}</strong>
+                        <strong>{swatch && <i className="spx-library-swatch" style={{ background: swatch }} aria-hidden="true" />}{item.name}{libraryDuplicateNames.has(item.name) ? '（重名）' : ''}</strong>
                         <span>{meta}</span>
                       </div>
                       {item.category === 'experiment'
@@ -5567,9 +5638,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                           .map(model => <option key={model} value={model}>{STEP_LABELS[model] ?? model}</option>)}
                       </select>
                     </label>
-                    <label className="spx-field"><span>duration (s)</span><input aria-label="步骤时长" type="number" step="0.01" value={Number(selectedFlowStep.duration ?? 0)} onChange={event => updateSelectedStep({ duration: Number(event.target.value) })} /></label>
-                    <label className="spx-field"><span>rate (µm/s)</span><input aria-label="步骤速率" type="number" step="0.01" value={Number(selectedFlowStep.rateMagnitude ?? selectedFlowStep.directionalRateMagnitude ?? 0)} onChange={event => updateSelectedStep({ rateMagnitude: Number(event.target.value) })} /></label>
-                    <label className="spx-field"><span>沉积材料</span>
+                    <label className="spx-field"><span title="duration">时长（s）</span><input aria-label="步骤时长" type="number" step="0.01" value={Number(selectedFlowStep.duration ?? 0)} onChange={event => updateSelectedStep({ duration: Number(event.target.value) })} /></label>
+                    <label className="spx-field"><span title="rateMagnitude">速率（µm/s）</span><input aria-label="步骤速率" type="number" step="0.01" value={Number(selectedFlowStep.rateMagnitude ?? selectedFlowStep.directionalRateMagnitude ?? 0)} onChange={event => updateSelectedStep({ rateMagnitude: Number(event.target.value) })} /></label>
+                    <label className="spx-field"><span title="depositMaterial">沉积材料</span>
                       <select aria-label="步骤沉积材料" value={String(selectedFlowStep.depositMaterial ?? '')} onChange={event => updateSelectedStep({ depositMaterial: event.target.value || undefined })}>
                         <option value="">—</option>
                         {materialCatalog.map(row => <option key={row.name} value={row.name}>{row.name}{materialPreset === row.name ? ' · 库' : ''}{materialTarget?.material === row.name ? ' · 当前材料' : ''}</option>)}
@@ -5579,8 +5650,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                       <label className="spx-field"><span>stickingProbability</span><input aria-label="步骤 stickingProbability" type="number" step="0.01" value={Number(selectedFlowStep.stickingProbability ?? 1)} onChange={event => updateSelectedStep({ stickingProbability: Number(event.target.value) })} /></label>
                       <label className="spx-field"><span>sourceExponent</span><input aria-label="步骤 sourceExponent" type="number" step="0.1" value={Number(selectedFlowStep.sourceExponent ?? 1)} onChange={event => updateSelectedStep({ sourceExponent: Number(event.target.value) })} /></label>
                     </>}
-                    <div className="spx-step-form-actions">
-                      <code>{selectedFlowStep.id}</code>
+                    <div className="spx-step-form-actions" title={selectedFlowStep.id}>
                       <button type="button" className="wf-button ghost" onClick={() => deleteAuthoredStep(selectedFlowStep.id)}>删除步骤</button>
                     </div>
                   </div> : <p className="spx-help">选择左侧步骤查看并编辑参数。</p>}
@@ -5740,7 +5810,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                   <button type="button" role="tab" aria-selected={active}
                     className={`wf-step-chip${active ? ' active' : ''}${row.kind === 'initial' ? ' initial' : ''}`}
                     data-step-id={row.stepId} data-run-id={row.runId} data-segment-id={row.segmentId}
-                    title={`${row.label} · ${row.runId}`}
+                    title={`${row.label} · ${row.stepId} · ${row.runId}`}
                     onClick={() => setStructurePick(key)}>
                     <span className="wf-step-chip-index">{String(index + 1).padStart(2, '0')}</span>
                     <span className="wf-step-chip-label">{row.label}</span>
@@ -5774,9 +5844,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 <div className="wf-structure-side">
                   <div className="wf-structure-info">
                     <span className="wf-muted">步骤</span>
-                    <strong>{structureSelection.label}</strong>
-                    <code>{structureSelection.stepId}</code>
-                    <span className="wf-muted" title={structureSelection.runId}>Segment {structureSelection.segmentIndex + 1} · Run 已记录</span>
+                    <strong title={structureSelection.stepId}>{structureSelection.label}</strong>
+                    <span className="wf-muted" title={structureSelection.runId}>第 {structureSelection.segmentIndex + 1} 段 · Run 已记录</span>
                   </div>
                   {measurement && <div className="wf-structure-info">
                     <span className="wf-muted">测量值</span>
@@ -5846,7 +5915,10 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
           {segment && <>
             <div className="wf-status-row">
               <span className={`wf-status ${segment.status}`}>{statusLabel(segment.status)}</span>
-              <code title={segment.runId ?? ''}>{segment.runId ? 'Run 已记录' : '尚未运行'}</code>
+              <code title={segment.runId ?? ''}>{`第 ${segmentNumber} 段 · ${statusLabel(segment.status)}`}</code>
+              {measurement && <code title={measurement.measurementId}>
+                {`第 ${segmentNumber} 段 · ${measurementHasValue(measurement) ? '已测量' : statusLabel(measurement.status)}`}
+              </code>}
             </div>
             {route && <div className="wf-route-tree">
               {route.attempts.map((attempt, attemptIndex) => {
@@ -5941,7 +6013,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 <span>参数</span><code>{JSON.stringify(metricDetail.recipe.parameters)}</code>
                 <span>快照</span><code>{metricDetail.measurement.sourceSnapshotHash.slice(0, 16)}…</code>
                 <span>交点</span><code>{metricDetail.measurement.intersections.join(', ') || '—'}</code>
-                <span>不确定度</span><code>{metricDetail.measurement.uncertainty ?? '—'} ({metricDetail.measurement.uncertaintyStatus})</code>
+                <span>不确定度</span><code>{metricDetail.measurement.uncertainty ?? '—'} ({uncertaintyLabel(metricDetail.measurement.uncertaintyStatus)})</code>
                 <span>绑定 (binding)</span><code>{bindingLabel(metricDetail.measurement.bindingStatus)}{metricDetail.measurement.bindingEvidence ? ` · ${metricDetail.measurement.bindingEvidence.methodVersion}` : ''}</code>
                 <span>等价 (equivalence)</span><code>{bindingLabel(metricDetail.measurement.equivalenceStatus)}</code>
                 <span>证据记录</span><code>{metricDetail.provenance.verifications.map(row => `${row.status}/${row.evidence.methodVersion}`).join(', ') || '—'}</code>
@@ -6126,10 +6198,17 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               <div className="wf-card-subhead">变体条件 · 作用于 {experimentTargetStep?.name ?? '—'} 的 duration</div>
               <table className="wf-table wf-variant-table" aria-label="变体输入表">
                 <thead><tr><th>#</th><th>条件摘要</th><th>duration（s）</th><th>重复数（1–8）</th><th>seed</th><th>操作</th></tr></thead>
-                <tbody>{experimentRows.map((row, index) => <tr key={index}>
+                <tbody>{experimentRows.map((row, index) => <tr key={index} className={duplicateVariantDurations.has(index) ? 'has-error' : ''}>
                   <td>V{index + 1}</td>
                   <td className="wf-condition">V{index + 1} · {formatNumber(Number(row.duration))} s · seed {row.seed} · ×{row.replicates}</td>
-                  <td><input aria-label={`变体 ${index + 1} duration`} value={row.duration} onChange={event => updateVariantRow(index, { duration: event.target.value })} /></td>
+                  <td>
+                    <input aria-label={`变体 ${index + 1} duration`} value={row.duration}
+                      aria-invalid={duplicateVariantDurations.has(index) ? 'true' : undefined}
+                      onChange={event => updateVariantRow(index, { duration: event.target.value })} />
+                    {duplicateVariantDurations.has(index) && <em className="wf-field-error" role="alert">
+                      与 V{(duplicateVariantDurations.get(index) ?? 0) + 1} 重复
+                    </em>}
+                  </td>
                   <td><input aria-label={`变体 ${index + 1} replicates`} type="number" min={1} max={8} value={row.replicates} onChange={event => updateVariantRow(index, { replicates: Number(event.target.value) || 1 })} /></td>
                   <td><input aria-label={`变体 ${index + 1} seed`} type="number" value={row.seed} onChange={event => updateVariantRow(index, { seed: event.target.value })} /></td>
                   <td><button type="button" className="wf-link" disabled={experimentRows.length <= 1} onClick={() => removeVariantRow(index)}>移除</button></td>
@@ -6137,9 +6216,14 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               </table>
               <div className="spx-run-actions">
                 <button className="wf-button ghost" disabled={experimentRows.length >= 16} onClick={() => resizeVariants(experimentRows.length + 1)}>＋ 添加变体</button>
-                <button className="wf-button primary" disabled={!!busy} onClick={() => void createPersistentExperiment()}>{busy === 'experiment' ? '创建中…' : '创建实验'}</button>
+                <button className="wf-button primary" disabled={!!busy || variantDurationConflict}
+                  title={variantDurationConflict ? '变体 duration 重复，请先修正标红的行' : '按当前变体创建实验'}
+                  onClick={() => void createPersistentExperiment()}>{busy === 'experiment' ? '创建中…' : '创建实验'}</button>
                 <span className="wf-muted">{experimentRows.length} 变体 × 平均 {formatNumber(experimentRows.reduce((total, row) => total + row.replicates, 0) / Math.max(1, experimentRows.length), 3)} 次重复</span>
               </div>
+              {variantDurationConflict && <div className="wf-block-reason" aria-label="变体禁用原因">
+                变体 duration 必须互不相同：请修正标红的行。需要同一条件的重复运行，请使用“重复数”而不是重复变体。
+              </div>}
 
               <div className="wf-card-subhead">DOE 全因子</div>
               <p className="wf-muted">每个因子 2–10 个取值（逗号分隔），1–5 个因子；组合数 = 各因子取值数相乘。</p>
@@ -6242,6 +6326,24 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             </div>
           </div>}
 
+          <div className="wf-card-subhead">候选 / 多视图</div>
+          <div className="spx-run-actions">
+            <button className="wf-button ghost" disabled={!!refreshCandidatesBlockedReason} onClick={loadExperimentCandidates}>刷新候选</button>
+            <button className="wf-button ghost" disabled={!hasExecutedRun || !!busy} onClick={addCurrentCandidate}>加入当前 Run</button>
+            <button className="wf-button primary" disabled={compareCandidates.length < 2 || !!busy}
+              title={compareCandidates.length < 2 ? '先选择至少 2 个候选' : '比较所选候选并加载结构视图'}
+              onClick={() => void runComparison()}>
+              {busy === 'compare' ? '比较中…' : '比较并加载视图'}
+            </button>
+            {autoAnalysisId && autoAnalysisId === experimentDoc?.experimentId && <span className="wf-muted">已自动载入该实验的候选</span>}
+          </div>
+          {refreshCandidatesBlockedReason && <div className="wf-block-reason" aria-label="刷新候选禁用原因">
+            {refreshCandidatesBlockedReason}
+          </div>}
+          {compareCandidates.length < 2 && <div className="wf-block-reason" aria-label="比较禁用原因">
+            先选择至少 2 个候选：点击“刷新候选”载入实验变体，或“加入当前 Run”添加一个对照。
+          </div>}
+
           {analysisReady && <>
             {measurement && <div className="wf-summary" aria-label="测量结果">
               <strong>{statusLabel(measurement.status)}</strong>
@@ -6263,21 +6365,6 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                   <span className={`wf-status ${row.status}`}>{statusLabel(row.status)}</span>
                 </span>)}
               </div>
-            </div>}
-
-            <div className="wf-card-subhead">候选 / 多视图</div>
-            <div className="spx-run-actions">
-              <button className="wf-button ghost" disabled={!experimentDoc || !!busy} onClick={loadExperimentCandidates}>刷新候选</button>
-              <button className="wf-button ghost" disabled={!hasExecutedRun || !!busy} onClick={addCurrentCandidate}>加入当前 Run</button>
-              <button className="wf-button primary" disabled={compareCandidates.length < 2 || !!busy}
-                title={compareCandidates.length < 2 ? '先选择至少 2 个候选' : '比较所选候选并加载结构视图'}
-                onClick={() => void runComparison()}>
-                {busy === 'compare' ? '比较中…' : '比较并加载视图'}
-              </button>
-              {autoAnalysisId && autoAnalysisId === experimentDoc?.experimentId && <span className="wf-muted">已自动载入该实验的候选</span>}
-            </div>
-            {compareCandidates.length < 2 && <div className="wf-block-reason" aria-label="比较禁用原因">
-              先选择至少 2 个候选：点击“刷新候选”载入实验变体，或“加入当前 Run”添加一个对照。
             </div>}
 
             {compareCandidates.length > 0 && <table className="wf-table" aria-label="候选表">
@@ -6382,12 +6469,12 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                   <label className="spx-field"><span>窗口下限（{displayUnit(experimentDoc?.unit)}）</span>
                     <input aria-label="窗口下限" ref={windowLowerRef} value={windowLower}
                       aria-invalid={windowError ? 'true' : undefined}
-                      onChange={event => { setWindowLower(event.target.value); setWindowError(''); }} placeholder="下限" />
+                      onChange={event => updateWindowBound('lower', event.target.value)} placeholder="下限" />
                   </label>
                   <label className="spx-field"><span>窗口上限（{displayUnit(experimentDoc?.unit)}）</span>
                     <input aria-label="窗口上限" ref={windowUpperRef} value={windowUpper}
                       aria-invalid={windowError ? 'true' : undefined}
-                      onChange={event => { setWindowUpper(event.target.value); setWindowError(''); }} placeholder="上限" />
+                      onChange={event => updateWindowBound('upper', event.target.value)} placeholder="上限" />
                   </label>
                   <div className="wf-field-action">
                     <button className="wf-button primary"
@@ -6413,9 +6500,24 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 </>}
 
                 <div className="wf-card-subhead">基础标定</div>
-                <label className="spx-field"><span>标定数据 CSV</span>
-                  <input aria-label="标定 CSV 文件" type="file" accept=".csv,text/csv" onChange={event => { const file = event.target.files?.[0]; if (file) void loadCalibrationFile(file); }} />
-                </label>
+                <div className="spx-field span-2">
+                  <span>标定数据 CSV</span>
+                  <div className="spx-file-row">
+                    <div className={calibrationCsv ? 'spx-file-name filled' : 'spx-file-name'} title={calibrationFileName || undefined}>
+                      {calibrationFileName || '未选择文件'}
+                    </div>
+                    <button type="button" className="wf-button ghost spx-browse" onClick={() => calibrationInput.current?.click()}>选择文件</button>
+                  </div>
+                  <input ref={calibrationInput} aria-label="标定 CSV 文件" type="file" accept=".csv,text/csv" hidden
+                    onChange={event => { const file = event.target.files?.[0]; if (file) void loadCalibrationFile(file); }} />
+                </div>
+                <details className="spx-advanced wf-csv-format">
+                  <summary>CSV 格式</summary>
+                  <div className="spx-advanced-body">
+                    <p className="wf-muted">列定义：<code>measured, simulated, weight(可选), label(可选)</code></p>
+                    <pre className="wf-code-block">{'measured,simulated,weight,label\n0.0120,0.0115,1.0,V1'}</pre>
+                  </div>
+                </details>
                 <div className="spx-field-grid">
                   <label className="spx-field"><span>模型</span>
                     <select aria-label="标定模型" value={calibrationModel} onChange={event => setCalibrationModel(event.target.value)}>
