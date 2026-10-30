@@ -7,6 +7,9 @@ import unittest
 from pathlib import Path
 
 from backend.main import app
+from backend.workflow.api import EquivalenceCheckRequest, MeasureSnapshotRequest
+from backend.workflow.equivalence import ComparisonProtocolV1
+from backend.workflow.metrology import SnapshotPayloadV1
 
 
 class WorkflowOpenApiTests(unittest.TestCase):
@@ -39,6 +42,14 @@ class WorkflowOpenApiTests(unittest.TestCase):
         self.assertEqual(
             schema["components"]["schemas"]["EquivalenceCheckRequest"]["properties"]["left"]["$ref"],
             "#/components/schemas/SnapshotPayloadV1",
+        )
+        fixture = json.loads((Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "2d-plane-etch.json").read_text(encoding="utf-8"))
+        snapshot = SnapshotPayloadV1.model_validate(fixture)
+        MeasureSnapshotRequest(recipeId="r", recipeVersion=1, snapshot=snapshot)
+        EquivalenceCheckRequest(
+            protocol=ComparisonProtocolV1(schemaVersion=1, protocolId="proto", version=1, pointTolerance=0.1),
+            left=snapshot,
+            right=snapshot,
         )
 
 

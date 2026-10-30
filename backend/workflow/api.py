@@ -9,7 +9,7 @@ from typing import Annotated
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import Field, ValidationError
 
-from .. import storage
+from .. import snapshots, storage
 from ..models import ProjectV7, StrictModel
 from .metrology import MeasurementResultV1, MetrologyRecipeV1, MetricDefinitionV1, SnapshotPayloadV1, snapshot_content_hash
 from .adoption import adopt_project, first_route
@@ -284,14 +284,27 @@ async def unpin_artifact(artifact_id: str) -> dict:
     return {"artifactId": artifact_id, "pinned": False}
 
 
+def _load_run_snapshot(run_id: str, step_id: str) -> tuple[dict | None, dict | None, str | None]:
+    try:
+        run_dir = storage.run_path(run_id)
+        manifest = storage.read_json(run_dir / "manifest.json")
+        row = next((item for item in manifest.get("snapshots", []) if item.get("stepId") == step_id), None)
+        if row is None:
+            return None, manifest, f"run {run_id!r} has no snapshot for step {step_id!r}"
+        path = snapshots.ensure_materialized(run_dir, step_id)
+        return storage.read_json(path), manifest, None
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        return None, None, f"run {run_id!r} snapshot is unavailable: {exc}"
+
+
 @router.post("/equivalence/check", response_model=EquivalenceResultV1)
 async def equivalence_check(request: EquivalenceCheckRequest) -> EquivalenceResultV1:
     def operation():
         store = get_store()
         store.register_comparison_protocol(request.protocol)
-        left = request.left.model_dump(mode="json", exclude_none=True)
-        right = request.right.model_dump(mode="json", exclude_none=True)
-        result = compare_snapshots(request.protocol, left, right).model_copy(update={
+        left_payload = request.left.model_dump(mode="json", exclude_none=True)
+        right_payload = request.right.model_dump(mode="json", exclude_none=True)
+        result = compare_snapshots(request.protocol, left_payload, right_payload).model_copy(update={
             "leftRunId": request.leftRunId,
             "rightRunId": request.rightRunId,
             "leftSegmentId": request.leftSegmentId,
@@ -299,38 +312,53 @@ async def equivalence_check(request: EquivalenceCheckRequest) -> EquivalenceResu
             "leftStepId": request.leftStepId,
             "rightStepId": request.rightStepId,
         })
-        reasons = list(result.reasons)
+        reasons: list[str] = []
+        failed = False
         if request.protocol.checkType != "snapshot":
             required = (request.leftRunId, request.rightRunId, request.leftSegmentId,
                         request.rightSegmentId, request.leftStepId, request.rightStepId)
             if any(value is None for value in required):
                 reasons.append("checkType requires both run/segment/step identities")
             else:
-                for run_id, step_id, digest in (
-                    (request.leftRunId, request.leftStepId, result.leftDigest),
-                    (request.rightRunId, request.rightStepId, result.rightDigest),
-                ):
-                    try:
-                        manifest = storage.read_json(storage.run_path(run_id) / "manifest.json")
-                        row = next((item for item in manifest.get("snapshots", []) if item.get("stepId") == step_id), None)
-                        if row is None:
-                            reasons.append(f"run {run_id!r} has no snapshot for step {step_id!r}")
-                        elif snapshot_content_hash(left if run_id == request.leftRunId else right) != digest:
-                            reasons.append("equivalence snapshot digest does not match the request payload")
-                    except (FileNotFoundError, OSError, ValueError):
-                        reasons.append(f"run {run_id!r} is unavailable")
-                if request.protocol.checkType == "same_segment_replay" and request.leftSegmentId != request.rightSegmentId:
-                    reasons.append("same_segment_replay requires the same Segment")
-                if request.protocol.checkType in {"continuous_vs_segmented", "prefix_reuse"} and request.leftSegmentId == request.rightSegmentId:
-                    reasons.append(f"{request.protocol.checkType} requires distinct Segments")
-                if request.protocol.checkType == "prefix_reuse":
-                    try:
-                        if store.get_segment(request.rightSegmentId).startAfterStepId is None:
-                            reasons.append("prefix_reuse right Segment has no reused checkpoint boundary")
-                    except Exception as exc:
-                        reasons.append(f"prefix_reuse right Segment is unavailable: {exc}")
+                left_actual, left_manifest, left_error = _load_run_snapshot(request.leftRunId, request.leftStepId)
+                right_actual, right_manifest, right_error = _load_run_snapshot(request.rightRunId, request.rightStepId)
+                if left_error:
+                    reasons.append(left_error)
+                if right_error:
+                    reasons.append(right_error)
+                if left_actual is not None and snapshot_content_hash(left_payload) != snapshot_content_hash(left_actual):
+                    reasons.append("left request snapshot does not match the actual run snapshot")
+                    failed = True
+                if right_actual is not None and snapshot_content_hash(right_payload) != snapshot_content_hash(right_actual):
+                    reasons.append("right request snapshot does not match the actual run snapshot")
+                    failed = True
+                try:
+                    left_segment = store.get_segment(request.leftSegmentId)
+                    right_segment = store.get_segment(request.rightSegmentId)
+                except Exception as exc:
+                    reasons.append(f"segment identity is unavailable: {exc}")
+                    left_segment = right_segment = None
+                if left_segment is not None and right_segment is not None:
+                    if request.protocol.checkType == "same_segment_replay":
+                        if left_segment.segmentId != right_segment.segmentId:
+                            reasons.append("same_segment_replay requires the same Segment")
+                        if left_segment.runId != request.leftRunId:
+                            reasons.append("left run is not owned by the selected Segment")
+                        if right_segment.runId != request.rightRunId:
+                            if left_manifest is None or right_manifest is None or left_manifest.get("requestedInputHash") != right_manifest.get("requestedInputHash"):
+                                reasons.append("right run is neither the Segment run nor a replay of the same input")
+                    else:
+                        if left_segment.segmentId == right_segment.segmentId:
+                            reasons.append(f"{request.protocol.checkType} requires distinct Segments")
+                        if left_segment.runId != request.leftRunId or right_segment.runId != request.rightRunId:
+                            reasons.append("one or both runs are not owned by their Segments")
+                        if request.protocol.checkType == "prefix_reuse":
+                            if right_segment.startAfterStepId is None or right_segment.startCheckpointRef is None:
+                                reasons.append("prefix_reuse right Segment has no checkpoint boundary")
+                            elif right_segment.startCheckpointRef.runId != request.leftRunId:
+                                reasons.append("prefix_reuse right Segment does not start from the left run")
         if reasons:
-            result = result.model_copy(update={"status": "inconclusive", "reasons": reasons})
+            result = result.model_copy(update={"status": "failed" if failed else "inconclusive", "reasons": reasons})
         return store.record_equivalence(result)
     return _call(operation)
 

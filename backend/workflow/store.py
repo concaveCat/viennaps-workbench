@@ -1236,12 +1236,21 @@ class WorkflowStore:
         terminal = "failed" if status == "timed_out" else status
         if terminal == "succeeded" and end_checkpoint is None:
             terminal = "failed"
+        from .metrology import snapshot_content_hash
+
+        result_digest = None
+        try:
+            result_path = storage.read_json(run_dir / f"{row['through_step_id']}.json")
+            result_digest = snapshot_content_hash(result_path)
+        except (FileNotFoundError, OSError, ValueError):
+            pass
         self.finish_segment(
             segment_id,
             terminal,
             end_checkpoint,
             provenance_input_hash=manifest.get("requestedInputHash"),
             execution_hash=manifest.get("executionHash"),
+            result_digest=result_digest,
         )
 
     def get_segment(self, segment_id: str) -> SegmentV1:
@@ -1396,31 +1405,37 @@ class WorkflowStore:
     def gc_dry_run(self) -> dict[str, Any]:
         from .. import storage
 
+        deps: set[tuple[str, str, str, str]] = set()
         with self._connect() as connection:
-            segment_runs = {row["run_id"] for row in connection.execute("SELECT run_id FROM segments WHERE run_id IS NOT NULL")}
-            measurement_runs = {row["source_run_id"] for row in connection.execute("SELECT source_run_id FROM measurements WHERE source_run_id IS NOT NULL")}
-            pins = {row["artifact_id"] for row in connection.execute("SELECT artifact_id FROM artifact_pins")}
-            refs = {row["artifact_id"] for row in connection.execute("SELECT artifact_id FROM artifact_refs")}
-            abandoned = {row["artifact_id"] for row in connection.execute("SELECT DISTINCT artifact_id FROM deletion_records")}
-            checkpoint_runs: set[str] = set()
-            for row in connection.execute("SELECT start_checkpoint_json, end_checkpoint_json FROM segments"):
-                for raw in row:
+            for row in connection.execute("SELECT segment_id, run_id FROM segments WHERE run_id IS NOT NULL"):
+                deps.add((row["run_id"], "segment", row["segment_id"], "report"))
+            for row in connection.execute("SELECT measurement_id, source_run_id FROM measurements WHERE source_run_id IS NOT NULL"):
+                deps.add((row["source_run_id"], "measurement", row["measurement_id"], "remeasure"))
+            for row in connection.execute("SELECT segment_id, start_checkpoint_json, end_checkpoint_json FROM segments"):
+                for raw in (row["start_checkpoint_json"], row["end_checkpoint_json"]):
                     if raw:
                         try:
                             run_id = json.loads(raw).get("runId")
                             if isinstance(run_id, str):
-                                checkpoint_runs.add(run_id)
+                                deps.add((run_id, "segment", row["segment_id"], "continue"))
                         except (ValueError, TypeError):
                             pass
-            for row in connection.execute("SELECT base_checkpoint_json FROM attempts WHERE base_checkpoint_json IS NOT NULL"):
+            for row in connection.execute("SELECT attempt_id, base_checkpoint_json FROM attempts WHERE base_checkpoint_json IS NOT NULL"):
                 try:
                     run_id = json.loads(row["base_checkpoint_json"]).get("runId")
                     if isinstance(run_id, str):
-                        checkpoint_runs.add(run_id)
+                        deps.add((run_id, "attempt", row["attempt_id"], "continue"))
                 except (ValueError, TypeError):
                     pass
-        auto_runs = (segment_runs | measurement_runs | checkpoint_runs) - abandoned
-        referenced = auto_runs | pins | refs
+            for row in connection.execute("SELECT artifact_id, owner_type, owner_id, required_for FROM artifact_refs"):
+                deps.add((row["artifact_id"], row["owner_type"], row["owner_id"], row["required_for"]))
+            pins = {row["artifact_id"] for row in connection.execute("SELECT artifact_id FROM artifact_pins")}
+            abandoned = {
+                (row["artifact_id"], row["owner_type"], row["owner_id"], row["capability"])
+                for row in connection.execute("SELECT artifact_id, owner_type, owner_id, capability FROM deletion_records")
+            }
+        active = deps - abandoned
+        referenced = {item[0] for item in active} | pins
         candidates = []
         for path in sorted(storage.RUNS.iterdir()) if storage.RUNS.is_dir() else []:
             if not path.is_dir() or path.name in referenced:
@@ -1491,6 +1506,7 @@ class WorkflowStore:
         *,
         provenance_input_hash: str | None = None,
         execution_hash: str | None = None,
+        result_digest: str | None = None,
     ) -> None:
         if status not in {"succeeded", "failed", "cancelled", "interrupted"}:
             raise WorkflowConflict(f"invalid terminal segment status {status!r}")
@@ -1503,8 +1519,8 @@ class WorkflowStore:
             if row is None:
                 raise WorkflowNotFound(f"segment {segment_id!r} does not exist")
             connection.execute(
-                "UPDATE segments SET status = ?, end_checkpoint_json = ?, provenance_input_hash = COALESCE(?, provenance_input_hash), execution_hash = COALESCE(?, execution_hash), updated_at = ? WHERE segment_id = ?",
-                (status, self._checkpoint_value(None if end_checkpoint is None else end_checkpoint.model_dump(mode="json")), provenance_input_hash, execution_hash, now, segment_id),
+                "UPDATE segments SET status = ?, end_checkpoint_json = ?, provenance_input_hash = COALESCE(?, provenance_input_hash), execution_hash = COALESCE(?, execution_hash), result_digest = COALESCE(?, result_digest), updated_at = ? WHERE segment_id = ?",
+                (status, self._checkpoint_value(None if end_checkpoint is None else end_checkpoint.model_dump(mode="json")), provenance_input_hash, execution_hash, result_digest, now, segment_id),
             )
             if end_checkpoint is not None:
                 connection.execute(

@@ -170,6 +170,28 @@ class BindingApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(records), 2)
         self.assertEqual(records[-1]["status"], "failed")
 
+    async def test_equivalence_rejects_payload_not_matching_actual_snapshot(self):
+        measurement = await self._measurement()
+        plan = await self._route()
+        snapshot = json.loads((storage.RUNS / self.run_id / f"{self.step_id}.json").read_text(encoding="utf-8"))
+        fake = json.loads(json.dumps(snapshot))
+        fake["points"][0][1] += 1.0
+        response = await asgi_request(
+            "/api/v1/workflow/equivalence/check",
+            method="POST",
+            payload={
+                "protocol": {"schemaVersion": 1, "protocolId": "proto_real", "version": 1, "pointTolerance": 0.01, "checkType": "same_segment_replay"},
+                "left": fake,
+                "right": snapshot,
+                "leftRunId": self.run_id, "rightRunId": self.run_id,
+                "leftSegmentId": plan.segments[0].segmentId, "rightSegmentId": plan.segments[0].segmentId,
+                "leftStepId": self.step_id, "rightStepId": self.step_id,
+            },
+        )
+        self.assertEqual(response[0], 200, response[2])
+        self.assertEqual(json_body(response)["status"], "failed")
+        self.assertTrue(any("actual run snapshot" in reason for reason in json_body(response)["reasons"]))
+
     async def test_snapshot_hash_mismatch_fails_binding(self):
         measurement = await self._measurement()
         await self._route()

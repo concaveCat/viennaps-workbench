@@ -10,6 +10,7 @@ from .. import storage
 from ..models import DomainStateRef, FixedRandom, ProjectV7
 from ..validation import ProjectInputError, validate_project
 from .hashing import full_project_hash
+from .metrology import snapshot_content_hash
 from .routes import CheckpointRefV1, SegmentV1
 from .store import WorkflowConflict, WorkflowNotFound, WorkflowStore
 
@@ -74,6 +75,7 @@ def _finish_from_manifest(store: WorkflowStore, segment_id: str, run_id: str, st
     end_checkpoint: CheckpointRefV1 | None = None
     provenance_input_hash = None
     execution_hash = None
+    result_digest = None
     try:
         run_dir = storage.run_path(run_id)
         manifest = storage.read_json(run_dir / "manifest.json")
@@ -81,6 +83,10 @@ def _finish_from_manifest(store: WorkflowStore, segment_id: str, run_id: str, st
         execution_hash = manifest.get("executionHash")
         segment = store.get_segment(segment_id)
         row = next((item for item in manifest.get("snapshots", []) if item.get("stepId") == segment.throughStepId), None)
+        try:
+            result_digest = snapshot_content_hash(storage.read_json(run_dir / f"{segment.throughStepId}.json"))
+        except (FileNotFoundError, OSError, ValueError):
+            result_digest = None
         state = None if row is None else row.get("nativeState")
         if isinstance(state, dict) and state.get("stateId"):
             end_checkpoint = CheckpointRefV1(
@@ -100,6 +106,7 @@ def _finish_from_manifest(store: WorkflowStore, segment_id: str, run_id: str, st
         end_checkpoint,
         provenance_input_hash=provenance_input_hash,
         execution_hash=execution_hash,
+        result_digest=result_digest,
     )
 
 
