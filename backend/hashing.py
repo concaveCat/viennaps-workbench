@@ -109,7 +109,9 @@ def requested_input(project: Project | ProjectV3 | ProjectV4 | ProjectV5 | Proje
         # the content hash and compatibility metadata define simulation input.
         result["continuationState"] = project.continuationState.model_dump(mode="json", exclude_none=True, exclude={"sourceRunId", "sourceStepId"})
     if project.schemaVersion == 7 and project.outputSettings is not None:
-        result["outputSettings"] = project.outputSettings.model_dump(mode="json")
+        # ``cellSet`` is a new optional block. Excluding None keeps every
+        # historical schema-7 hash stable when the block is omitted.
+        result["outputSettings"] = project.outputSettings.model_dump(mode="json", exclude_none=True)
     definitions = getattr(project, "materialDefinitions", None) or []
     if definitions:
         from .materials import referenced_material_names

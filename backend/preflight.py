@@ -52,7 +52,7 @@ import math
 import os
 from typing import Any
 
-from .runtime_limits import artifact_limit_bytes
+from .runtime_limits import MAX_CELL_SET_CELLS, artifact_limit_bytes
 
 MIB = 1024 * 1024
 
@@ -91,6 +91,13 @@ VOLUME_MESH_BYTES_PER_CELL = 600
 LEVEL_SET_BYTES_PER_CELL = 600
 LEVEL_SET_MESH_BYTES_PER_CELL = 300
 NATIVE_METADATA_BYTES_PER_CELL = 32
+#: Native DenseCellSet VTU payload measured on plane/trench probes at
+#: 2D and 3D: 19.8-20.9 bytes per cell (zlib-compressed appended arrays),
+#: plus a fixed XML header. 24 B/cell is a small safety margin. The compact
+#: JSON document is a summary (statistics, not per-cell arrays) and is
+#: independent of the cell count.
+CELL_SET_VTU_BYTES_PER_CELL = 24
+CELL_SET_JSON_BYTES = 64 * 1024
 
 #: ``state-*.vpsd`` growth per geometry kind. GDS is the calibrated reference.
 STATE_GEOMETRY_FACTOR = {
@@ -209,8 +216,94 @@ def _all_snapshot_bytes(cells: float, snapshot_factor: float, layer_factor: floa
     return int(round(cells * snapshot_factor * layer_factor * total))
 
 
+def _lateral_grid(project: dict[str, Any]) -> tuple[float, float]:
+    """Lateral level-set cell counts (float, unrounded) of the domain."""
+    domain = project.get("domain") or {}
+    try:
+        delta = float(domain.get("gridDelta") or 0.0)
+        x_extent = float(domain.get("xExtent") or 0.0)
+        y_extent = float(domain.get("yExtent") or 0.0) if int(project.get("dimension") or 2) == 3 else 0.0
+    except (TypeError, ValueError):
+        return 1.0, 1.0
+    if delta <= 0.0:
+        return 1.0, 1.0
+    return max(1.0, x_extent / delta), max(1.0, y_extent / delta)
+
+
+def _structure_vertical_extent(project: dict[str, Any]) -> float:
+    """Conservative vertical span of the initial geometry in um.
+
+    Used only to size a requested DenseCellSet; the worker repeats the bound
+    from the measured native surface before it builds anything. GDS is the one
+    kind where the initial depth is not fully described by the request, so its
+    layers are used when they carry 3D heights and zero otherwise.
+    """
+    geometry = project.get("geometry")
+    if not isinstance(geometry, dict):
+        return 0.0
+
+    def number(key: str) -> float:
+        try:
+            return abs(float(geometry.get(key) or 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    kind = geometry.get("kind")
+    if kind == "plane":
+        return number("height")
+    if kind in {"trench", "hole"}:
+        return max(number("depth"), number("maskHeight"))
+    if kind == "fin":
+        return max(number("height"), number("maskHeight"))
+    if kind == "stack":
+        base = number("baseHeight")
+        return base + sum(abs(float(row.get("thickness") or 0.0)) for row in geometry.get("layers") or [])
+    if kind == "gds":
+        heights: list[float] = []
+        for row in geometry.get("layers") or []:
+            if row.get("baseHeight") is None or row.get("height") is None:
+                continue
+            base = float(row["baseHeight"])
+            heights.extend((base, base + abs(float(row["height"]))))
+        return max(heights) - min(heights) if heights else 0.0
+    return 0.0
+
+
+def _cell_set_estimate(project: dict[str, Any], *, step_count: int) -> tuple[int, int]:
+    """Return ``(bytes, cells_upper_bound)`` for the optional cell set."""
+    settings = project.get("outputSettings") or {}
+    cell_set = settings.get("cellSet")
+    if not isinstance(cell_set, dict) or not cell_set.get("enabled"):
+        return 0, 0
+    domain = project.get("domain") or {}
+    try:
+        delta = float(domain.get("gridDelta") or 0.0)
+        height = max(0.0, float(cell_set.get("height") or 0.0))
+    except (TypeError, ValueError):
+        return 0, 0
+    if delta <= 0.0:
+        return 0, 0
+    nx, ny = _lateral_grid(project)
+    # The native generator walks the active level-set band, whose lower edge is
+    # roughly one cell below the lowest surface point, plus the requested cover
+    # region. Four extra rows and two extra lateral columns bound the extent
+    # without knowing the final surface.
+    rows = math.ceil((height + _structure_vertical_extent(project)) / delta) + 4
+    lateral = math.ceil(nx) + 2
+    if int(project.get("dimension") or 2) == 3:
+        lateral *= math.ceil(ny) + 2
+    cells = lateral * max(rows, 2)
+    fmt = str(cell_set.get("format") or "both")
+    per_step = 0
+    if fmt in {"vtu", "both"}:
+        per_step += cells * CELL_SET_VTU_BYTES_PER_CELL + 8192
+    if fmt in {"json", "both"}:
+        per_step += CELL_SET_JSON_BYTES
+    return per_step * max(1, step_count), cells
+
+
 def _optional_outputs(project: dict[str, Any], *, cells: float, step_count: int,
-                      all_snapshot_bytes: int) -> tuple[int, list[str]]:
+                      all_snapshot_bytes: int) -> tuple[int, list[str], int, int]:
     settings = project.get("outputSettings") or {}
     dimension = int(project.get("dimension") or 2)
     levelsets = _levelset_count(project)
@@ -234,7 +327,11 @@ def _optional_outputs(project: dict[str, Any], *, cells: float, step_count: int,
     if settings.get("nativeMetadata"):
         total += NATIVE_METADATA_BYTES_PER_CELL * cells * step_count
         contributors.append("nativeMetadata")
-    return int(round(total)), contributors
+    cell_set_bytes, cell_set_cells = _cell_set_estimate(project, step_count=step_count)
+    if cell_set_bytes:
+        total += cell_set_bytes
+        contributors.append(f"cellSet（至多 {cell_set_cells:,} 个单元/步）")
+    return int(round(total)), contributors, cell_set_bytes, cell_set_cells
 
 
 def _confidence(project: dict[str, Any]) -> str:
@@ -278,9 +375,17 @@ def _suggestions(project: dict[str, Any], estimate: dict[str, Any]) -> list[str]
         suggestions.append(
             f"禁用或合并至少 {disable} 个（共 {len(enabled)} 个）已启用步骤"
         )
-    optional = sorted(key for key, value in settings.items() if value)
+    optional = sorted(
+        key for key, value in settings.items()
+        if (value if isinstance(value, bool) else isinstance(value, dict) and bool(value.get("enabled")))
+    )
     if optional:
         suggestions.append("禁用可选输出：" + "、".join(optional))
+    cell_set = settings.get("cellSet")
+    if isinstance(cell_set, dict) and cell_set.get("enabled") and (
+            estimate.get("cellSetCellsUpperBound", 0) > MAX_CELL_SET_CELLS
+            or estimate["risk"] == "reject" and estimate["estimatedBytes"] > cap):
+        suggestions.append("降低 outputSettings.cellSet.height 或提高 gridDelta")
     if dimension == 3 and util > WARNING_FRACTION:
         suggestions.append("缩小 xExtent/yExtent（当前 "
                            f"{domain.get('xExtent')} x {domain.get('yExtent')} um）")
@@ -332,7 +437,7 @@ def estimate_artifacts(project: dict[str, Any], *, kind: str = "simulate",
             * (STEP_SNAPSHOT_BYTES_PER_CELL + STEP_SNAPSHOT_GROWTH_BYTES_PER_CELL * growth_units)
         ))
     all_snapshots_bytes = _all_snapshot_bytes(cells, snapshot_factor, layer_factor, step_count)
-    optional_bytes, optional_kinds = _optional_outputs(
+    optional_bytes, optional_kinds, cell_set_bytes, cell_set_cells = _optional_outputs(
         project, cells=cells, step_count=step_count, all_snapshot_bytes=all_snapshots_bytes
     )
 
@@ -353,7 +458,17 @@ def estimate_artifacts(project: dict[str, Any], *, kind: str = "simulate",
 
     risk = "ok"
     downgraded = False
-    if utilization > REJECT_FRACTION:
+    cell_set_forced_reject = bool(
+        cell_set_cells and (utilization > REJECT_FRACTION or cell_set_cells > MAX_CELL_SET_CELLS)
+    )
+    if cell_set_forced_reject:
+        # A requested cell set is a real, measurable artifact. Never let an
+        # unrelated low-confidence output downgrade an over-cap run (or a cell
+        # set above the hard construction limit) to a warning: reject before
+        # the worker starts writing.
+        risk = "reject"
+        downgraded = False
+    elif utilization > REJECT_FRACTION:
         if confidence == "low":
             # No calibration for this output mode: warn instead of blocking.
             risk = "warning"
@@ -409,6 +524,8 @@ def estimate_artifacts(project: dict[str, Any], *, kind: str = "simulate",
         "contributors": contributors,
         "suggestions": [],
     }
+    if cell_set_cells:
+        estimate["cellSetCellsUpperBound"] = cell_set_cells
     estimate["suggestions"] = _suggestions(project, estimate)
     return estimate
 

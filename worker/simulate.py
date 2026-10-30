@@ -28,7 +28,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from backend.rates import has_motion, is_geometry_step, uses_flux, signed_rates, signed_directional_rates, signed_directional_rate_sets
 from backend.models import normalized_geometry_v3, parse_project, project_structure_hash
-from backend.runtime_limits import artifact_limit_bytes, artifact_limit_label
+from backend.runtime_limits import MAX_CELL_SET_CELLS, artifact_limit_bytes, artifact_limit_label
+from backend.preflight import CELL_SET_JSON_BYTES, CELL_SET_VTU_BYTES_PER_CELL
 from backend.validation import fin_construction_decision
 from backend.gpu_devices import cuda_devices, resolve_gpu_device
 from worker.gds_mask import CONSTRUCTION as GDS_MASK_CONSTRUCTION
@@ -119,6 +120,218 @@ def check_artifact_budget(run_dir: Path) -> None:
             # A concurrent atomic replace may remove a file after rglob has
             # yielded its path. Continue with the remaining committed files.
             continue
+
+
+def artifact_bytes_used(run_dir: Path) -> int:
+    """Return the committed run payload without raising on a transient file."""
+    total = 0
+    for item in run_dir.rglob("*"):
+        try:
+            if item.name.endswith(".tmp") or not item.is_file():
+                continue
+            total += item.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _cell_set_upper_bound(requested: dict[str, Any], *, height: float, top: float, bottom: float,
+                          delta: float) -> int:
+    """Upper-bound the native cell count before allocating the dense grid.
+
+    The installed generator walks the active level-set band (roughly one cell
+    below the lowest surface point) up to the requested position. Domain cells
+    are fixed laterally, so the bound is exact up to the band margin.
+    """
+    x_extent = float(requested["domain"]["xExtent"])
+    nx = max(1, math.ceil(x_extent / delta))
+    if int(requested["dimension"]) == 3:
+        ny = max(1, math.ceil(float(requested["domain"]["yExtent"]) / delta))
+        lateral = (nx + 2) * (ny + 2)
+    else:
+        lateral = nx + 2
+    rows = math.ceil((top + height - bottom) / delta) + 4
+    return lateral * max(rows, 2)
+
+
+def _cell_set_field_row(label: str, values: list[float],
+                        material_names: dict[int, str] | None = None) -> dict[str, Any]:
+    if not values:
+        raise RuntimeError(f"DenseCellSet scalar {label!r} has no values")
+    if any(not math.isfinite(value) for value in values):
+        raise RuntimeError(f"DenseCellSet scalar {label!r} contains a non-finite value")
+    row: dict[str, Any] = {
+        "count": len(values),
+        "min": min(values),
+        "max": max(values),
+    }
+    if label == "Material":
+        counts: dict[int, int] = {}
+        for value in values:
+            counts[int(value)] = counts.get(int(value), 0) + 1
+        row["distinctCount"] = len(counts)
+        row["materialCounts"] = {str(key): counts[key] for key in sorted(counts)}
+        names = material_names or MATERIAL_NAMES
+        row["materialNames"] = {str(key): names.get(key, "unknown") for key in sorted(counts)}
+    else:
+        row["mean"] = sum(values) / len(values)
+        row["nonZeroCount"] = sum(1 for value in values if value != 0.0)
+        row["distinctCount"] = len(set(values))
+        if label == "FillingFraction":
+            row["partialCount"] = sum(1 for value in values if 1e-6 < value < 1.0 - 1e-6)
+    return row
+
+
+def write_cell_set_outputs(ps: Any, domain: Any, report: dict[str, Any], run_dir: Path, run_id: str,
+                           step_id: str, requested: dict[str, Any], settings: dict[str, Any],
+                           *, is3d: bool) -> list[dict[str, Any]]:
+    """Write the optional native DenseCellSet VTU and compact JSON summary.
+
+    A fresh ``DenseCellSet`` is built directly from the domain's level sets.
+    ``Domain.generateCellSet`` would store the grid on the Domain and a second
+    call on the same Domain appends duplicate scalar arrays, so the generic
+    output must not mutate the simulation Domain that is persisted as .vpsd.
+    """
+    dimension = int(requested["dimension"])
+    axis = 2 if is3d else 1
+    points = report.get("points") or []
+    if not points:
+        raise RuntimeError("DenseCellSet output requires the extracted native surface")
+    top = max(float(point[axis]) for point in points)
+    bottom = min(float(point[axis]) for point in points)
+    delta = float(domain.getGridDelta())
+    height = float(settings["height"])
+    if height + 1e-12 < delta:
+        raise RuntimeError(
+            f"cellSet.height {height:g} um is below one grid interval ({delta:g} um); "
+            "the installed DenseCellSet generator would crash")
+    cover_name = str(settings.get("coverMaterial") or "GAS")
+    if cover_name == "GAS":
+        cover = ps.Material.GAS
+    else:
+        cover = material_handle(ps, cover_name)
+    format_ = str(settings.get("format") or "both")
+    if format_ not in {"vtu", "json", "both"}:
+        raise RuntimeError(f"unsupported cellSet.format {format_!r}")
+    position = top + height
+    cells_upper = _cell_set_upper_bound(requested, height=height, top=top, bottom=bottom, delta=delta)
+    if cells_upper > MAX_CELL_SET_CELLS:
+        raise RuntimeError(
+            f"cell-set output needs at least {cells_upper:,} cells, above the "
+            f"{MAX_CELL_SET_CELLS:,}-cell limit; reduce cellSet.height or coarsen gridDelta")
+    estimate = 0
+    if format_ in {"vtu", "both"}:
+        estimate += cells_upper * CELL_SET_VTU_BYTES_PER_CELL + 8192
+    if format_ in {"json", "both"}:
+        estimate += CELL_SET_JSON_BYTES
+    artifact_dir = run_dir / "artifacts"
+    target_paths = []
+    if format_ in {"vtu", "both"}:
+        target_paths.append(artifact_dir / f"{step_id}-cell-set.vtu")
+    if format_ in {"json", "both"}:
+        target_paths.append(artifact_dir / f"{step_id}-cell-set.json")
+    # A deferred snapshot is materialised from its .vpsd state; the artifact it
+    # rewrites already counts in the run directory. Replace, do not double count.
+    replaced = sum(path.stat().st_size for path in target_paths if path.is_file())
+    cap = artifact_limit_bytes()
+    used = artifact_bytes_used(run_dir) - replaced
+    if used + estimate > cap:
+        raise RuntimeError(
+            f"cell-set output would need about {estimate / (1024 * 1024):.1f} MiB but only "
+            f"{(cap - used) / (1024 * 1024):.1f} MiB remain under the "
+            f"{artifact_limit_label()} cap; reduce cellSet.height, disable VTU, or raise the cap")
+    periodic = bool(settings.get("periodic", False))
+    periodic_boundary = ([periodic, periodic, False] if is3d else [periodic, False])
+    cell_set = ps.DenseCellSet()
+    cell_set.setCellSetPosition(True)
+    cell_set.setCoverMaterial(int(cover))
+    cell_set.fromLevelSets(domain.getLevelSets(), domain.getMaterialMap().getMaterialMap(), position)
+    cell_set.setPeriodicBoundary(periodic_boundary)
+    cells = int(cell_set.getNumberOfCells())
+    if cells <= 0:
+        raise RuntimeError("ViennaPS DenseCellSet generation produced no cells")
+    if cells > cells_upper:
+        raise RuntimeError(f"DenseCellSet produced {cells} cells, above the {cells_upper}-cell pre-write bound")
+    labels = [str(label) for label in cell_set.getScalarDataLabels()]
+    selected = list(settings.get("scalarLabels") or labels)
+    missing = sorted(set(selected) - set(labels))
+    if missing:
+        raise RuntimeError("DenseCellSet is missing requested scalar label(s): " + ", ".join(missing))
+    material_values = [float(value) for value in cell_set.getScalarData("Material")]
+    if len(material_values) != cells:
+        raise RuntimeError("DenseCellSet Material scalar length does not match its cell count")
+    if "FillingFraction" in labels:
+        filling = [float(value) for value in cell_set.getFillingFractions()]
+        if len(filling) != cells:
+            raise RuntimeError("DenseCellSet filling fraction length does not match its cell count")
+    else:
+        filling = []
+    bounds = json.loads(json.dumps(cell_set.getBoundingBox(), default=float))
+    material_names = {**MATERIAL_NAMES, int(ps.Material.GAS): "GAS"}
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, Any]] = []
+    association = "native DenseCellSet cell grid; separate from the returned surface mesh"
+    if format_ in {"vtu", "both"}:
+        path = artifact_dir / f"{step_id}-cell-set.vtu"
+        cell_set.writeVTU(str(path))
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise RuntimeError("ViennaPS DenseCellSet.writeVTU did not produce a nonempty VTU file")
+        rows.append(output_artifact(
+            path, run_dir, run_id, step_id, "cellSet", "VTU",
+            association=association, dimension=dimension, gridDelta=delta,
+            numberOfCells=cells, coverMaterial=cover_name, heightAboveSurface=height,
+            periodic=periodic))
+    if format_ in {"json", "both"}:
+        payload = {
+            "schemaVersion": 1,
+            "source": "viennaps.DenseCellSet.fromLevelSets after setCellSetPosition(true) and setCoverMaterial",
+            "nativeType": "DenseCellSet",
+            "dimension": dimension,
+            "association": association,
+            "setup": {
+                "heightAboveSurface": height,
+                "surfaceTop": top,
+                "surfaceBottom": bottom,
+                "position": position,
+                "verticalAxis": axis,
+                "coverMaterial": cover_name,
+                "coverMaterialId": int(cover),
+                "isAboveSurface": True,
+                "periodic": periodic,
+                "periodicBoundary": periodic_boundary,
+                "scalarLabels": selected,
+                "nativeScalarLabels": labels,
+            },
+            "numberOfCells": cells,
+            "numberOfNodes": len(cell_set.getNodes()),
+            "grid": {
+                "gridDelta": delta,
+                "nodes": len(cell_set.getNodes()),
+                "elements": len(cell_set.getElements()),
+                "elementNodes": len(cell_set.getElement(0)),
+                "nativeElementType": "tetra" if dimension == 2 else "hexahedron",
+                "logicalCellShape": "quad" if dimension == 2 else "hexahedron",
+                "bounds": bounds,
+            },
+            "fields": {
+                label: _cell_set_field_row(
+                    label,
+                    material_values if label == "Material" else filling if label == "FillingFraction" else
+                    [float(value) for value in cell_set.getScalarData(label)],
+                    material_names,
+                )
+                for label in selected
+            },
+            "nativeUnit": None,
+        }
+        path = artifact_dir / f"{step_id}-cell-set.json"
+        atomic_json(path, payload)
+        rows.append(output_artifact(
+            path, run_dir, run_id, step_id, "cellSetSummary", "JSON",
+            association=association, dimension=dimension, gridDelta=delta,
+            numberOfCells=cells, coverMaterial=cover_name, heightAboveSurface=height,
+            periodic=periodic))
+    return rows
 
 
 def cuda_runtime_readback(expected_device: dict[str, Any]) -> dict[str, Any]:
@@ -1826,7 +2039,10 @@ def save_snapshot(
         ps.ls.VTKWriter(mesh, str(run_dir / vtk_name)).apply()
     output_rows: list[dict[str, Any]] = list(extra_outputs or [])
     artifact_dir = run_dir / "artifacts"
-    if any(output_settings.get(key, False) for key in ("levelSets", "levelSetMeshes", "volumeMesh", "nativeMetadata")):
+    cell_set_settings = output_settings.get("cellSet")
+    cell_set_enabled = isinstance(cell_set_settings, dict) and bool(cell_set_settings.get("enabled"))
+    if (any(output_settings.get(key, False) for key in ("levelSets", "levelSetMeshes", "volumeMesh", "nativeMetadata"))
+            or cell_set_enabled):
         artifact_dir.mkdir(parents=True, exist_ok=True)
     if output_settings.get("levelSets"):
         prefix = artifact_dir / f"{step_id}-levelsets.vtk"
@@ -1897,6 +2113,10 @@ def save_snapshot(
         output_rows.append(output_artifact(metadata_path, run_dir, run_id, step_id, "nativeMetadata", "JSON",
                                            association="domain metadata", nativeUnit=None,
                                            metadataLevel=str(domain.getMetaDataLevel())))
+    if cell_set_enabled:
+        output_rows.extend(write_cell_set_outputs(
+            ps, render_domain, report, run_dir, run_id, step_id, requested,
+            cell_set_settings, is3d=is3d))
     check_artifact_budget(run_dir)
     ids = display_material_ids
     if is3d:

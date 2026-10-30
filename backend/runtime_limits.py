@@ -41,6 +41,13 @@ MAX_LOG_ENV = "WORKBENCH_MAX_LOG_MIB"
 DEFAULT_MAX_LOG_MIB = 4
 MIN_MAX_LOG_MIB = 1
 
+#: Hard per-step DenseCellSet construction limit. The native cell set is a
+#: dense voxel grid: 2 million cells already needs roughly 0.7 GiB of worker
+#: memory and a ~40 MiB VTU, so a larger request is an obvious configuration
+#: error rather than something the artifact preflight should discover late.
+#: The artifact cap is enforced separately and remains authoritative.
+MAX_CELL_SET_CELLS = 2_000_000
+
 # Invalid values are warned about once per distinct (env, value) pair so a
 # misconfigured long-running service does not log on every request.
 _WARNED_INVALID: set[tuple[str, str]] = set()
