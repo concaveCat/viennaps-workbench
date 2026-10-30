@@ -40,6 +40,7 @@ ViennaPS 4.6.2 的真实绑定、`ps.RateGrid` 的直接探测，以及
 | 数据行内的内联 `#` | 422（原生会把它当数值解析） |
 | `nan`/`inf`/十六进制/下划线/非有限值 | 422 |
 | 下溢为 0 的非零字面量（如 `1e-400`） | 422；显式 `0` 仍接受 |
+| 非零 subnormal（\|value\| < `sys.float_info.min`，如 `1e-308`/`5e-324`） | 422；原生 reader 拒绝 subnormal，IDW 会静默不动、LINEAR 可能崩溃。`1e-307`（最小 normal）可用 |
 | 数值格式 | 用 Python 最短往返十进制重新输出（如 `1.0e-7`、`0.5`、`-2.0`） |
 | 行尾 | 规范为 LF，末尾单个换行 |
 
@@ -97,7 +98,7 @@ worker 会再次 canonicalize 其 run 目录副本；只要字节不是规范形
 验证在 worker 启动前完成：
 
 - 资产存在且 SHA-256 匹配；存储字节必须是规范形式（否则提示重新上传）；元数据维度必须等于项目维度；
-- 表结构与维度匹配（2D 2 列 / 3D 3 列），所有数值有限且规范；
+- 表结构与维度匹配（2D 2 列 / 3D 3 列），所有数值有限、非 subnormal 且规范；
 - `LINEAR`：2D 要求 x 严格递增；3D 要求完整矩形 x/y 网格（至少 2×2，不能缺格）；
 - `IDW`：`idwNeighbors <= rowCount`；
 - 方向非零，2D 的第三个分量为 0，2D 的 `offset[1]` 为 0，offset 在 ±1e6 µm 内；
@@ -121,8 +122,8 @@ worker 会再次 canonicalize 其 run 目录副本；只要字节不是规范形
 
 | 项目 | 结果 |
 |---|---|
-| 2D | 平面、带 Mask 的 trench、负速率刻蚀、非零 offset、iso+dir 混合、关闭 visibility 均通过直接参考比较 |
-| 3D | 平面 LINEAR、完整/不完整网格 IDW、legacy stack + GDS overlay mask 均通过 |
+| 2D | 平面、带 Mask 的 trench、带 Mask 的 Fin、负速率刻蚀、非零 offset、iso+dir 混合、关闭 visibility 均通过直接参考比较 |
+| 3D | 平面 LINEAR、完整/不完整网格 IDW、stack 顶层 GDS mask、film-only legacy `gdsMask.protectsEtch` overlay 均通过 |
 | 操作 | 固定 `native`；正速率沉积、负速率刻蚀，由 CSV 符号决定 |
 | 引擎 | `not-applicable`（CPU 进程；不使用 GPU/射线通量） |
 | 直接参考误差 | 2D/3D 均为 0（容差断言 1e-6 µm） |

@@ -124,6 +124,17 @@ class CsvParserTests(unittest.TestCase):
         canonical_3d, _summary = canonicalize_rate_csv(
             b"0,0,1e+0\n0,1,2.\n1,0,.5\n1,1,-0.0\n", 3)
         self.assertEqual(canonical_3d, b"0.0,0.0,1.0\n0.0,1.0,2.0\n1.0,0.0,0.5\n1.0,1.0,0.0\n")
+        # 1e-307 is the smallest normal double, 1e-308 is subnormal and the
+        # native reader rejects it (LINEAR then SIGSEGVs).
+        normal, _summary = canonicalize_rate_csv(b"0,1e-307\n1,1e-307\n", 2)
+        self.assertEqual(normal, b"0.0,1.0e-307\n1.0,1.0e-307\n")
+        # Some native libraries in the same process enable flush-to-zero, so
+        # 1e-308 may parse as 0.0; either the underflow or the subnormal guard
+        # must reject it before the native rate grid sees it.
+        for body in (b"0,1e-308\n1,0.5\n", b"0,-5e-324\n1,0.5\n"):
+            with self.subTest(body=body):
+                with self.assertRaisesRegex(RateCsvError, "subnormal|underflows"):
+                    canonicalize_rate_csv(body, 2)
 
     def test_rejects_failed_native_load_shapes(self):
         cases = {
@@ -136,6 +147,9 @@ class CsvParserTests(unittest.TestCase):
             "unicode whitespace": ("0,\u00a00.5\n1,0.4\n".encode("utf-8"), 2),
             "unicode digit": ("0,\uff10.5\n1,0.4\n".encode("utf-8"), 2),
             "underflow": (b"0,1e-400\n1,0.5\n", 2),
+            "subnormal": (b"0,1e-308\n1,0.5\n", 2),
+            "smallest subnormal": (b"0,5e-324\n1,0.5\n", 2),
+            "negative subnormal": (b"0,-1e-308\n1,0.5\n", 2),
             "overflow": (b"0,1e400\n1,0.5\n", 2),
             "control character": (b"0,0.5\x01\n1,0.4\n", 2),
             "second bom": (b"0,0.5\n\xef\xbb\xbf1,0.4\n", 2),
@@ -228,6 +242,16 @@ class CsvAssetApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(tiny_probe["loaded"])
         self.assertAlmostEqual(tiny_probe["value"], 1e-7, places=12)
 
+        # Smallest normal double: accepted and native-safe. 1e-308 is
+        # subnormal and must be rejected before any native load.
+        normal = json.loads((await upload_csv(2, b"0,1e-307\n1,1e-307\n", "normal.csv"))[1])
+        self.assertEqual(storage.csv_asset_path(normal["assetId"]).read_bytes(),
+                         b"0.0,1.0e-307\n1.0,1.0e-307\n")
+        normal_probe = await self.native_probe(normal["assetId"], 2, "LINEAR", [0.5, 0.0, 0.0],
+                                               label="normal-linear")
+        self.assertTrue(normal_probe["loaded"])
+        self.assertEqual(normal_probe["value"], 1e-307)
+
         incomplete = b"0,0,1.0\n0,2,1.0\n2,0,1.0\n"
         idw_asset = json.loads((await upload_csv(3, incomplete, "incomplete.csv"))[1])
         idw = await self.native_probe(idw_asset["assetId"], 3, "IDW", [0.5, 0.5, 0.0],
@@ -243,6 +267,7 @@ class CsvAssetApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await upload_csv(2, b"0,nan\n1,0.5\n"))[0], 422)
         self.assertEqual((await upload_csv(2, b"0,0.5 # inline\n1,0.4\n"))[0], 422)
         self.assertEqual((await upload_csv(2, b"0,1e-400\n1,0.5\n"))[0], 422)
+        self.assertEqual((await upload_csv(2, b"0,1e-308\n1,0.5\n"))[0], 422)
         self.assertEqual((await upload_csv(3, CSV_3D))[0], 201)
 
         too_large = b"0,1\n" * ((16 * 1024 * 1024) // 4 + 1)
@@ -393,6 +418,37 @@ class CsvProjectValidationTests(unittest.TestCase):
             validate_project(project, kind="simulate")
         self.assertTrue(any("not in the canonical" in issue.message for issue in ctx.exception.issues))
 
+    def test_subnormal_rate_is_rejected_before_native_load(self):
+        import hashlib
+        from worker.csv_process import build_csv_process
+
+        raw = b"0,1e-308\n1,0.5\n"
+        asset_id = hashlib.sha256(raw).hexdigest()
+        storage.csv_asset_path(asset_id).write_bytes(raw)
+        storage.atomic_json(storage.csv_asset_metadata_path(asset_id), {
+            "assetId": asset_id, "fileName": "subnormal.csv", "dimension": 2,
+        })
+        project = base_project(2)
+        project["steps"] = [csv_step({"assetId": asset_id, "fileName": "subnormal.csv"}, 2)]
+        with self.assertRaises(ProjectInputError) as ctx:
+            validate_project(project, kind="simulate")
+        self.assertTrue(any("subnormal" in issue.message or "underflow" in issue.message
+                            for issue in ctx.exception.issues), ctx.exception.issues)
+
+        run_dir = storage.VAR / "test-csv-worker-subnormal"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        copy = run_dir / f"csv-source-{asset_id}.csv"
+        copy.write_bytes(raw)
+        with self.assertRaisesRegex(RuntimeError, "subnormal|underflow"):
+            build_csv_process(None, project, project["steps"][0],
+                              config={"csvAssets": {asset_id: str(copy)}}, run_dir=run_dir,
+                              material_handle=lambda name: name, material_ids={})
+
+        normal = self.asset(2, b"0,1e-307\n1,1e-307\n", "normal.csv")
+        project["steps"] = [csv_step(normal, 2)]
+        parsed, _warnings = validate_project(project, kind="simulate")
+        self.assertEqual(parsed.steps[0].assetId, normal["assetId"])
+
     def test_save_reopen_keeps_the_asset_reference(self):
         asset = self.asset(2, CSV_2D)
         project = base_project(2)
@@ -404,6 +460,27 @@ class CsvProjectValidationTests(unittest.TestCase):
         self.assertEqual(reopened["steps"][0]["fileName"], asset["fileName"])
         parsed, _warnings = validate_project(reopened, kind="simulate")
         self.assertEqual(parsed.steps[0].model, "csvProcess")
+
+
+def material_top_2d_at(snapshot: dict, material_id: int, x: float) -> float | None:
+    points = snapshot["points"]
+    lines = snapshot.get("lines") or []
+    ids = snapshot["cellData"]["materialIds"]
+    best: float | None = None
+    for line, material in zip(lines, ids):
+        if int(material) != material_id or len(line) < 2:
+            continue
+        a, b = points[line[0]], points[line[1]]
+        low, high = min(a[0], b[0]), max(a[0], b[0])
+        if x < low - 1e-12 or x > high + 1e-12:
+            continue
+        if abs(b[0] - a[0]) < 1e-12:
+            h = max(a[1], b[1])
+        else:
+            weight = (x - a[0]) / (b[0] - a[0])
+            h = a[1] + weight * (b[1] - a[1])
+        best = h if best is None else max(best, h)
+    return best
 
 
 def material_top_at(snapshot: dict, material_id: int, x: float, y: float) -> float | None:
@@ -584,7 +661,7 @@ class CsvNativeReferenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(execution["interpolationMode"], "IDW")
         self.assertEqual(execution["idwNeighbors"], 3)
 
-    async def test_legacy_stack_gds_mask_overlay_stays_immobile(self):
+    async def test_gds_mask_top_layer_stays_immobile(self):
         fixture = ROOT / "docs/gds-mask-diagnosis/fixtures/multi-layer.gds"
         upload = await asgi_request("/api/gds-assets?file_name=multi-layer.gds", method="POST",
                                     payload=fixture.read_bytes(),
@@ -631,6 +708,76 @@ class CsvNativeReferenceTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(after, (x, y))
             self.assertGreater(before, 0.5)
             self.assertAlmostEqual(before, after, delta=1e-9, msg=(x, y))
+
+    async def test_legacy_film_only_gds_mask_overlay_stays_immobile(self):
+        fixture = ROOT / "docs/gds-mask-diagnosis/fixtures/multi-layer.gds"
+        upload = await asgi_request("/api/gds-assets?file_name=multi-layer.gds", method="POST",
+                                    payload=fixture.read_bytes(),
+                                    headers=[(b"content-type", b"application/octet-stream")])
+        self.assertEqual(upload[0], 201, upload[2])
+        gds_asset = json_body(upload)
+        # Legacy representation: no role=mask layer and no source=gds-mask
+        # layer. The only mask material comes from geometry.gdsMask.protectsEtch.
+        geometry = {
+            "kind": "stack", "substrateMaterial": "Si", "baseHeight": 0.0,
+            "layers": [
+                {"id": "oxide", "name": "Oxide", "material": "SiO2", "thickness": 0.5, "role": "film"},
+            ],
+            "pattern": {"kind": "none"},
+            "gdsMask": {
+                "name": "GDS Mask", "assetId": gds_asset["assetId"], "fileName": "multi-layer.gds",
+                "structure": "MULTI", "layer": 2, "datatype": 0, "unitScale": 1.0,
+                "position": [0.0, 0.0, 0.0], "baseHeight": 0.5, "height": 0.5,
+                "material": "Mask", "retainedRegion": "inside", "protectsEtch": True,
+            },
+        }
+        asset = json.loads((await upload_csv(3, CSV_3D, "legacy-overlay.csv"))[1])
+        project = base_project(3, geometry)
+        project["steps"] = [csv_step(asset, 3, calculateVisibility=False)]
+        validation = json_body(await asgi_request("/api/projects/validate", method="POST", payload=project))
+        self.assertTrue(validation["valid"], validation)
+        run_id, _info = await self.execute(project)
+        execution = storage.read_json(storage.run_path(run_id) / "manifest.json")["actualExecution"][-1]["actualParameters"]["csvProcess"]
+        self.assertEqual(execution["maskMaterials"], ["Mask"])
+        initial = await self.snapshot(run_id, "initial")
+        final = await self.snapshot(run_id, "step_csv_0001")
+        for x, y in ((0.0, 0.0), (0.3, 0.5), (-0.3, -0.5)):
+            before = material_top_at(initial, 0, x, y)
+            after = material_top_at(final, 0, x, y)
+            self.assertIsNotNone(before, (x, y))
+            self.assertIsNotNone(after, (x, y))
+            self.assertGreater(before, 0.5)
+            self.assertAlmostEqual(before, after, delta=1e-9, msg=(x, y))
+
+    async def test_2d_masked_fin_preserves_the_fin_mask(self):
+        fin = {"kind": "fin", "width": 0.8, "height": 1.2, "taperAngle": 0.0,
+               "maskHeight": 0.5, "maskTaperAngle": 0.0, "substrateMaterial": "Si",
+               "maskMaterial": "Mask", "construction": "native"}
+        asset = json.loads((await upload_csv(2, b"-2,-0.4\n2,-0.4\n", "fin-etch.csv"))[1])
+        project = base_project(2, fin)
+        # Visibility is disabled for the same native multi-level-set reason as
+        # the GDS overlay test; mask protection is independent of it.
+        project["steps"] = [csv_step(asset, 2, calculateVisibility=False)]
+        validation = json_body(await asgi_request("/api/projects/validate", method="POST", payload=project))
+        self.assertTrue(validation["valid"], validation)
+        run_id, _info = await self.execute(project)
+        execution = storage.read_json(storage.run_path(run_id) / "manifest.json")["actualExecution"][-1]["actualParameters"]["csvProcess"]
+        self.assertEqual(execution["maskMaterials"], ["Mask"])
+        initial = await self.snapshot(run_id, "initial")
+        final = await self.snapshot(run_id, "step_csv_0001")
+        mask_before = material_top_2d_at(initial, 0, 0.0)
+        mask_after = material_top_2d_at(final, 0, 0.0)
+        self.assertIsNotNone(mask_before)
+        self.assertIsNotNone(mask_after)
+        self.assertGreater(mask_before, 1.0)
+        # A zero-velocity level set can still be re-distanced by the native
+        # advection pass; the measured coordinate floor is ~2.5e-9 um.
+        self.assertAlmostEqual(mask_before, mask_after, delta=5e-9)
+        film_before = material_top_2d_at(initial, 10, 1.5)
+        film_after = material_top_2d_at(final, 10, 1.5)
+        self.assertIsNotNone(film_before)
+        self.assertIsNotNone(film_after)
+        self.assertLess(film_after, film_before - 0.1)
 
     async def test_2d_mask_material_is_derived_like_ion_beam(self):
         trench = {"kind": "trench", "width": 1.5, "depth": 0.8, "taperAngle": 0.0,
