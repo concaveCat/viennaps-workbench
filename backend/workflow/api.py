@@ -578,6 +578,12 @@ class ReportRequest(StrictModel):
     lower: float | None = None
     upper: float | None = None
 
+    @model_validator(mode="after")
+    def require_source(self) -> "ReportRequest":
+        if not (self.runId or self.measurementId or self.experimentId):
+            raise ValueError("报告需要至少一次运行、测量或实验")
+        return self
+
 
 class ReportResponse(StrictModel):
     reportId: str

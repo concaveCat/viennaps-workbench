@@ -12,7 +12,12 @@ import uuid
 os.environ.setdefault("WORKBENCH_PORT", "8767")
 
 from backend.main import app  # noqa: E402
-from backend.workflow.analysis import compare_snapshots, process_window  # noqa: E402
+from backend.workflow.analysis import (  # noqa: E402
+    _status_label,
+    _svg_for_snapshot,
+    compare_snapshots,
+    process_window,
+)
 from tests.test_api_integration import asgi_request, json_body  # noqa: E402
 from tests.test_workflow_adoption import project  # noqa: E402
 
@@ -126,12 +131,21 @@ class AnalysisTests(unittest.IsolatedAsyncioTestCase):
         self.assertRegex(body["sha256"], r"^[a-f0-9]{64}$")
         html = body["html"]
         for text in (
-            "P3 acceptance report", self.adopted["flowId"], "ViennaPS", "actual seed",
-            self.metric_id, "Process window", "window candidate selected", "report-svg",
-            "Evidence / Provenance", self.measurement_id, "geometry kind",
+            "P3 acceptance report", self.adopted["flowId"], "ViennaPS", "实际种子",
+            "depth", "工艺窗口", "window candidate selected",
+            "report-svg", "证据", self.measurement_id, "几何类型", "生成时间", "报告摘要",
+            "技术详情", "报告哈希", "流程与编译", "几何 / Clip", "引擎与种子", "运行与测量",
+            "实验与统计", "结构视图", "结论", "95% 置信区间", "样本数",
+            "均值", "标准差", "统计状态", "候选", "成功",
         ):
             self.assertIn(text, html)
+        for stale in ("not recorded", "candidate 1", "No compile envelope selected.",
+                      "No run manifest selected.", "No measurement selected.",
+                      "Process window", "CI method", "actual seed", "report hash"):
+            self.assertNotIn(stale, html)
+        self.assertIn("<details", html)
         self.assertIn("打印 / 保存为 PDF", html)
+        self.assertEqual(html.count("<h2>"), 7)
 
         single = await asgi_request(
             "/api/v1/workflow/analysis/report", method="POST",
@@ -139,9 +153,10 @@ class AnalysisTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(single[0], 200, single[2])
         single_html = json_body(single)["html"]
-        for text in (self.adopted["flowId"], self.metric_id, "geometry kind", "variables", "compileId"):
+        for text in (self.adopted["flowId"], "流程与编译", "几何类型", "变量", "编译 ID", "实际种子"):
             self.assertIn(text, single_html)
-        self.assertNotIn("No compile envelope selected", single_html)
+        self.assertNotIn("未选择编译记录", single_html)
+        self.assertNotIn("not recorded", single_html)
 
     def test_process_window_rejects_single_sample_candidates(self):
         document = {
@@ -248,6 +263,59 @@ class AnalysisTests(unittest.IsolatedAsyncioTestCase):
         offset_body = json_body(offset_fit)
         self.assertEqual(len(offset_body["parameters"]), 3)
         self.assertIsNotNone(offset_body["trainResiduals"]["rmse"])
+
+
+class ReportValidationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_report_requires_a_run_measurement_or_experiment(self):
+        for payload in ({"title": "Empty report"}, {"title": "Empty report", "conclusions": "none"}):
+            response = await asgi_request(
+                "/api/v1/workflow/analysis/report", method="POST", payload=payload,
+            )
+            self.assertEqual(response[0], 422, response[2])
+            self.assertIn("报告需要至少一次运行、测量或实验", json.dumps(json_body(response), ensure_ascii=False))
+
+
+class ReportRenderingTests(unittest.TestCase):
+    def test_status_codes_are_localized(self):
+        for code, label in (
+            ("succeeded", "成功"), ("failed", "失败"), ("running", "运行中"), ("planned", "待执行"),
+            ("WITHIN_TOLERANCE", "在公差内"), ("OUTSIDE_TOLERANCE", "超出公差"),
+            ("NOT_EVALUATED", "未评估"), ("within_tolerance", "在公差内"),
+            ("outside_tolerance", "超出公差"), ("not_evaluated", "未评估"),
+        ):
+            self.assertEqual(_status_label(code), label)
+
+    def test_2d_svg_uses_height_axis_materials_and_axes(self):
+        # h-slot cross section (points are x/h/z with a flat z) must not collapse
+        # into a single horizontal line; the outline is a closed material loop.
+        snapshot = {
+            "dimension": 2, "axisMap": {"x": 0, "h": 1, "z": 2}, "coordinateUnit": "um",
+            "topology": "lines",
+            "points": [[0, 0, 0], [1, 0, 0], [1, 0.5, 0], [0, 0.5, 0]],
+            "lines": [[0, 1], [1, 2], [2, 3], [3, 0]],
+            "cellData": {"materialIds": [10, 10, 10, 10]},
+            "materials": {"10": {"name": "Si", "color": "#c79a08"}},
+        }
+        svg = _svg_for_snapshot(snapshot)
+        self.assertIn("report-svg", svg)
+        self.assertIn("<line", svg)
+        self.assertIn("<polygon", svg)
+        self.assertIn("材料图例", svg)
+        self.assertIn("Si", svg)
+        self.assertIn("µm", svg)
+        self.assertIn("x (µm)", svg)
+        polygon = svg.split("<polygon", 1)[1].split("/>", 1)[0]
+        coords = polygon.split('points="', 1)[1].split('"', 1)[0].split()
+        self.assertGreater(len({point.split(",")[1] for point in coords}), 1)
+
+        # z-slot cross section (points are x/0/z) follows axisMap.z for the vertical axis.
+        z_snapshot = {**snapshot, "points": [[0, 0, 0], [1, 0, 0], [1, 0, 0.5], [0, 0, 0.5]]}
+        z_svg = _svg_for_snapshot(z_snapshot)
+        self.assertIn("<polygon", z_svg)
+        self.assertIn("z (µm)", z_svg)
+        z_polygon = z_svg.split("<polygon", 1)[1].split("/>", 1)[0]
+        z_coords = z_polygon.split('points="', 1)[1].split('"', 1)[0].split()
+        self.assertGreater(len({point.split(",")[1] for point in z_coords}), 1)
 
 
 if __name__ == "__main__":
