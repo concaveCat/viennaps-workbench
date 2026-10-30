@@ -25,9 +25,9 @@
     3
   ],
   "summary": {
-    "advanced-parameter-or-output-not-exposed": 10,
+    "advanced-parameter-or-output-not-exposed": 9,
     "engine-model-not-exposed": 7,
-    "exposed": 61,
+    "exposed": 62,
     "internal-or-not-user-facing": 18
   },
   "classes": [
@@ -2038,22 +2038,25 @@
       ],
       "constructor": "DenseCellSet() + fromLevelSets(domain, ...) + setCellSetPosition/setCoverMaterial/setPeriodicBoundary/setFillingFraction/addScalarData/buildNeighborhood/updateSurface/writeVTU/writeCellSetData/readCellSetData",
       "docSummary": "Volumetric cell set over the simulation domain, carrying filling fractions and scalar fields.",
-      "classification": "advanced-parameter-or-output-not-exposed",
+      "classification": "exposed",
       "exposedBy": [
-        "output:nativeCellSet (OxideRegrowth only)"
+        "outputSettings.cellSet (schema 7, per step)",
+        "output:nativeCellSet (OxideRegrowth, unchanged)"
       ],
-      "notes": "Today the only cell set in a run is the one OxideRegrowth requires; its scalars are exported as one JSON artifact. No project can ask for a volumetric field of its own.",
+      "notes": "B4 exposes the generic native DenseCellSet as an opt-in per-step output: height above the measured surface, cover material, periodic flag, VTU and/or compact JSON, and the native Material/FillingFraction scalar labels. Generation is bounded by MAX_CELL_SET_CELLS = 2,000,000 and rejected before allocation/preflight when oversized; omitting outputSettings.cellSet keeps historical request hashes and artifacts unchanged. OxideRegrowth keeps its own by-product cell-set JSON and schema.",
       "members": {
         "exposed": [
-          "OxideRegrowth by-product field as JSON (numberOfCells + scalar arrays)"
+          "generic per-step generation from the current level sets",
+          "cell-set height, cover material, periodic flag and VTU/JSON format",
+          "Material and FillingFraction scalar labels",
+          "native VTU export and compact JSON summary",
+          "deterministic replay and lazy materialization",
+          "OxideRegrowth by-product field as JSON (unchanged)"
         ],
         "notExposed": [
-          "generic per-step cell-set generation",
-          "cell-set height/cover material/periodic options",
-          "filling fractions",
-          "user scalar data",
-          "VTU export",
-          "readCellSetData continuation"
+          "readCellSetData continuation from a cell set",
+          "arbitrary user scalar labels beyond Material/FillingFraction",
+          "below-surface cell sets (isAboveSurface=false)"
         ]
       },
       "partialExposure": true
@@ -2711,13 +2714,15 @@
         "DirectionalProcess(rateSets)"
       ],
       "risk": "medium",
-      "notes": "Per-material direction/velocity sets. The current scalar fields are a strict subset.",
+      "notes": "Implemented as steps[].rateSets[] on model:directional, mutually exclusive with the scalar fields. Each set carries its own direction, material velocities, optional maskMaterials and visibility; 1–8 sets are accepted and the worker uses the native Sequence[RateSet] overload. The scalar form remains the default and keeps historical hashes.",
       "acceptanceCriteria": [
-        "A rateSets list (bounded length) is accepted alongside, and mutually exclusive with, the scalar fields.",
-        "Existing directional projects keep their request hashes and results.",
-        "A two-set run (Si vs SiO2) matches a direct native reference within 1e-6 um.",
-        "Per-set maskMaterials are either fully supported or explicitly rejected, not silently ignored."
-      ]
+        "A rateSets list (1–8 sets) is accepted alongside, and mutually exclusive with, the scalar fields.",
+        "Existing directional projects keep their request hashes and results when rateSets is omitted.",
+        "A multi-set run matches a direct native reference within 1e-6 um; opposite sets cancel additively.",
+        "Per-set maskMaterials are fully supported (including an explicit empty list), not silently ignored.",
+        "2D third-component values are normalized before the native call; unsupported scalar/rateSets mixtures are rejected."
+      ],
+      "status": "implemented-backend-api"
     },
     {
       "id": "B3",
@@ -2739,19 +2744,20 @@
     {
       "id": "B4",
       "title": "Generic DenseCellSet output",
-      "classification": "advanced-parameter-or-output-not-exposed",
+      "classification": "exposed",
       "items": [
         "DenseCellSet"
       ],
       "risk": "medium",
-      "notes": "Today only OxideRegrowth yields a cell set. A generic opt-in would give volumetric fields (filling fractions, scalar data) but multiplies artifact size and needs its own budget.",
+      "notes": "Exposed as the opt-in outputSettings.cellSet block. The worker builds a generic native DenseCellSet from the current level sets, records counts/grid/fields, and writes VTU and/or JSON artifacts. Sizing is preflighted and re-bounded from the measured surface before allocation; OxideRegrowth output is unchanged. Below-surface sets and readCellSetData continuation remain unexposed.",
       "acceptanceCriteria": [
-        "A per-step opt-in (height mode, cover material, periodic flag, scalar labels) is validated before the run.",
+        "A per-step opt-in (height, cover material, periodic flag, format, scalar labels) is validated before the run.",
         "The existing OxideRegrowth artifact keeps its exact schema and hash.",
-        "Artifact size is preflighted against the existing cap; an oversized cell set fails before writing.",
-        "Cell count and field arrays replay byte-identically for a fixed seed.",
-        "No VTU export is enabled until the artifact budget for VTU is proven."
-      ]
+        "Artifact size is preflighted (24 B/cell VTU + 64 KiB JSON) and an oversized cell set fails before writing/allocating.",
+        "Cell counts and field arrays replay byte-identically for a fixed seed, including lazy materialization.",
+        "2D, 3D and periodic native runs produce real VTU/JSON artifacts; omitted block keeps historical hashes."
+      ],
+      "status": "implemented-backend-api"
     },
     {
       "id": "B5",

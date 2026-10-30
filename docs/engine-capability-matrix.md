@@ -19,9 +19,9 @@ behaviour changed.
 
 | Classification | Meaning | Count |
 | --- | --- | --- |
-| `exposed` | Reachable from a submitted project today, with its user-facing parameters | 61 |
+| `exposed` | Reachable from a submitted project today, with its user-facing parameters | 62 |
 | `engine-model-not-exposed` | A real native process model with no step, catalog entry or API field | 7 |
-| `advanced-parameter-or-output-not-exposed` | Only a strict subset is reachable, or the object is output-only | 10 |
+| `advanced-parameter-or-output-not-exposed` | Only a strict subset is reachable, or the object is output-only | 9 |
 | `internal-or-not-user-facing` | Native plumbing, base classes, callbacks, writer/enum utilities | 18 |
 | `absent-in-engine` | Not in ViennaPS at all; SPX (Sentaurus Process Explorer) reference only | 8 rows in `spxOnly` |
 
@@ -88,13 +88,14 @@ Fields shared with flat inputs use the flat catalog defaults (for example
 
 ### Geometry, output and material surface
 
-(61 `exposed` rows in the matrix overall, including the 18 models above.)
+(62 `exposed` rows in the matrix overall, including the 18 models above.)
 
 `MakePlane`, `MakeTrench`, `MakeHole` (`FULL` only), `MakeFin` (native + boolean construction),
 multi-layer `stack` (composed from `MakePlane` + `GeometryFactory`), `GeometryFactory`,
 `GDSGeometry`, `GDSReader`, `Extrude`, `Slice` (y-normal only), `Planarize` (cutoff or measured
 `stopMaterial`), `Domain`, `Process`; outputs are surface mesh VTK, snapshot JSON, native state,
-intermediate VTP/VTU and the OxideRegrowth cell-set JSON; `Material`/`MaterialRegistry` back the
+intermediate VTP/VTU, the optional generic `DenseCellSet` VTU/JSON export from
+`outputSettings.cellSet`, and the OxideRegrowth cell-set JSON; `Material`/`MaterialRegistry` back the
 custom material catalog.
 
 > Coverage gap: `docs/capabilities.json` still lists only `isotropic` and `singleParticle` under
@@ -124,7 +125,6 @@ custom material catalog.
 | `CF4O2ParametersSiGe` | B1: `beta_sigma`, `k_sigma`, `rho` | sputter/yield fields and `x`; `k_sigma_SiGe` method | A full SiGe yield editor is not available because the native branch does not read those fields |
 | `CoverageParameters` | `tolerance = 1e-3` (hard-coded) | `tolerance`, `maxIterations`, `initialized` | Convergence cannot be tightened or loosened |
 | `RateSet` | `model: directional` `rateSets[]`: 1–8 sets, per-set direction, velocities, masks and visibility | `print()` (debug helper) | Multiple simultaneous directions and per-set masks are now declarative |
-| `DenseCellSet` | OxideRegrowth by-product JSON only | generic per-step generation, height/cover/periodic options, filling fractions, user scalars, VTU export, continuation | No project can request a volumetric field of its own |
 | `Oxidation` advanced setters | 17 of 45: the 13 historical values + `setCFLFactor`, `setMechanicsTolerance`, `setCouplingTolerance`, `setSimplePressureRelaxation` via `steps[].advancedOxidation` | iteration caps, pressure/stokes tolerances, `setSimpleVelocityRelaxation`, `setMaxGridPoints`, `setSolveBounds`, mask mechanics, `GpuMode`/`GpuPreconditioner`, model-level `saveSurfaceMesh`/`saveVolumeMesh` helpers | Each accepted setter has a native surface-hash probe; the excluded ones are inert, unsafe, GPU-only, or have no verified LOCOS output. See [`oxidation-advanced-contract.md`](oxidation-advanced-contract.md) |
 | `SiliconOrientation.Si110` | 4 of 4 (`Si100`, `Si110`, `Si111`, `PolySi`) | — | Native enum value 1; changes the Deal-Grove planar readback and produces distinct 2D/3D surface hashes |
 | `OxidationParameters`, `psOxidation`, `psProcessContext` | not bound | entire legacy C++ parameter surface (`oxidantFlux`, `reactionRate`, `volumeExpansion`, `stabilityFactor`, `redoStabilityCheck`, `calculateError`, `maxCellTravelDistance`, `useFluxSolver`, `fluxMultiplier`, `solverStabilityFactor`, `trapLayer`, `diffusionCellSet`, `finiteVolume`, `fluxAtBoundary`) | The installed 4.6.2 Python module does not expose these names; the Workbench rejects them as unknown keys |
@@ -250,11 +250,23 @@ and units are documented in
 historical request hashes byte-identical, explicit native defaults are a behaviour no-op, and 2D/3D
 worker runs match an independent native reference exactly.
 
-### Batch B4 — generic `DenseCellSet` output
+### Batch B4 — generic `DenseCellSet` output (exposed, backend/API)
 
-- Acceptance: per-step opt-in validated before the run; the existing OxideRegrowth artifact keeps its
-  schema and hash; oversized cell sets fail preflight before writing; cell counts and field arrays
-  replay byte-identically; VTU export stays off until its artifact budget is proven.
+- `outputSettings.cellSet` is an opt-in per-step output: `height` above the measured surface,
+  `coverMaterial` (`GAS` or a catalog material), `periodic`, `format` (`vtu`/`json`/`both`) and an
+  optional subset of the native `Material`/`FillingFraction` labels.
+- The worker builds a real `viennaps.DenseCellSet` with
+  `setCellSetPosition(true)`/`setCoverMaterial`/`fromLevelSets`/`setPeriodicBoundary` and writes
+  `*-cell-set.vtu` and/or `*-cell-set.json` beside the snapshot. It records counts, grid, fields and
+  material names; OxideRegrowth keeps its existing by-product schema and hash unchanged.
+- Safety: `height >= gridDelta`, periodic must match the domain boundary, and
+  `MAX_CELL_SET_CELLS = 2,000,000`. Preflight uses 24 B/cell VTU + 64 KiB JSON, and the worker
+  re-bounds from the measured surface and every level-set band **before** allocating the grid.
+- Zero-rate steps still own their per-step cell-set outputs, and eager no-op copies preserve unrelated
+  rows such as `nativeMetadata`. Omitting the block leaves historical request hashes and artifacts
+  unchanged. Below-surface cell sets and `readCellSetData` continuation remain unexposed.
+- Tests: 2D, 3D and periodic native runs, VTU/JSON presence, counts/fields, lazy materialization,
+  replay determinism, omitted-block hash stability and oversized/preflight negatives.
 
 ### Batch B5 — Oxidation advanced setters and `Si110` (exposed, backend/API)
 
