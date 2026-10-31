@@ -6837,6 +6837,20 @@
         "title": "ProjectListResponse",
         "type": "object"
       },
+      "ProjectNormalizeResponse": {
+        "additionalProperties": false,
+        "description": "The server's canonical form of a project document (no persistence).",
+        "properties": {
+          "project": {
+            "$ref": "#/components/schemas/ProjectV7"
+          }
+        },
+        "required": [
+          "project"
+        ],
+        "title": "ProjectNormalizeResponse",
+        "type": "object"
+      },
       "ProjectRecordV1": {
         "additionalProperties": false,
         "description": "Summary of one persisted project; the document itself is ``ProjectV7``.",
@@ -13955,6 +13969,48 @@
           }
         },
         "summary": "Post Project",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/projects/normalize": {
+      "post": {
+        "description": "Return the canonical, default-completed form of a project document.\n\nPydantic validates the body exactly like ``POST /projects`` does, so the\nanswer is what a save would store: every omitted default (``maskMaterial``,\nFin ``taperAngle``/``maskHeight``, ``stack.baseHeight``, ``step.rateMode``,\nsolver defaults …) is filled in. Nothing is written to the store and\nnothing is compiled — the 03 page only needs the normalized document to\nfingerprint the authored project after the server completed it.",
+        "operationId": "normalize_project_api_v1_workflow_projects_normalize_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectV7"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectNormalizeResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Normalize Project",
         "tags": [
           "workflow"
         ]

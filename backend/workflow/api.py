@@ -515,6 +515,12 @@ class ProjectListResponse(StrictModel):
     projects: list[ProjectRecordV1]
 
 
+class ProjectNormalizeResponse(StrictModel):
+    """The server's canonical form of a project document (no persistence)."""
+
+    project: ProjectV7
+
+
 class ExpandFlowDefinitionRequest(StrictModel):
     variables: dict[str, float | int | str | bool] = Field(default_factory=dict)
 
@@ -1221,6 +1227,25 @@ async def post_project(request: ProjectV7, response: Response) -> ProjectRecordV
         # creating a duplicate row.
         response.status_code = 200
     return ProjectRecordV1.model_validate(record)
+
+
+@router.post(
+    "/projects/normalize",
+    response_model=ProjectNormalizeResponse,
+    response_model_exclude_none=True,
+)
+async def normalize_project(request: ProjectV7) -> ProjectNormalizeResponse:
+    """Return the canonical, default-completed form of a project document.
+
+    Pydantic validates the body exactly like ``POST /projects`` does, so the
+    answer is what a save would store: every omitted default (``maskMaterial``,
+    Fin ``taperAngle``/``maskHeight``, ``stack.baseHeight``, ``step.rateMode``,
+    solver defaults …) is filled in. Nothing is written to the store and
+    nothing is compiled — the 03 page only needs the normalized document to
+    fingerprint the authored project after the server completed it.
+    """
+
+    return ProjectNormalizeResponse(project=request)
 
 
 @router.get("/projects", response_model=ProjectListResponse)

@@ -2116,6 +2116,32 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setCompileStale(!basis || basis !== executionCompileBasis(document));
   };
 
+  /**
+   * The fingerprint must describe the document the server would store, not the
+   * imported one: saving fills defaults the raw JSON omits (`maskMaterial`,
+   * Fin `taperAngle`/`maskHeight`, `stack.baseHeight`, `step.rateMode`, solver
+   * defaults …). The typed normalize endpoint returns exactly that canonical
+   * form without persisting or compiling anything, so a Compile basis taken
+   * from it still matches the project after an unchanged save.
+   *
+   * A failed normalize is never silent: the raw document is used (the basis
+   * may then look stale after a save) and a closable banner says so.
+   */
+  const normalizeProjectForBasis = async (document: ProjectDoc): Promise<ProjectDoc> => {
+    try {
+      const data = await postJson<{ project?: ProjectDoc }>('/api/v1/workflow/projects/normalize', document);
+      if (!data || !data.project) throw new Error('响应缺少 project');
+      return data.project;
+    } catch (exc) {
+      const message = exc instanceof Error ? exc.message : String(exc);
+      setRestoreNotice(previous => [
+        previous,
+        `工程规范化失败，编译基线按原文档记录（保存后可能显示需重新编译）：${message}`,
+      ].filter(Boolean).join(' '));
+      return document;
+    }
+  };
+
   /** The document that actually goes to the server: geometry follows the 01 source tab. */
   const projectDocumentForSave = (): ProjectDoc => {
     if (!project) throw new Error('没有可保存的工程');
@@ -3016,10 +3042,17 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setCompile(result);
     setCompileStale(false);
     setRestoreNotice('');
-    recordCompile(result.compileId, executionCompileBasis(document));
-    setProject(previous => previous
-      ? { ...previous, steps: (result.authoredSteps ?? previous.steps ?? []) as ProjectStep[] }
-      : previous);
+    // The basis must describe the project *after* the Compile wrote its
+    // authored steps (and after the server filled defaults); the pre-compile
+    // closure made a 6-step template project look compiled as its old 5
+    // steps, so deleting the appended step and saving was wrongly fresh.
+    const authored = await normalizeProjectForBasis(document);
+    const nextProject: ProjectDoc = {
+      ...authored,
+      steps: (result.authoredSteps ?? authored.steps ?? []) as ProjectStep[],
+    };
+    setProject(nextProject);
+    recordCompile(result.compileId, executionCompileBasis(nextProject));
     setRoute(null);
     setSegment(null);
     setMeasurement(null);
@@ -3058,8 +3091,15 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     });
     if (compile) setPreviousCompile(compile);
     setCompile(result); setCompileStale(false); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);
-    recordCompile(result.compileId, executionCompileBasis(project));
-    setProject(previous => previous ? { ...previous, steps: (result.authoredSteps ?? previous.steps ?? []) as ProjectStep[] } : previous);
+    // Same rule as compileFlow: the authored project the template Compile
+    // produced, not the pre-template closure.
+    const authored = await normalizeProjectForBasis(project);
+    const nextProject: ProjectDoc = {
+      ...authored,
+      steps: (result.authoredSteps ?? authored.steps ?? []) as ProjectStep[],
+    };
+    setProject(nextProject);
+    recordCompile(result.compileId, executionCompileBasis(nextProject));
   });
 
   const createRoute = (rebuild = false) => run('route', async () => {
@@ -3323,10 +3363,12 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     const adopted = await postJson<CompileInfo>('/api/v1/workflow/flows/from-project', { project: cloned, flowId: compile.flowId });
     setCompile(adopted);
     setCompileStale(false);
-    // The branch Compile rewrites the tail duration; the basis still describes
-    // the authored project, so an unchanged save keeps the branch runnable.
+    // The branch Compile rewrites the tail duration in a *copy*; the authored
+    // project is unchanged, so the basis still describes it (normalized, so an
+    // imported project that omits defaults does not look edited after a save).
+    const authored = await normalizeProjectForBasis(project);
     setProjectState(previous => ({
-      ...previous, compileId: adopted.compileId, compileBasis: executionCompileBasis(project),
+      ...previous, compileId: adopted.compileId, compileBasis: executionCompileBasis(authored),
     }));
     const result = await postJson<{ plan: RoutePlan }>(`/api/v1/workflow/routes/${route.route.routeId}/branches`, {
       compileId: adopted.compileId, startAfterStepId: prefix.id, changedStepIds: [tail.id],
@@ -3766,10 +3808,13 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     });
     if (compile) setPreviousCompile(compile);
     setCompile(result); setCompileStale(false); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);
-    recordCompile(result.compileId, executionCompileBasis(nextProject));
-    setProject(previous => previous
-      ? { ...previous, steps: (result.authoredSteps ?? previous.steps ?? []) as ProjectStep[] }
-      : previous);
+    const authored = await normalizeProjectForBasis(nextProject);
+    const compiledProject: ProjectDoc = {
+      ...authored,
+      steps: (result.authoredSteps ?? authored.steps ?? []) as ProjectStep[],
+    };
+    setProject(compiledProject);
+    recordCompile(result.compileId, executionCompileBasis(compiledProject));
   });
 
   const parseJsonObject = (label: string, text: string): Record<string, unknown> => {
@@ -3830,7 +3875,11 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     );
     if (compile) setPreviousCompile(compile);
     setCompile(result); setCompileStale(false); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);
-    recordCompile(result.compileId, executionCompileBasis(project));
+    // A definition Compile expands the definition into the Compile; it does
+    // not rewrite the authored project, so the basis is that unchanged
+    // (normalized) project — never compile.project's expanded steps.
+    const authored = await normalizeProjectForBasis(project);
+    recordCompile(result.compileId, executionCompileBasis(authored));
     setModuleStatus(`模块化流程已编译 · ${result.stepCount} 步`);
   });
 

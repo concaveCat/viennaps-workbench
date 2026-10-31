@@ -43,6 +43,7 @@ class WorkflowOpenApiTests(unittest.TestCase):
             "/api/v1/workflow/library/items",
             "/api/v1/workflow/library/items/{item_id}",
             "/api/v1/workflow/projects",
+            "/api/v1/workflow/projects/normalize",
             "/api/v1/workflow/projects/{project_id}",
             "/api/v1/workflow/projects/{project_id}/state",
         ):
@@ -127,6 +128,20 @@ class WorkflowOpenApiTests(unittest.TestCase):
         )
         self.assertEqual(
             paths["/api/v1/workflow/projects"]["post"]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ProjectV7",
+        )
+        normalize_path = paths["/api/v1/workflow/projects/normalize"]
+        self.assertEqual(
+            normalize_path["post"]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ProjectV7",
+        )
+        self.assertEqual(
+            normalize_path["post"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ProjectNormalizeResponse",
+        )
+        self.assertIn("ProjectNormalizeResponse", schema["components"]["schemas"])
+        self.assertEqual(
+            schema["components"]["schemas"]["ProjectNormalizeResponse"]["properties"]["project"]["$ref"],
             "#/components/schemas/ProjectV7",
         )
         self.assertEqual(
