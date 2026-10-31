@@ -1294,6 +1294,34 @@ def _validate_v3_geometry(project: ProjectV3) -> list[FieldIssue]:
         if pattern["kind"] in ("none", "gds"): return out
         if pattern["kind"]=="hole" and project.dimension==2:
             return out+[FieldIssue("geometry.pattern.kind","2D stacks do not support hole patterns")]
+        if pattern.get("layers") is not None:
+            if pattern["kind"] != "trench":
+                return out+[FieldIssue("geometry.pattern.layers",
+                    "per-layer cutouts are supported only for trench patterns")]
+            by_id={layer["id"]:index for index,layer in enumerate(g["layers"])}
+            for position, entry in enumerate(pattern["layers"]):
+                index = entry.get("layerIndex")
+                if index is None:
+                    index = by_id.get(entry.get("layerId"))
+                if index is None or not 0 <= int(index) < len(g["layers"]):
+                    out.append(FieldIssue(
+                        f"geometry.pattern.layers[{position}]",
+                        "references an unknown stack layer"))
+                    continue
+                path=f"geometry.pattern.layers[{position}]"
+                thickness=float(g["layers"][int(index)]["thickness"])
+                # In the native per-layer constructor the cutout is anchored at
+                # the layer bottom, so width is the top width and a positive
+                # angle widens the bottom by 2*height*tan(angle).
+                change=2.0*thickness*math.tan(math.radians(float(entry["taperAngle"])))
+                narrow=float(entry["width"])+min(0.0,change)
+                wide=float(entry["width"])+max(0.0,change)
+                feature(float(entry["width"]),f"{path}.width")
+                feature(narrow,f"{path}.taperAngle")
+                if wide >= d.xExtent:
+                    out.append(FieldIssue(path,
+                        "per-layer cutout and tapered opening must fit inside the lateral domain"))
+            return out
         size=pattern["width"] if pattern["kind"]=="trench" else 2*pattern["radius"]
         change=2*g["layers"][-1]["thickness"]*math.tan(math.radians(pattern["taperAngle"]))
         feature(min(size,size-change),"geometry.pattern")

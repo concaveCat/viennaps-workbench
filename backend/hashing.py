@@ -56,6 +56,16 @@ def _applicable_solver(project: Project | ProjectV3 | ProjectV4 | ProjectV5 | Pr
 def requested_input(project: Project | ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 | ProjectV7) -> dict[str, Any]:
     geometry = json.loads(json.dumps(project.geometry)) if isinstance(project.geometry,dict) else project.geometry.model_dump(mode="json", exclude_none=True)
     if project.schemaVersion in (3,4,5,6,7) and geometry.get("kind") == "stack":
+        pattern = geometry.get("pattern") or {}
+        if pattern.get("layers"):
+            # Layer IDs are deliberately hash-neutral. Resolve ID references to
+            # positions before the IDs are removed so a pure rename keeps the
+            # request hash stable for per-layer stacks too.
+            by_id = {layer["id"]: index for index, layer in enumerate(geometry["layers"])}
+            for entry in pattern["layers"]:
+                if entry.get("layerId") is not None:
+                    entry["layerIndex"] = by_id[entry["layerId"]]
+                    entry.pop("layerId", None)
         for layer in geometry["layers"]:
             layer.pop("id", None)
             layer.pop("name", None)

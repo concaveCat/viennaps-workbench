@@ -468,22 +468,68 @@ class StackLayer(StrictModel):
     role: Literal["film", "mask"]
     source: Literal["gds-mask"] | None = None
 
+class StackPatternLayer(StrictModel):
+    """One cutout in the installed native ``MakeTrench(MaterialLayer[])`` list.
+
+    The entry is matched to one stack layer by zero-based ``layerIndex`` or by
+    ``layerId``. Exactly one reference form is allowed. ``isMask`` is the
+    native ``MaterialLayer.isMask`` flag: true cuts an opening through this
+    layer, false leaves the layer intact. It is therefore a per-layer geometry
+    flag, not the stack layer's etch-protection ``role``.
+    """
+
+    layerIndex: Annotated[Integer, Field(ge=0, le=15)] | None = None
+    layerId: Annotated[str, Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")] | None = None
+    width: Annotated[Number, Field(gt=0)]
+    taperAngle: Annotated[Number, Field(ge=-45, le=45)]
+    isMask: bool
+
+    @model_validator(mode="after")
+    def one_layer_reference(self):
+        if (self.layerIndex is None) == (self.layerId is None):
+            raise ValueError(
+                "each per-layer cutout must reference exactly one stack layer "
+                "with layerIndex or layerId")
+        return self
+
 class StackPattern(StrictModel):
     kind: Literal["none", "trench", "hole"]
     width: Annotated[Number, Field(gt=0)] | None = None
     radius: Annotated[Number, Field(gt=0)] | None = None
     taperAngle: Annotated[Number, Field(ge=-45, le=45)] | None = None
+    # Omitted keeps the historical top-layer stencil and its request hash.
+    layers: Annotated[list[StackPatternLayer], Field(min_length=1, max_length=16)] | None = None
 
     @model_validator(mode="after")
     def pattern_shape(self):
-        expected={"kind"} if self.kind in {"none", "gds"} else {"kind","width","taperAngle"} if self.kind=="trench" else {"kind","radius","taperAngle"}
-        if self.model_fields_set!=expected:
-            if self.kind in {"none", "gds"}: raise ValueError(f"{self.kind} pattern has no dimensions")
-            if self.kind == "trench": raise ValueError("trench pattern requires exactly width and taperAngle")
+        fields = set(self.model_fields_set)
+        if self.kind in {"none", "gds"}:
+            if fields != {"kind"}:
+                raise ValueError(f"{self.kind} pattern has no dimensions")
+            return self
+        if self.kind == "trench":
+            if "layers" in fields:
+                allowed = {"kind", "layers", "width", "taperAngle"}
+                if not {"kind", "layers"} <= fields or not fields <= allowed:
+                    raise ValueError(
+                        "per-layer trench patterns accept only kind, layers and "
+                        "the optional legacy width/taperAngle pair")
+                if ("width" in fields) != ("taperAngle" in fields):
+                    raise ValueError(
+                        "legacy width and taperAngle must be supplied together "
+                        "or omitted when per-layer cutouts are used")
+            elif fields != {"kind", "width", "taperAngle"}:
+                raise ValueError("trench pattern requires exactly width and taperAngle")
+            if self.layers is None and (self.width is None or self.taperAngle is None):
+                raise ValueError("trench pattern requires width and taperAngle")
+            return self
+        if "layers" in fields:
+            raise ValueError(
+                "per-layer holes are not supported: installed MakeHole has no "
+                "MaterialLayer[] overload")
+        if fields != {"kind", "radius", "taperAngle"}:
             raise ValueError("hole pattern requires exactly radius and taperAngle")
-        if self.kind == "trench" and (self.width is None or self.taperAngle is None):
-            raise ValueError("trench pattern requires width and taperAngle")
-        if self.kind == "hole" and (self.radius is None or self.taperAngle is None):
+        if self.radius is None or self.taperAngle is None:
             raise ValueError("hole pattern requires radius and taperAngle")
         return self
 
@@ -509,7 +555,57 @@ class StackV3(StrictModel):
             raise ValueError("a GDS mask must be the unique top layer with top pattern gds")
         if self.pattern.kind == "gds" and not gds_layers:
             raise ValueError("top pattern gds requires a GDS mask layer")
+        self._check_per_layer_pattern()
         return self
+
+    def _check_per_layer_pattern(self) -> None:
+        pattern = self.pattern
+        if pattern.layers is None:
+            return
+        if pattern.kind != "trench":
+            raise ValueError("per-layer cutouts are supported only for trench patterns")
+        if float(self.baseHeight) < 0:
+            raise ValueError("per-layer trench requires a non-negative baseHeight")
+        by_id = {layer.id: index for index, layer in enumerate(self.layers)}
+        resolved: dict[int, StackPatternLayer] = {}
+        previous = -1
+        for position, entry in enumerate(pattern.layers):
+            if entry.layerIndex is not None:
+                index = int(entry.layerIndex)
+                if index >= len(self.layers):
+                    raise ValueError(
+                        f"pattern.layers[{position}].layerIndex {index} is outside "
+                        f"the {len(self.layers)}-layer stack")
+            else:
+                assert entry.layerId is not None
+                if entry.layerId not in by_id:
+                    raise ValueError(
+                        f"pattern.layers[{position}].layerId {entry.layerId!r} is "
+                        "not present in the stack")
+                index = by_id[entry.layerId]
+            if index in resolved:
+                raise ValueError("per-layer cutouts must reference each stack layer at most once")
+            if index <= previous:
+                raise ValueError("per-layer cutouts must be ordered from bottom to top")
+            previous = index
+            resolved[index] = entry
+            if self.layers[index].source == "gds-mask":
+                raise ValueError("a GDS mask layer cannot carry a per-layer native cutout")
+        top = len(self.layers) - 1
+        if top not in resolved:
+            raise ValueError("per-layer trench must include the top stack layer")
+        if not resolved[top].isMask:
+            raise ValueError("per-layer trench requires isMask=true on the top stack layer")
+        if pattern.width is not None:
+            if not math.isclose(float(pattern.width), float(resolved[top].width),
+                                rel_tol=0.0, abs_tol=1e-12):
+                raise ValueError(
+                    "legacy pattern.width must match the top per-layer cutout width")
+            assert pattern.taperAngle is not None
+            if not math.isclose(float(pattern.taperAngle), float(resolved[top].taperAngle),
+                                rel_tol=0.0, abs_tol=1e-12):
+                raise ValueError(
+                    "legacy pattern.taperAngle must match the top per-layer cutout taperAngle")
 
 GeometryV3 = Annotated[Union[PlaneV3,TrenchV3,HoleV3,StackV3], Field(discriminator="kind")]
 
@@ -569,6 +665,15 @@ class GDSMaskPatternV7(StrictModel):
 class StackV7(StackV3):
     pattern: StackPatternV7
     gdsMask: GDSMaskPatternV7 | None = None
+
+    @model_validator(mode="after")
+    def per_layer_excludes_gds_mask(self):
+        # The native per-layer constructor clears and rebuilds the whole
+        # domain, while the GDS overlay is inserted afterwards from a layout.
+        # Combining them would silently discard one of the two geometries.
+        if self.pattern.layers is not None and self.gdsMask is not None:
+            raise ValueError("per-layer trench cannot be combined with a GDS mask overlay")
+        return self
 
 
 class GDSBlurV7(StrictModel):

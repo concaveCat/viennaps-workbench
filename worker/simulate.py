@@ -1606,6 +1606,103 @@ def apply_gpu_multi_particle_split(ps: Any, domain: Any, project: dict[str, Any]
     }
 
 
+def _per_layer_stack_geometry(ps: Any, domain: Any,
+                              project: dict[str, Any]) -> dict[str, Any]:
+    """Build a stack through the installed native ``MaterialLayer[]`` overload.
+
+    ``MakeTrench`` clears the domain and lays the listed layers from the bottom
+    up. The first non-mask layer is created as the substrate half-space, every
+    later layer as a finite slab, and ``isMask`` cuts an opening through its
+    own layer immediately after insertion. The Workbench substrate is one
+    level set below ``baseHeight``, so it is represented by a native substrate
+    layer of ``baseHeight + 1e-4`` (the constructor's own cutout epsilon).
+    """
+    g = project["geometry"]
+    pattern = g["pattern"]
+    stack = g["layers"]
+    if g.get("gdsMask") is not None:
+        raise RuntimeError("per-layer trench cannot be combined with a GDS mask overlay")
+    if pattern.get("kind") != "trench":
+        raise RuntimeError(
+            "per-layer cutouts require a trench pattern; installed MakeHole has "
+            "no MaterialLayer[] overload")
+    entries = pattern.get("layers")
+    if not entries:
+        raise RuntimeError("per-layer trench requires at least one cutout entry")
+    if float(g.get("baseHeight", 0.0)) < 0:
+        raise RuntimeError("per-layer trench requires a non-negative baseHeight")
+    by_id = {layer.get("id"): index for index, layer in enumerate(stack)}
+    cutouts: dict[int, dict[str, Any]] = {}
+    previous = -1
+    for position, entry in enumerate(entries):
+        index = entry.get("layerIndex")
+        layer_id = entry.get("layerId")
+        if (index is None) == (layer_id is None):
+            raise RuntimeError(
+                f"per-layer cutout {position} must reference exactly one stack layer")
+        if index is None:
+            if layer_id not in by_id:
+                raise RuntimeError(
+                    f"per-layer cutout {position} references unknown stack layer {layer_id!r}")
+            index = by_id[layer_id]
+        if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(stack):
+            raise RuntimeError(f"per-layer cutout {position} has an invalid stack layer index")
+        if index in cutouts:
+            raise RuntimeError("per-layer cutouts must reference each stack layer at most once")
+        if index <= previous:
+            raise RuntimeError("per-layer cutouts must be ordered from bottom to top")
+        previous = index
+        cutouts[index] = entry
+    top = len(stack) - 1
+    if top not in cutouts or not cutouts[top].get("isMask"):
+        raise RuntimeError(
+            "per-layer trench must include the top stack layer with isMask=true")
+
+    epsilon = 1e-4
+    records: list[dict[str, Any]] = []
+    native_layers: list[Any] = []
+
+    def append_layer(index: int | None, layer_id: str | None, name: str,
+                     material: str, height: float, width: float,
+                     taper_angle: float, is_mask: bool) -> None:
+        native_layers.append(ps.MakeTrench.MaterialLayer(
+            height=float(height), width=float(width),
+            taperAngle=float(taper_angle),
+            material=material_handle(ps, material), isMask=bool(is_mask)))
+        records.append({"stackLayerIndex": index, "stackLayerId": layer_id,
+                        "name": name, "material": material,
+                        "height": float(height), "width": float(width),
+                        "taperAngle": float(taper_angle), "isMask": bool(is_mask)})
+
+    base_height = float(g.get("baseHeight", 0.0))
+    append_layer(None, None, "substrate", g["substrateMaterial"],
+                 base_height + epsilon, 0.0, 0.0, False)
+    for index, layer in enumerate(stack):
+        if layer.get("source") == "gds-mask":
+            raise RuntimeError("a GDS mask layer cannot carry a per-layer native cutout")
+        entry = cutouts.get(index)
+        append_layer(index, layer.get("id"), str(layer.get("name", layer.get("id", ""))),
+                     layer["material"], float(layer["thickness"]),
+                     float(entry["width"]) if entry else 0.0,
+                     float(entry["taperAngle"]) if entry else 0.0,
+                     bool(entry["isMask"]) if entry else False)
+
+    ps.MakeTrench(domain=domain, materialLayers=native_layers,
+                  halfTrench=False).apply()
+    return {
+        "stack": True,
+        "perLayerPattern": {
+            "nativeConstructor":
+                "viennaps.MakeTrench(domain, materialLayers=MaterialLayer[], halfTrench=False)",
+            "nativeLayerType": "viennaps.MakeTrench.MaterialLayer",
+            "nativeOrder": "bottom-to-top; first non-mask native layer is the substrate",
+            "baseHeight": base_height,
+            "substrateEpsilon": epsilon,
+            "layers": records,
+        },
+    }
+
+
 def _stack_geometry(ps: Any, domain: Any, project: dict[str, Any]) -> None:
     g=project["geometry"]; dim=project["dimension"]
     height=float(g.get("baseHeight",0.0))
@@ -1896,6 +1993,10 @@ def make_v3_geometry(ps: Any, domain: Any, project: dict[str,Any], *, config: di
                      run_dir: Path | None = None) -> dict[str,Any] | None:
     g=project["geometry"]
     if g["kind"]=="stack":
+        if g["pattern"].get("layers") is not None:
+            # The native multi-layer constructor rebuilds the whole domain;
+            # adding the substrate plane first would be discarded.
+            return _per_layer_stack_geometry(ps, domain, project)
         # The bulk substrate is the bottom half-space; the first plane marks
         # its top interface, and subsequent planes add requested films.
         ps.MakePlane(domain,height=float(g.get("baseHeight",0.0)),material=material_handle(ps,g["substrateMaterial"]),addToExisting=False).apply()
