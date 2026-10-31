@@ -116,7 +116,7 @@ custom material catalog.
 
 | Native class | Verified dims | What it actually is | Precondition / risk |
 | --- | --- | --- | --- |
-| `FaradayCageEtching` + `FaradayCageParameters` | 2 (CPU_DISK only) / 3 | Ion-beam etch with a Faraday-cage angular filter: `cageAngle` plus a full `IBEParameters` | The original "engine-side 2D hang" was not dimensional: those probes left `Process` on AUTO, which resolves to the GPU kernel. With CPU_DISK pinned, `worker/probe_faraday_2d.py --matrix safe-2d` completes all 117 cageAngle/tiltAngle pairs (cage 0–180°, tilt −90–180°) plus the key IBE, geometry, grid, duration, ray and thread variants with no timeout, crash or empty level set; the only non-OK cases are the deliberate `thresholdEnergy == meanEnergy` probe, which aborts the native ray trace with a clean error. The same matrix on AUTO/GPU_DISK hangs for a large region (e.g. cage 0.2/10/30/45 at tilt 0/30). 2D is therefore exposed only with `solver.enginePreference: cpu`; AUTO/GPU requests are a 422 before the worker starts. Negative `tiltAngle` is a native no-op (also in 3D) and is warned in 2D. |
+| `FaradayCageEtching` + `FaradayCageParameters` | 2 (CPU_DISK only) / 3 | Ion-beam etch with a Faraday-cage angular filter: `cageAngle` plus a full `IBEParameters` | The original "engine-side 2D hang" was not dimensional: those probes left `Process` on AUTO, which resolves to the GPU kernel. With CPU_DISK pinned, `worker/probe_faraday_2d.py --matrix safe-2d` completes all 117 cageAngle/tiltAngle pairs (cage 0–180°, tilt −90–180°) plus the key IBE, geometry, grid, duration, ray and thread variants with no timeout, crash or empty level set; the deliberate `thresholdEnergy >= meanEnergy` probe is now rejected by the shared energy rule before the native call. The same matrix on AUTO/GPU_DISK hangs for a large region (e.g. cage 0.2/10/30/45 at tilt 0/30). 2D is therefore exposed only with `solver.enginePreference: cpu`; AUTO/GPU requests are a 422 before the worker starts. Negative `tiltAngle` is accepted but is not symmetric to positive tilt: a small negative tilt still etches (tilt −0.2° with cage 45° lowered the 2D surface 0.8 → 0.782019 µm) and the etch depth falls toward zero as the tilt becomes more negative; 2D warns about that asymmetry. `IBEParameters` also requires `thresholdEnergy < meanEnergy` in both dimensions: at `threshold >= mean` the native yield normalization changes sign, so an etch grows the surface (mean 100 / threshold 200 / sigma 500: 0.8 → 0.969595 µm), aborts the ray trace when equal with `sigmaEnergy > 0`, or empties the top level set when `sigmaEnergy == 0`. |
 | `GeometricTrenchDeposition` | 2/3 | Closed-form analytic trench fill (`trenchWidth, trenchDepth, depositionRate, bottomMed, a, b, n`), no flux engine | The 2026-10-30 3D SIGSEGV was a parameter-reach crash that also occurs in 2D; the guard now requires `depositionRate >= max(a+b, bottomMed)` because `rate < radius - 2*gridDelta` leaves an empty deposited level set. 3D plane/trench/hole/fin/stack complete and match a direct native reference. GDS stays 422 |
 | `CSVFileProcess` + `RateGrid` | 2/3 | Rate interpolated from a CSV grid with directional + isotropic components | Needs a new uploaded asset kind and an explicit interpolation mode: the engine only logs `Interpolation mode not set.` and continues. `setCustomInterpolator` is arbitrary Python |
 | `CustomSphereDistribution` | none | Multi-radius sphere distribution | **Blocked (A4).** Re-probe with and without a mask aborts in 2D and 3D (`returnCode -6`): `terminate called after throwing an instance of 'std::runtime_error'` / `what(): Point ID 3 is out of bounds for CustomSphereDistribution with 3 radii!`. It indexes one radius per surface point, so no bounded project-derived parameterization exists. See [`particle-shape-distribution-contract.md`](particle-shape-distribution-contract.md) |
@@ -170,16 +170,17 @@ SPX-only, and any UI that implies otherwise would be wrong.
 Each batch is independent, ships behind its own schema field, and must not change existing request
 hashes when unused.
 
-### Batch A1 — `FaradayCageEtching` (3D)
+### Batch A1 — `FaradayCageEtching` (2D CPU-only / 3D)
 
 - Model fields: `cageAngle` + the existing `ionBeam` parameter group (reuse the `IBEParameters` block).
 - Mask materials come from the geometry, exactly like `ionBeam`.
 - Acceptance:
-  1. 2D is admitted only with the pinned `CPU_DISK` engine (AUTO/GPU is a 422 before the worker starts); 3D is unchanged;
+  1. 2D is admitted only with the pinned `CPU_DISK` engine (AUTO/GPU is a 422 before the worker starts); 3D keeps its previous engine behaviour;
   2. 2D/3D surface equals a direct native reference within `1e-6 µm`;
   3. an independent native Faraday reference (cage source directions, not ordinary normal-incidence IBE) matches within `1e-6 µm`;
-  4. replay reproduces artifact hashes exactly;
-  5. `specialized-models` catalog row states `engineVersion 4.6.2`, dimensions 2/3 and the 2D CPU-only engine restriction.
+  4. `thresholdEnergy < meanEnergy` is enforced before the worker in 2D and 3D; equal or higher is a 422 because the native yield sign reverses;
+  5. replay reproduces artifact hashes exactly;
+  6. `specialized-models` catalog row states `engineVersion 4.6.2`, dimensions 2/3 and the 2D CPU-only engine restriction.
 
 ### Batch A2 — `GeometricTrenchDeposition` (2D/3D)
 

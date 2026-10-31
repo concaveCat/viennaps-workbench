@@ -12,7 +12,10 @@ native semantics that the catalog cannot change:
 
 * ``FaradayCageEtching`` wraps ``IBEParameters`` in ``FaradayCageParameters``
   and builds a two-direction periodic cage source. Mask materials are forced
-  to a zero plane-wafer rate by the native constructor.
+  to a zero plane-wafer rate by the native constructor. Both IBE models require
+  ``thresholdEnergy < meanEnergy``: at or above the mean the native yield sign
+  reverses and an etch grows the surface (or aborts/empties at equality).
+  A small negative ``tiltAngle`` still etches; it is not a no-op.
 * ``GeometricTrenchDeposition`` is a ViennaLS geometric-advection distribution.
   It grows the selectable ``depositMaterial`` top level set, ignores
   ``trenchWidth`` and the process duration, and evaluates its local radius from
@@ -589,12 +592,56 @@ class SpecializedValidationNegatives(unittest.TestCase):
         normalized = parsed.model_dump(mode="json", exclude_none=True)
         self.assertEqual(select_engine(normalized, normalized["steps"][0]), "GPU_DISK")
 
-    def test_2d_faraday_negative_tilt_warning_documents_the_native_no_op(self):
+    def test_2d_faraday_negative_tilt_warning_is_accurate(self):
+        # -0.2 deg is not a no-op (the native run etches 0.8 -> 0.782019 um),
+        # so the warning must not promise an unchanged surface.
         project = faraday_project(2)
-        project["steps"][0]["nativeParameters"]["tiltAngle"] = -30.0
+        project["steps"][0]["nativeParameters"]["tiltAngle"] = -0.2
         _parsed, warnings = validate_project(project, kind="simulate")
-        self.assertTrue(any("tiltAngle" in warning and "no etch" in warning
-                            for warning in warnings), warnings)
+        messages = [warning for warning in warnings if "tiltAngle" in warning]
+        self.assertTrue(messages, warnings)
+        text = messages[0]
+        self.assertIn("can still etch", text)
+        self.assertIn("not symmetric", text)
+        for false_claim in ("no etch", "no-op", "unchanged surface"):
+            self.assertNotIn(false_claim, text)
+
+    def test_ibe_energy_order_rejects_threshold_at_or_above_mean(self):
+        # Native normalization reverses the flux sign at threshold >= mean, so
+        # the same rule must reject 2D and 3D before the worker.
+        for dimension in (2, 3):
+            for threshold, mean, sigma in ((200.0, 100.0, 500.0),
+                                           (100.0, 100.0, 10.0),
+                                           (100.0, 100.0, 0.0),
+                                           (101.0, 100.0, 10.0)):
+                with self.subTest(dimension=dimension, threshold=threshold,
+                                  mean=mean, sigma=sigma):
+                    project = faraday_project(dimension)
+                    project["steps"][0]["nativeParameters"].update({
+                        "meanEnergy": mean, "thresholdEnergy": threshold,
+                        "sigmaEnergy": sigma})
+                    with self.assertRaises(ProjectInputError) as ctx:
+                        validate_project(project, kind="simulate")
+                    messages = [
+                        issue.message for issue in ctx.exception.issues
+                        if issue.path == "steps[0].nativeParameters.thresholdEnergy"]
+                    self.assertTrue(messages,
+                                    [(issue.path, issue.message) for issue in ctx.exception.issues])
+                    self.assertIn("less than meanEnergy", messages[0])
+        # IonBeamEtching wraps the same native IBEParameters struct.
+        ion_beam = make_project("ionBeam", 3)
+        ion_beam["steps"][0]["nativeParameters"].update({
+            "meanEnergy": 100.0, "thresholdEnergy": 200.0})
+        with self.assertRaises(ProjectInputError) as ctx:
+            validate_project(ion_beam, kind="simulate")
+        self.assertTrue(any(issue.path == "steps[0].nativeParameters.thresholdEnergy"
+                            for issue in ctx.exception.issues))
+        # Just below the mean stays valid (the probe etched at 99.9/100).
+        valid = faraday_project(2)
+        valid["steps"][0]["nativeParameters"].update({
+            "meanEnergy": 100.0, "thresholdEnergy": 99.9, "sigmaEnergy": 500.0})
+        parsed, _warnings = validate_project(valid, kind="simulate")
+        self.assertEqual(parsed.steps[0].nativeParameters["thresholdEnergy"], 99.9)
 
 
 class WorkerSafetyPreflight(unittest.TestCase):
@@ -665,6 +712,38 @@ class WorkerSafetyPreflight(unittest.TestCase):
         self.assertEqual(container["dimension"], 2)
         self.assertEqual(container["fluxEngine"], "CPU_DISK")
         self.assertEqual(container["fluxEngineGate"], "CPU_DISK only in 2D")
+
+    def test_direct_worker_rejects_threshold_at_or_above_mean(self):
+        # Direct worker input reaches build_specialized_model without
+        # backend.validation; the energy rule must fire before the native
+        # IBEParameters object exists (domain=None proves that).
+        for dimension in (2, 3):
+            for threshold, mean, sigma in ((200.0, 100.0, 500.0),
+                                           (100.0, 100.0, 10.0),
+                                           (100.0, 100.0, 0.0)):
+                with self.subTest(dimension=dimension, threshold=threshold,
+                                  mean=mean, sigma=sigma):
+                    project = faraday_project(dimension)
+                    project["steps"][0]["nativeParameters"].update({
+                        "meanEnergy": mean, "thresholdEnergy": threshold,
+                        "sigmaEnergy": sigma})
+                    normalized, step = self.normalized(project)
+                    with self.assertRaises(RuntimeError) as ctx:
+                        build_specialized_model(ps, None, normalized, step,
+                                                material_handle, {},
+                                                flux_engine="CPU_DISK")
+                    message = str(ctx.exception)
+                    self.assertIn("FaradayCageEtching rejected", message)
+                    self.assertIn("thresholdEnergy", message)
+                    self.assertIn("less than meanEnergy", message)
+        # IonBeamEtching shares the native struct and the same rule.
+        ion_beam = make_project("ionBeam", 3)
+        ion_beam["steps"][0]["nativeParameters"].update({
+            "meanEnergy": 100.0, "thresholdEnergy": 200.0})
+        normalized, step = self.normalized(ion_beam)
+        with self.assertRaises(RuntimeError) as ctx:
+            build_specialized_model(ps, None, normalized, step, material_handle, {})
+        self.assertIn("thresholdEnergy", str(ctx.exception))
 
 
 class NativeFaradayCage(unittest.TestCase):
@@ -755,14 +834,32 @@ class NativeFaradayCage2D(unittest.TestCase):
                 self.assertEqual(surface_signature(product, 2),
                                  surface_signature(reference, 2))
 
-    def test_2d_negative_tilt_is_a_stable_native_no_op(self):
+    def test_2d_small_negative_tilt_still_etches(self):
+        # Regression for the false "unchanged surface" claim: -0.2 deg etches.
         project = faraday_project(2)
-        project["steps"][0]["nativeParameters"]["tiltAngle"] = -30.0
+        project["steps"][0]["nativeParameters"]["tiltAngle"] = -0.2
         domain = native_stack(2, "periodic")
         before = surface_top(domain, 2)
         model, _actual = run_specialized(project, domain)
         self.assertEqual(type(model).__name__, "FaradayCageEtching")
-        self.assertEqual(surface_top(domain, 2), before)
+        self.assertLess(surface_top(domain, 2), before - 1e-6)
+
+    def test_valid_energy_order_still_etches(self):
+        # thresholdEnergy < meanEnergy remains an ordinary etch, including at
+        # the near-boundary values that the probe measured.
+        for threshold in (20.0, 90.0, 99.9):
+            with self.subTest(threshold=threshold):
+                project = faraday_project(2)
+                project["steps"][0]["nativeParameters"].update({
+                    "meanEnergy": 100.0, "thresholdEnergy": threshold,
+                    "sigmaEnergy": 500.0})
+                domain = native_stack(2, "periodic")
+                before = surface_top(domain, 2)
+                _model, actual = run_specialized(project, domain)
+                self.assertLess(surface_top(domain, 2), before - 1e-6)
+                self.assertEqual(
+                    actual["nativeParameterContainer"]["ibeParameters"]["thresholdEnergy"],
+                    threshold)
 
 
 class NativeGeometricTrenchDeposition(unittest.TestCase):
@@ -1183,6 +1280,21 @@ class FaradayCpuReplay(unittest.IsolatedAsyncioTestCase):
         payload = json_body(response)["detail"]
         self.assertTrue(any("CPU_DISK" in issue.get("message", "")
                             for issue in payload), payload)
+
+    async def test_faraday_energy_reversal_is_rejected_before_the_worker(self):
+        # Exact codex repro: mean 100 / threshold 200 / sigma 500 grew the
+        # surface on the pre-fix build. It must now be a 422.
+        project = faraday_project(2)
+        project["steps"][0]["nativeParameters"].update({
+            "meanEnergy": 100.0, "thresholdEnergy": 200.0, "sigmaEnergy": 500.0})
+        project["solver"]["enginePreference"] = "cpu"
+        response = await asgi_request("/api/runs", method="POST",
+                                      payload={"kind": "simulate", "project": project})
+        self.assertEqual(response[0], 422, response[2])
+        detail = json_body(response)["detail"]
+        self.assertTrue(any(issue.get("path") == "steps[0].nativeParameters.thresholdEnergy"
+                            and "less than meanEnergy" in issue.get("message", "")
+                            for issue in detail), detail)
 
     async def test_explicit_coverage_tolerance_cpu_run_replays(self):
         project = plasma_project(2)

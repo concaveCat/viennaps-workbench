@@ -14,9 +14,10 @@ from pydantic import ValidationError
 from .models import Domain3D, Project, ProjectV3, ProjectV4, ProjectV5, ProjectV6, ProjectV7, parse_project
 from .materials import attach_and_reconcile_project_materials, geometry_mask_material_names
 from .rates import has_motion, is_geometry_step, uses_flux, value as step_value
-from .specialized_models import (FLUOROCARBON_MATERIAL_DEFAULTS, faraday_cage_2d_engine_error,
-                                 geometric_trench_issues,
-                                 nv_factors_issues, model_spec, oxidation_advanced_spec)
+from .specialized_models import (FLUOROCARBON_MATERIAL_DEFAULTS, IBE_ENERGY_MODELS,
+                                 faraday_cage_2d_engine_error, geometric_trench_issues,
+                                 ibe_energy_issues, nv_factors_issues, model_spec,
+                                 oxidation_advanced_spec)
 from .runtime_limits import available_cpu_threads
 from .engine import (EVIDENCE_ENGINE_VERSION, OXIDATION_ADVANCED_RESTRICTED,
                      ald_surface_diffusion_error, ald_surface_diffusion_supported,
@@ -368,15 +369,21 @@ def _specialized_model_warnings(project: Any) -> list[str]:
                     f"and requires periodic lateral boundaries; this project uses {boundary!r}. The native run "
                     f"still executes but does not represent a periodic Faraday cage.")
             if project.dimension == 2:
-                # 2D is newly exposed: 4.6.2/4.7.0 returns a zero velocity field
-                # for a negative tiltAngle, i.e. a silent no-op. 3D keeps its
-                # existing response (same native behaviour, unchanged surface).
+                # 2D is newly exposed. A negative tiltAngle is accepted and is
+                # NOT a no-op for small values: cage 45 / tilt -0.2 still
+                # lowered the surface (0.8 -> 0.782019 um in the probe). The
+                # etch depth falls toward zero as the tilt becomes more
+                # negative (tilt -30 produced no measurable etch at the same
+                # settings), so warn about the asymmetry without claiming an
+                # unchanged surface. 3D keeps its existing response.
                 tilt = step_value(step_value(step, "nativeParameters", {}), "tiltAngle", None)
                 if isinstance(tilt, (int, float)) and float(tilt) < 0.0:
                     warnings.append(
                         f"steps[{index}].nativeParameters.tiltAngle: the installed native FaradayCageEtching "
-                        f"produces no etch for a negative tiltAngle ({float(tilt):g} deg); the run completes "
-                        f"with an unchanged surface. Use a tiltAngle of 0 or more for an etching step.")
+                        f"accepts a negative tiltAngle, but the cage source is not symmetric between positive "
+                        f"and negative tilt. A small negative tilt can still etch (tiltAngle -0.2 deg with "
+                        f"cageAngle 45 deg lowered the 2D surface), and the etch depth falls toward zero as the "
+                        f"tilt becomes more negative. Do not assume the surface stays flat.")
         if model_id == "geometricTrenchDeposition":
             warnings.append(
                 f"steps[{index}].nativeModel: GeometricTrenchDeposition is a ViennaLS geometric-advection "
@@ -1041,6 +1048,11 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
             # Shared with the worker: a direct worker input cannot bypass the
             # dimension/geometry/depth/reach checks.
             for suffix, message in geometric_trench_issues(project, step):
+                issues.append(FieldIssue(f"steps[{index}].{suffix}", message))
+        if step.nativeModel in IBE_ENERGY_MODELS:
+            # Shared with the worker: thresholdEnergy >= meanEnergy reverses
+            # the native IBE flux and turns an etch step into growth.
+            for suffix, message in ibe_energy_issues(params):
                 issues.append(FieldIssue(f"steps[{index}].{suffix}", message))
         for field in spec["fields"]:
             key = field["key"]

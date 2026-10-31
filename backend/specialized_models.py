@@ -307,6 +307,51 @@ def ibe_fields() -> list[dict[str, Any]]:
             rates("materialPlaneWaferRateByMaterial", 0.0, label="材料平面晶圆速率表")]
 
 
+IBE_ENERGY_MODELS = frozenset({"ionBeam", "faradayCage"})
+
+
+def ibe_energy_issues(parameters: Any) -> list[tuple[str, str]]:
+    """Shared ``thresholdEnergy < meanEnergy`` rule for both IBE models.
+
+    ViennaPS 4.6.2 normalizes the IBE yield by comparing the sampled energy
+    with ``thresholdEnergy``. At ``thresholdEnergy >= meanEnergy`` that native
+    comparison changes the sign of the flux, so an ``etch`` step deposits:
+
+    * threshold 200 / mean 100 / sigmaEnergy 500 grew a 2D stack from
+      0.8 um to 0.969595 um (also in 3D: 0.8 -> 0.974824 um);
+    * threshold == mean aborts the ray trace ("No geometry was passed to
+      rayTrace") when sigmaEnergy > 0, and empties the top level set when
+      sigmaEnergy == 0;
+    * threshold > mean with a small sigmaEnergy can also silently no-op
+      (0.8 um unchanged) instead of etching.
+
+    Every probed combination with ``thresholdEnergy < meanEnergy``, including
+    sigmaEnergy up to the catalog maximum, etched normally. Both API
+    validation and ``build_specialized_model`` call this function, so a direct
+    worker input cannot reach the native constructor with a reversed yield.
+    """
+    if not isinstance(parameters, dict):
+        return []
+    mean = parameters.get("meanEnergy")
+    threshold = parameters.get("thresholdEnergy")
+    for value in (mean, threshold):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            # Type/range validation owns malformed values; stay silent here.
+            return []
+        if not math.isfinite(float(value)):
+            return []
+    if float(threshold) < float(mean):
+        return []
+    return [(
+        "nativeParameters.thresholdEnergy",
+        f"must be less than meanEnergy ({float(mean):g}); ViennaPS {engine_version()} compares the sampled "
+        f"energy with thresholdEnergy when it normalizes the IonBeamEtching/FaradayCageEtching yield, and "
+        f"thresholdEnergy >= meanEnergy reverses the native flux sign. An etch step then grows the surface "
+        f"(threshold 200 with mean 100 and sigmaEnergy 500 grew 0.8 um to 0.969595 um), aborts the ray trace "
+        f"when thresholdEnergy equals meanEnergy with sigmaEnergy > 0, or empties the top level set when "
+        f"sigmaEnergy is 0. Keep thresholdEnergy below meanEnergy.")]
+
+
 # 2D FaradayCageEtching is only exposed on the pinned CPU disk flux engine.
 # ``worker/probe_faraday_2d.py --matrix safe-2d`` runs every catalog
 # cageAngle/tiltAngle pair (13 x 9 = 117) plus the key IBEParameters, geometry,

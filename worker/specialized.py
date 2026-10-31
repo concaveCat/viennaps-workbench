@@ -4,9 +4,9 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from backend.specialized_models import (PLASMA_COVERAGE_MODELS, advanced_spec,
+from backend.specialized_models import (IBE_ENERGY_MODELS, PLASMA_COVERAGE_MODELS, advanced_spec,
                                        coverage_tolerance_issues, faraday_cage_2d_engine_error,
-                                       geometric_trench_issues,
+                                       geometric_trench_issues, ibe_energy_issues,
                                        model_spec, nv_factors_issues,
                                        oxidation_advanced_spec)
 from backend.engine import (ald_surface_diffusion_error, engine_version,
@@ -216,6 +216,13 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
         gate_message = faraday_cage_2d_engine_error(flux_engine)
         if gate_message is not None:
             raise RuntimeError(f"FaradayCageEtching rejected before the native call: {gate_message}")
+    if model_id in IBE_ENERGY_MODELS:
+        # Same rule as backend.validation: thresholdEnergy >= meanEnergy makes
+        # the native IBE yield change sign, so reject before IBEParameters is
+        # constructed (a hand-edited/replayed worker input reaches this point
+        # without validation).
+        for suffix, message in ibe_energy_issues(p):
+            raise RuntimeError(f"{spec['nativeClass']} rejected before the native call: {suffix}: {message}")
     if "coverageTolerance" in p:
         if model_id not in PLASMA_COVERAGE_MODELS:
             raise RuntimeError(f"{model_id} does not accept nativeParameters.coverageTolerance")

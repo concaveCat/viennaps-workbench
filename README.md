@@ -57,7 +57,9 @@ data on the local disk, and never calls an external API. Verified against
   warning. The 2D FaradayCage halt the original audit saw belongs to the unpinned
   AUTO/GPU kernel; with CPU_DISK every catalog cage/tilt combination completes, so
   2D is admitted only when `solver.enginePreference` is `cpu` (AUTO/GPU requests
-  are a 422 before the worker starts). GeometricTrenchDeposition runs in both
+  are a 422 before the worker starts). The IBE models also require
+  `thresholdEnergy < meanEnergy`; at or above the mean the native yield sign
+  reverses and an etch grows the surface. GeometricTrenchDeposition runs in both
   dimensions for plane, trench, hole, fin and stack geometry, while GDS inputs
   are rejected because the native radius needs a bounded vertical span.
 - Optional native controls: `nvFactors` on selective epitaxy, `coverageTolerance`

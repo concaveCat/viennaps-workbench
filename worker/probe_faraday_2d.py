@@ -44,8 +44,8 @@ if str(ROOT) not in sys.path:
 CAGE_ANGLES = (0, 0.2, 1, 5, 10, 30, 45, 60, 75, 89, 90, 120, 180)
 TILT_ANGLES = (-90, -60, -30, 0, 30, 60, 90, 120, 180)
 IBE_OVERRIDES = (
-    {"meanEnergy": 0.0},
-    {"meanEnergy": 1.0},
+    {"meanEnergy": 50.0},
+    {"meanEnergy": 25.0},
     {"meanEnergy": 1000.0},
     {"sigmaEnergy": 0.0},
     {"sigmaEnergy": 1e-06},
@@ -357,7 +357,7 @@ def _cases_for(matrix: str) -> list[dict[str, Any]]:
             for tilt in THREE_D_TILT_ANGLES:
                 cases.append({"dimension": 3, "cageAngle": cage, "tiltAngle": tilt,
                               "engine": "CPU_DISK"})
-        for override in ({"meanEnergy": 0.0}, {"sigmaEnergy": 0.0}, {"exponent": 0.0},
+        for override in ({"meanEnergy": 50.0}, {"sigmaEnergy": 0.0}, {"exponent": 0.0},
                          {"thetaRMin": 0.0, "thetaRMax": 180.0},
                          {"planeWaferRate": 0.0}):
             cases.append({"dimension": 3, "cageAngle": 45, "tiltAngle": 30,

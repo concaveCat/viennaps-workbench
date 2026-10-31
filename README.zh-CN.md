@@ -49,8 +49,9 @@
   Stage 8/9 直接参考验收行，因此运行时会附带验证警告。原始审计看到的 2D 法拉第笼
   不返回属于未固定引擎的 AUTO/GPU 内核；固定 CPU_DISK 后全部 cage/tilt 组合都能完成，
   因此 2D 只在 `solver.enginePreference` 为 `cpu` 时放行（AUTO/GPU 请求在启动 worker
-  之前返回 422）。几何沟槽沉积在平面、沟槽、孔、鳍与叠层几何上支持 2D/3D，
-  GDS 输入因缺少可界定的垂直范围仍被拒绝。
+  之前返回 422）。IBE 模型还要求 `thresholdEnergy < meanEnergy`；阈值等于或高于平均
+  能量时原生产额符号反转，刻蚀步骤会变成生长。几何沟槽沉积在平面、沟槽、孔、鳍与叠层
+  几何上支持 2D/3D，GDS 输入因缺少可界定的垂直范围仍被拒绝。
 - 可选原生控制：选择性外延的 `nvFactors`、四个等离子体模型的
   `coverageTolerance`，以及 `advanced` 等离子体参数对象。
 - 定向速率模型与选择性对照。
