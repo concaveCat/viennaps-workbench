@@ -18,6 +18,7 @@ import { mkdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
+import { executionCompileBasis } from '../src/workflow/fingerprint.ts';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const baseUrl = (process.env.WORKBENCH_URL ?? 'http://127.0.0.1:8912').replace(/\/$/, '');
@@ -170,9 +171,11 @@ for (const variant of finished.variants) {
 const projectA = await postJson('/api/v1/workflow/projects', {
   ...fixture, geometry: gdsGeometry, domain: compiled.compile.project.domain,
 });
+const projectADoc = await getJson(`/api/v1/workflow/projects/${projectA.projectId}`);
 await putJson(`/api/v1/workflow/projects/${projectA.projectId}/state`, {
   schemaVersion: 1,
   compileId: compiled.compileId,
+  compileBasis: executionCompileBasis(projectADoc),
   routeId: routePlan.route.routeId,
   segmentRuns: [{ segmentId: first.segmentId, runId: firstDone.runId, measurementId: boundMeasurement.measurementId }],
   measurementIds: [boundMeasurement.measurementId],
@@ -187,8 +190,10 @@ const routeB = await postJson('/api/v1/workflow/routes/from-compile', {
 const projectB = await postJson('/api/v1/workflow/projects', {
   ...fixture, name: `${fixtureName} · 无前序`, geometry: gdsGeometry, domain: compiled.compile.project.domain,
 });
+const projectBDoc = await getJson(`/api/v1/workflow/projects/${projectB.projectId}`);
 await putJson(`/api/v1/workflow/projects/${projectB.projectId}/state`, {
-  schemaVersion: 1, compileId: compiled.compileId, routeId: routeB.plan.route.routeId,
+  schemaVersion: 1, compileId: compiled.compileId,
+  compileBasis: executionCompileBasis(projectBDoc), routeId: routeB.plan.route.routeId,
   segmentRuns: [], measurementIds: [], experimentIds: [],
 });
 
@@ -211,8 +216,10 @@ const run3d = await postJson(`/api/v1/workflow/segments/${route3d.plan.segments[
 const done3d = await waitSegment(run3d.segment.segmentId);
 assert.equal(done3d.status, 'succeeded');
 const project3d = await postJson('/api/v1/workflow/projects', { ...fixture3d });
+const project3dDoc = await getJson(`/api/v1/workflow/projects/${project3d.projectId}`);
 await putJson(`/api/v1/workflow/projects/${project3d.projectId}/state`, {
-  schemaVersion: 1, compileId: compiled3d.compileId, routeId: route3d.plan.route.routeId,
+  schemaVersion: 1, compileId: compiled3d.compileId,
+  compileBasis: executionCompileBasis(project3dDoc), routeId: route3d.plan.route.routeId,
   segmentRuns: [{ segmentId: done3d.segmentId, runId: done3d.runId, measurementId: null }],
   measurementIds: [], experimentIds: [],
 });

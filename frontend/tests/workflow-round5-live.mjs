@@ -13,6 +13,7 @@ import { mkdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
+import { executionCompileBasis } from '../src/workflow/fingerprint.ts';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const baseUrl = (process.env.WORKBENCH_URL ?? 'http://127.0.0.1:8912').replace(/\/$/, '');
@@ -100,8 +101,10 @@ const bound = await postJson(`/api/v1/workflow/measurements/${measured.measureme
   segmentId: firstSegment.segmentId, runId: firstDone.runId, stepId: firstDone.throughStepId,
 });
 const recordA = await postJson('/api/v1/workflow/projects', projectA);
+const recordADoc = await getJson(`/api/v1/workflow/projects/${recordA.projectId}`);
 await putJson(`/api/v1/workflow/projects/${recordA.projectId}/state`, {
-  schemaVersion: 1, compileId: compiledA.compileId, routeId: routeA.plan.route.routeId,
+  schemaVersion: 1, compileId: compiledA.compileId,
+  compileBasis: executionCompileBasis(recordADoc), routeId: routeA.plan.route.routeId,
   segmentRuns: [{ segmentId: firstSegment.segmentId, runId: firstDone.runId, measurementId: bound.measurementId }],
   measurementIds: [bound.measurementId], experimentIds: [],
 });
@@ -132,8 +135,10 @@ assert.equal(finishedB.variants.length, 9);
 const experimentMeasurement = finishedB.variants[0].replicates[0].measurementId;
 assert.ok(experimentMeasurement, 'the experiment must produce a measurement');
 const recordB = await postJson('/api/v1/workflow/projects', projectB);
+const recordBDoc = await getJson(`/api/v1/workflow/projects/${recordB.projectId}`);
 await putJson(`/api/v1/workflow/projects/${recordB.projectId}/state`, {
-  schemaVersion: 1, compileId: compiledB.compileId, routeId: null,
+  schemaVersion: 1, compileId: compiledB.compileId,
+  compileBasis: executionCompileBasis(recordBDoc), routeId: null,
   segmentRuns: [], measurementIds: [experimentMeasurement],
   experimentIds: [experimentB.experimentId],
 });

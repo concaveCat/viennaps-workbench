@@ -20,6 +20,7 @@ import path from 'node:path';
 import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
+import { executionCompileBasis } from '../src/workflow/fingerprint.ts';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const baseUrl = (process.env.WORKBENCH_URL ?? 'http://127.0.0.1:8961').replace(/\/$/, '');
@@ -201,8 +202,10 @@ assert.equal(finishedA.variants.length, 9);
 const measurementA = finishedA.variants[0].replicates[0].measurementId;
 assert.ok(measurementA, 'the experiment must produce a measurement');
 const recordA = await postJson('/api/v1/workflow/projects', projectA);
+const recordADoc = await getJson(`/api/v1/workflow/projects/${recordA.projectId}`);
 await putJson(`/api/v1/workflow/projects/${recordA.projectId}/state`, {
-  schemaVersion: 1, compileId: compiledA.compileId, routeId: routeA.plan.route.routeId,
+  schemaVersion: 1, compileId: compiledA.compileId,
+  compileBasis: executionCompileBasis(recordADoc), routeId: routeA.plan.route.routeId,
   segmentRuns: [], measurementIds: [measurementA], experimentIds: [experimentA.experimentId],
 });
 
@@ -226,8 +229,10 @@ const experimentB = await postJson('/api/v1/workflow/experiments', {
 });
 assert.equal(experimentB.status, 'planned');
 const recordB = await postJson('/api/v1/workflow/projects', projectB);
+const recordBDoc = await getJson(`/api/v1/workflow/projects/${recordB.projectId}`);
 await putJson(`/api/v1/workflow/projects/${recordB.projectId}/state`, {
-  schemaVersion: 1, compileId: compiledB.compileId, routeId: null,
+  schemaVersion: 1, compileId: compiledB.compileId,
+  compileBasis: executionCompileBasis(recordBDoc), routeId: null,
   segmentRuns: [], measurementIds: [], experimentIds: [experimentB.experimentId],
 });
 
@@ -241,8 +246,10 @@ const run3d = await postJson(`/api/v1/workflow/segments/${route3d.plan.segments[
 const done3d = await waitSegment(run3d.segment.segmentId);
 assert.equal(done3d.status, 'succeeded');
 const record3d = await postJson('/api/v1/workflow/projects', project3d);
+const record3dDoc = await getJson(`/api/v1/workflow/projects/${record3d.projectId}`);
 await putJson(`/api/v1/workflow/projects/${record3d.projectId}/state`, {
-  schemaVersion: 1, compileId: compiled3d.compileId, routeId: route3d.plan.route.routeId,
+  schemaVersion: 1, compileId: compiled3d.compileId,
+  compileBasis: executionCompileBasis(record3dDoc), routeId: route3d.plan.route.routeId,
   segmentRuns: [{ segmentId: run3d.segment.segmentId, runId: done3d.runId, measurementId: null }],
   measurementIds: [], experimentIds: [],
 });
