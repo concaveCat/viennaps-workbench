@@ -26,6 +26,7 @@ from pydantic import ValidationError
 from starlette.background import BackgroundTask
 
 from . import storage
+from . import settings as settings_store
 from . import preflight as artifact_preflight
 from . import materials as material_registry
 from .models import Project, ProjectV6, ProjectV7, FluxRunRequest, SliceRequestV7, normalized_geometry_v3, parse_project, parse_replay, project_structure_hash, RunRequest
@@ -288,6 +289,40 @@ async def capabilities() -> dict[str, Any]:
         capability_data["knownEngineLimitations"] = []
     return {"capabilities": capability_data, "resourcePolicy": resource_policy,
             "runtimeLimits": limits}
+
+
+@app.get("/api/settings")
+async def get_settings() -> dict[str, Any]:
+    """Return persistent limits, storage usage, and installed engine versions."""
+    return settings_store.settings_response()
+
+
+@app.put("/api/settings", responses={
+    422: {
+        "description": "Validation Error",
+        "content": {"application/json": {"schema": {
+            "type": "object",
+            "required": ["detail"],
+            "properties": {"detail": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["path", "message"],
+                    "properties": {
+                        "path": {"type": "string"},
+                        "message": {"type": "string"},
+                    },
+                },
+            }},
+        }}},
+    },
+})
+async def put_settings(payload: Any = Body(...)) -> dict[str, Any]:
+    """Update limit overrides; ``null`` removes an override."""
+    try:
+        return settings_store.apply_update(payload)
+    except settings_store.SettingsValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.issues) from exc
 
 
 @app.get("/api/gpu-devices")
