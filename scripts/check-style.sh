@@ -10,24 +10,26 @@ cd "$root"
 
 python_bin="${PYTHON:-.venv/bin/python}"
 
-echo "== compileall =="
-"$python_bin" -m compileall -q backend worker scripts
-
-echo "== ruff =="
-ruff_cmd=()
+# ruff is a dev-only tool (requirements-dev.txt). Missing ruff is a hard failure:
+# a gate that silently skips linting reports success it did not verify.
 if command -v ruff >/dev/null 2>&1; then
   ruff_cmd=(ruff)
 elif "$python_bin" -m ruff --version >/dev/null 2>&1; then
   ruff_cmd=("$python_bin" -m ruff)
-fi
-if [ ${#ruff_cmd[@]} -gt 0 ]; then
-  targets=(backend/api backend/api_errors.py backend/packages.py backend/planning.py
-           backend/supervisor.py worker/artifacts.py worker/engine_policy.py worker/steps)
-  "${ruff_cmd[@]}" check "${targets[@]}"
-  "${ruff_cmd[@]}" format --check "${targets[@]}"
 else
-  echo "ruff not found; skipping ruff check/format (install ruff to enable)"
+  echo "ruff not found; install dev tools with: $python_bin -m pip install -r requirements-dev.txt" >&2
+  exit 1
 fi
+
+targets=(backend/api backend/api_errors.py backend/packages.py backend/planning.py
+         backend/supervisor.py worker/artifacts.py worker/engine_policy.py worker/steps)
+
+echo "== compileall =="
+"$python_bin" -m compileall -q backend worker scripts
+
+echo "== ruff =="
+"${ruff_cmd[@]}" check "${targets[@]}"
+"${ruff_cmd[@]}" format --check "${targets[@]}"
 
 echo "== frontend typecheck =="
 (cd frontend && npm run typecheck)

@@ -23,7 +23,9 @@ def atomic_json(path: Path, data: Any) -> None:
     # Keep the encode-then-write form: measured on a 7.4 MB snapshot,
     # json.dump(stream) is ~3.8x slower than json.dumps() + write_text()
     # (293 ms vs 77 ms), because the stream path writes in small chunks.
-    tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n", encoding="utf-8")
+    tmp.write_text(
+        json.dumps(data, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n", encoding="utf-8"
+    )
     os.replace(tmp, path)
 
 
@@ -40,9 +42,7 @@ def check_artifact_budget(run_dir: Path) -> None:
                 continue
             total += item.stat().st_size
             if total > max_run_bytes:
-                raise RuntimeError(
-                    f"run artifacts exceeded the {artifact_limit_label()} application cap"
-                )
+                raise RuntimeError(f"run artifacts exceeded the {artifact_limit_label()} application cap")
         except OSError:
             # A concurrent atomic replace may remove a file after rglob has
             # yielded its path. Continue with the remaining committed files.
@@ -70,9 +70,16 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def output_artifact(path: Path, run_dir: Path, run_id: str, step_id: str, kind: str, fmt: str,
-                    **details: Any) -> dict[str, Any]:
+def output_artifact(
+    path: Path, run_dir: Path, run_id: str, step_id: str, kind: str, fmt: str, **details: Any
+) -> dict[str, Any]:
     relative = path.resolve().relative_to(run_dir.resolve()).as_posix()
-    return {"kind": kind, "fileName": relative,
-            "url": f"/api/runs/{run_id}/artifacts/{step_id}?fileName={relative}",
-            "format": fmt, "sizeBytes": path.stat().st_size, "sha256": file_sha256(path), **details}
+    return {
+        "kind": kind,
+        "fileName": relative,
+        "url": f"/api/runs/{run_id}/artifacts/{step_id}?fileName={relative}",
+        "format": fmt,
+        "sizeBytes": path.stat().st_size,
+        "sha256": file_sha256(path),
+        **details,
+    }

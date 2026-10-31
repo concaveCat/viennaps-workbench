@@ -8,8 +8,8 @@
 - 新的 step model 放进 `worker/steps/`，实现一个 executor（参考 `context.RunContext`
   与 `geometry.py` / `cellset.py` / `noop.py`）。只有当 executor 确实表达不了时才允许在
   `execute()` 里加分支。
-- 新的 API 资源放进 `backend/api/`（路由）或 `backend/packages.py`（可复用流程/包），
-  不要把新逻辑堆进 `backend/main.py`。`main.py` 只做装配与再导出。
+- 新的 API 资源放进 `backend/api/`（路由）或 `backend/packages.py`（可复用流程/包）。
+  新逻辑一律不要写进 `backend/main.py`：它是组装根，只保留已有的历史路由与再导出。
 - 共享常量只有一份。GPU 多粒子/多离子策略字符串以 `backend/validation.py` 为准，
   worker 侧通过 import 引用，不再本地复制。
 - 新的前端状态放进 `frontend/src/features/` 或 `frontend/src/hooks/`，不要继续
@@ -30,6 +30,7 @@
 
 ```bash
 bash scripts/check-style.sh          # compileall + 新模块 ruff + 前端 typecheck + diff --check
+                                    # 缺 ruff 会直接失败：.venv/bin/python -m pip install -r requirements-dev.txt
 .venv/bin/python -m unittest tests.test_contract_parity tests.test_native_multiion_policy -v
 ```
 

@@ -72,11 +72,16 @@ class RunContext:
         simulate_module().event(self.run_dir, data)
 
     def save_snapshot(self, domain: Any, **kwargs: Any) -> dict[str, Any]:
-        return simulate_module().save_snapshot(
-            self.ps, domain, self.run_dir, run_id=self.run_id, **kwargs)
+        return simulate_module().save_snapshot(self.ps, domain, self.run_dir, run_id=self.run_id, **kwargs)
 
     def save_native_state(self, domain: Any, step_id: str) -> dict[str, Any]:
         return simulate_module().save_native_state(
-            self.ps, domain, self.run_dir, project=self.project,
-            run_id=self.run_id, step_id=step_id,
-            viennaps_version=self.ps_version, viennals_version=self.ls_version)
+            self.ps,
+            domain,
+            self.run_dir,
+            project=self.project,
+            run_id=self.run_id,
+            step_id=step_id,
+            viennaps_version=self.ps_version,
+            viennals_version=self.ls_version,
+        )

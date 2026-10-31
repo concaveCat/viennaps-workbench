@@ -31,5 +31,7 @@ def project_or_422(payload: Any, *, kind: str = "project") -> tuple[Project, dic
     try:
         project, warnings = validate_project(payload, kind=kind)
     except ProjectInputError as exc:
-        raise HTTPException(status_code=422, detail=[{"path": issue.path, "message": issue.message} for issue in exc.issues]) from exc
+        raise HTTPException(
+            status_code=422, detail=[{"path": issue.path, "message": issue.message} for issue in exc.issues]
+        ) from exc
     return project, project.model_dump(mode="json", exclude_none=True), warnings

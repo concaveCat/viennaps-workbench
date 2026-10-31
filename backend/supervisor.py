@@ -13,16 +13,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .hashing import execution_hash
 from . import storage
-from .native_build import configured_runtime
-from .runtime_limits import max_log_bytes, max_log_mib, rss_limit_mib
 from .gpu_devices import cuda_devices
+from .hashing import execution_hash
+from .native_build import configured_runtime
+
 # Re-exported for the API layer and the acceptance tests, which import
 # ``ReplayMismatch``/``now_iso`` from ``backend.supervisor``.
-from .planning import (ReplayMismatch, now_iso, plan_run,  # noqa: F401
-                       requested_input_hash_from_dict)
-
+from .planning import ReplayMismatch, now_iso, plan_run, requested_input_hash_from_dict  # noqa: F401
+from .runtime_limits import max_log_bytes, max_log_mib, rss_limit_mib
 
 ROOT = storage.ROOT
 PYTHON = ROOT / ".venv" / "bin" / "python"
@@ -35,13 +34,31 @@ ACTIVE = {"pending", "running", "cancelling"}
 def child_command(run_dir: Path, timeout: int) -> list[str]:
     """Build the bounded-child command for one supervised worker run."""
     return [
-        str(PYTHON), str(GUARD), "--cwd", str(ROOT), "--record", str(run_dir / "child-record.json"),
-        "--log-path", str(run_dir / "run.log"),
-        "--ready-file", str(run_dir / ".guard-ready"),
-        "--parent-pid", str(os.getpid()),
-        "--timeout-seconds", str(timeout), "--max-rss-mib", str(rss_limit_mib()),
-        "--max-log-bytes", str(max_log_bytes()),
-        "--terminate-grace-seconds", "5", "--", str(PYTHON), str(WORKER), str(run_dir / "input.json"), str(run_dir),
+        str(PYTHON),
+        str(GUARD),
+        "--cwd",
+        str(ROOT),
+        "--record",
+        str(run_dir / "child-record.json"),
+        "--log-path",
+        str(run_dir / "run.log"),
+        "--ready-file",
+        str(run_dir / ".guard-ready"),
+        "--parent-pid",
+        str(os.getpid()),
+        "--timeout-seconds",
+        str(timeout),
+        "--max-rss-mib",
+        str(rss_limit_mib()),
+        "--max-log-bytes",
+        str(max_log_bytes()),
+        "--terminate-grace-seconds",
+        "5",
+        "--",
+        str(PYTHON),
+        str(WORKER),
+        str(run_dir / "input.json"),
+        str(run_dir),
     ]
 
 
@@ -158,21 +175,42 @@ class Supervisor:
                 pgid = managed.get("pgid")  # legacy development records
             if all(isinstance(item, int) for item in (pid, start_ticks, pgid)):
                 _terminate_recorded(pid, start_ticks, pgid)
-            manifest.update({"status": "interrupted", "finishedAt": now_iso(), "failureReason": "server restarted before the run reached a terminal state"})
+            manifest.update(
+                {
+                    "status": "interrupted",
+                    "finishedAt": now_iso(),
+                    "failureReason": "server restarted before the run reached a terminal state",
+                }
+            )
             storage.atomic_json(manifest_path, manifest)
 
-    def start(self, kind: str, project: dict[str, Any], *, replay: dict[str, Any] | None = None,
-              analysis_step_id: str | None = None, slice_request: dict[str, Any] | None = None) -> dict[str, Any]:
+    def start(
+        self,
+        kind: str,
+        project: dict[str, Any],
+        *,
+        replay: dict[str, Any] | None = None,
+        analysis_step_id: str | None = None,
+        slice_request: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         with self.lock:
             if self.active and self._status(self.active.run_id) in ACTIVE:
                 raise ActiveRunError(self.active.run_id)
             # ``cuda_devices`` is resolved here so patching the supervisor
             # module global still supplies the plan with a fake inventory.
-            plan = plan_run(kind, project, replay=replay, analysis_step_id=analysis_step_id,
-                            slice_request=slice_request, inventory_provider=cuda_devices)
+            plan = plan_run(
+                kind,
+                project,
+                replay=replay,
+                analysis_step_id=analysis_step_id,
+                slice_request=slice_request,
+                inventory_provider=cuda_devices,
+            )
             handle = RunHandle(plan.run_id, plan.run_dir)
             self.active = handle
-            handle.thread = threading.Thread(target=self._run, args=(handle,), name=f"viennaps-{plan.run_id}", daemon=True)
+            handle.thread = threading.Thread(
+                target=self._run, args=(handle,), name=f"viennaps-{plan.run_id}", daemon=True
+            )
             handle.thread.start()
             return {"runId": plan.run_id, "status": "pending", "requestedInputHash": plan.request_hash}
 
@@ -194,9 +232,18 @@ class Supervisor:
                 if actual_fingerprint != expected_fingerprint:
                     raise ReplayMismatch("patched ViennaPS engine changed before worker start")
                 worker_env["PYTHONPATH"] = os.pathsep.join(
-                    [str(runtime_dir), str(ROOT), worker_env.get("PYTHONPATH", "")])
-            proc = subprocess.Popen(cmd, cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                    start_new_session=True, close_fds=True, env=worker_env)
+                    [str(runtime_dir), str(ROOT), worker_env.get("PYTHONPATH", "")]
+                )
+            proc = subprocess.Popen(
+                cmd,
+                cwd=ROOT,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+                env=worker_env,
+            )
             handle.process = proc
             ready_deadline = time.monotonic() + 10.0
             while not ready_path.is_file() and proc.poll() is None and time.monotonic() < ready_deadline:
@@ -212,10 +259,16 @@ class Supervisor:
                 return
             identity = _proc_identity(proc.pid)
             with self.lock:
-                self._set_status(handle, "running", startedAt=now_iso(), supervisorProcess={
-                    "pid": proc.pid, "processGroupId": identity["pgid"] if identity else proc.pid,
-                    "startTicks": identity["startTicks"] if identity else None,
-                })
+                self._set_status(
+                    handle,
+                    "running",
+                    startedAt=now_iso(),
+                    supervisorProcess={
+                        "pid": proc.pid,
+                        "processGroupId": identity["pgid"] if identity else proc.pid,
+                        "startTicks": identity["startTicks"] if identity else None,
+                    },
+                )
             last_storage_check = time.monotonic()
             while proc.poll() is None:
                 self._read_events(handle)
@@ -268,25 +321,79 @@ class Supervisor:
                 manifest["currentStepId"] = item.get("stepId")
                 manifest["currentStepName"] = item.get("name")
             elif event_type == "snapshot":
-                entry = {key: item[key] for key in ("stepId", "name", "stepIndex", "snapshot", "vtk", "pointCount", "lineCount", "triangleCount", "topology", "dimension", "materialIds", "materialIdsByLevelSetIndex", "noOp", "measuredGeometry", "geometryReadback", "sliceReadback", "nativeState", "oxidation", "outputs") if key in item}
+                entry = {
+                    key: item[key]
+                    for key in (
+                        "stepId",
+                        "name",
+                        "stepIndex",
+                        "snapshot",
+                        "vtk",
+                        "pointCount",
+                        "lineCount",
+                        "triangleCount",
+                        "topology",
+                        "dimension",
+                        "materialIds",
+                        "materialIdsByLevelSetIndex",
+                        "noOp",
+                        "measuredGeometry",
+                        "geometryReadback",
+                        "sliceReadback",
+                        "nativeState",
+                        "oxidation",
+                        "outputs",
+                    )
+                    if key in item
+                }
                 if not any(existing.get("stepId") == entry.get("stepId") for existing in manifest["snapshots"]):
                     manifest["snapshots"].append(entry)
                 if entry.get("stepId") != "initial" and entry.get("stepId") not in manifest["completedStepIds"]:
                     manifest["completedStepIds"].append(entry["stepId"])
                 if entry.get("noOp"):
-                    manifest["noOpSteps"].append({"stepId": entry["stepId"], "reason": "zero-rate step; process was not called"})
+                    manifest["noOpSteps"].append(
+                        {"stepId": entry["stepId"], "reason": "zero-rate step; process was not called"}
+                    )
                 manifest["currentStepId"] = None
                 manifest["currentStepName"] = None
             elif event_type == "worker-failed":
                 manifest["workerError"] = item.get("error")
             elif event_type == "step-configured":
-                record = {key: item[key] for key in ("stepId", "operation", "model", "noOp", "actualEngine", "engineSelectionReason",
-                                                      "requestedEnginePreference", "actualSeed", "actualRate", "duration", "actualParameters") if key in item}
+                record = {
+                    key: item[key]
+                    for key in (
+                        "stepId",
+                        "operation",
+                        "model",
+                        "noOp",
+                        "actualEngine",
+                        "engineSelectionReason",
+                        "requestedEnginePreference",
+                        "actualSeed",
+                        "actualRate",
+                        "duration",
+                        "actualParameters",
+                    )
+                    if key in item
+                }
                 existing = manifest.setdefault("actualExecution", [])
                 existing[:] = [old for old in existing if old.get("stepId") != record.get("stepId")]
                 existing.append(record)
             elif event_type == "flux-result":
-                manifest["fluxResult"] = {key: item[key] for key in ("fileName", "vtk", "meshIdentity", "pointCount", "fieldCount", "fieldNames", "actualEngine", "actualSeed") if key in item}
+                manifest["fluxResult"] = {
+                    key: item[key]
+                    for key in (
+                        "fileName",
+                        "vtk",
+                        "meshIdentity",
+                        "pointCount",
+                        "fieldCount",
+                        "fieldNames",
+                        "actualEngine",
+                        "actualSeed",
+                    )
+                    if key in item
+                }
                 manifest["currentStepId"] = None
                 manifest["currentStepName"] = None
             elif event_type == "intermediate-output":
@@ -319,7 +426,12 @@ class Supervisor:
                 return
             manifest = storage.read_json(run_dir / "manifest.json")
             if worker_result.get("nativeEngineFingerprint") != manifest.get("nativeEngineFingerprint"):
-                self._finish(handle, "failed", failure="worker native engine build identity differs from the planned run", childRecord=child_record)
+                self._finish(
+                    handle,
+                    "failed",
+                    failure="worker native engine build identity differs from the planned run",
+                    childRecord=child_record,
+                )
                 return
             actual = worker_result.get("actualSteps", [])
             request_hash = manifest["requestedInputHash"]
@@ -332,23 +444,49 @@ class Supervisor:
                 viennals_version=worker_result["versions"]["viennals"],
                 native_engine_fingerprint=manifest.get("nativeEngineFingerprint"),
             )
-            self._finish(handle, "succeeded", workerResult=worker_result, childRecord=child_record,
-                         actualExecution=worker_result.get("stepRecords", []), executionHash=exec_hash)
+            self._finish(
+                handle,
+                "succeeded",
+                workerResult=worker_result,
+                childRecord=child_record,
+                actualExecution=worker_result.get("stepRecords", []),
+                executionHash=exec_hash,
+            )
             return
         reason = child_record.get("terminationReason")
         if reason == "timeout":
-            self._finish(handle, "timed_out", failure="run exceeded its configured wall-clock timeout", childRecord=child_record)
+            self._finish(
+                handle, "timed_out", failure="run exceeded its configured wall-clock timeout", childRecord=child_record
+            )
         elif reason == "supervisor_cancelled" or handle.cancel_event.is_set():
-            self._finish(handle, "cancelled", failure="run cancelled by the user or server shutdown", childRecord=child_record)
+            self._finish(
+                handle, "cancelled", failure="run cancelled by the user or server shutdown", childRecord=child_record
+            )
         elif reason == "rss_limit":
-            self._finish(handle, "failed", failure=f"observed process-group RSS exceeded the {rss_limit_mib()} MiB termination threshold", childRecord=child_record)
+            self._finish(
+                handle,
+                "failed",
+                failure=f"observed process-group RSS exceeded the {rss_limit_mib()} MiB termination threshold",
+                childRecord=child_record,
+            )
         elif reason == "log_limit":
-            self._finish(handle, "failed", failure=f"combined stdout/stderr exceeded the {max_log_mib()} MiB log cap", childRecord=child_record)
+            self._finish(
+                handle,
+                "failed",
+                failure=f"combined stdout/stderr exceeded the {max_log_mib()} MiB log cap",
+                childRecord=child_record,
+            )
         elif reason == "orphaned_child":
-            self._finish(handle, "failed", failure="worker left a process in its owned process group", childRecord=child_record)
+            self._finish(
+                handle, "failed", failure="worker left a process in its owned process group", childRecord=child_record
+            )
         else:
             current = storage.read_json(run_dir / "manifest.json")
-            detail = current.get("workerError") or _tail_text(run_dir / "run.log") or f"worker exited with return code {return_code}"
+            detail = (
+                current.get("workerError")
+                or _tail_text(run_dir / "run.log")
+                or f"worker exited with return code {return_code}"
+            )
             self._finish(handle, "failed", failure=detail[-8192:], childRecord=child_record)
 
     def _finish(self, handle: RunHandle, status: str, *, failure: str | None = None, **updates: Any) -> None:
@@ -392,7 +530,11 @@ class Supervisor:
             identity = manifest.get("supervisorProcess") or {}
             current = _proc_identity(proc.pid)
             expected_pgid = identity.get("processGroupId", identity.get("pgid"))
-            if current and current.get("startTicks") == identity.get("startTicks") and current.get("pgid") == expected_pgid:
+            if (
+                current
+                and current.get("startTicks") == identity.get("startTicks")
+                and current.get("pgid") == expected_pgid
+            ):
                 os.kill(proc.pid, signum)
         except (OSError, ValueError):
             pass
@@ -451,9 +593,17 @@ class Supervisor:
             "status": manifest.get("status"),
             "currentStepId": manifest.get("currentStepId"),
             "completedStepIds": manifest.get("completedStepIds", []),
-            "stepTotal": sum(1 for step in manifest.get("normalizedProject", {}).get("steps", []) if step.get("enabled")) if manifest.get("kind") == "simulate" else 0,
+            "stepTotal": sum(
+                1 for step in manifest.get("normalizedProject", {}).get("steps", []) if step.get("enabled")
+            )
+            if manifest.get("kind") == "simulate"
+            else 0,
             "startedAt": manifest.get("startedAt"),
-            "elapsedSeconds": round(max(0.0, time.time() - calendar.timegm(time.strptime(manifest["startedAt"], "%Y-%m-%dT%H:%M:%SZ"))), 3) if manifest.get("status") in ACTIVE and manifest.get("startedAt") else manifest.get("elapsedSeconds", 0),
+            "elapsedSeconds": round(
+                max(0.0, time.time() - calendar.timegm(time.strptime(manifest["startedAt"], "%Y-%m-%dT%H:%M:%SZ"))), 3
+            )
+            if manifest.get("status") in ACTIVE and manifest.get("startedAt")
+            else manifest.get("elapsedSeconds", 0),
             "requestedInputHash": manifest.get("requestedInputHash"),
             "executionHash": manifest.get("executionHash"),
             "runMode": manifest.get("runMode", "from-initial"),
@@ -463,7 +613,12 @@ class Supervisor:
             "intermediateOutputs": manifest.get("intermediateOutputs", []),
             "failureReason": manifest.get("failureReason"),
             "termination": termination,
-            "log": {"cursor": cursor, "nextCursor": next_cursor, "truncated": was_truncated, "text": data.decode("utf-8", errors="replace")},
+            "log": {
+                "cursor": cursor,
+                "nextCursor": next_cursor,
+                "truncated": was_truncated,
+                "text": data.decode("utf-8", errors="replace"),
+            },
             "snapshots": manifest.get("snapshots", []),
             "actualExecution": manifest.get("actualExecution", []),
             "completedAt": manifest.get("finishedAt"),
@@ -471,4 +626,3 @@ class Supervisor:
 
     def get_manifest(self, run_id: str) -> dict[str, Any]:
         return self._manifest(run_id)
-

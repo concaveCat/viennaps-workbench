@@ -12,12 +12,10 @@ import math
 from typing import Any
 
 from backend.engine import multi_ion_gpu_error
-from backend.validation import (GPU_MULTIPARTICLE_FLUX_STRATEGY,
-                                capability_verified, gpu_project_signature)
+from backend.validation import GPU_MULTIPARTICLE_FLUX_STRATEGY, capability_verified, gpu_project_signature
 
 
-def requested_engine_for_step(project: dict[str, Any], step: dict[str, Any],
-                              step_engines: dict[str, Any]) -> str:
+def requested_engine_for_step(project: dict[str, Any], step: dict[str, Any], step_engines: dict[str, Any]) -> str:
     """Resolve one worker engine without ever contradicting solver.gpuEngine.
 
     Direct worker input does not pass through backend.validation, so an
@@ -30,11 +28,11 @@ def requested_engine_for_step(project: dict[str, Any], step: dict[str, Any],
     requested = solver.get("gpuEngine") if project.get("schemaVersion") == 7 else None
     if requested is not None:
         if solver.get("enginePreference") != "gpu":
-            raise RuntimeError(
-                "solver.gpuEngine requires solver.enginePreference=gpu in the worker input")
+            raise RuntimeError("solver.gpuEngine requires solver.enginePreference=gpu in the worker input")
         if explicit is not None and explicit != requested:
             raise RuntimeError(
-                f"pinned engine {explicit} for step {step['id']} differs from solver.gpuEngine {requested}")
+                f"pinned engine {explicit} for step {step['id']} differs from solver.gpuEngine {requested}"
+            )
         return str(requested)
     if explicit is not None:
         return str(explicit)
@@ -54,12 +52,20 @@ def verify_worker_engine_evidence(project: dict[str, Any], step: dict[str, Any],
     model = f"specialized:{step['nativeModel']}" if step.get("model") == "specialized" else step["model"]
     boundary = project["domain"].get("boundaryXY", project["domain"].get("xBoundary"))
     signature = gpu_project_signature(project, step)
-    if not capability_verified(project["dimension"], model, step["operation"], boundary, engine,
-                               schema_version=project.get("schemaVersion"), **signature):
+    if not capability_verified(
+        project["dimension"],
+        model,
+        step["operation"],
+        boundary,
+        engine,
+        schema_version=project.get("schemaVersion"),
+        **signature,
+    ):
         raise RuntimeError(
             f"GPU_TRIANGLE has no direct-reference acceptance row for {model} "
             f"{step['operation']} on {boundary} in {project['dimension']}D; the worker refuses "
-            "the request instead of falling back to GPU_DISK or CPU_DISK")
+            "the request instead of falling back to GPU_DISK or CPU_DISK"
+        )
 
 
 def native_slice_position(position: float, grid_delta: float) -> float:
@@ -107,8 +113,7 @@ def require_multi_ion_gpu_policy(step: dict[str, Any], engine: str | None) -> No
         raise RuntimeError(policy)
 
 
-def require_multi_ion_flux_fields(report: dict[str, Any], step: dict[str, Any],
-                                  flux_strategy: str | None) -> None:
+def require_multi_ion_flux_fields(report: dict[str, Any], step: dict[str, Any], flux_strategy: str | None) -> None:
     """Reject a native GPU flux mesh that dropped species fields.
 
     Applies to the single native ``calculateFlux()`` call, including the
@@ -126,4 +131,5 @@ def require_multi_ion_flux_fields(report: dict[str, Any], step: dict[str, Any],
         raise RuntimeError(
             f"native GPU MultiParticle flux is missing species fields: {sorted(missing)} "
             f"(present: {sorted(present_fields)}); the installed binding returned a truncated "
-            f"multi-ion flux, so the run is rejected instead of reporting a partial result")
+            f"multi-ion flux, so the run is rejected instead of reporting a partial result"
+        )
