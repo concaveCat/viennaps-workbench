@@ -413,10 +413,32 @@ the patched build. The patch is ABI-bound to ViennaLS 5.8.5.
   (`steps[i].species`) by `backend/engine.multi_ion_gpu_error()`, naming the
   measured behaviour and both escapes: the 4.6.2 patched runtime, or
   `CPU_DISK` on 4.7.0 (which is verified above).
-- `worker/simulate.py` calls the same helper, so a hand-edited `input.json`
-  cannot reach the lossy binding; `backend/supervisor.py` raises the policy
-  instead of the old "patched runtime is not configured" whenever a multi-ion
-  GPU run needs the patched build.
+- `worker/simulate.py` calls the same helper from the process path
+  (`execute`), so a hand-edited `input.json` cannot reach the lossy binding.
+- **Single-pass flux path (fixed after the default switch).** The first cut of
+  this gate only covered `execute`, which left three ways to reach a GPU flux
+  call with two or more ions:
+  1. `worker/simulate.py` `calculate_single_flux(..., engine="GPU_DISK",
+     flux_strategy=None)` (and `GPU_TRIANGLE`) went straight to
+     `Process.calculateFlux()`;
+  2. the species-completeness check only ran for
+     `native-multi-ion-flux-v1`, so a `None` strategy skipped it and accepted
+     the truncated native field set;
+  3. `backend/supervisor.py` keyed the gate off `needs_native_patch`, so a
+     flux replay carrying `per-species-native-mesh-merge-v1` and **no**
+     fingerprint (that route needs no patched build) was accepted as pending.
+  All three now call the shared policy: `worker.simulate.multi_ion_gpu_step()`
+  / `require_multi_ion_gpu_policy()` run at the top of `calculate_single_flux`
+  before any native model, `deposit` duplication or GPU context, for
+  `GPU_DISK`/`GPU_TRIANGLE`, 2D/3D and every strategy including `None`;
+  `require_multi_ion_flux_fields()` checks the species fields of any
+  non-merge multi-ion GPU flux (`flux_strategy=None` included) and rejects the
+  known truncated field set; `Supervisor.start()` rejects every multi-ion GPU
+  step in `actual_steps` before `needs_native_patch` is consulted, new run or
+  replay, process or flux; `POST /api/runs/replay` applies the same check for
+  API parity.
+- The per-species merge route (`per-species-native-mesh-merge-v1`) has 4.6.2
+  evidence only, so it is gated on ≥ 4.7.0 as well; the policy text says so.
 - Single-ion and multi-ion **CPU_DISK** stay available on 4.7.0. On 4.6.2
   nothing changes: the patched runtime path, the operator-split strategy and
   the native strategy are untouched.
@@ -428,6 +450,18 @@ the patched build. The patch is ABI-bound to ViennaLS 5.8.5.
 - `tests/test_native_multiion_policy.py` — new policy class: 4.7.0 rejects,
   4.6.2 accepts (both branches exercised through `backend.engine.engine_version`).
   The historical split-route audit pins its recorded 4.6.2 runtime.
+  `MultiIonGpuFluxPolicyTests` covers the single-pass path: direct
+  `calculate_single_flux` rejection for `GPU_DISK`/`GPU_TRIANGLE` × 2D/3D ×
+  `{None, per-species, native}` (called with `domain=None`, which proves the
+  gate runs before any native work), the non-gated matrix
+  (`CPU_DISK`/`CPU_TRIANGLE`/single-ion/non-multiParticle), truncated native
+  flux rejection for `None` and native strategies, and a real 2D `CPU_DISK`
+  two-ion flux that still emits `ion00`/`ion11`.
+- `tests/test_api_integration.py` —
+  `test_multi_ion_gpu_flux_replay_is_rejected_before_a_worker_starts` drives
+  `Supervisor.start("flux", ...)` directly with a `per-species-native-mesh-merge-v1`
+  replay and no fingerprint, asserts the policy text, that validation refuses
+  the same project with the same text, and that no run directory is created.
 - `tests/test_engine_batch1_specialized.py` — 2D Faraday native/replay cases
   are `skipUnless(FARADAY_2D_ETCHES)`; a new
   `test_2d_policy_matches_the_installed_runtime` asserts the rejection and keeps

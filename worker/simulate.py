@@ -3119,9 +3119,60 @@ def apply_geometry_operation(ps: Any, domain: Any, project: dict[str, Any], step
     raise RuntimeError(f"unsupported geometry operation {model!r}")
 
 
+def multi_ion_gpu_step(step: dict[str, Any], engine: str | None) -> bool:
+    """True when a step asks a GPU flux engine to convert more than one ion."""
+    if step.get("model") != "multiParticle" or not str(engine or "").startswith("GPU_"):
+        return False
+    return sum(row.get("kind") == "ion" for row in step.get("species", [])) > 1
+
+
+def require_multi_ion_gpu_policy(step: dict[str, Any], engine: str | None) -> None:
+    """Shared >= 4.7.0 multi-ion GPU policy for the single-pass flux path.
+
+    Applied before any native model or GPU flux call and independently of the
+    recorded flux strategy: on 4.7.0 every GPU flux engine converts one ion per
+    native call, so a multi-ion flux is either silently truncated (stock native
+    call) or unverified (per-species merge, which has 4.6.2 evidence only).
+    ``backend.validation`` rejects API requests and ``backend.supervisor``
+    rejects queued runs with the same helper, but a direct worker caller reaches
+    this function without either, so the gate lives here as well.
+    """
+    if not multi_ion_gpu_step(step, engine):
+        return
+    policy = multi_ion_gpu_error()
+    if policy is not None:
+        raise RuntimeError(policy)
+
+
+def require_multi_ion_flux_fields(report: dict[str, Any], step: dict[str, Any],
+                                  flux_strategy: str | None) -> None:
+    """Reject a native GPU flux mesh that dropped species fields.
+
+    Applies to the single native ``calculateFlux()`` call, including the
+    ``flux_strategy is None`` case: an unstrategised multi-ion GPU flux is not
+    "no strategy needed", it is the exact configuration where the installed
+    binding returns one ``<label><index>`` field and silently ignores the rest.
+    The per-species merge route builds its own fields and is checked by the
+    merge, not here.
+    """
+    if flux_strategy == GPU_MULTIPARTICLE_FLUX_STRATEGY:
+        return
+    expected_fields = {f"{row['label']}{index}" for index, row in enumerate(step["species"])}
+    present_fields = set(report["pointData"]["scalars"]) | set(report["cellData"]["scalars"])
+    if missing := expected_fields - present_fields:
+        raise RuntimeError(
+            f"native GPU MultiParticle flux is missing species fields: {sorted(missing)} "
+            f"(present: {sorted(present_fields)}); the installed binding returned a truncated "
+            f"multi-ion flux, so the run is rejected instead of reporting a partial result")
+
+
 def calculate_single_flux(ps: Any, domain: Any, project: dict[str, Any], step: dict[str, Any],
                           engine: str, seed: int, run_dir: Path,
                           flux_strategy: str | None = None) -> dict[str, Any]:
+    ion_count = (sum(row.get("kind") == "ion" for row in step.get("species", []))
+                 if step.get("model") == "multiParticle" else 0)
+    multi_ion_gpu = ion_count > 1 and engine in {"GPU_DISK", "GPU_TRIANGLE"}
+    require_multi_ion_gpu_policy(step, engine)
     if step["operation"] == "deposit":
         domain.duplicateTopLevelSet(material_handle(ps, step["depositMaterial"]))
     split_flux = None
@@ -3136,7 +3187,6 @@ def calculate_single_flux(ps: Any, domain: Any, project: dict[str, Any], step: d
             flux_engine=engine)
         rate = None
     elif step["model"] == "multiParticle":
-        ion_count = sum(row.get("kind") == "ion" for row in step.get("species", []))
         if engine == "GPU_DISK" and ion_count > 1 and flux_strategy == GPU_MULTIPARTICLE_FLUX_STRATEGY:
             split_flux = calculate_multi_particle_flux_by_species(ps, domain, project, step, engine, seed, run_dir)
             multi_actual = multi_particle_step_summary(step)
@@ -3177,11 +3227,11 @@ def calculate_single_flux(ps: Any, domain: Any, project: dict[str, Any], step: d
         elapsed = sum(float(row["elapsedSeconds"]) for row in split_flux["species"])
     if not report["points"]:
         raise RuntimeError("ViennaPS Process.calculateFlux returned an empty mesh")
-    if flux_strategy == GPU_MULTIPARTICLE_NATIVE_FLUX_STRATEGY:
-        expected_fields = {f"{row['label']}{index}" for index, row in enumerate(step["species"])}
-        present_fields = set(report["pointData"]["scalars"]) | set(report["cellData"]["scalars"])
-        if missing := expected_fields - present_fields:
-            raise RuntimeError(f"native GPU MultiParticle flux is missing species fields: {sorted(missing)}")
+    if flux_strategy == GPU_MULTIPARTICLE_NATIVE_FLUX_STRATEGY or (multi_ion_gpu and split_flux is None):
+        # A multi-ion GPU flux that did not take the per-species merge route is
+        # one native call, whatever strategy it recorded (including None), so
+        # the species fields must all be present.
+        require_multi_ion_flux_fields(report, step, flux_strategy)
     for association in ("pointData", "cellData"):
         for kind in ("scalars", "vectors"):
             for label, values in report[association][kind].items():

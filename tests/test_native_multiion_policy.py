@@ -49,6 +49,116 @@ class MultiIonGpuRuntimePolicyTests(unittest.TestCase):
         self.assertEqual(select_engine(normalized, normalized["steps"][0]), "GPU_DISK")
 
 
+class MultiIonGpuFluxPolicyTests(unittest.TestCase):
+    """The single-pass flux path must apply the same policy as the process path.
+
+    A direct worker caller reaches ``calculate_single_flux`` without passing
+    ``backend.validation`` or ``backend.supervisor``, which is how a 4.7.0
+    ``GPU_DISK`` two-ion ``flux_strategy=None`` request used to reach
+    ``Process.calculateFlux()`` and come back truncated.
+    """
+
+    FLUX = "per-species-native-mesh-merge-v1"
+    NATIVE_FLUX = "native-multi-ion-flux-v1"
+
+    def flux_project(self, dimension: int, ions: int = 2) -> dict:
+        from tests.test_stage7 import multi_project
+        project = multi_project(dimension, "etch")
+        step = project["steps"][0]
+        template = step["species"][0]
+        step["species"] = []
+        for index in range(ions):
+            species = json.loads(json.dumps(template))
+            species["label"] = f"ion{index}"
+            step["species"].append(species)
+        labels = [row["label"] for row in step["species"]]
+        step["rateCoefficients"] = {"defaultBySpecies": {name: 0.025 for name in labels},
+                                    "byMaterial": {"SiO2": {name: 0.04 for name in labels}}}
+        project["solver"]["enginePreference"] = "gpu"
+        return project
+
+    def test_direct_gpu_flux_is_rejected_for_two_ions_in_2d_and_3d(self):
+        from backend.engine import multi_ion_gpu_error
+        from worker.simulate import calculate_single_flux
+
+        policy = multi_ion_gpu_error()
+        self.assertIsNotNone(policy)
+        for dimension in (2, 3):
+            project = self.flux_project(dimension)
+            step = project["steps"][0]
+            for engine in ("GPU_DISK", "GPU_TRIANGLE"):
+                for strategy in (None, self.FLUX, self.NATIVE_FLUX):
+                    with self.subTest(dimension=dimension, engine=engine, strategy=strategy):
+                        # domain=None proves the gate fires before any native
+                        # model construction, flux calculation or GPU context.
+                        with self.assertRaises(RuntimeError) as context:
+                            calculate_single_flux(None, None, project, step, engine, 271828,
+                                                  Path("/nonexistent"), flux_strategy=strategy)
+                        self.assertEqual(str(context.exception), policy)
+
+    def test_cpu_multi_ion_and_single_ion_gpu_are_not_gated(self):
+        from worker.simulate import (multi_ion_gpu_error, multi_ion_gpu_step,
+                                     require_multi_ion_gpu_policy)
+
+        self.assertIsNone(multi_ion_gpu_error("4.6.2"))
+        project = self.flux_project(2)
+        two_ions = project["steps"][0]
+        single_ion = {**two_ions, "species": two_ions["species"][:1]}
+        for engine, step, expected in (("CPU_DISK", two_ions, False),
+                                       ("CPU_TRIANGLE", two_ions, False),
+                                       ("GPU_DISK", single_ion, False),
+                                       ("GPU_TRIANGLE", single_ion, False),
+                                       ("GPU_DISK", {"model": "singleParticle"}, False),
+                                       ("GPU_DISK", two_ions, True),
+                                       ("GPU_TRIANGLE", two_ions, True)):
+            with self.subTest(engine=engine, model=step.get("model")):
+                self.assertIs(multi_ion_gpu_step(step, engine), expected)
+                if not expected:
+                    self.assertIsNone(require_multi_ion_gpu_policy(step, engine))
+
+    def test_truncated_native_flux_is_rejected_even_without_a_strategy(self):
+        from worker.simulate import require_multi_ion_flux_fields
+
+        step = self.flux_project(2)["steps"][0]
+        truncated = {"pointData": {"scalars": {"ion00": [1.0]}},
+                     "cellData": {"scalars": {"MaterialIds": [10]}}}
+        complete = {"pointData": {"scalars": {"ion00": [1.0], "ion11": [1.0]}},
+                    "cellData": {"scalars": {"ion00": [1.0], "ion11": [1.0]}}}
+        for strategy in (None, self.NATIVE_FLUX):
+            with self.subTest(strategy=strategy):
+                with self.assertRaises(RuntimeError) as context:
+                    require_multi_ion_flux_fields(truncated, step, strategy)
+                self.assertIn("missing species fields", str(context.exception))
+                self.assertIn("truncated multi-ion flux", str(context.exception))
+                self.assertIn("ion11", str(context.exception))
+                require_multi_ion_flux_fields(complete, step, strategy)
+        # The per-species merge route owns its own field check.
+        require_multi_ion_flux_fields(truncated, step, self.FLUX)
+
+    def test_cpu_multi_ion_flux_still_emits_every_species_field(self):
+        import viennaps as ps
+        from backend.engine import engine_version
+        from worker.simulate import calculate_single_flux
+
+        if engine_version() != "4.7.0":
+            self.skipTest("the CPU multi-ion flux probe is pinned to the default runtime")
+        project = self.flux_project(2)
+        step = project["steps"][0]
+        project["solver"]["enginePreference"] = "cpu"
+        ps.setDimension(2)
+        ps.setNumThreads(1)
+        domain = ps.Domain(0.2, 2.4, boundary=ps.BoundaryType.REFLECTIVE_BOUNDARY)
+        ps.MakePlane(domain, height=0.0, material=ps.Material.Si, addToExisting=False).apply()
+        run_dir = Path(tempfile.mkdtemp(prefix="multi-ion-flux-", dir=str(ROOT / "var")))
+        self.addCleanup(__import__("shutil").rmtree, run_dir, ignore_errors=True)
+        result = calculate_single_flux(ps, domain_domain := domain, project, step, "CPU_DISK",
+                                       271828, run_dir, flux_strategy=None)
+        self.assertEqual(result["actualEngine"], "CPU_DISK")
+        self.assertIn("ion00", result["fieldNames"])
+        self.assertIn("ion11", result["fieldNames"])
+        self.assertTrue(domain_domain.getSurfaceMesh().getNodes())
+
+
 class NativeMultiIonPolicyTests(unittest.TestCase):
     def test_historical_split_route_profiles_are_resolved_and_not_gpu_admission_gates(self):
         matrix = json.loads((ROOT / "docs/stage9-evidence/gpu-capability-matrix.json").read_text())

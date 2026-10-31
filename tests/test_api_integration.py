@@ -618,6 +618,63 @@ class ApiIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manifest["childRecord"]["terminationReason"], "supervisor_cancelled")
         self.assertEqual(manifest["childRecord"]["remainingOwnedGroupMembers"], [])
 
+    async def test_multi_ion_gpu_flux_replay_is_rejected_before_a_worker_starts(self) -> None:
+        """A direct supervisor replay must not queue a run the worker must refuse.
+
+        ``per-species-native-mesh-merge-v1`` needs no patched-runtime
+        fingerprint, so keying the policy off ``needs_native_patch`` used to
+        leave this flux replay pending on ViennaPS 4.7.0 even though the GPU
+        binding can only emit one species field per native flux call.
+        """
+        from importlib.metadata import version
+        from backend.engine import engine_version, multi_ion_gpu_error
+        from backend.models import ProjectV7
+        from backend.supervisor import ReplayMismatch
+        from tests.test_stage7 import multi_project
+
+        policy = multi_ion_gpu_error()
+        if policy is None:
+            self.skipTest(f"ViennaPS {engine_version()} keeps multi-ion GPU support")
+
+        project = multi_project(2, "etch")
+        step = project["steps"][0]
+        second = json.loads(json.dumps(step["species"][0]))
+        second["label"] = "ion_second"
+        step["species"].append(second)
+        step["rateCoefficients"]["defaultBySpecies"]["ion_second"] = 0.02
+        project["solver"]["enginePreference"] = "gpu"
+        project["solver"]["gpuEngine"] = "GPU_DISK"
+        normalized = ProjectV7.model_validate(project).model_dump(mode="json", exclude_none=True)
+        self.assertEqual(sum(row["kind"] == "ion" for row in normalized["steps"][0]["species"]), 2)
+
+        # The API validates the same project before queueing, so all three
+        # layers must refuse with the same policy text.
+        from backend.validation import ProjectInputError, validate_project
+        with self.assertRaises(ProjectInputError) as validation:
+            validate_project(normalized, kind="simulate")
+        self.assertIn(policy, " ".join(issue.message for issue in validation.exception.issues))
+
+        replay = {
+            "analysisMode": "flux",
+            "analysisStepId": step["id"],
+            "seed": 271828,
+            "viennapsVersion": version("viennaps"),
+            "viennalsVersion": version("viennals"),
+            "stepsById": {step["id"]: {
+                "stepId": step["id"], "engine": "GPU_DISK", "seed": 271828,
+                "fluxStrategy": "per-species-native-mesh-merge-v1"}},
+        }
+        manager = Supervisor(os.dup(app.state.supervisor.lock_fd))
+        try:
+            before = set(storage.RUNS.iterdir()) if storage.RUNS.is_dir() else set()
+            with self.assertRaises(ReplayMismatch) as context:
+                manager.start("flux", normalized, replay=replay)
+            self.assertEqual(str(context.exception), policy)
+            after = set(storage.RUNS.iterdir()) if storage.RUNS.is_dir() else set()
+            self.assertEqual(before, after, "a refused replay must not create a run directory")
+        finally:
+            manager.close()
+
     async def test_random_cpu_particle_replay_matches_mesh(self) -> None:
         project = default_project()
         project["name"] = "CPU_DISK 重放验收"

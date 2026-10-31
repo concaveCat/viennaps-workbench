@@ -113,7 +113,9 @@ def multi_ion_gpu_error(engine: str | None = None) -> str | None:
     return (f"ViennaPS {version_value} GPU flux engines silently drop every ion "
             f"after the first: the rate callback receives a one-element flux "
             f"vector and a rate that depends on the later species leaves the "
-            f"surface unchanged. Run this multi-ion GPU step on the ViennaPS "
+            f"surface unchanged, and a native flux call emits only the first "
+            f"species field; the per-species flux-merge route is verified on "
+            f"4.6.2 only. Run this multi-ion GPU step on the ViennaPS "
             f"4.6.2 patched runtime, or use CPU_DISK on {version_value}.")
 
 

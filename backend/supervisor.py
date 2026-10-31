@@ -366,6 +366,21 @@ class Supervisor:
                 item["stepId"] in gpu_multi_steps and item["engine"] == "GPU_DISK"
                 and _requires_patched_multi_particle(gpu_multi_steps[item["stepId"]])
                 for item in actual_steps)
+            # Shared policy for every multi-ion GPU step, new run or replay,
+            # process or single-pass flux, and independently of the recorded
+            # strategy: a per-species flux replay needs no patched-runtime
+            # fingerprint, so keying the gate off ``needs_native_patch`` left it
+            # accepted as pending on 4.7.0 while the worker could only truncate
+            # or guess. API validation, the worker and this supervisor agree.
+            multi_ion_gpu_steps = [
+                item["stepId"] for item in actual_steps
+                if str(item["engine"]).startswith("GPU_")
+                and item["stepId"] in gpu_multi_steps
+                and _requires_patched_multi_particle(gpu_multi_steps[item["stepId"]])]
+            if multi_ion_gpu_steps:
+                policy = multi_ion_gpu_error()
+                if policy is not None:
+                    raise ReplayMismatch(policy)
             # Old replays without a fingerprint must retain their original
             # runtime and execution identity. New runs only inject the patched
             # build for the multi-particle shapes that actually need it.
@@ -375,12 +390,6 @@ class Supervisor:
                 raise ReplayMismatch("replay native engine identity does not match its GPU MultiParticle steps")
             native_engine_fingerprint = None
             if needs_native_patch:
-                # Stock 4.7.0 cannot honour a multi-ion GPU step, and the
-                # patched build is ABI-bound to 4.6.2. Fail with the policy
-                # instead of "no patched runtime is configured".
-                policy = multi_ion_gpu_error()
-                if policy is not None:
-                    raise ReplayMismatch(policy)
                 try:
                     _, native_engine_fingerprint = configured_runtime(requested_fingerprint)
                 except (OSError, RuntimeError, ValueError) as exc:
