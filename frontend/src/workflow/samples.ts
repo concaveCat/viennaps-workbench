@@ -1,4 +1,17 @@
 /* Bundled starter projects for the Project Setup gallery. */
+import exampleSamples from './exampleSamples.json';
+
+export type ExampleSample = {
+  id: string;
+  label: string;
+  meta: string;
+  source: string;
+  note: string;
+  sample: Record<string, unknown>;
+};
+
+/** Eight ViennaPS example starters plus a GDS-import card in the gallery. */
+export const SAMPLE_EXAMPLES = exampleSamples as ExampleSample[];
 
 export const SAMPLE_2D_PLANE: Record<string, unknown> = {
   "schemaVersion": 7,

@@ -651,8 +651,8 @@ body {
 .spx-summary-grid span { display: block; color: var(--spx-muted); font-size: 9px; }
 .spx-summary-grid strong { font-size: 12px; font-weight: 600; }
 .spx-inline-section { margin: 9px 10px 0; padding-top: 8px; border-top: 1px solid var(--spx-line-soft); }
-.spx-samples { display: flex; gap: 8px; }
-.spx-sample { width: 180px; min-height: 82px; display: flex; flex-direction: column; align-items: flex-start; gap: 3px; padding: 8px 10px; border: 1px solid var(--spx-line); background: #fff; color: var(--spx-ink); cursor: pointer; text-align: left; }
+.spx-samples { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }
+.spx-sample { min-height: 82px; display: flex; flex-direction: column; align-items: flex-start; gap: 3px; padding: 8px 10px; border: 1px solid var(--spx-line); background: #fff; color: var(--spx-ink); cursor: pointer; text-align: left; }
 .spx-sample:hover { border-color: var(--spx-blue); background: #f7fbff; }
 .spx-sample strong { font-size: 12px; }
 .spx-sample span { color: var(--spx-muted); font-size: 10px; }

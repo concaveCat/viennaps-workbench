@@ -1,7 +1,7 @@
 import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import type { PointerEvent as ReactPointerEvent } from 'react';
 import './workflow.css';
-import { SAMPLE_2D_PLANE, SAMPLE_2D_TRENCH, SAMPLE_3D_HOLE } from './samples';
+import { SAMPLE_EXAMPLES } from './samples';
 import { executionCompileBasis } from './fingerprint';
 import {
   coverageStepNames,
@@ -6242,15 +6242,24 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
           {!project && <div className="spx-sheet spx-examples" id="spx-examples">
             <div className="spx-sheet-title">示例工程</div>
             <div className="spx-samples">
-              {[
-                { label: '2D 平面刻蚀', sample: SAMPLE_2D_PLANE, meta: '2D · plane · 1 step' },
-                { label: '2D Trench', sample: SAMPLE_2D_TRENCH, meta: '2D · trench · 1 step' },
-                { label: '3D 孔刻蚀', sample: SAMPLE_3D_HOLE, meta: '3D · hole · 1 step' },
-              ].map(item => <button type="button" className="spx-sample" key={item.label} onClick={() => loadSample(item.sample, item.label)}>
+              {SAMPLE_EXAMPLES.map(item => <button type="button" className="spx-sample" key={item.id}
+                data-example-id={item.id} title={`${item.source}\n${item.note}`}
+                onClick={() => loadSample(item.sample, item.label)}>
                 <strong>{item.label}</strong>
                 <span>{item.meta}</span>
                 <em>载入示例</em>
               </button>)}
+              <button type="button" className="spx-sample" data-example-id="gds-mask-import"
+                title={'examples/GDSReader\n需要上传 GDS；2D 图层→材料，3D 还需 baseHeight/height。'}
+                onClick={() => {
+                  setSetupMode('new');
+                  setDraft(previous => ({ ...previous, source: 'layout' }));
+                  gdsInput.current?.click();
+                }}>
+                <strong>GDS Mask Import</strong>
+                <span>2D / 3D · GDS 图层→材料</span>
+                <em>上传 GDS</em>
+              </button>
             </div>
           </div>}
 

@@ -267,7 +267,9 @@ try {
   assert.equal(await page.locator('.spx-save-button').count(), 0, 'no save pill without a project');
   assert.equal(await page.locator('.spx-sheet-title').filter({ hasText: '最近工程' }).count(), 1);
   assert.equal(await page.locator('.spx-sheet-title').filter({ hasText: '示例工程' }).count(), 1);
-  assert.equal(await page.locator('#spx-examples .spx-sample').count(), 3, 'examples live in their own block');
+  assert.equal(await page.locator('#spx-examples .spx-sample').count(), 9, 'all nine ViennaPS examples live in their own block');
+  assert.equal(await page.locator('#spx-examples .spx-sample[data-example-id="trench-deposition"]').count(), 1);
+  assert.equal(await page.locator('#spx-examples .spx-sample[data-example-id="gds-mask-import"]').count(), 1);
   await page.locator('.spx-command').filter({ hasText: '新建工程' }).click();
   const newForm = await page.locator('.spx-sheet').filter({ hasText: '新建工程' }).last().innerText();
   assert.doesNotMatch(newForm, /Domain & Grid|Solver|Engine|Rays per point|CPU threads|Plane height|X extent|gridDelta|Timeout \(s\)|\bSeed\b/, newForm);
