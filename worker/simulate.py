@@ -3407,6 +3407,29 @@ def _field_material_map(domain: Any) -> list[int]:
     return [int(value) for value in values]
 
 
+def _stored_band_half_cells(domain: Any) -> int:
+    """Return the exact stored level-set band half-width in grid cells.
+
+    ``viennals.Expand(width)`` only grows a band; a level set that already
+    carries a wider band (for example one produced by an earlier native
+    operation or a continuation state) keeps it. The native cell-set bottom is
+    therefore the surface minus the *stored* half-width, not the half-width
+    requested by the field step. ``getLevelSetWidth()`` is the only exposed
+    width API; take the widest level set because the dense grid spans all of
+    them.
+    """
+    widest = 2
+    for level_set in domain.getLevelSets():
+        try:
+            widest = max(widest, int(level_set.getLevelSetWidth()))
+        except (AttributeError, TypeError, ValueError):
+            continue
+    # Measured on 4.7.0: Expand(width) yields a stored band of ``width`` and a
+    # native bottom of ``floor(width / 2)`` cells below the surface (width 19
+    # and 21 both give 9 and 10 cells, 201/202 give 100/101).
+    return max(1, widest // 2)
+
+
 def _field_surface_bounds(domain: Any, *, is3d: bool) -> tuple[float, float]:
     """Return the current ``(highest, lowest)`` surface coordinate."""
     mesh = domain.getSurfaceMesh(addInterfaces=True, sharpCorners=False,
@@ -3481,8 +3504,10 @@ def _generate_field_cell_set(ps: Any, source_domain: Any, project: dict[str, Any
             "band, the native generator allocates the whole band between them). Set "
             "cellSet.height above the surface or lower the geometry")
     planned_top = float(height)
+    stored_half = _stored_band_half_cells(source_domain)
+    band_half = max(int(band_cells) // 2, stored_half)
     planned_bottom = (math.floor(surface_bottom / delta + 1e-9) * delta
-                      - (int(band_cells) // 2) * delta)
+                      - band_half * delta)
     bound = _field_grid_cell_bound(project, top=planned_top, bottom=planned_bottom,
                                    delta=delta)
     if bound > MAX_CELL_SET_CELLS:
@@ -3520,6 +3545,8 @@ def _generate_field_cell_set(ps: Any, source_domain: Any, project: dict[str, Any
         "surfaceBottom": surface_bottom,
         "heightAboveSurface": height,
         "substrateBandExpandCells": int(band_cells),
+        "storedBandHalfCells": int(stored_half),
+        "bandHalfCells": int(band_half),
         "sourceLevelSetPoints": original_points,
         "grid": grid,
     }
@@ -3547,6 +3574,8 @@ def _field_setup_record(step: dict[str, Any], state: dict[str, Any],
         "heightAboveSurface": float(info["heightAboveSurface"]),
         "substrateDepth": float(state["substrateDepth"]),
         "substrateBandExpandCells": int(info["substrateBandExpandCells"]),
+        "storedBandHalfCells": int(info.get("storedBandHalfCells") or 0),
+        "bandHalfCells": int(info.get("bandHalfCells") or 0),
         "substrateConstruction": "viennals.Expand on a deep Domain copy; the simulated surface is unchanged",
         "sourceLevelSetPoints": int(info["sourceLevelSetPoints"]),
         "coverMaterial": cover_name,
@@ -3606,13 +3635,14 @@ def remap_field_cell_set(ps: Any, domain: Any, project: dict[str, Any],
     bottom_node = math.floor(surface_bottom / delta + 1e-9) * delta
     requested_height = float(captured.top)
     required_top = max(float(captured.top), top_node)
-    lowest_reachable = bottom_node - delta
+    stored_half = _stored_band_half_cells(domain)
+    lowest_reachable = bottom_node - max(1, stored_half) * delta
     if float(captured.bottom) <= lowest_reachable + 1e-9:
         required_bottom = float(captured.bottom)
         band_cells = max(2, 2 * int(round((bottom_node - required_bottom) / delta)))
     else:
         required_bottom = lowest_reachable
-        band_cells = 2
+        band_cells = max(2, 2 * stored_half)
     height = required_top
     field_domain, cell_set, grid, info = _generate_field_cell_set(
         ps, domain, project, height=height, band_cells=band_cells,

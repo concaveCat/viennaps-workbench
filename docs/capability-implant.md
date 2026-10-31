@@ -319,25 +319,39 @@ captured grid:
 top_node       = ceil(highest_surface / delta) * delta
 bottom_node    = floor(lowest_surface / delta) * delta
 required_top   = max(captured.top, top_node)
-required_bottom= captured.bottom            if captured.bottom <= bottom_node - delta
-                 bottom_node - delta        otherwise        (native minimum band)
-band_cells     = 2 * round((bottom_node - required_bottom) / delta), min 2
-rows           = ceil((required_top - required_bottom) / delta) + 4
+stored_half    = ceil(widest_stored_level_set_width / 2)
+band_half      = max(requested_band_cells // 2, stored_half)
+planned_bottom = bottom_node - band_half * delta
+rows           = ceil((required_top - planned_bottom) / delta) + 4
 lateral        = (ceil(xExtent/delta) + 2) * (ceil(yExtent/delta) + 2)   # +2 is 2D
 bound          = lateral * max(rows, 2)
 ```
 
+`viennals.Expand(width)` only grows a band: a level set that already carries a
+wider stored band (an earlier native operation or a Domain continuation) keeps
+it. The bound therefore uses `getLevelSetWidth()` across **all** level sets;
+with a 202-point stored band, a requested 18-point Expand still allocates the
+2220-cell `[-5.05, 0.5]` grid and the bound is 2552 instead of 506.
+
 `bound` is checked against `MAX_CELL_SET_CELLS` (2,000,000) before
 `generateCellSet`; the bound carries two lateral cells of slack per axis and
 four spare rows, which covers the measured native extent for plane, trench,
-fin, stack and Boolean-grown surfaces. On the first field step the native
-top is the absolute `cellSet.height`, so a `height` below the highest surface
-point is refused before allocation instead of letting the native generator
-walk the whole surface band between the requested position and the surface.
-For parametric geometries (plane/trench/hole/fin/stack) the API performs the
-same check statically from the geometry, so the 101 um plane/0.5 um height
-case is a 422 before a worker starts; GDS geometry and Domain continuations
-have no project-level vertical extent and are left to the worker's live check.
+fin, stack, Boolean-grown surfaces and pre-expanded bands. If a stored band
+forces the bottom below the captured grid, the remap accepts the downward
+growth as an integer-offset overlap (new cells `0`) instead of failing.
+
+On the first field step the native top is the absolute `cellSet.height`, so a
+`height` below the highest surface point is refused before allocation instead
+of letting the native generator walk the whole surface band between the
+requested position and the surface. For parametric geometries
+(plane/trench/hole/fin/stack) the API performs the same check statically from
+the geometry **when the field step is the first enabled operation**, so the
+101 um plane/0.5 um height case is a 422 before a worker starts. An earlier
+enabled step (planarize, boolean, process, ...) can move the surface
+arbitrarily, so a static geometry check would reject valid sequences such as
+`plane(2) → planarize(0) → implant`; those rely on the worker's live
+pre-allocation check. GDS geometry and Domain continuations likewise have no
+project-level vertical extent.
 
 ## 4. Rejection rules (HTTP 422, no worker, no native call)
 
@@ -357,7 +371,7 @@ have no project-level vertical extent and are left to the worker's live check.
 | `periodic` differs from the domain | the cell set can only mirror the domain boundary |
 | analysis before any implant/anneal | `analysis requires an earlier implant or anneal step` |
 | consumed label not produced earlier | `cell-set label(s) not produced by an earlier step` |
-| `cellSet.height` below the initial surface top (parametric geometry) | `cellSet.height ... is below the highest initial surface point ... the native generateCellSet position is an absolute coordinate` |
+| `cellSet.height` below the initial surface top (parametric geometry, first enabled step) | `cellSet.height ... is below the highest initial surface point ... the native generateCellSet position is an absolute coordinate` |
 | surface-aware grid above 2,000,000 cells (API) | `the field grid would need about N cells ... above the 2,000,000-cell construction limit` |
 | regenerated grid above 2,000,000 cells (worker) | `field cell grid needs at least N cells ... above the 2,000,000-cell construction limit` (before allocation) |
 | a regenerated grid off the captured lattice | `conservative grid remap not implemented` (worker, no native process call) |
@@ -437,7 +451,7 @@ have no project-level vertical extent and are left to the worker's live check.
 * `_field_integral` unit regression: `C=2 um^-3`, `delta=2 um` gives
   `8 um^-1` in 2D and the exported 2D `integralUnit` is `1/um` (3D omits it).
 
-`tests/test_field_remap.py` (25 tests):
+`tests/test_field_remap.py` (30 tests):
 
 * pure-Python mapping: `CellGrid` round-trip from native node points, ordered
   same-grid copy (`O(N)`, exact digests), integer-shift overlap, grid growth
@@ -450,14 +464,18 @@ have no project-level vertical extent and are left to the worker's live check.
   computed), `implant → deposit → anneal` (grid unchanged, `mass.lost = 0`),
   a deep etch that grows the grid downwards conservatively, a Boolean union
   that lifts the surface from 0 to 2 um (380 → 980 cells inside the
-  pre-allocation bound), replay reproducing the remap record and every field
-  digest bit-identically;
+  pre-allocation bound), `plane(2) → planarize(0) → implant → anneal →
+  analysis` in 2D (380 cells) and 3D (18,400 cells), replay reproducing the
+  remap record and every field digest bit-identically;
 * limits: a Boolean growth whose regenerated grid would need ~2.4 M cells
   fails with the construction-limit message *before* allocation (`run.log`
-  never contains `DenseCellSet generation produced`); the 3D 101 um
-  plane/0.5 um height request is a 422, a hand-edited worker input is refused
-  by the same preflight check, and GDS/continuation geometry is left to the
-  worker's live check;
+  never contains `DenseCellSet generation produced`); a pre-expanded 202-point
+  stored band is bounded (2220 cells, bound 2552) and refused before any
+  native `Domain` is created when the cap is 1000, and an odd 19-point band
+  uses the measured `floor(width/2)` half-width; the 3D 101 um
+  plane/0.5 um height request (field step first) is a 422, a hand-edited
+  worker input is refused by the same preflight check, and GDS/continuation
+  geometry is left to the worker's live check;
 * schema: a surface step between field steps is accepted, a later step with a
   different `height` is still rejected, and analysis before an implant is still
   rejected.

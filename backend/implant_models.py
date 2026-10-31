@@ -400,8 +400,11 @@ def field_geometry_issues(steps: Iterable[Any], *, geometry: Any, dimension: int
       the domain's lateral grid is checked against ``MAX_CELL_SET_CELLS`` before
       the worker allocates the dense grid.
 
-    GDS geometry and Domain continuations have no project-level vertical extent
-    and are left to the worker's live check.
+    The checks only apply when the field step is the first enabled operation:
+    an earlier enabled step (planarize, boolean, process, ...) can move the
+    surface arbitrarily, so the original geometry no longer bounds it and the
+    worker's live pre-allocation check decides. GDS geometry and Domain
+    continuations likewise have no project-level vertical extent.
     """
     from .runtime_limits import MAX_CELL_SET_CELLS
 
@@ -417,6 +420,13 @@ def field_geometry_issues(steps: Iterable[Any], *, geometry: Any, dimension: int
     if first is None:
         return []
     index, step = first
+    if any(step_value(earlier, "enabled") for earlier in steps[:index]):
+        # A preceding enabled operation (planarize, boolean, a process step,
+        # ...) can move the surface arbitrarily before the grid is built, so the
+        # original geometry bounds no longer describe it. The worker checks the
+        # live surface before it allocates; a static check here would reject
+        # valid sequences such as plane(2) -> planarize(0) -> implant.
+        return []
     settings = step_cell_set(step) or {}
     if settings.get("height") is None:
         return []

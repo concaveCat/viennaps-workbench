@@ -28,6 +28,7 @@ from array import array
 from importlib.metadata import version
 from itertools import product
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -54,6 +55,13 @@ def boolean_step(**overrides) -> dict:
              "model": "boolean", "booleanOperation": "union",
              "position": [0.0, -0.1, 0.0], "width": 4.0, "height": 2.1,
              "applyToAll": True}
+    value.update(overrides)
+    return value
+
+
+def planarize_step(**overrides) -> dict:
+    value = {"id": "planarize_step_01", "name": "planarize", "enabled": True,
+             "model": "planarize", "cutoffHeight": 0.0}
     value.update(overrides)
     return value
 
@@ -482,6 +490,42 @@ class FieldRemapWorkflow(unittest.IsolatedAsyncioTestCase):
         self.assertFalse((artifacts / "analysis_step_01-cell-set-fields.json").exists())
         self.assertFalse((artifacts / "boolean_step_01-cell-set-fields.json").exists())
 
+    async def test_planarize_before_the_first_field_step_is_allowed_2d(self) -> None:
+        settings = field_settings()
+        value = project(2, steps=[planarize_step(),
+                                  implant_step(cellSet=dict(settings)),
+                                  anneal_step(cellSet=dict(settings)),
+                                  analysis_step(cellSet=dict(settings))])
+        value["geometry"] = {"kind": "plane", "height": 2.0,
+                             "substrateMaterial": "Si"}
+        value["domain"] = {"gridDelta": 0.05, "xExtent": 1.0,
+                           "xBoundary": "reflective"}
+        run_id, _manifest = await self.run_project(value)
+        payload = self.summary(run_id)
+        # plane(2) -> planarize(0) -> implant on a 0.5/0.4 grid, not on the
+        # original 2 um surface: 20 lateral * 19 rows.
+        self.assertEqual(payload["numberOfCells"], 380)
+        self.assertAlmostEqual(payload["cellSetSetup"]["grid"]["top"], 0.5)
+        self.assertAlmostEqual(payload["cellSetSetup"]["grid"]["bottom"], -0.45)
+        self.assertEqual(payload["cellSetSetup"]["remapCount"], 0)
+
+    async def test_planarize_before_the_first_field_step_is_allowed_3d(self) -> None:
+        settings = field_settings()
+        value = project(3, steps=[planarize_step(),
+                                  implant_step(cellSet=dict(settings)),
+                                  anneal_step(cellSet=dict(settings)),
+                                  analysis_step(cellSet=dict(settings))])
+        value["geometry"] = {"kind": "plane", "height": 2.0,
+                             "substrateMaterial": "Si"}
+        value["domain"] = {"gridDelta": 0.02, "xExtent": 0.4, "yExtent": 0.4,
+                           "boundaryXY": "reflective"}
+        run_id, _manifest = await self.run_project(value)
+        payload = self.summary(run_id)
+        self.assertEqual(payload["numberOfCells"], 18_400)
+        self.assertAlmostEqual(payload["cellSetSetup"]["grid"]["top"], 0.5)
+        self.assertAlmostEqual(payload["cellSetSetup"]["grid"]["bottom"], -0.42)
+
+
 
 class FieldRemapGeometryLimitTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
@@ -575,6 +619,77 @@ class FieldRemapDirectWorkerBounds(unittest.TestCase):
         self.assertIn("initial surface point", output)
         self.assertNotIn("DenseCellSet generation produced", output)
         self.assertFalse((run_dir / "artifacts").exists())
+
+
+class _CountingPs:
+    """Proxy that fails if the worker allocates a native Domain too early."""
+
+    def __init__(self, real) -> None:
+        self._real = real
+        self.domain_calls = 0
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def Domain(self, *args, **kwargs):
+        self.domain_calls += 1
+        raise AssertionError("native Domain created before the pre-allocation bound")
+
+
+class FieldRemapWideBandTests(unittest.TestCase):
+    """A stored level-set band wider than the requested Expand must be bounded."""
+
+    def source_domain(self, width: int = 202):
+        import viennaps as ps
+        import viennals as ls
+        ps.setDimension(2)
+        delta = 0.05
+        domain = ps.Domain(delta, 1.0, ps.BoundaryType.REFLECTIVE_BOUNDARY)
+        ps.MakePlane(domain, height=0.0, material=ps.Material.Si).apply()
+        for level_set in domain.getLevelSets():
+            ls.Expand(level_set, width).apply()
+        project = {"dimension": 2,
+                   "domain": {"gridDelta": delta, "xExtent": 1.0},
+                   "schemaVersion": 7}
+        return ps, domain, project
+
+    def test_pre_expanded_band_is_inside_the_pre_allocation_bound(self) -> None:
+        from worker.simulate import _generate_field_cell_set
+        ps, domain, project = self.source_domain()
+        _fd, cell_set, grid, info = _generate_field_cell_set(
+            ps, domain, project, height=0.5, band_cells=18,
+            cover=ps.Material.GAS, periodic=False)
+        # Expand(18) keeps the 202-point stored band: 20 lateral * 111 rows.
+        self.assertEqual(cell_set.getNumberOfCells(), 2220)
+        self.assertEqual(info["storedBandHalfCells"], 101)
+        self.assertEqual(info["bandHalfCells"], 101)
+        self.assertGreaterEqual(info["cellsUpperBound"], 2220)
+        self.assertAlmostEqual(grid.bottom, -5.05, places=9)
+        self.assertAlmostEqual(grid.top, 0.5, places=9)
+
+    def test_odd_stored_band_uses_the_measured_floor_half_width(self) -> None:
+        from worker.simulate import _generate_field_cell_set, _stored_band_half_cells
+        ps, domain, project = self.source_domain(width=19)
+        self.assertEqual(_stored_band_half_cells(domain), 9)
+        _fd, cell_set, grid, info = _generate_field_cell_set(
+            ps, domain, project, height=0.5, band_cells=2,
+            cover=ps.Material.GAS, periodic=False)
+        self.assertEqual(cell_set.getNumberOfCells(), 380)
+        self.assertEqual(info["storedBandHalfCells"], 9)
+        self.assertEqual(info["bandHalfCells"], 9)
+        self.assertAlmostEqual(grid.bottom, -0.45, places=9)
+
+    def test_pre_expanded_band_above_the_cap_is_refused_before_allocating(self) -> None:
+        from worker.simulate import _generate_field_cell_set
+        ps, domain, project = self.source_domain()
+        proxy = _CountingPs(ps)
+        with patch("worker.simulate.MAX_CELL_SET_CELLS", 1000):
+            with self.assertRaises(RuntimeError) as context:
+                _generate_field_cell_set(proxy, domain, project, height=0.5,
+                                         band_cells=18, cover=ps.Material.GAS,
+                                         periodic=False)
+        self.assertIn("construction limit", str(context.exception))
+        self.assertEqual(proxy.domain_calls, 0)
 
 
 class FieldRemapSchemaTests(unittest.TestCase):
