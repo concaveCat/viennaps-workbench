@@ -264,6 +264,241 @@
         "title": "AnalysisCompareRequest",
         "type": "object"
       },
+      "AnalysisStepV7": {
+        "additionalProperties": false,
+        "description": "Native ``NetDoping`` / ``SheetResistance`` analysis of the cell set.\n\nThis step never changes geometry. ``netDoping`` writes its output field into\nthe cell set; ``sheetResistance`` only reports the native scalar.",
+        "properties": {
+          "cellSet": {
+            "$ref": "#/components/schemas/StepCellSetV7"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "id": {
+            "maxLength": 64,
+            "minLength": 8,
+            "pattern": "^[A-Za-z0-9_-]+$",
+            "title": "Id",
+            "type": "string"
+          },
+          "model": {
+            "const": "analysis",
+            "title": "Model",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "netDoping": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NetDopingV7"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "scanDepth": {
+            "anyOf": [
+              {
+                "ge": 0,
+                "le": 10000,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scandepth"
+          },
+          "sheetResistance": {
+            "items": {
+              "$ref": "#/components/schemas/SheetResistanceEntryV7"
+            },
+            "maxItems": 8,
+            "title": "Sheetresistance",
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "enabled",
+          "model",
+          "cellSet"
+        ],
+        "title": "AnalysisStepV7",
+        "type": "object"
+      },
+      "AnnealStepV7": {
+        "additionalProperties": false,
+        "description": "Native ``viennaps.Anneal`` on the cell set produced by an implant.\n\nOnly the parameters proven to run on the installed 4.7.0 runtime are\nexposed. Defect coupling, TED/Fermi enhancement, trapping/segregation,\nclustering and source-field injection are intentionally absent: they are\nseparate calibrated models whose parameter provenance the workbench cannot\nvalidate.",
+        "properties": {
+          "activationOnly": {
+            "default": false,
+            "title": "Activationonly",
+            "type": "boolean"
+          },
+          "activeLabel": {
+            "maxLength": 48,
+            "minLength": 1,
+            "title": "Activelabel",
+            "type": "string"
+          },
+          "blockingMaterials": {
+            "items": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            "title": "Blockingmaterials",
+            "type": "array"
+          },
+          "cellSet": {
+            "$ref": "#/components/schemas/StepCellSetV7"
+          },
+          "diffusionMaterials": {
+            "items": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            "title": "Diffusionmaterials",
+            "type": "array"
+          },
+          "diffusivity": {
+            "discriminator": {
+              "mapping": {
+                "arrhenius": "#/components/schemas/ArrheniusDiffusivityV7",
+                "constant": "#/components/schemas/ConstantDiffusivityV7"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ArrheniusDiffusivityV7"
+              },
+              {
+                "$ref": "#/components/schemas/ConstantDiffusivityV7"
+              }
+            ],
+            "title": "Diffusivity"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "id": {
+            "maxLength": 64,
+            "minLength": 8,
+            "pattern": "^[A-Za-z0-9_-]+$",
+            "title": "Id",
+            "type": "string"
+          },
+          "implicitSolver": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ImplicitSolverOptionsV7"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "mode": {
+            "default": "GaussSeidel",
+            "enum": [
+              "GaussSeidel",
+              "Explicit"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "model": {
+            "const": "anneal",
+            "title": "Model",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "schedule": {
+            "discriminator": {
+              "mapping": {
+                "isothermal": "#/components/schemas/IsothermalScheduleV7",
+                "schedule": "#/components/schemas/StepScheduleV7"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/IsothermalScheduleV7"
+              },
+              {
+                "$ref": "#/components/schemas/StepScheduleV7"
+              }
+            ],
+            "title": "Schedule"
+          },
+          "solidActivation": {
+            "$ref": "#/components/schemas/SolidActivationV7"
+          },
+          "speciesLabel": {
+            "maxLength": 48,
+            "minLength": 1,
+            "title": "Specieslabel",
+            "type": "string"
+          },
+          "stabilityFactor": {
+            "anyOf": [
+              {
+                "ge": 0.01,
+                "le": 1,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stabilityfactor"
+          },
+          "timeStep": {
+            "anyOf": [
+              {
+                "gt": 0,
+                "le": 1000000,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timestep"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "enabled",
+          "model",
+          "schedule",
+          "diffusivity",
+          "speciesLabel",
+          "activeLabel",
+          "solidActivation",
+          "cellSet"
+        ],
+        "title": "AnnealStepV7",
+        "type": "object"
+      },
       "AppendAttemptRequest": {
         "additionalProperties": false,
         "properties": {
@@ -290,6 +525,35 @@
           "segments"
         ],
         "title": "AppendAttemptRequest",
+        "type": "object"
+      },
+      "ArrheniusDiffusivityV7": {
+        "additionalProperties": false,
+        "properties": {
+          "D0": {
+            "gt": 0,
+            "le": 1e+40,
+            "title": "D0",
+            "type": "number"
+          },
+          "Ea_eV": {
+            "ge": 0,
+            "le": 100,
+            "title": "Ea Ev",
+            "type": "number"
+          },
+          "kind": {
+            "const": "arrhenius",
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "D0",
+          "Ea_eV"
+        ],
+        "title": "ArrheniusDiffusivityV7",
         "type": "object"
       },
       "ArtifactRefItemV1": {
@@ -839,6 +1103,66 @@
           "parallelScale"
         ],
         "title": "Camera3D",
+        "type": "object"
+      },
+      "CellSetOutputV7": {
+        "additionalProperties": false,
+        "description": "Native ``viennaps.DenseCellSet`` output for every saved step.\n\nNative ``Domain.generateCellSet(position, coverMaterial, isAboveSurface)``\ntakes an absolute *coordinate* and a direction flag, not a periodic flag.\nThis request exposes the safe generic form only: a cell set built above the\nsurface (``isAboveSurface=true``), i.e. the level-set band plus a cover\nregion whose top is ``height`` above the highest surface point. The\n``periodic`` flag mirrors the domain's lateral boundary and is applied to\nthe cell set through ``DenseCellSet.setPeriodicBoundary``.",
+        "properties": {
+          "coverMaterial": {
+            "default": "GAS",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Covermaterial",
+            "type": "string"
+          },
+          "enabled": {
+            "default": false,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "format": {
+            "default": "both",
+            "enum": [
+              "vtu",
+              "json",
+              "both"
+            ],
+            "title": "Format",
+            "type": "string"
+          },
+          "height": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Height"
+          },
+          "periodic": {
+            "default": false,
+            "title": "Periodic",
+            "type": "boolean"
+          },
+          "scalarLabels": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scalarlabels"
+          }
+        },
+        "title": "CellSetOutputV7",
         "type": "object"
       },
       "CheckpointRefV1": {
@@ -1901,6 +2225,28 @@
         "title": "CompiledWorkflowV1",
         "type": "object"
       },
+      "ConstantDiffusivityV7": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "constant",
+            "title": "Kind",
+            "type": "string"
+          },
+          "value": {
+            "ge": 0,
+            "le": 1e+40,
+            "title": "Value",
+            "type": "number"
+          }
+        },
+        "required": [
+          "kind",
+          "value"
+        ],
+        "title": "ConstantDiffusivityV7",
+        "type": "object"
+      },
       "CreateExperimentRequest": {
         "additionalProperties": false,
         "properties": {
@@ -1969,6 +2315,190 @@
         "title": "CreateExperimentRequest",
         "type": "object"
       },
+      "CsvProcessStepV7": {
+        "additionalProperties": false,
+        "description": "Native ``ps.CSVFileProcess`` with an uploaded ``RateGrid`` table.\n\n``operation`` is ``native`` because the installed model has no etch/deposit\nflag: the sign of every CSV rate chooses the direction of material motion\nfor the selected direction vector (negative rates etch, positive rates\ndeposit for a downward direction). ``interpolationMode`` is mandatory.\n``CUSTOM`` and ``setCustomInterpolator`` are deliberately not expressible.",
+        "properties": {
+          "assetId": {
+            "pattern": "^[a-f0-9]{64}$",
+            "title": "Assetid",
+            "type": "string"
+          },
+          "calculateVisibility": {
+            "default": true,
+            "title": "Calculatevisibility",
+            "type": "boolean"
+          },
+          "direction": {
+            "items": {
+              "ge": -1,
+              "le": 1,
+              "type": "number"
+            },
+            "maxItems": 3,
+            "minItems": 3,
+            "title": "Direction",
+            "type": "array"
+          },
+          "directionalComponent": {
+            "default": 1.0,
+            "ge": 0,
+            "le": 100,
+            "title": "Directionalcomponent",
+            "type": "number"
+          },
+          "duration": {
+            "ge": 0.01,
+            "le": 600,
+            "title": "Duration",
+            "type": "number"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "fileName": {
+            "maxLength": 255,
+            "minLength": 1,
+            "pattern": "^[^/\\\\\\x00-\\x1f\\x7f]+$",
+            "title": "Filename",
+            "type": "string"
+          },
+          "id": {
+            "maxLength": 64,
+            "minLength": 8,
+            "pattern": "^[A-Za-z0-9_-]+$",
+            "title": "Id",
+            "type": "string"
+          },
+          "idwNeighbors": {
+            "anyOf": [
+              {
+                "ge": 1,
+                "le": 64,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idwneighbors"
+          },
+          "interpolationMode": {
+            "enum": [
+              "LINEAR",
+              "IDW"
+            ],
+            "title": "Interpolationmode",
+            "type": "string"
+          },
+          "isotropicComponent": {
+            "default": 0.0,
+            "ge": 0,
+            "le": 100,
+            "title": "Isotropiccomponent",
+            "type": "number"
+          },
+          "model": {
+            "const": "csvProcess",
+            "title": "Model",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "offset": {
+            "items": {
+              "type": "number"
+            },
+            "maxItems": 2,
+            "minItems": 2,
+            "title": "Offset",
+            "type": "array"
+          },
+          "operation": {
+            "const": "native",
+            "title": "Operation",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "enabled",
+          "operation",
+          "model",
+          "duration",
+          "assetId",
+          "fileName",
+          "direction",
+          "offset",
+          "interpolationMode"
+        ],
+        "title": "CsvProcessStepV7",
+        "type": "object"
+      },
+      "DirectionalRateSetV5": {
+        "additionalProperties": false,
+        "description": "One real ``viennaps.RateSet`` of the native multi-set overload.\n\n``directionalVelocity`` and ``isotropicVelocity`` are non-negative rate\nmagnitudes in um/s, exactly like the step-level scalar fields: the step\n``operation`` selects the native sign (etch negative, deposit positive).\nThe name follows the native RateSet property and is not a signed raw value.",
+        "properties": {
+          "calculateVisibility": {
+            "default": true,
+            "title": "Calculatevisibility",
+            "type": "boolean"
+          },
+          "direction": {
+            "items": {
+              "ge": -1,
+              "le": 1,
+              "type": "number"
+            },
+            "maxItems": 3,
+            "minItems": 3,
+            "title": "Direction",
+            "type": "array"
+          },
+          "directionalVelocity": {
+            "ge": 0,
+            "le": 2,
+            "title": "Directionalvelocity",
+            "type": "number"
+          },
+          "isotropicVelocity": {
+            "default": 0.0,
+            "ge": 0,
+            "le": 2,
+            "title": "Isotropicvelocity",
+            "type": "number"
+          },
+          "maskMaterials": {
+            "anyOf": [
+              {
+                "items": {
+                  "maxLength": 80,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "maxItems": 16,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Maskmaterials"
+          }
+        },
+        "required": [
+          "direction",
+          "directionalVelocity"
+        ],
+        "title": "DirectionalRateSetV5",
+        "type": "object"
+      },
       "DirectionalStepV5": {
         "additionalProperties": false,
         "properties": {
@@ -1989,21 +2519,35 @@
             "title": "Depositmaterial"
           },
           "direction": {
-            "items": {
-              "ge": -1,
-              "le": 1,
-              "type": "number"
-            },
-            "maxItems": 3,
-            "minItems": 3,
-            "title": "Direction",
-            "type": "array"
+            "anyOf": [
+              {
+                "items": {
+                  "ge": -1,
+                  "le": 1,
+                  "type": "number"
+                },
+                "maxItems": 3,
+                "minItems": 3,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Direction"
           },
           "directionalRateMagnitude": {
-            "ge": 0,
-            "le": 2,
-            "title": "Directionalratemagnitude",
-            "type": "number"
+            "anyOf": [
+              {
+                "ge": 0,
+                "le": 2,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Directionalratemagnitude"
           },
           "duration": {
             "ge": 0.01,
@@ -2023,10 +2567,17 @@
             "type": "string"
           },
           "isotropicRateMagnitude": {
-            "ge": 0,
-            "le": 2,
-            "title": "Isotropicratemagnitude",
-            "type": "number"
+            "anyOf": [
+              {
+                "ge": 0,
+                "le": 2,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Isotropicratemagnitude"
           },
           "model": {
             "const": "directional",
@@ -2046,6 +2597,22 @@
             ],
             "title": "Operation",
             "type": "string"
+          },
+          "rateSets": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/DirectionalRateSetV5"
+                },
+                "maxItems": 8,
+                "minItems": 1,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ratesets"
           }
         },
         "required": [
@@ -2054,9 +2621,6 @@
           "enabled",
           "operation",
           "model",
-          "direction",
-          "directionalRateMagnitude",
-          "isotropicRateMagnitude",
           "duration"
         ],
         "title": "DirectionalStepV5",
@@ -3836,6 +4400,127 @@
         "title": "GcDryRunResponse",
         "type": "object"
       },
+      "GdsBooleanMaskV7": {
+        "additionalProperties": false,
+        "description": "One selected GDS layer/datatype used as a boolean operand.\n\nThe geometry kind ``gds`` geometry owns the asset; this step re-reads that\nsame asset and layer, so there is no second upload path. ``position`` is an\nadditional XY placement (and a z offset added to ``baseHeight``) relative\nto the geometry placement, so the zero default is exactly aligned.",
+        "properties": {
+          "baseHeight": {
+            "ge": 0,
+            "title": "Baseheight",
+            "type": "number"
+          },
+          "datatype": {
+            "default": 0,
+            "ge": 0,
+            "le": 32767,
+            "title": "Datatype",
+            "type": "integer"
+          },
+          "height": {
+            "gt": 0,
+            "title": "Height",
+            "type": "number"
+          },
+          "layer": {
+            "ge": 0,
+            "le": 65535,
+            "title": "Layer",
+            "type": "integer"
+          },
+          "position": {
+            "default": [
+              0,
+              0,
+              0
+            ],
+            "items": {
+              "type": "number"
+            },
+            "maxItems": 3,
+            "minItems": 3,
+            "title": "Position",
+            "type": "array"
+          },
+          "retainedRegion": {
+            "default": "inside",
+            "enum": [
+              "inside",
+              "outside"
+            ],
+            "title": "Retainedregion",
+            "type": "string"
+          },
+          "unitScale": {
+            "default": 1,
+            "gt": 0,
+            "le": 1000000,
+            "title": "Unitscale",
+            "type": "number"
+          }
+        },
+        "required": [
+          "layer",
+          "baseHeight",
+          "height"
+        ],
+        "title": "GdsBooleanMaskV7",
+        "type": "object"
+      },
+      "GdsBooleanStepV7": {
+        "additionalProperties": false,
+        "description": "A boolean cut/add whose operand is a real 3D mask built from a GDS layer.",
+        "properties": {
+          "applyToAll": {
+            "default": true,
+            "title": "Applytoall",
+            "type": "boolean"
+          },
+          "booleanOperation": {
+            "enum": [
+              "union",
+              "intersection",
+              "difference"
+            ],
+            "title": "Booleanoperation",
+            "type": "string"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "gdsMask": {
+            "$ref": "#/components/schemas/GdsBooleanMaskV7"
+          },
+          "id": {
+            "maxLength": 64,
+            "minLength": 8,
+            "pattern": "^[A-Za-z0-9_-]+$",
+            "title": "Id",
+            "type": "string"
+          },
+          "model": {
+            "const": "gdsBoolean",
+            "title": "Model",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "enabled",
+          "model",
+          "booleanOperation",
+          "gdsMask"
+        ],
+        "title": "GdsBooleanStepV7",
+        "type": "object"
+      },
       "GeometryBindingV1": {
         "additionalProperties": false,
         "description": "An immutable application of a geometry source to one compile.\n\n``Clip`` stays editable. This object freezes the material mapping, stack,\ndomain, grid and coordinate transform that the compiler actually consumed.",
@@ -3957,6 +4642,274 @@
         "title": "HTTPValidationError",
         "type": "object"
       },
+      "ImplantDamageV7": {
+        "additionalProperties": false,
+        "description": "The installed ``viennaps.ImplantDamageHobler`` constructor arguments.",
+        "properties": {
+          "defectsPerIon": {
+            "ge": 0,
+            "le": 100000,
+            "title": "Defectsperion",
+            "type": "number"
+          },
+          "kind": {
+            "const": "hobler",
+            "title": "Kind",
+            "type": "string"
+          },
+          "lambdaValue": {
+            "gt": 0,
+            "le": 100000,
+            "title": "Lambdavalue",
+            "type": "number"
+          },
+          "lateralDeltaSigma": {
+            "default": 0,
+            "ge": -10000,
+            "le": 10000,
+            "title": "Lateraldeltasigma",
+            "type": "number"
+          },
+          "lateralSigma": {
+            "gt": 0,
+            "le": 10000,
+            "title": "Lateralsigma",
+            "type": "number"
+          },
+          "projectedRange": {
+            "gt": 0,
+            "le": 10000,
+            "title": "Projectedrange",
+            "type": "number"
+          },
+          "verticalSigma": {
+            "gt": 0,
+            "le": 10000,
+            "title": "Verticalsigma",
+            "type": "number"
+          }
+        },
+        "required": [
+          "kind",
+          "projectedRange",
+          "verticalSigma",
+          "lambdaValue",
+          "defectsPerIon",
+          "lateralSigma"
+        ],
+        "title": "ImplantDamageV7",
+        "type": "object"
+      },
+      "ImplantLabelsV7": {
+        "additionalProperties": false,
+        "properties": {
+          "concentration": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Concentration"
+          },
+          "damage": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Damage"
+          },
+          "lastDamage": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lastdamage"
+          }
+        },
+        "title": "ImplantLabelsV7",
+        "type": "object"
+      },
+      "ImplantStepV7": {
+        "additionalProperties": false,
+        "description": "Native ``viennaps.IonImplantation`` applied to the domain cell set.\n\nThe model never moves the level sets; ``ps.Process(domain, implant, 0.0)``\nonly stamps the concentration (and optional damage) fields into the cell\nset. ``energyKeV``/``rotationDeg`` are recorded request metadata: the\nmanual Pearson IV path has no native energy or rotation parameter (only\n``ImplantTableModel`` consumes them), so a nonzero rotation is refused\ninstead of being silently dropped.",
+        "properties": {
+          "cellSet": {
+            "$ref": "#/components/schemas/StepCellSetV7"
+          },
+          "damage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ImplantDamageV7"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "damageFactor": {
+            "default": 1,
+            "gt": 0,
+            "le": 1000000,
+            "title": "Damagefactor",
+            "type": "number"
+          },
+          "doseCm2": {
+            "gt": 0,
+            "le": 1e+19,
+            "title": "Dosecm2",
+            "type": "number"
+          },
+          "doseControl": {
+            "default": "WaferDose",
+            "enum": [
+              "Off",
+              "WaferDose",
+              "BeamDose"
+            ],
+            "title": "Dosecontrol",
+            "type": "string"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "energyKeV": {
+            "gt": 0,
+            "le": 100000,
+            "title": "Energykev",
+            "type": "number"
+          },
+          "id": {
+            "maxLength": 64,
+            "minLength": 8,
+            "pattern": "^[A-Za-z0-9_-]+$",
+            "title": "Id",
+            "type": "string"
+          },
+          "labels": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ImplantLabelsV7"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "maskMaterials": {
+            "items": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            "title": "Maskmaterials",
+            "type": "array"
+          },
+          "material": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Material",
+            "type": "string"
+          },
+          "model": {
+            "const": "implant",
+            "title": "Model",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "profile": {
+            "$ref": "#/components/schemas/ManualImplantProfileV7"
+          },
+          "rotationDeg": {
+            "default": 0,
+            "ge": 0,
+            "le": 360,
+            "title": "Rotationdeg",
+            "type": "number"
+          },
+          "screenMaterials": {
+            "items": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            "title": "Screenmaterials",
+            "type": "array"
+          },
+          "species": {
+            "maxLength": 24,
+            "minLength": 1,
+            "pattern": "^[A-Za-z][A-Za-z0-9_-]*$",
+            "title": "Species",
+            "type": "string"
+          },
+          "tiltDeg": {
+            "ge": 0,
+            "le": 90,
+            "title": "Tiltdeg",
+            "type": "number"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "enabled",
+          "model",
+          "species",
+          "material",
+          "energyKeV",
+          "doseCm2",
+          "tiltDeg",
+          "profile",
+          "cellSet"
+        ],
+        "title": "ImplantStepV7",
+        "type": "object"
+      },
+      "ImplicitSolverOptionsV7": {
+        "additionalProperties": false,
+        "properties": {
+          "maxIterations": {
+            "default": 400,
+            "ge": 1,
+            "le": 100000,
+            "title": "Maxiterations",
+            "type": "integer"
+          },
+          "relativeTolerance": {
+            "default": 1e-06,
+            "gt": 0,
+            "le": 1,
+            "title": "Relativetolerance",
+            "type": "number"
+          },
+          "relaxation": {
+            "default": 1.0,
+            "gt": 0,
+            "le": 2,
+            "title": "Relaxation",
+            "type": "number"
+          }
+        },
+        "title": "ImplicitSolverOptionsV7",
+        "type": "object"
+      },
       "IonParticleV7": {
         "additionalProperties": false,
         "properties": {
@@ -4048,6 +5001,35 @@
           "sourcePower"
         ],
         "title": "IonParticleV7",
+        "type": "object"
+      },
+      "IsothermalScheduleV7": {
+        "additionalProperties": false,
+        "properties": {
+          "durationSeconds": {
+            "ge": 0,
+            "le": 1000000,
+            "title": "Durationseconds",
+            "type": "number"
+          },
+          "kind": {
+            "const": "isothermal",
+            "title": "Kind",
+            "type": "string"
+          },
+          "temperatureK": {
+            "gt": 0,
+            "le": 5000,
+            "title": "Temperaturek",
+            "type": "number"
+          }
+        },
+        "required": [
+          "kind",
+          "temperatureK",
+          "durationSeconds"
+        ],
+        "title": "IsothermalScheduleV7",
         "type": "object"
       },
       "IterationV1": {
@@ -5099,6 +6081,141 @@
           "seed"
         ],
         "title": "LibraryReplicateV1",
+        "type": "object"
+      },
+      "ManualImplantProfileV7": {
+        "additionalProperties": false,
+        "description": "A manually specified analytical profile.\n\nViennaPS 4.7.0 ships no model database in the wheel, so the only proven\nprofile source is an explicit moment set. ``kind`` selects the native\nconstructor: ``ImplantPearsonIV``, ``ImplantDualPearsonIV`` or\n``ImplantPearsonIVChanneling``. Moments are substrate-depth moments in the\nproject length unit (um) and are *not* corrected for a screen oxide.",
+        "properties": {
+          "head": {
+            "$ref": "#/components/schemas/PearsonIVParametersV7"
+          },
+          "headFraction": {
+            "anyOf": [
+              {
+                "ge": 0,
+                "le": 1,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Headfraction"
+          },
+          "kind": {
+            "enum": [
+              "pearsonIV",
+              "dualPearsonIV",
+              "pearsonIVChanneling"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "lateralMu": {
+            "default": 0,
+            "title": "Lateralmu",
+            "type": "number"
+          },
+          "lateralSigma": {
+            "default": 5,
+            "gt": 0,
+            "le": 10000,
+            "title": "Lateralsigma",
+            "type": "number"
+          },
+          "source": {
+            "const": "manual",
+            "title": "Source",
+            "type": "string"
+          },
+          "tail": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PearsonIVParametersV7"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "tailBlendWidth": {
+            "default": 0,
+            "ge": 0,
+            "le": 10000,
+            "title": "Tailblendwidth",
+            "type": "number"
+          },
+          "tailDecayLength": {
+            "anyOf": [
+              {
+                "gt": 0,
+                "le": 10000,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Taildecaylength"
+          },
+          "tailFraction": {
+            "anyOf": [
+              {
+                "ge": 0,
+                "le": 1,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tailfraction"
+          },
+          "tailLateralMu": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Taillateralmu"
+          },
+          "tailLateralSigma": {
+            "anyOf": [
+              {
+                "gt": 0,
+                "le": 10000,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Taillateralsigma"
+          },
+          "tailStartDepth": {
+            "anyOf": [
+              {
+                "ge": 0,
+                "le": 10000,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tailstartdepth"
+          }
+        },
+        "required": [
+          "source",
+          "kind",
+          "head"
+        ],
+        "title": "ManualImplantProfileV7",
         "type": "object"
       },
       "MaterialDefinition": {
@@ -6584,6 +7701,52 @@
         "title": "MultiParticleStepV7",
         "type": "object"
       },
+      "NetDopingV7": {
+        "additionalProperties": false,
+        "description": "Native ``viennaps.NetDoping`` on the current cell set.",
+        "properties": {
+          "acceptorLabels": {
+            "items": {
+              "maxLength": 48,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 8,
+            "title": "Acceptorlabels",
+            "type": "array"
+          },
+          "donorLabels": {
+            "items": {
+              "maxLength": 48,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 8,
+            "title": "Donorlabels",
+            "type": "array"
+          },
+          "outputLabel": {
+            "default": "net_doping",
+            "maxLength": 48,
+            "minLength": 1,
+            "title": "Outputlabel",
+            "type": "string"
+          },
+          "surfacePosition": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Surfaceposition"
+          }
+        },
+        "title": "NetDopingV7",
+        "type": "object"
+      },
       "NeutralParticleV7": {
         "additionalProperties": false,
         "properties": {
@@ -6627,6 +7790,16 @@
         "additionalProperties": false,
         "description": "Native result artifacts; the surface mesh remains the viewer's required result.",
         "properties": {
+          "cellSet": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CellSetOutputV7"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "levelSetMeshes": {
             "default": false,
             "title": "Levelsetmeshes",
@@ -6654,6 +7827,42 @@
           }
         },
         "title": "OutputSettingsV7",
+        "type": "object"
+      },
+      "OxidationAdvancedV7": {
+        "additionalProperties": false,
+        "description": "Optional native solver controls for ``specialized:oxidation``.\n\nThe installed ViennaPS 4.6.2 ``Oxidation`` binding exposes many setters but\nno getters. This block carries only members proven to change the returned\nsurface deterministically. Defaults are the installed native defaults, so an\nexplicitly materialised block is a behaviour no-op relative to omitting it\n(the request hash still changes because the request text differs).\n\nTightening ``mechanicsTolerance`` below the native default (0.01) or\n``couplingTolerance`` below 0.05 is not exposed: controlled probes stopped\nconverging. ``couplingTolerance`` must stay at least ``mechanicsTolerance``\nbecause the native validator already warns about that ordering.",
+        "properties": {
+          "cflFactor": {
+            "default": 0.499,
+            "ge": 0.01,
+            "le": 0.499,
+            "title": "Cflfactor",
+            "type": "number"
+          },
+          "couplingTolerance": {
+            "default": 0.05,
+            "ge": 0.05,
+            "le": 0.5,
+            "title": "Couplingtolerance",
+            "type": "number"
+          },
+          "mechanicsTolerance": {
+            "default": 0.01,
+            "ge": 0.01,
+            "le": 0.2,
+            "title": "Mechanicstolerance",
+            "type": "number"
+          },
+          "simplePressureRelaxation": {
+            "default": 0.5,
+            "ge": 0.01,
+            "le": 1.0,
+            "title": "Simplepressurerelaxation",
+            "type": "number"
+          }
+        },
+        "title": "OxidationAdvancedV7",
         "type": "object"
       },
       "ParameterProvenanceV1": {
@@ -6687,6 +7896,129 @@
           "kind"
         ],
         "title": "ParameterProvenanceV1",
+        "type": "object"
+      },
+      "ParticleShapeStepV7": {
+        "additionalProperties": false,
+        "description": "Native ``BoxDistribution`` / ``SphereDistribution`` geometry offset.\n\nThese are ViennaLS geometric-advection distributions, not velocity models:\n``ps.Process(domain, model, duration)`` ignores the duration and moves the\nexposed surface by exactly one radius / half-axis set. A masked *etch*\nthrough ``addMaskMaterial`` is the officially supported native combination\nand uses the project's geometry mask materials; a masked *deposition*\nSIGSEGVs in 2D and 3D on 4.6.2 and 4.7.0, so depositions stay maskless and\nthe run record lists the omitted mask materials. ``operation`` only selects\nthe sign (deposit grows, etch erodes); individual half-axes are positive\nmagnitudes.",
+        "properties": {
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "halfAxes": {
+            "anyOf": [
+              {
+                "items": {
+                  "gt": 0,
+                  "le": 2,
+                  "type": "number"
+                },
+                "maxItems": 3,
+                "minItems": 2,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Halfaxes"
+          },
+          "id": {
+            "maxLength": 64,
+            "minLength": 8,
+            "pattern": "^[A-Za-z0-9_-]+$",
+            "title": "Id",
+            "type": "string"
+          },
+          "model": {
+            "const": "particleShape",
+            "title": "Model",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "operation": {
+            "enum": [
+              "etch",
+              "deposit"
+            ],
+            "title": "Operation",
+            "type": "string"
+          },
+          "radius": {
+            "anyOf": [
+              {
+                "gt": 0,
+                "le": 2,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Radius"
+          },
+          "shape": {
+            "enum": [
+              "box",
+              "sphere"
+            ],
+            "title": "Shape",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "enabled",
+          "operation",
+          "model",
+          "shape"
+        ],
+        "title": "ParticleShapeStepV7",
+        "type": "object"
+      },
+      "PearsonIVParametersV7": {
+        "additionalProperties": false,
+        "description": "The installed ``viennaps.PearsonIVParameters`` fields, in length units.\n\n``mu``/``sigma`` use the project length unit (um); the native constructor\nstores exactly these values. ``beta`` and ``gamma`` are the fourth and third\nstandardized moments the native ``PearsonIV`` function expects.",
+        "properties": {
+          "beta": {
+            "gt": 0,
+            "le": 1000,
+            "title": "Beta",
+            "type": "number"
+          },
+          "gamma": {
+            "ge": -1000,
+            "le": 1000,
+            "title": "Gamma",
+            "type": "number"
+          },
+          "mu": {
+            "ge": 0,
+            "le": 10000,
+            "title": "Mu",
+            "type": "number"
+          },
+          "sigma": {
+            "gt": 0,
+            "le": 10000,
+            "title": "Sigma",
+            "type": "number"
+          }
+        },
+        "required": [
+          "mu",
+          "sigma",
+          "beta",
+          "gamma"
+        ],
+        "title": "PearsonIVParametersV7",
         "type": "object"
       },
       "PlanarizeStepV5": {
@@ -7010,10 +8342,16 @@
             "items": {
               "discriminator": {
                 "mapping": {
+                  "analysis": "#/components/schemas/AnalysisStepV7",
+                  "anneal": "#/components/schemas/AnnealStepV7",
                   "boolean": "#/components/schemas/BooleanStepV5",
+                  "csvProcess": "#/components/schemas/CsvProcessStepV7",
                   "directional": "#/components/schemas/DirectionalStepV5",
+                  "gdsBoolean": "#/components/schemas/GdsBooleanStepV7",
+                  "implant": "#/components/schemas/ImplantStepV7",
                   "isotropic": "#/components/schemas/StepV4",
                   "multiParticle": "#/components/schemas/MultiParticleStepV7",
+                  "particleShape": "#/components/schemas/ParticleShapeStepV7",
                   "planarize": "#/components/schemas/PlanarizeStepV5",
                   "removeMaterial": "#/components/schemas/RemoveMaterialStepV5",
                   "singleParticle": "#/components/schemas/StepV4",
@@ -7042,6 +8380,24 @@
                 },
                 {
                   "$ref": "#/components/schemas/SpecializedStepV7"
+                },
+                {
+                  "$ref": "#/components/schemas/GdsBooleanStepV7"
+                },
+                {
+                  "$ref": "#/components/schemas/CsvProcessStepV7"
+                },
+                {
+                  "$ref": "#/components/schemas/ParticleShapeStepV7"
+                },
+                {
+                  "$ref": "#/components/schemas/ImplantStepV7"
+                },
+                {
+                  "$ref": "#/components/schemas/AnnealStepV7"
+                },
+                {
+                  "$ref": "#/components/schemas/AnalysisStepV7"
                 }
               ]
             },
@@ -8174,6 +9530,43 @@
         "title": "SegmentV1",
         "type": "object"
       },
+      "SheetResistanceEntryV7": {
+        "additionalProperties": false,
+        "description": "One native ``viennaps.SheetResistance`` evaluation.\n\n``computeElectron`` uses the Masetti-Severi n-type mobility (donors) and\n``computeHole`` the p-type mobility (acceptors). The native length unit is\nfixed at 1e-4 cm (the workbench's um), which also sets the matching\nconcentration unit 1e12 cm^-3.",
+        "properties": {
+          "carrier": {
+            "enum": [
+              "electron",
+              "hole"
+            ],
+            "title": "Carrier",
+            "type": "string"
+          },
+          "concentrationLabel": {
+            "maxLength": 48,
+            "minLength": 1,
+            "title": "Concentrationlabel",
+            "type": "string"
+          },
+          "surfacePosition": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Surfaceposition"
+          }
+        },
+        "required": [
+          "concentrationLabel",
+          "carrier"
+        ],
+        "title": "SheetResistanceEntryV7",
+        "type": "object"
+      },
       "SnapshotPayloadV1": {
         "additionalProperties": false,
         "description": "Typed top-level viewer snapshot payload used by measurement/equivalence.",
@@ -8219,6 +9612,18 @@
               }
             ],
             "title": "Domainreadback"
+          },
+          "geometryReadback": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Geometryreadback"
           },
           "gridDelta": {
             "title": "Griddelta",
@@ -8435,6 +9840,30 @@
         "title": "SnapshotPayloadV1",
         "type": "object"
       },
+      "SolidActivationV7": {
+        "additionalProperties": false,
+        "description": "``enableSolidActivation(True)`` + ``setSolidSolubilityArrhenius``.\n\nThe native activation model writes ``C_active = C_SS·C/(C_SS+C)`` with\n``C_SS = C0·exp(-Ea/kT)``. Without this block the anneal would diffuse the\ndopant but never produce an electrically active field.",
+        "properties": {
+          "solubilityC0": {
+            "gt": 0,
+            "le": 1e+40,
+            "title": "Solubilityc0",
+            "type": "number"
+          },
+          "solubilityEa_eV": {
+            "ge": 0,
+            "le": 100,
+            "title": "Solubilityea Ev",
+            "type": "number"
+          }
+        },
+        "required": [
+          "solubilityC0",
+          "solubilityEa_eV"
+        ],
+        "title": "SolidActivationV7",
+        "type": "object"
+      },
       "SolverV7": {
         "additionalProperties": false,
         "properties": {
@@ -8466,6 +9895,21 @@
               }
             ],
             "title": "Gpudeviceid"
+          },
+          "gpuEngine": {
+            "anyOf": [
+              {
+                "enum": [
+                  "GPU_DISK",
+                  "GPU_TRIANGLE"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Gpuengine"
           },
           "random": {
             "discriminator": {
@@ -8655,6 +10099,16 @@
       "SpecializedStepV7": {
         "additionalProperties": false,
         "properties": {
+          "advancedOxidation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OxidationAdvancedV7"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "depositMaterial": {
             "anyOf": [
               {
@@ -8720,6 +10174,16 @@
             ],
             "title": "Operation",
             "type": "string"
+          },
+          "surfaceDiffusion": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SurfaceDiffusionV7"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -8732,6 +10196,112 @@
           "nativeParameters"
         ],
         "title": "SpecializedStepV7",
+        "type": "object"
+      },
+      "StepCellSetV7": {
+        "additionalProperties": false,
+        "description": "The native ``DenseCellSet`` a cell-set field step runs on.\n\n``viennaps.Domain.generateCellSet(position, coverMaterial, isAboveSurface)``\nis the only native constructor available (verified on 4.7.0). ``height`` is\npassed as the native ``position`` argument; measured on 4.7.0 that argument\nis the **absolute** top coordinate of the grid (a plane at ``z = 0.05`` with\n``position = 0.5`` produced a grid topping out at ``0.50``). For the default\nplane at ``z = 0`` it therefore equals the height above the surface. The\ngrid is captured at the first cell-set step and every later\nimplant/anneal/analysis step reuses the same absolute grid (a surface-moving\nstep in between regenerates the native cell set and conservatively remaps\nthe scalar fields).",
+        "properties": {
+          "coverMaterial": {
+            "default": "GAS",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Covermaterial",
+            "type": "string"
+          },
+          "format": {
+            "default": "both",
+            "enum": [
+              "vtu",
+              "json",
+              "both"
+            ],
+            "title": "Format",
+            "type": "string"
+          },
+          "height": {
+            "gt": 0,
+            "le": 1000,
+            "title": "Height",
+            "type": "number"
+          },
+          "periodic": {
+            "default": false,
+            "title": "Periodic",
+            "type": "boolean"
+          },
+          "scalarLabels": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scalarlabels"
+          },
+          "substrateDepth": {
+            "anyOf": [
+              {
+                "gt": 0,
+                "le": 1000,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Substratedepth"
+          }
+        },
+        "required": [
+          "height"
+        ],
+        "title": "StepCellSetV7",
+        "type": "object"
+      },
+      "StepScheduleV7": {
+        "additionalProperties": false,
+        "description": "``Anneal.setTemperatureSchedule(durations, temperatures)``.\n\nNative accepts N durations with N isothermal temperatures or N+1 ramp\nendpoint temperatures (the 4.7.0 example uses three ramp/soak steps).",
+        "properties": {
+          "durations": {
+            "items": {
+              "ge": 0,
+              "le": 1000000,
+              "type": "number"
+            },
+            "maxItems": 32,
+            "minItems": 1,
+            "title": "Durations",
+            "type": "array"
+          },
+          "kind": {
+            "const": "schedule",
+            "title": "Kind",
+            "type": "string"
+          },
+          "temperatures": {
+            "items": {
+              "gt": 0,
+              "le": 5000,
+              "type": "number"
+            },
+            "maxItems": 33,
+            "minItems": 1,
+            "title": "Temperatures",
+            "type": "array"
+          }
+        },
+        "required": [
+          "kind",
+          "durations",
+          "temperatures"
+        ],
+        "title": "StepScheduleV7",
         "type": "object"
       },
       "StepV4": {
@@ -8868,6 +10438,64 @@
           "duration"
         ],
         "title": "StepV4",
+        "type": "object"
+      },
+      "SurfaceDiffusionV7": {
+        "additionalProperties": false,
+        "description": "Native ``SurfaceDiffusionParameters`` smoothing of ALD coverage.\n\nViennaPS 4.6.2 builds this Laplacian stencil only inside the ALP strategy,\nand the ALP flag is set solely by a positive\n``SingleParticleALDParams.coverageDiffusionCoefficient``. It therefore\nsmooths the scalar coverage field (which drives the ALD growth rate), not\nthe level-set geometry, and is accepted only on ``specialized:ald`` steps.\nDefaults are the installed native struct defaults, so materializing them is\na behaviour no-op relative to omitting the object.",
+        "properties": {
+          "enabled": {
+            "default": true,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "kNeighbors": {
+            "default": 16,
+            "ge": 1,
+            "le": 64,
+            "title": "Kneighbors",
+            "type": "integer"
+          },
+          "normalCutoff": {
+            "default": 0.25,
+            "ge": -1,
+            "le": 1,
+            "title": "Normalcutoff",
+            "type": "number"
+          },
+          "normalizeByLocalScale": {
+            "default": true,
+            "title": "Normalizebylocalscale",
+            "type": "boolean"
+          },
+          "radius": {
+            "default": 0.0,
+            "ge": 0,
+            "le": 2,
+            "title": "Radius",
+            "type": "number"
+          },
+          "sigmaNormal": {
+            "default": 0.35,
+            "gt": 0,
+            "le": 10,
+            "title": "Sigmanormal",
+            "type": "number"
+          },
+          "stabilityFactor": {
+            "default": 1.0,
+            "gt": 0,
+            "le": 1,
+            "title": "Stabilityfactor",
+            "type": "number"
+          },
+          "symmetrizeWeights": {
+            "default": true,
+            "title": "Symmetrizeweights",
+            "type": "boolean"
+          }
+        },
+        "title": "SurfaceDiffusionV7",
         "type": "object"
       },
       "TargetStepEvidenceV1": {
@@ -9508,6 +11136,100 @@
           }
         },
         "summary": "Continuation Package Import"
+      }
+    },
+    "/api/csv-assets": {
+      "post": {
+        "operationId": "csv_asset_upload_api_csv_assets_post",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "file_name",
+            "required": false,
+            "schema": {
+              "default": "rates.csv",
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "File Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "dimension",
+            "required": true,
+            "schema": {
+              "title": "Dimension",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Csv Asset Upload Api Csv Assets Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Csv Asset Upload"
+      }
+    },
+    "/api/csv-assets/{asset_id}": {
+      "get": {
+        "operationId": "csv_asset_get_api_csv_assets__asset_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "asset_id",
+            "required": true,
+            "schema": {
+              "title": "Asset Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Csv Asset Get Api Csv Assets  Asset Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Csv Asset Get"
       }
     },
     "/api/gds-assets": {

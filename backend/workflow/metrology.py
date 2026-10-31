@@ -98,6 +98,7 @@ class SnapshotPayloadV1(StrictModel):
     noOp: bool = False
     measuredGeometry: dict[str, Any] | None = None
     measuredRemoval: dict[str, Any] | None = None
+    geometryReadback: dict[str, Any] | None = None
     topology: str | None = None
     surfaceBounds: list[Any] | None = None
     domainReadback: dict[str, Any] | None = None
