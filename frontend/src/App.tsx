@@ -3,7 +3,7 @@ import NativeIntermediatePanel from './NativeIntermediatePanel';
 import { RunErrorDialog } from './RunErrorDialog';
 import { defaultView3D, snapshotDimension } from './types3d';
 import type { View3D } from './types3d';
-import { useCallback, useEffect, useRef, useState, type FormEvent, type KeyboardEvent, type PointerEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { TopBar } from './app/TopBar';
 import { Rail } from './app/Rail';
@@ -27,12 +27,14 @@ import { DeleteMaterialDialog } from './components/DeleteMaterialDialog';
 import { MaterialPropertyInspector } from './components/MaterialPropertyInspector';
 import { NumericField, SelectField } from './components/fields';
 import { SvgViewer } from './viewer/SvgViewer';
-import { ApiError, api, effectiveArtifactCapBytes, formatArtifactCapMiB, prettyError, saveBlob } from './api/client';
-import type { AdvectionSettings, Capabilities, CsvRateAsset, DirectionalMaterialRate, Domain, FluxResult, GDSAsset, GDSGeometry, GDSMaskPattern, Geometry, GpuCapabilityRow, GpuDeviceInventory, GpuProfileFailure, Layer, MaterialCatalogItem, OutputSettings, ParticleSpecies, Project, ProjectRow, RayTracingSettings, RunInfo, RunSummary, Snapshot, Solver, SpecializedCatalog, StackGeometry, Step, ViewSettings } from './api/types';
+import { api, effectiveArtifactCapBytes, formatArtifactCapMiB, prettyError, saveBlob } from './api/client';
+import type { AdvectionSettings, CsvRateAsset, DirectionalMaterialRate, Domain, FluxResult, GDSAsset, GDSGeometry, GDSMaskPattern, Geometry, GpuCapabilityRow, GpuProfileFailure, Layer, MaterialCatalogItem, OutputSettings, ParticleSpecies, Project, RayTracingSettings, RunInfo, Snapshot, Solver, StackGeometry, Step, ViewSettings } from './api/types';
 import { gdsAssetIdFromProject, gdsLayerIds, gdsMaskPairs, gdsPairs } from './lib/gds';
-import { fitPanelWidths, maxPanelWidth, panelWidthLimits, type PanelWidths, type ResizablePanel } from './lib/panelLayout';
+import { fitPanelWidths, maxPanelWidth, panelWidthLimits } from './lib/panelLayout';
 import { MATERIAL_CATEGORY_OPTIONS, configuredMaterialRates, directionalMaterialRates, geometryMaterialNames, isDirectionalMaterialMode, isGeometryStep, materialCategoryLabel, materialRateModeActive, materialRateModeAvailable, scalarMaterialRates, specializedDefaults, specializedDimensionLabel, specializedModelAvailable, stepKindLabel, stripDirectionalRateTable, stripDirectionalScalarRates, stripIsotropicMethod, usesFlux } from './lib/projectRules';
 import { ARTIFACT_RISK_LABELS, NOT_APPLICABLE_ENGINE, artifactEstimateFromError, engineTone, errorRunStates, formatEstimateMiB, formatMicron, formatThickness, humanStatus, runEngineLabel, runEnginesOf, runFailureDialogData, terminalStates, type RunFailureDialogData } from './lib/runPresentation';
+import { usePanelLayout } from './hooks/usePanelLayout';
+import { useWorkbenchBootstrap } from './hooks/useWorkbenchBootstrap';
 import { defaultDirection, defaultIonSpecies, defaultMultiParticleFields, defaultNeutralSpecies, defaultProject, initialVisibleMaterialIds, normalizeGdsMaskLayer, promoteProjectToV5, promoteProjectToV7 } from './project/defaults';
 
 // Ray count is the dominant cost knob for stochastic flux steps: measured on
@@ -61,14 +63,19 @@ export default function App() {
   const [historyView3D, setHistoryView3D] = useState<View3D>(structuredClone(defaultView3D));
   const [projectId, setProjectId] = useState<string | null>(null);
   const [savedProjectJson, setSavedProjectJson] = useState<string | null>(null);
-  const [projectRows, setProjectRows] = useState<ProjectRow[]>([]);
   const [savedSelection, setSavedSelection] = useState('');
-  const [runs, setRuns] = useState<RunSummary[]>([]);
-  const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
-  const [gpuInventory, setGpuInventory] = useState<GpuDeviceInventory | null>(null);
-  const [materials, setMaterials] = useState<MaterialCatalogItem[]>([]);
-  const [specializedCatalog, setSpecializedCatalog] = useState<SpecializedCatalog | null>(null);
-  const [newSpecializedModel, setNewSpecializedModel] = useState('sf6o2');
+  const {
+    projectRows,
+    runs,
+    capabilities,
+    gpuInventory,
+    materials, setMaterials,
+    specializedCatalog,
+    newSpecializedModel, setNewSpecializedModel,
+    health, setHealth,
+    notice, setNotice,
+    refreshLists,
+  } = useWorkbenchBootstrap();
   const [materialDraft, setMaterialDraft] = useState({ name: '', color: '#8b5cf6', category: 'Generic', densityGcm3: '', conductive: false, description: '' });
   const [materialBusy, setMaterialBusy] = useState(false);
   const [deletingMaterial, setDeletingMaterial] = useState<string | null>(null);
@@ -97,12 +104,10 @@ export default function App() {
   const [directionalRateRowMaterial, setDirectionalRateRowMaterial] = useState('');
   const [multiRateMaterial, setMultiRateMaterial] = useState('');
   const [multiStickingMaterial, setMultiStickingMaterial] = useState('');
-  const [health, setHealth] = useState<'checking' | 'ready' | 'offline'>('checking');
   const [inputHash, setInputHash] = useState('');
   const [warnings, setWarnings] = useState<string[]>([]);
   const [artifactEstimate, setArtifactEstimate] = useState<ArtifactEstimate | null>(null);
   const [validationMessage, setValidationMessage] = useState('');
-  const [notice, setNotice] = useState('');
   const [loading, setLoading] = useState(false);
   const [latestRunId, setLatestRunId] = useState<string | null>(null);
   const [runInfo, setRunInfo] = useState<RunInfo | null>(null);
@@ -128,10 +133,7 @@ export default function App() {
   const [dockTab, setDockTab] = useState<DockTab>('log');
   const [dockOpen, setDockOpen] = useState(false);
   const [mobilePanel, setMobilePanel] = useState<'structure' | 'viewer' | 'settings'>('viewer');
-  const [panelWidths, setPanelWidths] = useState<PanelWidths>({ structure: 300, settings: 320 });
-  const [isResizingPanels, setIsResizingPanels] = useState(false);
-  const workspaceRef = useRef<HTMLElement>(null);
-  const panelResizeRef = useRef<{ panel: ResizablePanel; pointerX: number; width: number } | null>(null);
+  const { panelWidths, setPanelWidths, isResizingPanels, workspaceRef, beginPanelResize, movePanelResize, endPanelResize, adjustPanelWidth } = usePanelLayout();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const gdsInputRef = useRef<HTMLInputElement>(null);
   const csvInputRef = useRef<HTMLInputElement>(null);
@@ -199,60 +201,6 @@ export default function App() {
       || selection.kind === 'artifact' && !!selectedSnapshot?.outputs?.some(artifact => artifact.fileName === selection.key);
     if (!selectionExists) setSelection({ kind: 'none' });
   }, [selection, project.steps, materials, runs, selectedSnapshot, displayRunId]);
-
-  useEffect(() => {
-    const workspace = workspaceRef.current;
-    if (!workspace) return undefined;
-    const fitToWorkspace = () => {
-      if (window.matchMedia('(max-width: 900px)').matches) return;
-      setPanelWidths(previous => {
-        const next = fitPanelWidths(previous, workspace.clientWidth);
-        return Math.abs(next.structure - previous.structure) < 0.5 && Math.abs(next.settings - previous.settings) < 0.5 ? previous : next;
-      });
-    };
-    const observer = new ResizeObserver(fitToWorkspace);
-    observer.observe(workspace);
-    window.addEventListener('resize', fitToWorkspace);
-    fitToWorkspace();
-    return () => { observer.disconnect(); window.removeEventListener('resize', fitToWorkspace); };
-  }, []);
-
-  useEffect(() => {
-    const workspace = workspaceRef.current;
-    if (!workspace) return;
-    workspace.style.setProperty('--left-panel-width', `${panelWidths.structure}px`);
-    workspace.style.setProperty('--right-panel-width', `${panelWidths.settings}px`);
-  }, [panelWidths]);
-
-  const beginPanelResize = (event: PointerEvent<HTMLDivElement>, panel: ResizablePanel) => {
-    if (window.matchMedia('(max-width: 900px)').matches) return;
-    event.preventDefault();
-    event.currentTarget.setPointerCapture(event.pointerId);
-    panelResizeRef.current = { panel, pointerX: event.clientX, width: panelWidths[panel] };
-    setIsResizingPanels(true);
-  };
-  const movePanelResize = (event: PointerEvent<HTMLDivElement>) => {
-    const drag = panelResizeRef.current;
-    const workspace = workspaceRef.current;
-    if (!drag || !workspace) return;
-    const delta = event.clientX - drag.pointerX;
-    const nextWidth = drag.width + (drag.panel === 'structure' ? delta : -delta);
-    setPanelWidths(previous => fitPanelWidths({ ...previous, [drag.panel]: nextWidth }, workspace.clientWidth));
-  };
-  const endPanelResize = () => {
-    panelResizeRef.current = null;
-    setIsResizingPanels(false);
-  };
-  const adjustPanelWidth = (event: KeyboardEvent<HTMLDivElement>, panel: ResizablePanel) => {
-    const grows = panel === 'structure' ? event.key === 'ArrowRight' : event.key === 'ArrowLeft';
-    const shrinks = panel === 'structure' ? event.key === 'ArrowLeft' : event.key === 'ArrowRight';
-    if (!grows && !shrinks) return;
-    event.preventDefault();
-    const workspace = workspaceRef.current;
-    if (!workspace) return;
-    const delta = grows ? 12 : -12;
-    setPanelWidths(previous => fitPanelWidths({ ...previous, [panel]: previous[panel] + delta }, workspace.clientWidth));
-  };
 
   const updateProject = useCallback((updater: (previous: Project) => Project) => setProject(previous => {
     const next = updater(previous);
@@ -340,34 +288,6 @@ export default function App() {
     else if (directionalActual || multiParticleActual || specializedActual || geometryActual || hasMeasuredChange) { setDockTab('native'); setDockOpen(true); }
     else if (visibleLog) { setDockTab('log'); setDockOpen(true); }
   }, [displayInfo?.kind, displayInfo?.intermediateOutputs?.length, selectedSnapshot?.outputs?.length, directionalActual, multiParticleActual, specializedActual, geometryActual, hasMeasuredChange, visibleLog]);
-
-  const refreshLists = useCallback(async () => {
-    try {
-      const [projectData, runData] = await Promise.all([api<{ projects: ProjectRow[] }>('/api/projects'), api<{ runs: RunSummary[] }>('/api/runs')]);
-      if (!Array.isArray(projectData.projects) || !Array.isArray(runData.runs)) throw new ApiError('本机工作台返回的项目或运行记录格式无效。', null);
-      setProjectRows(projectData.projects); setRuns(runData.runs);
-    } catch (error) { setNotice(prettyError(error)); }
-  }, []);
-
-  useEffect(() => {
-    let mounted = true;
-    void Promise.all([
-      api<Record<string, unknown>>('/api/health'),
-      api<Capabilities>('/api/capabilities'),
-      api<GpuDeviceInventory>('/api/gpu-devices'),
-      api<SpecializedCatalog>('/api/specialized-models'),
-    ]).then(([, cap, gpuInfo, specialized]) => {
-      if (!Array.isArray(specialized.models)) throw new ApiError('本机工作台返回的专用模型目录格式无效。', null);
-      if (mounted) { setHealth('ready'); setCapabilities(cap); setGpuInventory(gpuInfo); setSpecializedCatalog(specialized); if (specialized.models.length) setNewSpecializedModel(specialized.models[0].id); }
-    })
-      .catch(() => { if (mounted) setHealth('offline'); });
-    void refreshLists();
-    void api<{ materials: MaterialCatalogItem[] }>('/api/materials').then(result => {
-      if (!Array.isArray(result.materials)) throw new ApiError('本机工作台返回的材料目录格式无效。', null);
-      setMaterials(result.materials);
-    }).catch(error => setNotice(`材料目录加载失败：${prettyError(error)}`));
-    return () => { mounted = false; };
-  }, [refreshLists]);
 
   useEffect(() => {
     const sequence = ++validationSequence.current;
