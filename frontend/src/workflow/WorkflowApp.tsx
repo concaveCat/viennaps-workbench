@@ -755,6 +755,48 @@ function candidateKey(row: { runId: string; stepId: string }): string {
 }
 
 /**
+ * Solver fields the backend fills in when a project is saved or compiled
+ * (`SolverV7` defaults). A raw imported project omits them, so both sides of a
+ * fingerprint comparison are padded before hashing; otherwise an unchanged
+ * project would look edited right after its first save.
+ */
+const SOLVER_EXECUTION_DEFAULTS = {
+  timeoutSeconds: 0,
+  advection: {
+    spatialScheme: 'ENGQUIST_OSHER_1ST_ORDER',
+    temporalScheme: 'FORWARD_EULER',
+    adaptiveTimeStepping: false,
+    adaptiveTimeStepSubdivisions: 20,
+    calculateIntermediateVelocities: false,
+    checkDissipation: true,
+    dissipationAlpha: 1.0,
+    ignoreVoids: false,
+    velocityOutput: false,
+  },
+  rayTracing: {
+    diskRadius: 0.0,
+    ignoreFluxBoundaries: false,
+    maxBoundaryHits: 1000,
+    maxReflections: 4294967295,
+    minNodeDistanceFactor: 0.05,
+    normalizationType: 'SOURCE',
+    smoothingNeighbors: 1,
+  },
+};
+
+function normalizeSolverForFingerprint(solver: unknown): Record<string, unknown> {
+  const raw = (solver && typeof solver === 'object' ? solver : {}) as Record<string, unknown>;
+  const advection = (raw.advection && typeof raw.advection === 'object' ? raw.advection : {}) as Record<string, unknown>;
+  const rayTracing = (raw.rayTracing && typeof raw.rayTracing === 'object' ? raw.rayTracing : {}) as Record<string, unknown>;
+  return {
+    ...SOLVER_EXECUTION_DEFAULTS,
+    ...raw,
+    advection: { ...SOLVER_EXECUTION_DEFAULTS.advection, ...advection },
+    rayTracing: { ...SOLVER_EXECUTION_DEFAULTS.rayTracing, ...rayTracing },
+  };
+}
+
+/**
  * Execution fingerprint of a project: only the fields that change what a
  * Compile/Run actually does. Labels (name/view/timestamps) are ignored, null
  * defaults are dropped, and a compiled envelope's generated step ids are
@@ -793,7 +835,7 @@ function executionProjectFingerprint(
     domain: raw.domain,
     geometry: raw.geometry,
     steps: normalizedSteps,
-    solver: raw.solver,
+    solver: normalizeSolverForFingerprint(raw.solver),
   }));
 }
 
@@ -802,6 +844,25 @@ function compileMatchesProject(document: ProjectDoc | null | undefined, compile:
   if (!document || !compile) return false;
   return executionProjectFingerprint(document)
     === executionProjectFingerprint(compile.compile.project as ProjectDoc, compile.compile.sourceMap);
+}
+
+/**
+ * A module/definition Compile expands its own steps: the source map's authored
+ * ids do not exist in `project.steps`, so a project fingerprint comparison is
+ * meaningless. Such a Compile is trusted on restore and invalidated only by the
+ * edit actions that call `setCompileStale(true)`.
+ */
+function isDefinitionCompile(
+  document: ProjectDoc | null | undefined,
+  sourceMap: Array<{ stepId: string; authoredStepId: string }> | undefined,
+): boolean {
+  const authoredIds = new Set((document?.steps ?? []).map(step => step.id));
+  const entries = sourceMap ?? [];
+  if (!authoredIds.size || !entries.length) return false;
+  // A normal Compile maps authored ids that still exist in project.steps (a
+  // deleted step leaves the others). A definition Compile has no overlap at
+  // all, because its authored ids are module step ids.
+  return entries.every(entry => !authoredIds.has(entry.authoredStepId));
 }
 
 function metricMethodLabel(method: string): string {
@@ -1518,7 +1579,11 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [candidateViews, setCandidateViews] = useState<Record<string, CandidateView>>({});
   const [candidateViewErrors, setCandidateViewErrors] = useState<Record<string, string>>({});
   const [compareCoverage, setCompareCoverage] = useState<{ compared: string[]; total: number; prefix: boolean } | null>(null);
-  const [comparePick, setComparePick] = useState<string[]>([]);
+  /**
+   * Compare-table selection. `null` means "not chosen yet" (the first four
+   * candidates are checked); `[]` means the user unchecked everything.
+   */
+  const [comparePick, setComparePick] = useState<string[] | null>(null);
   const [syncZoom, setSyncZoom] = useState(1);
   const [syncAxis, setSyncAxis] = useState<'xy' | 'xz' | 'yz'>('xy');
   const [windowLower, setWindowLower] = useState('');
@@ -1773,7 +1838,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setCandidateViews({});
     setCandidateViewErrors({});
     setCompareCoverage(null);
-    setComparePick([]);
+    setComparePick(null);
     setSyncZoom(1);
     setSyncAxis('xy');
     setWindowLower('');
@@ -1876,35 +1941,24 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       measurementIds: stored.measurementIds ?? [],
       experimentIds: stored.experimentIds ?? [],
     };
-    if (next.compileId) {
-      try {
-        const envelope = await api<CompiledEnvelope>(`/api/v1/workflow/compiles/${next.compileId}`);
-        setCompile(compileInfoFromEnvelope(envelope));
-        // The saved Compile only describes the project as it was compiled. If
-        // 01/02 changed afterwards (and was saved), restoring it as "fresh"
-        // would route and execute the stale durations. Compare the execution
-        // fields before trusting the envelope.
-        const currentDocument = document ?? project;
-        const matches = !!currentDocument
-          && executionProjectFingerprint(currentDocument)
-            === executionProjectFingerprint(envelope.project, envelope.sourceMap);
-        setCompileStale(!matches);
-        if (!matches) notices.push('工程在编译后有修改，需重新编译。');
-      } catch (exc) {
-        if ((exc as { status?: number }).status === 404) {
-          next.compileId = null;
-          notices.push('上次编译记录已不可用，已清空编译状态。');
-        } else {
-          notices.push(`编译记录恢复失败：${exc instanceof Error ? exc.message : String(exc)}`);
-        }
-      }
-    }
+    // The Route is restored first: a branch Route runs a derived Compile, and
+    // that Compile — not the one recorded in the state — is what 03 executes.
+    let restoredRoute: RoutePlan | null = null;
     if (next.routeId) {
       try {
         const data = await api<{ plan: RoutePlan }>(`/api/v1/workflow/routes/${next.routeId}`);
+        restoredRoute = data.plan;
         setRoute(data.plan);
+        // Resume at the planned Segment of a branch attempt (a branch Route
+        // leaves its new tail planned). Non-branch Routes keep the previous
+        // behaviour: show the Segment the saved state points at.
+        const headAttemptId = data.plan.route.headAttemptId;
+        const branchPlanned = data.plan.attempts.length > 1
+          ? data.plan.segments.find(item => item.status === 'planned' && item.attemptId === headAttemptId) ?? null
+          : null;
         const executed = data.plan.segments.filter(item => item.runId && !item.runId.startsWith('pending_'));
-        const current = [...executed].reverse().find(item => next.segmentRuns.some(row => row.segmentId === item.segmentId))
+        const current = branchPlanned
+          ?? [...executed].reverse().find(item => next.segmentRuns.some(row => row.segmentId === item.segmentId))
           ?? executed[executed.length - 1]
           ?? data.plan.segments[data.plan.segments.length - 1]
           ?? null;
@@ -1916,6 +1970,74 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
           notices.push('上次 Route 已不可用，已清空 Route 状态。');
         } else {
           notices.push(`Route 恢复失败：${exc instanceof Error ? exc.message : String(exc)}`);
+        }
+      }
+    }
+    if (next.compileId) {
+      try {
+        const envelope = await api<CompiledEnvelope>(`/api/v1/workflow/compiles/${next.compileId}`);
+        const currentDocument = document ?? project;
+        const headAttempt = restoredRoute
+          ? restoredRoute.attempts.find(attempt => attempt.attemptId === restoredRoute?.route.headAttemptId)
+            ?? restoredRoute.attempts[restoredRoute.attempts.length - 1]
+            ?? null
+          : null;
+        // The base attempt owns the Segment that starts at the first step; the
+        // attempts array order is not stable, so do not rely on index 0.
+        const baseSegment = restoredRoute
+          ? restoredRoute.segments.find(item => item.startAfterStepId === null) ?? restoredRoute.segments[0] ?? null
+          : null;
+        const baseAttempt = restoredRoute
+          ? restoredRoute.attempts.find(attempt => attempt.attemptId === baseSegment?.attemptId)
+            ?? restoredRoute.attempts[0]
+            ?? null
+          : null;
+        // A branch attempt keeps the base Route but compiles a derived project
+        // (e.g. the tail step 0.01 → 0.04). The head attempt's Compile is the
+        // one that will run, so it must not be judged against the base project.
+        const branchCompileId = headAttempt && baseAttempt
+          && headAttempt.compileId !== baseAttempt.compileId
+          ? headAttempt.compileId
+          : '';
+        let info = compileInfoFromEnvelope(envelope);
+        let matches: boolean;
+        if (branchCompileId) {
+          if (branchCompileId !== next.compileId) {
+            const branchEnvelope = await api<CompiledEnvelope>(`/api/v1/workflow/compiles/${branchCompileId}`);
+            info = compileInfoFromEnvelope(branchEnvelope);
+          }
+          // The reused prefix still has to describe the current project; the
+          // changed tail is expected to differ from the base project.
+          matches = true;
+          if (baseAttempt && baseAttempt.compileId !== branchCompileId) {
+            try {
+              const baseEnvelope = await api<CompiledEnvelope>(`/api/v1/workflow/compiles/${baseAttempt.compileId}`);
+              matches = !!currentDocument
+                && executionProjectFingerprint(currentDocument)
+                  === executionProjectFingerprint(baseEnvelope.project, baseEnvelope.sourceMap);
+            } catch { /* the base Compile was pruned: trust the branch attempt */ }
+          }
+          next.compileId = branchCompileId;
+        } else if (isDefinitionCompile(currentDocument, envelope.sourceMap)) {
+          // A definition Compile expands steps that are not in project.steps.
+          matches = true;
+        } else {
+          // The saved Compile only describes the project as it was compiled.
+          // If 01/02 changed afterwards (and was saved), restoring it as
+          // "fresh" would route and execute the stale durations.
+          matches = !!currentDocument
+            && executionProjectFingerprint(currentDocument)
+              === executionProjectFingerprint(envelope.project, envelope.sourceMap);
+        }
+        setCompile(info);
+        setCompileStale(!matches);
+        if (!matches) notices.push('工程在编译后有修改，需重新编译。');
+      } catch (exc) {
+        if ((exc as { status?: number }).status === 404) {
+          next.compileId = null;
+          notices.push('上次编译记录已不可用，已清空编译状态。');
+        } else {
+          notices.push(`编译记录恢复失败：${exc instanceof Error ? exc.message : String(exc)}`);
         }
       }
     }
@@ -2089,9 +2211,12 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   /**
    * A saved edit must invalidate the Compile immediately: otherwise 02 keeps
    * offering "去 03" and the old Compile silently runs the previous durations.
+   * Definition Compiles expand steps that are not in `project.steps`, so they
+   * are left to the edit actions instead of being compared by fingerprint.
    */
   const refreshCompileStaleness = (document: ProjectDoc) => {
     if (!compile) return;
+    if (isDefinitionCompile(document, compile.compile.sourceMap)) return;
     setCompileStale(!compileMatchesProject(document, compile));
   };
 
@@ -2118,9 +2243,12 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       const record = projectId
         ? await projectRequest(`/api/v1/workflow/projects/${projectId}`, 'PUT', document)
         : await projectRequest('/api/v1/workflow/projects', 'POST', document);
-      setProject(document);
-      await applySavedRecord(record, document);
-      refreshCompileStaleness(document);
+      // The server normalizes the document (solver defaults, schema fields);
+      // keep that copy so an unchanged save compares equal to its Compile.
+      const saved = await api<ProjectDoc>(`/api/v1/workflow/projects/${record.projectId}`);
+      setProject(saved);
+      await applySavedRecord(record, saved);
+      refreshCompileStaleness(saved);
       // A new projectId (or a just-created draft) still needs its state PUT.
       lastStateJson.current = '';
       setProjectState(previous => ({ ...previous }));
@@ -2143,9 +2271,10 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     const document = projectDocumentForSave();
     const record = await projectRequest(`/api/v1/workflow/projects/${overwriteArmed.projectId}`, 'PUT', document);
     setOverwriteArmed(null);
-    setProject(document);
-    await applySavedRecord(record, document);
-    refreshCompileStaleness(document);
+    const saved = await api<ProjectDoc>(`/api/v1/workflow/projects/${record.projectId}`);
+    setProject(saved);
+    await applySavedRecord(record, saved);
+    refreshCompileStaleness(saved);
     lastStateJson.current = '';
     setProjectState(previous => ({ ...previous }));
   });
@@ -3468,7 +3597,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setCandidateViews({});
     setCandidateViewErrors({});
     setCompareCoverage(null);
-    setComparePick([]);
+    setComparePick(null);
     setAutoAnalysisId('');
     setShowAllCandidates(false);
     setExperimentInputsOpen(false);
@@ -3504,7 +3633,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setCandidateViews({});
     setCandidateViewErrors({});
     setCompareCoverage(null);
-    setComparePick([]);
+    setComparePick(null);
     setShowAllCandidates(false);
     setAutoAnalysisId('');
     autoAnalysisRef.current = '';
@@ -3527,7 +3656,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       setCandidateViews({});
       setCandidateViewErrors({});
       setCompareCoverage(null);
-      setComparePick([]);
+      setComparePick(null);
       setAutoAnalysisId('');
       autoAnalysisRef.current = '';
     }
@@ -4326,7 +4455,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setCandidateViews({});
     setCandidateViewErrors({});
     setCompareCoverage(null);
-    setComparePick([]);
+    setComparePick(null);
     setAutoAnalysisId('');
     setExperimentInputsOpen(false);
     recordExperiment(document.experimentId);
@@ -4397,16 +4526,17 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     }).filter(row => row.runId && row.stepId);
   };
 
-  const loadAnalysis = async (rows: Array<{ runId: string; stepId: string; label: string }>, picks: string[] = comparePick) => {
+  const loadAnalysis = async (rows: Array<{ runId: string; stepId: string; label: string }>, picks: string[] | null = comparePick) => {
     const candidates = rows.filter(item => item.runId && item.stepId);
     if (!candidates.length) throw new Error('实验还没有可分析的 Run');
     const total = candidates.length;
     // Only the selected (≤ COMPARE_CANDIDATE_LIMIT) candidates go to the
     // pairwise comparison; every candidate still gets its own structure view.
-    const picked = picks.length
-      ? candidates.filter(item => picks.includes(candidateKey(item)))
-      : [];
-    const compareRows = (picked.length ? picked : candidates).slice(0, COMPARE_CANDIDATE_LIMIT);
+    // `null` picks the default first four, an explicit `[]` compares nothing.
+    const picked = picks === null
+      ? candidates.slice(0, COMPARE_CANDIDATE_LIMIT)
+      : candidates.filter(item => picks.includes(candidateKey(item)));
+    const compareRows = picked.slice(0, COMPARE_CANDIDATE_LIMIT);
     const prefix = compareRows.every((row, index) => candidateKey(row) === candidateKey(candidates[index]));
     if (compareRows.length >= 2) {
       const result = await postJson<CompareResult>('/api/v1/workflow/analysis/compare', {
@@ -4438,7 +4568,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const loadExperimentCandidates = () => {
     const rows = experimentCandidates(experimentDoc);
     if (!rows.length) return;
-    setComparePick([]);
+    setComparePick(null);
     setCompareCandidates(rows);
   };
 
@@ -4455,14 +4585,14 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       };
     }).filter(row => row.runId && row.stepId);
     if (!rows.length) return;
-    setComparePick([]);
+    setComparePick(null);
     setCompareCandidates(rows);
     void run('compare', () => loadAnalysis(rows, rows.slice(0, COMPARE_CANDIDATE_LIMIT).map(candidateKey))).catch(() => undefined);
   };
 
   const addCurrentCandidate = () => {
     if (!hasExecutedRun || !segment?.runId) return;
-    setComparePick([]);
+    setComparePick(null);
     setCompareCandidates(previous => [
       ...previous.filter(item => item.runId !== segment.runId),
       { runId: segment.runId!, stepId: segment.throughStepId, label: `当前 Run · ${statusLabel(segment.status)}` },
@@ -4472,21 +4602,23 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const runComparison = () => run('compare', async () => {
     const candidates = compareCandidates.filter(item => item.runId && item.stepId);
     if (candidates.length < 1) throw new Error('实验还没有可分析的 Run');
-    await loadAnalysis(candidates);
+    if (comparedCandidateKeys.length < 2) throw new Error('至少选择 2 个候选');
+    await loadAnalysis(candidates, comparedCandidateKeys);
   });
 
   /**
    * The checked candidates in the compare table. `comparePick` is the single
-   * source of truth: it is seeded with the first 4 candidates whenever the
-   * candidate list changes, toggled directly by the checkboxes, and synced to
-   * the actually compared keys after a comparison finishes.
+   * source of truth: `null` falls back to the first 4 candidates, `[]` is an
+   * explicit "compare nothing" selection, checkboxes toggle it directly, and a
+   * finished comparison syncs it to the actually compared keys.
    */
   useEffect(() => {
-    setComparePick(compareCandidates.slice(0, COMPARE_CANDIDATE_LIMIT).map(candidateKey));
+    setComparePick(null);
   }, [compareCandidates]);
 
   const comparedCandidateKeys = useMemo(() => {
     const known = new Set(compareCandidates.map(candidateKey));
+    if (comparePick === null) return compareCandidates.slice(0, COMPARE_CANDIDATE_LIMIT).map(candidateKey);
     return comparePick.filter(key => known.has(key));
   }, [comparePick, compareCandidates]);
   /** Checkboxes changed after the last comparison: the table is one click behind. */
@@ -4499,7 +4631,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const toggleCompareCandidate = (key: string) => {
     setComparePick(current => {
       const known = new Set(compareCandidates.map(candidateKey));
-      const base = current.filter(item => known.has(item));
+      const base = current === null
+        ? compareCandidates.slice(0, COMPARE_CANDIDATE_LIMIT).map(candidateKey)
+        : current.filter(item => known.has(item));
       if (base.includes(key)) return base.filter(item => item !== key);
       if (base.length >= COMPARE_CANDIDATE_LIMIT) return base;
       return [...base, key];
@@ -4516,7 +4650,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     if (!rows.length) return;
     autoAnalysisRef.current = experimentDoc.experimentId;
     setAutoAnalysisId(experimentDoc.experimentId);
-    setComparePick([]);
+    setComparePick(null);
     setCompareCandidates(rows);
     void run('compare', () => loadAnalysis(rows, rows.slice(0, COMPARE_CANDIDATE_LIMIT).map(candidateKey))).catch(() => undefined);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -6909,8 +7043,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
           <div className="spx-run-actions">
             <button className="wf-button ghost" disabled={!!refreshCandidatesBlockedReason} onClick={loadExperimentCandidates}>刷新候选</button>
             <button className="wf-button ghost" disabled={!hasExecutedRun || !!busy} onClick={addCurrentCandidate}>加入当前 Run</button>
-            <button className="wf-button primary" disabled={compareCandidates.length < 2 || !!busy}
-              title={compareCandidates.length < 2 ? '先选择至少 2 个候选' : '比较所选候选并加载结构视图'}
+            <button className="wf-button primary" disabled={compareCandidates.length < 2 || comparedCandidateKeys.length < 2 || !!busy}
+              title={compareCandidates.length < 2 ? '先选择至少 2 个候选'
+                : comparedCandidateKeys.length < 2 ? '至少选择 2 个候选' : '比较所选候选并加载结构视图'}
               onClick={() => void runComparison()}>
               {busy === 'compare' ? '比较中…' : '比较并加载视图'}
             </button>
@@ -6927,6 +7062,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
           </div>}
           {compareCandidates.length < 2 && <div className="wf-block-reason" aria-label="比较禁用原因">
             先选择至少 2 个候选：点击“刷新候选”载入实验变体，或“加入当前 Run”添加一个对照。
+          </div>}
+          {compareCandidates.length >= 2 && comparedCandidateKeys.length < 2 && <div className="wf-block-reason" aria-label="比较禁用原因">
+            至少选择 2 个候选：在候选表中勾选要对比的候选。
           </div>}
 
           {analysisReady && <>
@@ -6979,13 +7117,13 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               })}</tbody>
             </table>}
 
-            {compareCoverage && compareCoverage.total > COMPARE_CANDIDATE_LIMIT && <div className="wf-block-reason" aria-label="对比候选说明">
+            {compareCoverage && (comparePickPending || compareCoverage.total > COMPARE_CANDIDATE_LIMIT) && <div className="wf-block-reason" aria-label="对比候选说明">
               {comparePickPending
-                ? `已选择 ${comparedCandidateKeys.length}/${compareCoverage.total} 个候选；点击“比较并加载视图”更新对比表。`
+                ? `已修改对比选择（${comparedCandidateKeys.length}/${compareCoverage.total}）；点击“比较并加载视图”更新对比表。`
                 : `对比${compareCoverage.prefix ? '前' : '所选'} ${compareCoverage.compared.length}/${compareCoverage.total} 个候选；其余候选的结构视图仍全部加载与显示。`}
               <button type="button" className="wf-link" onClick={() => document.getElementById('wf-candidate-table')?.scrollIntoView({ block: 'center' })}>选择对比候选</button>
               <button type="button" className="wf-link" disabled={!!busy}
-                onClick={() => void run('compare', () => loadAnalysis(compareCandidates)).catch(() => undefined)}>显示全部视图</button>
+                onClick={() => void run('compare', () => loadAnalysis(compareCandidates, comparedCandidateKeys)).catch(() => undefined)}>显示全部视图</button>
             </div>}
 
             {Object.keys(candidateViews).length > 0 && <div className="wf-compare-controls">
