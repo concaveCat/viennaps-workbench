@@ -66,6 +66,20 @@ def planarize_step(**overrides) -> dict:
     return value
 
 
+def fin_geometry(dimension: int) -> dict:
+    """A fin whose mask band protrudes above the position plane.
+
+    Measured on 4.7.0: ``finHeight=0.3`` with ``maskHeight=0.2`` produces a
+    native ``DenseCellSet`` whose bounding lattice is 20x33 (2D) / 12x12x33
+    (3D) while only 517 / 3794 cells are active, the sparse layout from the
+    GDS FinFET flow.
+    """
+    return {"kind": "fin", "width": 0.4 if dimension == 2 else 0.2,
+            "height": 0.3, "taperAngle": 0.0, "maskHeight": 0.2,
+            "maskTaperAngle": 0.0, "substrateMaterial": "Si",
+            "maskMaterial": "Mask"}
+
+
 def make_grid(*, dimension: int = 2, delta: float = 0.5,
               origin: tuple[float, float, float] = (0.0, 0.0, 0.0),
               shape: tuple[int, int, int] = (4, 4, 1)) -> CellGrid:
@@ -84,8 +98,9 @@ def grid_nodes(grid: CellGrid) -> list[list[float]]:
     return points
 
 
-def solid_material(grid: CellGrid, material: int = 10) -> list[float]:
-    return [float(material)] * grid.cell_count
+def solid_material(grid: CellGrid, material: int = 10,
+                   count: int | None = None) -> list[float]:
+    return [float(material)] * (grid.active_count if count is None else count)
 
 
 def surface_step(kind: str, *, rate: float, duration: float, **extra) -> dict:
@@ -265,6 +280,82 @@ class FieldRemapUnitTests(unittest.TestCase):
                                         "yExtent": 0.4}},
             top=99.9, bottom=-0.42, delta=0.02)
         self.assertGreater(bound3, 2_000_000)
+
+    def sparse_grid(self, shape=(4, 4, 1), *, origin=(0.0, 0.0, 0.0),
+                    missing=()):
+        missing = set(missing)
+        dense = make_grid(shape=shape, origin=origin)
+        active = array("q", [key for key in range(dense.cell_count)
+                             if key not in missing])
+        return dense.with_active(active)
+
+    def test_sparse_same_layout_copies_by_lattice_key(self) -> None:
+        grid = self.sparse_grid(missing=(12,))
+        values = [float(index) for index in range(grid.active_count)]
+        result = remap_cell_fields(
+            grid, grid, old_values={"dopant": values},
+            old_material=solid_material(grid), new_material=solid_material(grid),
+            cover_material_id=3, labels=["dopant"])
+        self.assertEqual(result.labels["dopant"], values)
+        record = result.record
+        self.assertTrue(record["sameGrid"])
+        self.assertTrue(record["sparse"])
+        self.assertEqual(record["oldCellCount"], 15)
+        self.assertEqual(record["oldFullCellCount"], 16)
+        self.assertEqual(record["oldMissingCellCount"], 1)
+        self.assertEqual(record["remappedCells"], 15)
+        self.assertEqual(record["newCells"], 0)
+        self.assertEqual(record["removedCells"], 0)
+        self.assertEqual(record["mass"]["dopant"]["lost"], 0.0)
+
+    def test_sparse_new_active_cells_start_at_zero(self) -> None:
+        old = self.sparse_grid(missing=(12,))
+        new = self.sparse_grid()  # dense: key 12 becomes active
+        values = [float(index + 1) for index in range(old.active_count)]
+        result = remap_cell_fields(
+            old, new, old_values={"dopant": values},
+            old_material=solid_material(old), new_material=solid_material(new),
+            cover_material_id=3, labels=["dopant"])
+        self.assertEqual(result.record["newCells"], 1)
+        self.assertEqual(result.record["newCellCount"], 16)
+        # Linear key 12 is the 13th dense cell; active positions 0..11 keep
+        # their values, position 12 is the new cell, 13..15 keep theirs.
+        self.assertEqual(result.labels["dopant"][:12], values[:12])
+        self.assertEqual(result.labels["dopant"][12], 0.0)
+        self.assertEqual(result.labels["dopant"][13:], values[12:])
+        self.assertEqual(result.record["mass"]["dopant"]["lost"], 0.0)
+
+    def test_sparse_removed_active_cell_records_grid_loss(self) -> None:
+        old = self.sparse_grid()
+        new = self.sparse_grid(missing=(12,))
+        values = [2.0] * old.active_count
+        result = remap_cell_fields(
+            old, new, old_values={"dopant": values},
+            old_material=solid_material(old), new_material=solid_material(new),
+            cover_material_id=3, labels=["dopant"])
+        self.assertEqual(result.record["removedByGrid"], 1)
+        self.assertEqual(result.record["removedByMaterial"], 0)
+        self.assertEqual(result.record["removedCells"], 1)
+        self.assertEqual(result.record["mass"]["dopant"]["lost"], 2.0 * 0.25)
+        self.assertEqual(result.record["newCells"], 0)
+
+    def test_sparse_integer_shift_maps_by_lattice_key(self) -> None:
+        old = self.sparse_grid(shape=(4, 4, 1), missing=(12,))
+        shifted = array("q", sorted({int(key) - 4 for key in old.active
+                                     if int(key) - 4 >= 0}))
+        new = make_grid(shape=(4, 4, 1), origin=(0.0, 0.5, 0.0)).with_active(shifted)
+        values = [float(index + 1) for index in range(old.active_count)]
+        result = remap_cell_fields(
+            old, new, old_values={"dopant": values},
+            old_material=solid_material(old), new_material=solid_material(new),
+            cover_material_id=3, labels=["dopant"])
+        source = {int(key): values[position]
+                  for position, key in enumerate(old.active)}
+        for position, key in enumerate(new.active):
+            expected = source.get(int(key) + 4, 0.0)
+            self.assertEqual(result.labels["dopant"][position], expected)
+        self.assertEqual(result.record["cellOffset"], {"x": 0, "y": 1, "z": 0})
+        self.assertGreater(result.record["oldMissingCellCount"], 0)
 
 
 class FieldRemapWorkflow(unittest.IsolatedAsyncioTestCase):
@@ -525,6 +616,61 @@ class FieldRemapWorkflow(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(payload["cellSetSetup"]["grid"]["top"], 0.5)
         self.assertAlmostEqual(payload["cellSetSetup"]["grid"]["bottom"], -0.42)
 
+    async def test_sparse_fin_implant_deposit_anneal_2d(self) -> None:
+        settings = field_settings(height=0.6)
+        value = project(2, steps=[implant_step(cellSet=dict(settings)),
+                                  surface_step("deposit", rate=0.5, duration=0.1),
+                                  anneal_step(cellSet=dict(settings)),
+                                  analysis_step(cellSet=dict(settings))])
+        value["geometry"] = fin_geometry(2)
+        value["domain"] = {"gridDelta": 0.05, "xExtent": 1.0,
+                           "xBoundary": "reflective"}
+        run_id, _manifest = await self.run_project(value)
+        implant_setup = self.snapshot(run_id, "implant_step_01")["cellSetProcess"]["cellSet"]
+        self.assertTrue(implant_setup["sparse"], implant_setup)
+        self.assertLess(implant_setup["activeCellCount"],
+                        implant_setup["fullCellCount"])
+        payload = self.summary(run_id)
+        setup = payload["cellSetSetup"]
+        self.assertEqual(setup["remapCount"], 1)
+        record = setup["remaps"][0]
+        self.assertEqual(record["sourceStepId"], "deposit_step_0001")
+        self.assertTrue(record["sparse"])
+        self.assertEqual(record["method"],
+                         "conservative-axis-aligned-integer-overlap")
+        self.assertGreater(record["oldFullCellCount"], record["oldCellCount"])
+        self.assertGreater(record["newCells"], 0)
+        self.assertEqual(record["removedByGrid"], 0)
+        self.assert_mass_balance(record)
+        self.assertGreater(record["mass"]["P_total"]["after"], 0.0)
+        self.assertIn("P_active", payload["fieldDigests"])
+        self.assertIn("net_doping", payload["fieldDigests"])
+
+    async def test_sparse_fin_implant_etch_anneal_3d(self) -> None:
+        settings = field_settings(height=0.6)
+        value = project(3, steps=[implant_step(cellSet=dict(settings)),
+                                  surface_step("etch", rate=0.5, duration=0.1),
+                                  anneal_step(cellSet=dict(settings)),
+                                  analysis_step(cellSet=dict(settings))])
+        value["geometry"] = fin_geometry(3)
+        value["domain"] = {"gridDelta": 0.05, "xExtent": 0.6, "yExtent": 0.6,
+                           "boundaryXY": "reflective"}
+        run_id, _manifest = await self.run_project(value)
+        implant_setup = self.snapshot(run_id, "implant_step_01")["cellSetProcess"]["cellSet"]
+        self.assertTrue(implant_setup["sparse"], implant_setup)
+        self.assertLess(implant_setup["activeCellCount"],
+                        implant_setup["fullCellCount"])
+        payload = self.summary(run_id)
+        record = payload["cellSetSetup"]["remaps"][0]
+        self.assertEqual(record["sourceStepId"], "etch_step_0001")
+        self.assertTrue(record["sparse"])
+        self.assertGreater(record["oldFullCellCount"], record["oldCellCount"])
+        self.assertGreater(record["newCells"], 0)
+        self.assertGreater(record["mass"]["P_total"]["lost"], 0.0)
+        self.assert_mass_balance(record)
+        self.assertEqual(payload["dimension"], 3)
+        self.assertEqual(payload["grid"]["nativeElementType"], "hexahedron")
+
 
 
 class FieldRemapGeometryLimitTests(unittest.IsolatedAsyncioTestCase):
@@ -690,6 +836,63 @@ class FieldRemapWideBandTests(unittest.TestCase):
                                          periodic=False)
         self.assertIn("construction limit", str(context.exception))
         self.assertEqual(proxy.domain_calls, 0)
+
+
+class FieldRemapSparseNativeTests(unittest.TestCase):
+    """The native cell set of a structured geometry is not a full box."""
+
+    def build(self, dimension: int):
+        import viennaps as ps
+        ps.setDimension(dimension)
+        delta = 0.05
+        if dimension == 2:
+            domain = ps.Domain(delta, 1.0, ps.BoundaryType.REFLECTIVE_BOUNDARY)
+            ps.MakeFin(domain, finWidth=0.4, finHeight=0.3, finTaperAngle=0.0,
+                       maskHeight=0.2, maskTaperAngle=0.0, halfFin=False,
+                       material=ps.Material.Si, maskMaterial=ps.Material.Mask).apply()
+            project = {"dimension": 2,
+                       "domain": {"gridDelta": delta, "xExtent": 1.0},
+                       "schemaVersion": 7}
+        else:
+            domain = ps.Domain(delta, 0.6, 0.6,
+                               ps.BoundaryType.REFLECTIVE_BOUNDARY)
+            ps.d3.MakeFin(domain, finWidth=0.2, finHeight=0.3, finTaperAngle=0.0,
+                          maskHeight=0.2, maskTaperAngle=0.0, halfFin=False,
+                          material=ps.Material.Si, maskMaterial=ps.Material.Mask).apply()
+            project = {"dimension": 3,
+                       "domain": {"gridDelta": delta, "xExtent": 0.6,
+                                  "yExtent": 0.6},
+                       "schemaVersion": 7}
+        return ps, domain, project
+
+    def test_fin_cell_set_is_sparse_not_rejected_as_a_regular_box(self) -> None:
+        from worker.simulate import _generate_field_cell_set
+        # The 1,860,000-cell FinFET bounding lattice is 100x100x186; this fin
+        # reproduces the sparse shape at a test-sized grid. The exact active
+        # count depends on native global state left by other modules, so only
+        # the sparse invariant and the bounding lattice are pinned.
+        expected_full = {2: 660, 3: 4752}
+        for dimension in (2, 3):
+            with self.subTest(dimension=dimension):
+                ps, domain, project = self.build(dimension)
+                _fd, cell_set, grid, info = _generate_field_cell_set(
+                    ps, domain, project, height=0.6, band_cells=18,
+                    cover=ps.Material.GAS, periodic=False)
+                active = int(cell_set.getNumberOfCells())
+                full = expected_full[dimension]
+                self.assertTrue(info["sparse"])
+                self.assertGreater(active, 0)
+                self.assertLess(active, full)
+                self.assertEqual(info["activeCellCount"], active)
+                self.assertEqual(info["fullCellCount"], full)
+                self.assertEqual(info["missingCellCount"], full - active)
+                self.assertEqual(grid.active_count, active)
+                self.assertEqual(grid.cell_count, full)
+                signature = grid.signature()
+                self.assertEqual(signature["numberOfCells"], active)
+                self.assertEqual(signature["fullCellCount"], full)
+                self.assertEqual(signature["missingCellCount"], full - active)
+                self.assertTrue(signature["sparse"])
 
 
 class FieldRemapSchemaTests(unittest.TestCase):
