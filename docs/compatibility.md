@@ -4,8 +4,8 @@ Date: 2026-10-26
 
 ## Environment
 
-- Python 3.12.14; installed ViennaPS 4.6.2 and ViennaLS 5.8.5. Metadata was read without importing ViennaPS.
-- Supported runtimes: **4.6.2 / 5.8.5 (production default)** and **4.7.0 / 5.10.0 (evaluated, isolated)**. The 4.7.0 runtime is exercised through the same backend with version gates for ALD `surfaceDiffusion` and the advanced oxidation controls; see [`migration-viennaps-4.7.0.md`](migration-viennaps-4.7.0.md).
+- Python 3.12.14; the default runtime is the isolated venv `requirements-v470.lock` (ViennaPS 4.7.0 / ViennaLS 5.10.0). The 4.6.2 / 5.8.5 system environment is retained for replay, legacy runs and the two capabilities 4.7.0 lacks. Metadata was read without importing ViennaPS.
+- Supported runtimes: **4.7.0 / 5.10.0 (default)** and **4.6.2 / 5.8.5 (retained legacy/replay)**. Both runtimes go through the same backend; 4.7.0 adds version gates for ALD `surfaceDiffusion`, the advanced oxidation controls, the 2D Faraday cage etch and multi-ion GPU; see [`migration-viennaps-4.7.0.md`](migration-viennaps-4.7.0.md).
 - `/root/ViennaPS` is a development snapshot (HEAD `7a8b17f`, 2026-09-18) whose CMake version already says 4.7.0. It was used only to compare documented call shape; the official 4.7.0 release is the PyPI wheel / tag `f65c1dc`.
 - The project `.venv` was created with `--system-site-packages`. Before P0 probes, `scripts/bounded_child.py` was implemented and exercised with a success child, a one-second timeout, a 1 MiB RSS threshold, and a 1 KiB log cap. Every engine probe then ran through that guard in a new session and process group.
 - RSS supervision measures `/proc` resident pages for the owned process group every 200 ms. It is not a hard memory cap. No usable `memory.max` cgroup file was available in this sandbox; RLIMIT_AS is not used.

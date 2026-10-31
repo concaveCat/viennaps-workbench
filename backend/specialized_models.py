@@ -5,7 +5,7 @@ import math
 from copy import deepcopy
 from typing import Any
 
-from .engine import OXIDATION_ADVANCED_RESTRICTED, engine_version
+from .engine import OXIDATION_ADVANCED_RESTRICTED, engine_version, faraday_2d_error
 
 
 def number(key: str, default: float, *, minimum: float = 0.0, maximum: float = 1_000_000.0,
@@ -393,10 +393,14 @@ FARADAY_CAGE_2D_ENGINE_NOTE = (
 def faraday_cage_2d_engine_error(flux_engine: str | None) -> str | None:
     """Strict shared 2D FaradayCage gate used by API validation and the worker.
 
-    Returns ``None`` only for an explicitly pinned CPU disk engine. ``None``
-    (no engine supplied) is rejected as well: a direct worker caller must state
-    the engine it is about to pin instead of inheriting AUTO.
+    Returns ``None`` only for an explicitly pinned CPU disk engine on a runtime
+    whose 2D kernel actually etches. ``None`` (no engine supplied) is rejected
+    as well: a direct worker caller must state the engine it is about to pin
+    instead of inheriting AUTO.
     """
+    version_message = faraday_2d_error()
+    if version_message is not None:
+        return version_message
     if flux_engine in FARADAY_CAGE_2D_ENGINES:
         return None
     resolved = "no explicit flux engine" if flux_engine is None else f"the {flux_engine} flux engine"

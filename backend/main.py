@@ -42,7 +42,7 @@ from .runtime_limits import (artifact_limit_bytes, artifact_limit_label,
                              artifact_limit_startup_message, deployment_limit_status,
                              deployment_limits_startup_message, cpu_thread_limit)
 from .gpu_devices import cuda_devices
-from .engine import EngineVersionMismatch
+from .engine import EngineVersionMismatch, multi_ion_gpu_error
 
 
 ROOT = storage.ROOT
@@ -777,6 +777,14 @@ async def run_replay(request: Request, payload: Any = Body(...)) -> dict[str, An
             ion_count = sum(row.get("kind") == "ion" for row in step.get("species", [])) if step else 0
             multi_ion_gpu = (project_payload["schemaVersion"] == 7 and item.engine == "GPU_DISK"
                              and capability_model == "multiParticle" and ion_count > 1)
+            if (project_payload["schemaVersion"] == 7 and str(item.engine).startswith("GPU_")
+                    and capability_model == "multiParticle" and ion_count > 1):
+                # Same shared policy the worker and supervisor apply, so the API
+                # never queues a replay that the worker would have to truncate.
+                policy = multi_ion_gpu_error()
+                if policy is not None:
+                    raise HTTPException(status_code=422, detail={
+                        "path": "executionRequirements.steps", "message": policy})
             valid_strategy = (
                 item.executionStrategy in {GPU_MULTIPARTICLE_SPLIT_STRATEGY, GPU_MULTIPARTICLE_NATIVE_STRATEGY}
                 and item.fluxStrategy is None if multi_ion_gpu and analysis_mode != "flux" else

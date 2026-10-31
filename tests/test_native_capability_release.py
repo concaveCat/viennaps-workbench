@@ -65,6 +65,35 @@ def bounds(snapshot: dict) -> dict:
             for index, axis in enumerate(("x", "h"))}
 
 
+def comparison_tolerance(reference: dict, installed: str) -> float | None:
+    """Exact match for same-runtime references, float32 ULP tolerance across runtimes.
+
+    The archived GPU_TRIANGLE references were measured on ViennaPS 4.6.2. The
+    4.7.0 kernel returns the same topology and materials but coordinates that
+    differ by ~3e-9 um (single-precision rounding), so a cross-runtime replay
+    compares numerically instead of demanding bit identity.
+    """
+    measured = (reference.get("versions") or {}).get("viennaps")
+    return None if measured == installed else 1e-6
+
+
+def assert_signature_matches(testcase: unittest.TestCase, actual: dict, expected: dict,
+                            tolerance: float | None) -> None:
+    for key in ("materialIds", "materialIdsByLevelSetIndex"):
+        testcase.assertEqual(actual[key], expected[key], key)
+    topology = [key for key in actual if key.startswith("topology/")]
+    for key in topology:
+        testcase.assertEqual(actual[key], expected[key], key)
+    if tolerance is None:
+        testcase.assertEqual(actual["points"], expected["points"])
+        return
+    testcase.assertEqual(len(actual["points"]), len(expected["points"]))
+    worst = max((abs(float(a[i]) - float(b[i])) for a, b in zip(actual["points"], expected["points"])
+                 for i in range(len(a))), default=0.0)
+    testcase.assertLessEqual(worst, tolerance,
+                             f"largest coordinate deviation from the archived reference: {worst:g}")
+
+
 class NativeCapabilityRelease(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         EVIDENCE.mkdir(parents=True, exist_ok=True)
@@ -207,7 +236,9 @@ class NativeCapabilityRelease(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(readback["uuid"], DEVICE["uuid"])
             self.assertEqual(readback["readbackStatus"], "verified")
             product = await self.snapshot(run_id, "stage8_sf6o2")
-            self.assertEqual(signature(product), direct_signature(direct, "final"))
+            tolerance = comparison_tolerance(direct, version("viennaps"))
+            assert_signature_matches(self, signature(product), direct_signature(direct, "final"),
+                                     tolerance)
 
             replay = json_body(await asgi_request(f"/api/runs/{run_id}/replay-project"))
             self.assertEqual(replay["executionRequirements"]["steps"][0]["engine"], "GPU_TRIANGLE")
@@ -224,7 +255,12 @@ class NativeCapabilityRelease(unittest.IsolatedAsyncioTestCase):
             (EVIDENCE / "capability-gpu-triangle.json").write_text(json.dumps({
                 "case": f"{dimension}D", "runId": run_id, "replayRunId": replay_id,
                 "engine": "GPU_TRIANGLE", "gpuDeviceId": DEVICE["uuid"],
-                "productDirectExact": True, "replayExact": True,
+                "productDirectExact": tolerance is None,
+                "productDirectMatch": "exact" if tolerance is None else "1e-6-um",
+                "referenceVersions": direct.get("versions"),
+                "installedVersions": {"viennaps": version("viennaps"),
+                                      "viennals": version("viennals")},
+                "replayExact": True,
                 "directReference": str(direct_path.relative_to(ROOT)),
             }, indent=2) + "\n", encoding="utf-8")
 

@@ -26,6 +26,7 @@ from .validation import (GPU_MULTIPARTICLE_FLUX_STRATEGY, GPU_MULTIPARTICLE_SPLI
                          select_engine, capability_verified, experimental_cpu_replay_allowed,
                          gpu_project_signature, slice_position_issue)
 from .native_build import configured_runtime
+from .engine import multi_ion_gpu_error
 from .rates import uses_flux
 from .runtime_limits import max_log_bytes, max_log_mib, rss_limit_mib
 from .gpu_devices import cuda_devices, resolve_gpu_device
@@ -365,6 +366,21 @@ class Supervisor:
                 item["stepId"] in gpu_multi_steps and item["engine"] == "GPU_DISK"
                 and _requires_patched_multi_particle(gpu_multi_steps[item["stepId"]])
                 for item in actual_steps)
+            # Shared policy for every multi-ion GPU step, new run or replay,
+            # process or single-pass flux, and independently of the recorded
+            # strategy: a per-species flux replay needs no patched-runtime
+            # fingerprint, so keying the gate off ``needs_native_patch`` left it
+            # accepted as pending on 4.7.0 while the worker could only truncate
+            # or guess. API validation, the worker and this supervisor agree.
+            multi_ion_gpu_steps = [
+                item["stepId"] for item in actual_steps
+                if str(item["engine"]).startswith("GPU_")
+                and item["stepId"] in gpu_multi_steps
+                and _requires_patched_multi_particle(gpu_multi_steps[item["stepId"]])]
+            if multi_ion_gpu_steps:
+                policy = multi_ion_gpu_error()
+                if policy is not None:
+                    raise ReplayMismatch(policy)
             # Old replays without a fingerprint must retain their original
             # runtime and execution identity. New runs only inject the patched
             # build for the multi-particle shapes that actually need it.

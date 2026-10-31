@@ -21,7 +21,7 @@ from .specialized_models import (FLUOROCARBON_MATERIAL_DEFAULTS, IBE_ENERGY_MODE
 from .runtime_limits import available_cpu_threads
 from .engine import (EVIDENCE_ENGINE_VERSION, OXIDATION_ADVANCED_RESTRICTED,
                      ald_surface_diffusion_error, ald_surface_diffusion_supported,
-                     engine_version, oxidation_advanced_supported)
+                     engine_version, multi_ion_gpu_error, oxidation_advanced_supported)
 
 
 # These ViennaPS 4.6.2 combinations either SIGSEGV or produce different final
@@ -249,6 +249,15 @@ def validate_project(payload: Any, *, kind: str = "project") -> tuple[Project, l
                 continue
             if step_value(step,"enabled") and (uses_flux(step) if project.schemaVersion in (4,5,6,7) else step_value(step,"model")=="singleParticle" and step_value(step,"rateMagnitude")>0):
                 engine=select_engine(normalized,step_dict)
+                if (step_value(step, "model") == "multiParticle" and engine.startswith("GPU_")
+                        and sum(1 for row in (step_dict.get("species") or []) if row.get("kind") == "ion") > 1):
+                    # Stock 4.7.0 drops every ion after the first without an
+                    # error, so a multi-ion GPU step must be rejected here
+                    # instead of silently producing a wrong geometry.
+                    policy = multi_ion_gpu_error()
+                    if policy is not None:
+                        issues.append(FieldIssue(f"steps[{i}].species", policy))
+                        continue
                 signature = gpu_project_signature(normalized, step_dict)
                 if engine=="unavailable" or (not engine.startswith("GPU_") and not capability_verified(
                         project.dimension,step_value(step,"model"),step_value(step,"operation"),boundary,engine,

@@ -1,8 +1,10 @@
 """Installed ViennaPS/ViennaLS identity and version-qualified policy.
 
-The Workbench keeps compatibility with the 4.6.2 production runtime while
-allowing an isolated 4.7.0 evaluation runtime. Everything that depends on a
-concrete engine version belongs here instead of spread-out literals.
+ViennaPS 4.7.0 / ViennaLS 5.10.0 is the default runtime. The 4.6.2 runtime is
+retained for replay, legacy runs and the two capabilities that 4.7.0 does not
+provide (the patched multi-ion GPU build and the 2D Faraday cage etch).
+Everything that depends on a concrete engine version belongs here instead of
+spread-out literals.
 
 ``EVIDENCE_ENGINE_VERSION`` is deliberately *not* the installed version: the
 archived capability/evidence matrices in ``docs/`` were measured against 4.6.2
@@ -17,16 +19,23 @@ from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Iterable
 
 
-SUPPORTED_ENGINE_VERSIONS = ("4.6.2", "4.7.0")
-EVIDENCE_ENGINE_VERSION = "4.6.2"
-# On-disk catalogs/registries keep the historical header so the unchanged
-# 4.6.2 service can still read a file written by the 4.7.0 evaluation runtime.
+DEFAULT_ENGINE_VERSION = "4.7.0"
+LEGACY_ENGINE_VERSION = "4.6.2"
+SUPPORTED_ENGINE_VERSIONS = (DEFAULT_ENGINE_VERSION, LEGACY_ENGINE_VERSION)
+EVIDENCE_ENGINE_VERSION = LEGACY_ENGINE_VERSION
+# On-disk catalogs/registries keep the historical header so a retained 4.6.2
+# service can still read a file written by the default 4.7.0 runtime.
 # Readers accept every SUPPORTED_ENGINE_VERSIONS value.
-ENGINE_REGISTRY_VERSION = "4.6.2"
+ENGINE_REGISTRY_VERSION = LEGACY_ENGINE_VERSION
 
 # The patched multi-ion GPU runtime is an ABI-bound 4.6.2 build. It cannot be
 # loaded by a 4.7.0/ViennaLS-5.10 environment, so keep the accepted set explicit.
-PATCHED_RUNTIME_VERSIONS = ("4.6.2",)
+PATCHED_RUNTIME_VERSIONS = (LEGACY_ENGINE_VERSION,)
+# Versions whose stock GPU binding converts every configured ion species.
+# Stock 4.7.0 still emits only one per-species flux field and hands the rate
+# callback a one-element vector, so extra ions are dropped without an error;
+# only the patched 4.6.2 build is verified for multi-ion GPU runs.
+MULTI_ION_GPU_STOCK_VERSIONS = (LEGACY_ENGINE_VERSION,)
 
 
 @lru_cache(maxsize=1)
@@ -85,6 +94,45 @@ def ald_surface_diffusion_error(engine: str | None = None) -> str | None:
                 f"SurfaceDiffusionParameters stencil; the worker process would never "
                 f"return. Use the ViennaPS 4.6.2 runtime, or remove or disable this block.")
     return None
+
+
+def multi_ion_gpu_error(engine: str | None = None) -> str | None:
+    """Shared multi-ion GPU policy; None when the runtime can honour it.
+
+    Measured on the stock 4.7.0 wheel (``probe_stock_multiion_gpu.py``): a
+    ``MultiParticleProcess`` with two or four ions on ``GPU_DISK`` or
+    ``GPU_TRIANGLE`` produces a single ``ion<label><0>`` flux field and calls the
+    rate callback with a one-element flux vector in 2D and 3D. A rate relation
+    that depends on the second ion then leaves the surface unchanged while the
+    run still reports success. The patched 4.6.2 build is the only verified
+    multi-ion GPU runtime, so reject instead of silently dropping species.
+    """
+    version_value = engine or engine_version()
+    if version_value in MULTI_ION_GPU_STOCK_VERSIONS:
+        return None
+    return (f"ViennaPS {version_value} GPU flux engines silently drop every ion "
+            f"after the first: the rate callback receives a one-element flux "
+            f"vector and a rate that depends on the later species leaves the "
+            f"surface unchanged, and a native flux call emits only the first "
+            f"species field; the per-species flux-merge route is verified on "
+            f"4.6.2 only. Run this multi-ion GPU step on the ViennaPS "
+            f"4.6.2 patched runtime, or use CPU_DISK on {version_value}.")
+
+
+def faraday_2d_error(engine: str | None = None) -> str | None:
+    """Shared 2D FaradayCageEtching policy; None when the runtime etches.
+
+    ``worker/probe_faraday_2d.py`` on the stock 4.7.0 wheel returns
+    ``etchedDepth = 0.0`` for every measured cage/tilt anchor (the 4.6.2 wheel
+    etches the same case), so a 4.7.0 2D run would be a silent no-op.
+    """
+    version_value = engine or engine_version()
+    if not at_least(version_value, "4.7.0"):
+        return None
+    return (f"ViennaPS {version_value} 2D FaradayCageEtching produces no etch "
+            f"(measured etched depth 0.0 for cageAngle 0.2 and 90 at tiltAngle 0; "
+            f"the ViennaPS 4.6.2 runtime etches the same case). Run this 2D step "
+            f"on the ViennaPS 4.6.2 runtime, or use the 3D model.")
 
 
 # Setters that are bound but inert (or unbound) on 4.7.0 for the Workbench

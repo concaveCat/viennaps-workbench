@@ -1,14 +1,18 @@
-# Isolated ViennaPS 4.7.0 migration runtime (Python 3.12).
+# Default application stack: isolated ViennaPS 4.7.0 runtime (Python 3.12).
 #
-# This file is NOT the production lock. The production Workbench still runs on
-# the system-site-packages environment pinned by requirements.lock (ViennaPS
-# 4.6.2 / ViennaLS 5.8.5). Install this stack only into a dedicated venv, e.g.
+# This is the production lock. Install it into the Workbench venv:
 #
 #   python3.12 -m venv .venv
 #   .venv/bin/python -m pip install -r requirements-v470.lock
 #
 # ViennaPS 4.7.0 metadata requires ViennaLS>=5.10.0; 5.10.0 is the version the
-# migration probes and the Workbench test suite were exercised against.
+# migration probes and the Workbench test suite are exercised against.
+#
+# The ViennaPS 4.6.2 / ViennaLS 5.8.5 environment stays available under
+# requirements.lock for replay, legacy runs and the two capabilities 4.7.0
+# does not provide (patched multi-ion GPU, 2D Faraday cage etch). Old runs are
+# never reinterpreted under a different runtime: they are rejected with the
+# required/installed version pair instead.
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1
