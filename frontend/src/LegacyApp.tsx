@@ -41,16 +41,19 @@ type NeutralSpecies = { kind: 'neutral'; label: string; defaultStickingProbabili
 type ParticleSpecies = IonSpecies | NeutralSpecies;
 type MultiParticleRateCoefficients = { defaultBySpecies: Record<string, number>; byMaterial: Record<string, Record<string, number>> };
 type SpecializedField = { key: string; label: string; kind: 'number' | 'boolean' | 'enum' | 'vector3' | 'material' | 'materialOptional' | 'text' | 'materialRates' | 'fluorocarbonMaterials'; default: unknown; minimum?: number; maximum?: number; step?: number; nativeUnit?: string | null; options?: { value: string; label: string }[]; defaults?: Record<string, number> };
-type SpecializedModel = { id: string; label: string; nativeClass: string; operation: 'etch' | 'deposit' | 'native'; usesFlux: boolean; depositMaterial?: string; depositMaterialSelectable?: boolean; fields: SpecializedField[] };
+type SpecializedModel = { id: string; label: string; nativeClass: string; operation: 'etch' | 'deposit' | 'native'; usesFlux: boolean; dimensions?: number[]; depositMaterial?: string; depositMaterialSelectable?: boolean; fields: SpecializedField[] };
 type SpecializedCatalog = { schemaVersion: number; engineVersion: string; unitsNote: string; models: SpecializedModel[] };
+type CsvRateAsset = { assetId: string; fileName: string; dimension: 2 | 3; columns: string[]; rowCount: number; x: { min: number; max: number; count: number }; y?: { min: number; max: number; count: number }; rate: { min: number; max: number; sign: string }; linearCompatible: boolean; sizeBytes: number };
 type Step = {
-  id: string; name: string; enabled: boolean; operation?: 'etch' | 'deposit' | 'native'; model: 'isotropic' | 'singleParticle' | 'multiParticle' | 'directional' | 'specialized' | 'removeMaterial' | 'planarize' | 'boolean';
+  id: string; name: string; enabled: boolean; operation?: 'etch' | 'deposit' | 'native'; model: 'isotropic' | 'singleParticle' | 'multiParticle' | 'directional' | 'specialized' | 'csvProcess' | 'removeMaterial' | 'planarize' | 'boolean' | 'gdsBoolean';
   rateMagnitude?: number; directionalRateMagnitude?: number; isotropicRateMagnitude?: number; direction?: [number, number, number]; calculateVisibility?: boolean;
   duration?: number; depositMaterial?: string; stickingProbability?: number; sourceExponent?: number;
   rateMode?: 'uniform' | 'material'; materialRates?: Record<string, number>; selectivityReference?: string;
   species?: ParticleSpecies[]; rateCoefficients?: MultiParticleRateCoefficients;
   nativeModel?: string; nativeParameters?: Record<string, unknown>;
+  assetId?: string; fileName?: string; offset?: [number, number]; isotropicComponent?: number; directionalComponent?: number; interpolationMode?: 'LINEAR' | 'IDW'; idwNeighbors?: number;
   material?: string; cutoffHeight?: number; stopMaterial?: string; overPolish?: number; booleanOperation?: 'union' | 'intersection' | 'difference'; position?: [number, number, number]; width?: number; height?: number; depth?: number; angle?: number; applyToAll?: boolean;
+  gdsMask?: { layer: number; datatype: number; unitScale: number; position: [number, number, number]; baseHeight: number; height: number; retainedRegion: 'inside' | 'outside' };
 };
 type FixedRandom = { mode: 'fixed'; seed: number };
 type RandomPolicy = FixedRandom | { mode: 'random' };
@@ -198,7 +201,7 @@ function initialVisibleMaterialIds(catalog: MaterialCatalogItem[], geometry: Geo
   const usedIds = catalog.filter(material => usedNames.includes(material.name)).map(material => material.id);
   return [...new Set([...usedIds, ...preferred, ...catalogIds])].filter(id => catalogIds.includes(id)).slice(0, 16);
 }
-const SPECIALIZED_FLUX_MODELS = new Set(['sf6o2', 'cf4o2', 'hbro2', 'sf6c4f8', 'fluorocarbon', 'ionBeam', 'teosDeposition', 'teospecvd', 'ald', 'neutralTransport']);
+const SPECIALIZED_FLUX_MODELS = new Set(['sf6o2', 'cf4o2', 'hbro2', 'sf6c4f8', 'fluorocarbon', 'ionBeam', 'faradayCage', 'teosDeposition', 'teospecvd', 'ald', 'neutralTransport']);
 const NATIVE_MAKEFIN_SIGSEGV_MODELS = new Set(['sf6o2', 'hbro2', 'sf6c4f8', 'neutralTransport']);
 // Mirrors backend.models.MIN_DOMAIN_EXTENT_3D: a 22 nm FinFET cell is only
 // 0.48 x 0.50 um, so the old 1 um 3D floor blocked real layouts. The 2D domain
@@ -208,7 +211,7 @@ const MIN_DOMAIN_EXTENT_3D = 0.1;
 const minThreeDExtent = (gridDelta: number) => Math.max(MIN_DOMAIN_EXTENT_3D, 2 * gridDelta);
 function hasMotion(step: Step): boolean {
   if (isGeometryStep(step)) return false;
-  if (step.model === 'specialized') return true;
+  if (step.model === 'specialized' || step.model === 'csvProcess') return true;
   if (step.model === 'directional') return (step.directionalRateMagnitude ?? 0) > 0 || (step.isotropicRateMagnitude ?? 0) > 0;
   if (step.model === 'multiParticle') {
     const table = step.rateCoefficients;
@@ -219,7 +222,7 @@ function hasMotion(step: Step): boolean {
   return (step.rateMagnitude ?? 0) > 0 || Object.values(step.materialRates ?? {}).some(rate => rate > 0);
 }
 function usesFlux(step: Step): boolean { return step.enabled && ((step.model === 'specialized' && SPECIALIZED_FLUX_MODELS.has(step.nativeModel ?? '')) || (step.model === 'singleParticle' || step.model === 'multiParticle') && hasMotion(step)); }
-function isGeometryStep(step: Step): boolean { return step.model === 'removeMaterial' || step.model === 'planarize' || step.model === 'boolean'; }
+function isGeometryStep(step: Step): boolean { return step.model === 'removeMaterial' || step.model === 'planarize' || step.model === 'boolean' || step.model === 'gdsBoolean'; }
 // Thicknesses are small (a spacer etch removes a couple of nm), so keep µm for
 // absolute heights and switch to nm for sub-10 nm thickness readouts.
 function formatMicron(value: number | null | undefined): string { return value == null || !Number.isFinite(value) ? '—' : `${value.toFixed(4)} µm`; }
@@ -231,7 +234,9 @@ function stepKindLabel(step: Step): string {
   if (step.model === 'removeMaterial') return `移除材料 · ${step.material ?? '未选择'}`;
   if (step.model === 'planarize') return step.stopMaterial ? `平坦化 · 停在 ${step.stopMaterial}` : '平坦化';
   if (step.model === 'boolean') return `布尔几何 · ${{ union: '并集', intersection: '交集', difference: '差集' }[step.booleanOperation ?? 'difference']}`;
+  if (step.model === 'gdsBoolean') return `GDS 布尔 · layer ${step.gdsMask?.layer ?? '—'}/${step.gdsMask?.datatype ?? 0} · ${{ union: '并集', intersection: '交集', difference: '差集' }[step.booleanOperation ?? 'difference']}`;
   if (step.model === 'specialized') return `ViennaPS 专用模型 · ${step.nativeModel ?? '未选择'}`;
+  if (step.model === 'csvProcess') return `CSV 速率表 · ${step.fileName ?? '未选择文件'} · ${step.interpolationMode ?? '未设置插值'}`;
   return `${step.operation === 'etch' ? '刻蚀' : '沉积'} · ${step.model === 'isotropic' ? '各向同性' : step.model === 'singleParticle' ? '单粒子' : step.model === 'multiParticle' ? '多粒子' : '定向过程'}${hasMotion(step) ? '' : ' · 零速率'}`;
 }
 function geometryMaterialNames(geometry: Geometry): string[] {
@@ -243,6 +248,13 @@ function geometryMaterialNames(geometry: Geometry): string[] {
     if ((geometry.kind === 'trench' || geometry.kind === 'hole' || geometry.kind === 'fin') && geometry.maskHeight > 0) names.add(geometry.maskMaterial ?? 'Mask');
   }
   return [...names].filter(Boolean).sort();
+}
+function specializedModelAvailable(spec: SpecializedModel, dimension: number): boolean {
+  return !spec.dimensions || spec.dimensions.includes(dimension);
+}
+function specializedDimensionLabel(spec: SpecializedModel): string | null {
+  if (!spec.dimensions || spec.dimensions.length === 0 || spec.dimensions.length >= 2) return null;
+  return `仅支持 ${spec.dimensions[0]}D`;
 }
 function specializedDefaults(spec: SpecializedModel, geometry: Geometry): Record<string, unknown> {
   const names = geometryMaterialNames(geometry);
@@ -259,7 +271,7 @@ function promoteProjectToV5(source: Project): Project {
   return {
     ...source,
     schemaVersion: source.schemaVersion >= 7 ? 7 : source.schemaVersion === 6 ? 6 : 5,
-    steps: source.steps.map(step => step.model === 'directional' || step.model === 'multiParticle' || step.model === 'specialized' || isGeometryStep(step) ? step : { ...step, rateMode: step.rateMode ?? 'uniform' }),
+    steps: source.steps.map(step => step.model === 'directional' || step.model === 'multiParticle' || step.model === 'specialized' || step.model === 'csvProcess' || isGeometryStep(step) ? step : { ...step, rateMode: step.rateMode ?? 'uniform' }),
     solver: { ...source.solver, enginePreference: 'cpu' },
   };
 }
@@ -268,7 +280,7 @@ function promoteProjectToV7(source: Project): Project {
   return {
     ...source,
     schemaVersion: 7,
-    steps: source.steps.map(step => step.model === 'directional' || step.model === 'multiParticle' || step.model === 'specialized' || isGeometryStep(step) ? step : { ...step, rateMode: step.rateMode ?? 'uniform' }),
+    steps: source.steps.map(step => step.model === 'directional' || step.model === 'multiParticle' || step.model === 'specialized' || step.model === 'csvProcess' || isGeometryStep(step) ? step : { ...step, rateMode: step.rateMode ?? 'uniform' }),
     solver: { ...source.solver, enginePreference: 'auto', advection: { ...defaults.advection!, ...source.solver.advection }, rayTracing: { ...defaults.rayTracing!, ...source.solver.rayTracing } },
     outputSettings: source.outputSettings ?? { ...structuredClone(defaultProject.outputSettings!), volumeMesh: source.dimension === 3 },
   };
@@ -554,12 +566,13 @@ function SelectField({ label, value, options, onChange, hint }: { label: string;
 
 function ArtifactPreflightCard({ estimate }: { estimate: ArtifactEstimate | null }) {
   const risk = estimate?.risk ?? null;
+  const emptyEstimate = estimate !== null && estimate.estimatedMiB <= 0 && estimate.risk === 'ok';
   return <section className="panel-section artifact-preflight-panel" aria-label="运行产物预估">
     <div className="section-heading">
-      <div><span className="eyebrow">运行目录 · 工艺运行</span><h2>运行产物预估</h2></div>
+      <div><span className="eyebrow">当前工程 · 工艺运行</span><h2>运行产物预估</h2></div>
       {risk && <span className={`artifact-risk ${risk}`}>{ARTIFACT_RISK_LABELS[risk]}</span>}
     </div>
-    {!estimate ? <div className="inline-note">等待工作台校验后显示本次工艺运行目录的预估大小。该数值来自运行产物预检，是保守估算而不是实际测量。</div> : <>
+    {emptyEstimate ? <div className="inline-note">当前工程没有可估算的工艺步骤（历史运行请在“结果”页查看该 run 的快照和下载信息）。导入或新建工程并添加步骤后，这里会显示本次运行的目录预估。</div> : !estimate ? <div className="inline-note">等待工作台校验后显示本次工艺运行目录的预估大小。该数值来自运行产物预检，是保守估算而不是实际测量。</div> : <>
       <div className={`artifact-meter ${estimate.risk}`} role="img"
         aria-label={`预估占 ${estimate.capMiB} MiB 上限的 ${Math.round(estimate.utilization * 100)}%`}>
         <i style={{ width: `${Math.min(100, Math.max(2, Math.round(estimate.utilization * 100)))}%` }} />
@@ -731,6 +744,8 @@ export default function App() {
   const [deleteMaterialCandidate, setDeleteMaterialCandidate] = useState<MaterialCatalogItem | null>(null);
   const [deleteMaterialError, setDeleteMaterialError] = useState('');
   const [gdsAsset, setGdsAsset] = useState<GDSAsset | null>(null);
+  const [csvAsset, setCsvAsset] = useState<CsvRateAsset | null>(null);
+  const [csvUploadMode, setCsvUploadMode] = useState<'new' | 'replace'>('new');
   const [gdsInspection, setGdsInspection] = useState<Record<string, unknown> | null>(null);
   const [gdsImportOpen, setGdsImportOpen] = useState(false);
   const [gdsImportPosition, setGdsImportPosition] = useState<{ top: number; left: number; side: 'right' | 'left' } | null>(null);
@@ -787,6 +802,7 @@ export default function App() {
   const panelResizeRef = useRef<{ panel: ResizablePanel; pointerX: number; width: number } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const gdsInputRef = useRef<HTMLInputElement>(null);
+  const csvInputRef = useRef<HTMLInputElement>(null);
   const gdsImportButtonRef = useRef<HTMLButtonElement>(null);
   const gdsImportCardRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
@@ -974,7 +990,7 @@ export default function App() {
   const directionalActual = selectedExecution?.model === 'directional' ? selectedExecution.actualParameters ?? {} : null;
   const multiParticleActual = selectedExecution?.model === 'multiParticle' ? selectedExecution.actualParameters ?? {} : null;
   const specializedActual = selectedExecution?.model === 'specialized' ? selectedExecution.actualParameters ?? {} : null;
-  const geometryActual = selectedExecution && ['removeMaterial', 'planarize', 'boolean'].includes(selectedExecution.model ?? '') ? selectedExecution.actualParameters ?? {} : null;
+  const geometryActual = selectedExecution && ['removeMaterial', 'planarize', 'boolean', 'gdsBoolean'].includes(selectedExecution.model ?? '') ? selectedExecution.actualParameters ?? {} : null;
   const measuredChange = selectedSnapshot?.measuredRemoval
     ? { kind: 'removal' as const, record: selectedSnapshot.measuredRemoval }
     : selectedSnapshot?.measuredAdded ? { kind: 'addition' as const, record: selectedSnapshot.measuredAdded } : null;
@@ -1577,7 +1593,8 @@ export default function App() {
   const addStep = (model: Step['model'] = 'isotropic') => {
     const id = newStepId();
     if (model === 'specialized') {
-      const spec = specializedCatalog?.models.find(row => row.id === newSpecializedModel);
+      const spec = specializedCatalog?.models.find(row => row.id === newSpecializedModel
+        && specializedModelAvailable(row, project.dimension)) ?? availableSpecializedModels[0];
       if (!spec) { setNotice('ViennaPS 专用模型目录尚未加载完成。'); return; }
       const step: Step = { id, name: `步骤 ${project.steps.length + 1}`, enabled: true, model: 'specialized',
         nativeModel: spec.id, operation: spec.operation, nativeParameters: specializedDefaults(spec, project.geometry),
@@ -1612,9 +1629,55 @@ export default function App() {
       ...(model === 'singleParticle' ? { stickingProbability: 0.5, sourceExponent: 1 } : {}) };
     updateProject(previous => ({ ...previous, steps: [...previous.steps, step] })); setSelectedStep(id);
   };
+  const addCsvStep = (asset: CsvRateAsset) => {
+    const id = newStepId();
+    const step: Step = {
+      id, name: `步骤 ${project.steps.length + 1}`, enabled: true, operation: 'native', model: 'csvProcess',
+      duration: 0.2, assetId: asset.assetId, fileName: asset.fileName,
+      direction: defaultDirection(project.dimension), offset: [0, 0],
+      isotropicComponent: 0, directionalComponent: 1,
+      interpolationMode: asset.linearCompatible ? 'LINEAR' : 'IDW',
+      ...(asset.linearCompatible ? {} : { idwNeighbors: Math.min(4, asset.rowCount) }),
+      calculateVisibility: true,
+    };
+    setProject(previous => {
+      const promoted = promoteProjectToV7(previous);
+      return { ...promoted, steps: [...promoted.steps, step] };
+    });
+    setSelectedStep(id);
+  };
+  const uploadCsvFile = async (file: File, mode: 'new' | 'replace') => {
+    setLoading(true); setNotice('');
+    try {
+      const response = await fetch(`/api/csv-assets?file_name=${encodeURIComponent(file.name)}&dimension=${project.dimension}`, {
+        method: 'POST', headers: { 'Content-Type': 'text/csv' }, body: file,
+      });
+      const result = await response.json() as CsvRateAsset | { detail?: unknown };
+      if (!response.ok) {
+        const detail = 'detail' in result ? result.detail : undefined;
+        throw new Error(typeof detail === 'string' ? detail : `CSV 上传失败：HTTP ${response.status}`);
+      }
+      const asset = result as CsvRateAsset;
+      setCsvAsset(asset);
+      if (mode === 'replace' && selectedStep) {
+        setProject(previous => ({ ...previous, steps: previous.steps.map(step => {
+          if (step.id !== selectedStep || step.model !== 'csvProcess') return step;
+          const nextMode = asset.linearCompatible ? step.interpolationMode ?? 'LINEAR' : step.interpolationMode === 'LINEAR' ? 'IDW' : step.interpolationMode ?? 'IDW';
+          return { ...step, assetId: asset.assetId, fileName: asset.fileName, interpolationMode: nextMode,
+            ...(nextMode === 'IDW' ? { idwNeighbors: Math.min(step.idwNeighbors ?? 4, asset.rowCount) } : { idwNeighbors: undefined }) };
+        }) }));
+        setNotice(`已替换为 ${asset.fileName}（${asset.rowCount} 行，${asset.linearCompatible ? '支持 LINEAR' : '仅 IDW'}）。`);
+      } else {
+        addCsvStep(asset);
+        setNotice(`已上传 ${asset.fileName}（${asset.dimension}D，${asset.rowCount} 行）。`);
+      }
+    } catch (error) { setNotice(prettyError(error)); }
+    finally { setLoading(false); if (csvInputRef.current) csvInputRef.current.value = ''; }
+  };
   const changeSpecializedModel = (stepId: string, nativeModel: string) => {
     const spec = specializedCatalog?.models.find(row => row.id === nativeModel);
     if (!spec) return;
+    if (!specializedModelAvailable(spec, project.dimension)) { setNotice(`${spec.label} ${specializedDimensionLabel(spec) ?? '不支持当前维度'}。`); return; }
     setProject(previous => {
       const promoted = promoteProjectToV7(previous);
       return { ...promoted, steps: promoted.steps.map(step => {
@@ -1626,11 +1689,29 @@ export default function App() {
       }) };
     });
   };
+  const availableSpecializedModels = (specializedCatalog?.models ?? []).filter(spec => specializedModelAvailable(spec, project.dimension));
   const editSpecializedParameter = (stepId: string, key: string, value: unknown) => editStep(stepId, step => step.model === 'specialized'
     ? { ...step, nativeParameters: { ...(step.nativeParameters ?? {}), [key]: value } } : step);
-  const addGeometryStep = (model: 'removeMaterial' | 'planarize' | 'boolean') => {
+  const addGeometryStep = (model: 'removeMaterial' | 'planarize' | 'boolean' | 'gdsBoolean') => {
     const id = newStepId();
-    const name = model === 'removeMaterial' ? '移除材料' : model === 'planarize' ? '平坦化' : '布尔几何';
+    const name = model === 'removeMaterial' ? '移除材料' : model === 'planarize' ? '平坦化' : model === 'gdsBoolean' ? 'GDS 布尔' : '布尔几何';
+    if (model === 'gdsBoolean') {
+      const geometry = project.geometry.kind === 'gds' ? project.geometry : null;
+      const pairs = geometry && gdsAsset ? gdsMaskPairs(gdsAsset, geometry.structure) : [];
+      const [layer, datatype] = pairs[0] ?? [geometry?.layers[0]?.layer ?? 1, 0];
+      const first = geometry?.layers.find(row => row.layer === layer) ?? geometry?.layers[0];
+      const step: Step = { id, name, enabled: true, model, booleanOperation: 'difference', applyToAll: true,
+        gdsMask: { layer, datatype, unitScale: 1, position: [0, 0, 0],
+          baseHeight: first?.baseHeight ?? 0,
+          height: Math.max(2 * project.domain.gridDelta, first?.height ?? 0.5),
+          retainedRegion: 'inside' } };
+      setProject(previous => {
+        const promoted = promoteProjectToV7(previous);
+        return { ...promoted, steps: [...promoted.steps, step] };
+      });
+      setSelectedStep(id);
+      return;
+    }
     const step: Step = model === 'removeMaterial'
       ? { id, name, enabled: true, model, material: materials.find(item => item.name === 'SiO2')?.name ?? materials[0]?.name ?? 'SiO2' }
       : model === 'planarize'
@@ -1906,7 +1987,27 @@ export default function App() {
       const { extrusion: _extrusion, ...fin } = source.geometry;
       geometry = fin;
     }
-    const convertedSteps = source.steps.map(step => {
+    const droppedGdsBoolean = dimension === 2 && source.steps.some(step => step.model === 'gdsBoolean');
+    const droppedSpecialized = source.steps.filter(step => {
+      if (step.model !== 'specialized') return false;
+      const spec = specializedCatalog?.models.find(item => item.id === step.nativeModel);
+      return !!spec?.dimensions?.length && !spec.dimensions.includes(dimension);
+    });
+    const droppedSpecializedIds = new Set(droppedSpecialized.map(step => step.id));
+    const droppedCsv = source.steps.filter(step => step.model === 'csvProcess');
+    const droppedCsvIds = new Set(droppedCsv.map(step => step.id));
+    const droppedNotice = [
+      droppedSpecialized.length
+        ? `已移除不支持的专用模型：${droppedSpecialized.map(step => step.nativeModel).join('、')}。`
+        : '',
+      droppedGdsBoolean ? '已移除 GDS 布尔步骤（仅支持 3D GDS 项目）。' : '',
+      droppedCsv.length
+        ? `已移除 CSV 速率表步骤：${droppedCsv.map(step => step.fileName ?? '未命名').join('、')}（速率表维度、方向与 offset 在 2D/3D 之间不兼容，请重新上传并添加）。`
+        : '',
+    ].filter(Boolean).join(' ');
+    const convertedSteps = source.steps
+      .filter(step => !(dimension === 2 && step.model === 'gdsBoolean') && !droppedSpecializedIds.has(step.id) && !droppedCsvIds.has(step.id))
+      .map(step => {
       if (step.model === 'boolean') {
         const position = step.position ?? [0, 0, 0];
         if (dimension === 3) return { ...step, position: [position[0], 0, position[1]] as [number, number, number], depth: step.depth ?? step.width ?? 1 };
@@ -1965,11 +2066,12 @@ export default function App() {
       setHistoryView3D(structuredClone(source.view3D ?? historyView3D));
     }
     setProject(next); setProjectId(null); setSavedSelection(''); clearDisplayedRun();
-    setNotice(directionFallback
+    const baseNotice = directionFallback
       ? '已转换到 2D：3D 方向若只有 y 分量则没有对应二维方向，已改为 [0, -1, 0]（向下）。'
       : convertedHole
       ? '已新建对应 2D 工程：圆孔按 x 截面转换为宽度等于孔径的沟槽；原工程和历史结果保持不变。'
-      : `已新建对应 ${dimension}D 工程；原工程和历史结果保持不变。`);
+      : `已新建对应 ${dimension}D 工程；原工程和历史结果保持不变。`;
+    setNotice(`${baseNotice}${droppedNotice ? ` ${droppedNotice}` : ''}`);
   };
   const snapshotRows = displayInfo?.runId === displayRunId ? displayInfo.snapshots : [];
   const gpuStatus = capabilities?.capabilities?.engines?.gpu?.status ?? 'unverified-outside-sandbox';
@@ -2181,6 +2283,7 @@ export default function App() {
     : '';
 
   return <div className={`app-shell ${isResizingPanels ? 'columns-resizing' : ''}`}>
+    <input ref={csvInputRef} data-testid="csv-asset-input" type="file" accept=".csv,text/csv" hidden onChange={event => { const file = event.target.files?.[0]; if (file) void uploadCsvFile(file, csvUploadMode); }} />
     <TopBar>
       <header className="topbar topbar-shell">
         <div className="brand-block"><div className="brand-mark">V<span>PS</span></div><div className="brand-copy"><strong>ViennaPS 工艺工作台</strong><span>二维 / 三维本机仿真 · µm · s</span></div></div>
@@ -2513,11 +2616,18 @@ export default function App() {
                 <button className="button add-step" onClick={() => addStep('multiParticle')}>＋ 添加多粒子步骤</button>
                 <button className="button add-step" onClick={() => addStep('directional')}>＋ 添加定向步骤</button>
               </div></div>
-              <div className="add-step-group"><strong>ViennaPS 专用模型</strong><div className="specialized-add-row"><select aria-label="选择 ViennaPS 专用模型" value={newSpecializedModel} onChange={event => setNewSpecializedModel(event.target.value)}>{(specializedCatalog?.models ?? []).map(spec => <option key={spec.id} value={spec.id}>{spec.label}</option>)}</select><button className="button add-step" disabled={!specializedCatalog} onClick={() => addStep('specialized')}>＋ 添加专用模型步骤</button></div></div>
+              <div className="add-step-group"><strong>ViennaPS 专用模型</strong><div className="specialized-add-row"><select aria-label="选择 ViennaPS 专用模型" value={availableSpecializedModels.some(spec => spec.id === newSpecializedModel) ? newSpecializedModel : availableSpecializedModels[0]?.id ?? ''} onChange={event => setNewSpecializedModel(event.target.value)}>{availableSpecializedModels.map(spec => <option key={spec.id} value={spec.id}>{spec.label}</option>)}</select><button className="button add-step" disabled={!specializedCatalog} onClick={() => addStep('specialized')}>＋ 添加专用模型步骤</button></div></div>
+              <div className="add-step-group"><strong>CSV 速率表</strong><div className="specialized-add-row">
+                <button className="button add-step" disabled={loading} onClick={() => { setCsvUploadMode('new'); csvInputRef.current?.click(); }}>＋ 上传 CSV 并添加步骤</button>
+                <span className="inline-note">{csvAsset ? `已上传 ${csvAsset.fileName}（${csvAsset.dimension}D，${csvAsset.rowCount} 行，${csvAsset.linearCompatible ? 'LINEAR 可用' : '仅 IDW'}）` : `${project.dimension === 2 ? 'x,rate' : 'x,y,rate'} · ≤16 MiB`}</span>
+              </div></div>
               <div className="add-step-group"><strong>几何操作</strong><div className="add-step-row">
                 <button className="button add-step" onClick={() => addGeometryStep('removeMaterial')}>＋ 移除材料</button>
                 <button className="button add-step" onClick={() => addGeometryStep('planarize')}>＋ 平坦化</button>
                 <button className="button add-step" onClick={() => addGeometryStep('boolean')}>＋ 布尔几何</button>
+                <button className="button add-step" disabled={project.dimension !== 3 || project.geometry.kind !== 'gds'}
+                  title={project.dimension === 3 && project.geometry.kind === 'gds' ? '用项目 GDS 版图的某个图层多边形作为布尔操作数' : '仅三维 GDS 项目可用'}
+                  onClick={() => addGeometryStep('gdsBoolean')}>＋ GDS 布尔</button>
               </div></div>
             </div>
           </div>
@@ -2525,7 +2635,7 @@ export default function App() {
             {project.steps.map((step, index) => <div key={step.id} className={`step-card ${selectedStep === step.id ? 'selected' : ''} ${!step.enabled ? 'disabled-step' : ''}`}>
               <button className="step-main" onClick={() => { setSelectedStep(step.id); setSelection({ kind: 'step', id: step.id }); setActivity('recipe'); setInspectorOpen(true); setMobilePanel('settings'); }}>
                 <span className="step-number">{String(index + 1).padStart(2, '0')}</span>
-                <span className={`step-symbol ${isGeometryStep(step) ? 'geometry' : step.operation}`}>{isGeometryStep(step) ? '◇' : step.operation === 'etch' ? '−' : '+'}</span>
+                <span className={`step-symbol ${isGeometryStep(step) ? 'geometry' : step.model === 'csvProcess' ? 'native' : step.operation}`}>{isGeometryStep(step) ? '◇' : step.model === 'csvProcess' ? '≈' : step.operation === 'etch' ? '−' : '+'}</span>
                 <span className="step-title"><strong>{step.name}</strong><small>{stepKindLabel(step)}</small></span>
               </button>
               <label className="toggle" aria-label="启用步骤"><input type="checkbox" checked={step.enabled} onChange={event => editStep(step.id, value => ({ ...value, enabled: event.target.checked }))} /><span /></label>
@@ -2784,16 +2894,16 @@ export default function App() {
               </div>
               {!isGeometryStep(selectedStepObject) ? <>
               <div className="step-tab-panel" data-step-tab-panel="basic">
-              {selectedStepObject.model !== 'specialized' && <SelectField label="工艺操作" value={selectedStepObject.operation ?? 'etch'} options={[{ value: 'etch', label: '刻蚀' }, { value: 'deposit', label: '沉积' }]} onChange={value => editStep(selectedStepObject.id, step => {
+              {selectedStepObject.model !== 'specialized' && selectedStepObject.model !== 'csvProcess' && <SelectField label="工艺操作" value={selectedStepObject.operation ?? 'etch'} options={[{ value: 'etch', label: '刻蚀' }, { value: 'deposit', label: '沉积' }]} onChange={value => editStep(selectedStepObject.id, step => {
                 const next = { ...step, operation: value as Step['operation'] };
                 if (next.operation === 'deposit') next.depositMaterial = materials.find(m => m.name === 'SiO2')?.name ?? 'SiO2'; else delete next.depositMaterial;
                 delete next.materialRates; delete next.selectivityReference;
                 if (next.model !== 'directional' && next.model !== 'multiParticle' && project.schemaVersion >= 4) next.rateMode = 'uniform'; else delete next.rateMode;
                 return next;
               })} />}
-              {selectedStepObject.model !== 'specialized' && <SelectField label="过程模型" value={selectedStepObject.model} options={[{ value: 'isotropic', label: '各向同性过程' }, { value: 'singleParticle', label: '单粒子过程' }, { value: 'multiParticle', label: '多粒子过程' }, { value: 'directional', label: '定向过程' }]} onChange={value => changeStepModel(selectedStepObject.id, value as Step['model'])} />}
-              {selectedStepObject.model !== 'specialized' && selectedStepObject.operation === 'deposit' && <SelectField label="沉积材料" value={selectedStepObject.depositMaterial ?? materials[0]?.name ?? 'SiO2'} options={materials.map(m => ({ value: m.name, label: m.name }))} onChange={value => editStep(selectedStepObject.id, step => ({ ...step, depositMaterial: value }))} hint="材料不改变通用全局速率" />}
-              {selectedStepObject.model === 'specialized' && <SelectField label="ViennaPS 4.6.2 专用模型" value={selectedStepObject.nativeModel ?? ''} options={specializedCatalog?.models.map(item => ({ value: item.id, label: item.label })) ?? []} onChange={value => changeSpecializedModel(selectedStepObject.id, value)} />}
+              {selectedStepObject.model !== 'specialized' && selectedStepObject.model !== 'csvProcess' && <SelectField label="过程模型" value={selectedStepObject.model} options={[{ value: 'isotropic', label: '各向同性过程' }, { value: 'singleParticle', label: '单粒子过程' }, { value: 'multiParticle', label: '多粒子过程' }, { value: 'directional', label: '定向过程' }]} onChange={value => changeStepModel(selectedStepObject.id, value as Step['model'])} />}
+              {selectedStepObject.model !== 'specialized' && selectedStepObject.model !== 'csvProcess' && selectedStepObject.operation === 'deposit' && <SelectField label="沉积材料" value={selectedStepObject.depositMaterial ?? materials[0]?.name ?? 'SiO2'} options={materials.map(m => ({ value: m.name, label: m.name }))} onChange={value => editStep(selectedStepObject.id, step => ({ ...step, depositMaterial: value }))} hint="材料不改变通用全局速率" />}
+              {selectedStepObject.model === 'specialized' && <SelectField label="ViennaPS 4.6.2 专用模型" value={selectedStepObject.nativeModel ?? ''} options={availableSpecializedModels.map(item => ({ value: item.id, label: item.label }))} onChange={value => changeSpecializedModel(selectedStepObject.id, value)} />}
               </div>
               {selectedStepObject.model === 'specialized' ? <div className="step-tab-panel" data-step-tab-panel="native">
                 {(() => {
@@ -2803,6 +2913,7 @@ export default function App() {
                   const geometryNames = geometryMaterialNames(project.geometry);
                   return <>
                     <div className="inline-note">参数直接传给安装的 {spec.nativeClass}。{specializedCatalog?.unitsNote} 原生模型规定的工艺速率由该模型内部计算，工作台不叠加通用速率。</div>
+                    {specializedDimensionLabel(spec) && <div className="inline-note warning">安装版 {spec.nativeClass} {specializedDimensionLabel(spec)}：{spec.dimensions?.[0] === 2 ? '3D 绑定在受控探测中崩溃' : '2D 绑定在受控探测中不返回'}，因此其他维度的项目会被验证拒绝。</div>}
                     {spec.id === 'oxideRegrowth' && <div className="inline-note warning">本机 ViennaPS 4.6.2 的 OxideRegrowth 已验证条件是含 SiO₂ / Si₃N₄ 的平坦多层结构。请将“顶层图案”设为“无”；此版本在带沟槽或圆孔的 Domain 上可能崩溃。{project.geometry.kind === 'stack' && project.geometry.pattern.kind !== 'none' && <button className="button" onClick={() => updateProject(previous => previous.geometry.kind === 'stack' ? { ...previous, geometry: { ...previous.geometry, pattern: { kind: 'none' } } } : previous)}>将顶层图案改为无</button>}</div>}
                     {spec.depositMaterial && <div className="not-applicable"><strong>原生沉积材料</strong><span>{spec.depositMaterial}（由模型固定）</span></div>}
                     {spec.depositMaterialSelectable && <SelectField label="沉积材料" value={selectedStepObject.depositMaterial ?? 'Al2O3'} options={materials.map(item => ({ value: item.name, label: item.name }))} onChange={value => editStep(selectedStepObject.id, step => ({ ...step, depositMaterial: value }))} />}
@@ -2827,6 +2938,45 @@ export default function App() {
                     {spec.id !== 'oxidation' && <NumericField label="持续时间" unit="s" value={selectedStepObject.duration ?? 0.2} min={0.01} max={600} step="0.01" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, duration: value }))} />}
                     {spec.id === 'oxidation' && <div className="not-applicable"><strong>时间输入</strong><span>使用原生参数中的小时数与时间步；不再添加通用过程持续时间。</span></div>}
                     {spec.usesFlux && <div className="inline-note">此模型使用真实 ViennaPS 射线/通量路径。引擎、随机种子与线程会记录在本次运行历史中。</div>}
+                  </>;
+                })()}
+              </div> : selectedStepObject.model === 'csvProcess' ? <div className="step-tab-panel" data-step-tab-panel="native">
+                {(() => {
+                  const asset = csvAsset && csvAsset.assetId === selectedStepObject.assetId ? csvAsset : null;
+                  const direction = selectedStepObject.direction ?? defaultDirection(project.dimension);
+                  const offset = selectedStepObject.offset ?? [0, 0];
+                  return <>
+                    <div className="inline-note">原生 ps.CSVFileProcess + RateGrid。{project.dimension === 2 ? '二维表格为 x,rate' : '三维表格为 x,y,rate'}，没有 z 列：速率只随横向坐标变化。上传时已检查有限数值、列数和行结构；缺失或不兼容的表现在会被验证拒绝。</div>
+                    <div className="not-applicable"><strong>速率表</strong><span>{selectedStepObject.fileName ?? '未选择'} · {selectedStepObject.assetId?.slice(0, 12) ?? '—'}…{asset ? ` · ${asset.rowCount} 行 · ${asset.linearCompatible ? 'LINEAR 可用' : '仅 IDW'}` : ''}</span></div>
+                    <button className="button" disabled={loading} onClick={() => { setCsvUploadMode('replace'); csvInputRef.current?.click(); }}>重新上传并替换速率表</button>
+                    <div className="inline-note warning">操作固定为原生：正速率配合向下方向使表面外移（沉积），负速率刻蚀。原生模型没有独立的 etch/deposit 参数，因此不显示工艺操作选择。自定义 Python 插值器不可达。</div>
+                    <SelectField label="插值模式（必填）" value={selectedStepObject.interpolationMode ?? 'LINEAR'} options={[{ value: 'LINEAR', label: 'LINEAR · 原生线性/双线性' }, { value: 'IDW', label: 'IDW · 反距离权重' }]} onChange={value => editStep(selectedStepObject.id, step => {
+                      const next = { ...step, interpolationMode: value as 'LINEAR' | 'IDW' };
+                      if (value === 'IDW') next.idwNeighbors = step.idwNeighbors ?? Math.min(4, asset?.rowCount ?? 4); else delete next.idwNeighbors;
+                      return next;
+                    })} />
+                    {selectedStepObject.interpolationMode === 'IDW' && <NumericField label="IDW 邻居数" value={selectedStepObject.idwNeighbors ?? 4} min={1} max={64} step="1" hint="必须不超过表行数；原生 setIDWNeighbors" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, idwNeighbors: Math.round(value) }))} />}
+                    <div className="directional-axis-fields">
+                      {(project.dimension === 2 ? [0, 1] as const : [0, 1, 2] as const).map(axis => {
+                        const label = project.dimension === 2 ? (axis === 0 ? '方向 x 分量' : '方向 h 分量') : ['方向 x 分量', '方向 y 分量', '方向 z 分量'][axis];
+                        return <NumericField key={label} label={label} value={direction[axis]} min={-1} max={1} step="0.05" onChange={value => editStep(selectedStepObject.id, step => {
+                          const next: [number, number, number] = [...(step.direction ?? defaultDirection(project.dimension))];
+                          next[axis] = value;
+                          if (project.dimension === 2) next[2] = 0;
+                          return { ...step, direction: next };
+                        })} />;
+                      })}
+                    </div>
+                    <NumericField label="速率表 offset x" unit="µm" value={offset[0]} min={-1000000} max={1000000} step="0.05" hint="原生在 coordinate+offset 处查表" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, offset: [value, (step.offset ?? [0, 0])[1]] }))} />
+                    {project.dimension === 3 && <NumericField label="速率表 offset y" unit="µm" value={offset[1]} min={-1000000} max={1000000} step="0.05" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, offset: [(step.offset ?? [0, 0])[0], value] }))} />}
+                    <NumericField label="各向同性分量" value={selectedStepObject.isotropicComponent ?? 0} min={0} max={100} step="0.01" hint="原生 isotropicComponent；沿法向的速率倍数" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, isotropicComponent: value }))} />
+                    <NumericField label="定向分量" value={selectedStepObject.directionalComponent ?? 1} min={0} max={100} step="0.01" hint="原生 directionalComponent；沿方向向量的速率倍数" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, directionalComponent: value }))} />
+                    <label className="visibility-option">
+                      <input type="checkbox" aria-label="计算方向可见性" checked={selectedStepObject.calculateVisibility ?? true}
+                        onChange={event => editStep(selectedStepObject.id, step => ({ ...step, calculateVisibility: event.target.checked }))} />
+                      <span><strong>计算遮挡可见性</strong><small>原生 calculateVisibility；关闭后不计算方向遮挡</small></span>
+                    </label>
+                    <NumericField label="持续时间" unit="s" value={selectedStepObject.duration ?? 0.2} min={0.01} max={600} step="0.01" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, duration: value }))} />
                   </>;
                 })()}
               </div> : selectedStepObject.model === 'directional' ? <div className="step-tab-panel" data-step-tab-panel="physics">
@@ -2976,6 +3126,27 @@ export default function App() {
                   <NumericField label="盒体旋转角" unit="°" value={selectedStepObject.angle ?? 0} min={-45} max={45} step="1" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, angle: value }))} />
                   <label className="visibility-option"><input type="checkbox" aria-label="布尔操作应用到所有材料界面" checked={selectedStepObject.applyToAll ?? true} onChange={event => editStep(selectedStepObject.id, step => ({ ...step, applyToAll: event.target.checked }))} /><span><strong>应用到所有材料界面</strong><small>传入 ViennaPS Domain.applyBooleanOperation 的 applyToAll 参数</small></span></label>
                 </>}
+                {selectedStepObject.model === 'gdsBoolean' && <>
+                  {project.geometry.kind !== 'gds'
+                    ? <div className="inline-note">GDS 布尔步骤只适用于 geometry.kind=gds 的三维项目。</div>
+                    : <>
+                      <SelectField label="布尔操作" value={selectedStepObject.booleanOperation ?? 'difference'} options={[{ value: 'difference', label: '差集 · RELATIVE_COMPLEMENT（挖孔/开槽）' }, { value: 'union', label: '并集 · UNION（在掩膜区补加材料）' }, { value: 'intersection', label: '交集 · INTERSECT（只保留掩膜区）' }]} onChange={value => editStep(selectedStepObject.id, step => ({ ...step, booleanOperation: value as Step['booleanOperation'] }))} />
+                      <div className="inline-note">操作数来自当前版图结构 <code>{project.geometry.structure}</code>：所选图层多边形按保留区域竖直拉伸成真实三维掩膜体，再调用原生 <code>Domain.applyBooleanOperation</code>。位置相对版图放置，默认 0 即与版图对齐。这是几何操作，不包含光刻胶、光学邻近/偏置、侧壁角或材料选择比。</div>
+                      {!gdsAsset && <div className="inline-note">正在读取版图图层…</div>}
+                      {gdsAsset && gdsMaskPairs(gdsAsset, project.geometry.structure).length === 0 && <div className="inline-note">该结构没有闭合的多边形图层，无法作为布尔掩膜。</div>}
+                      {gdsAsset && gdsMaskPairs(gdsAsset, project.geometry.structure).length > 0 && <SelectField label="掩膜图层 / datatype" value={`${selectedStepObject.gdsMask?.layer ?? 0}/${selectedStepObject.gdsMask?.datatype ?? 0}`} options={gdsMaskPairs(gdsAsset, project.geometry.structure).map(([gdsLayer, datatype]) => ({ value: `${gdsLayer}/${datatype}`, label: `Layer ${gdsLayer} · datatype ${datatype}` }))} onChange={value => { const [gdsLayer, datatype] = value.split('/').map(Number); editStep(selectedStepObject.id, step => ({ ...step, gdsMask: { ...(step.gdsMask ?? { layer: gdsLayer, datatype, unitScale: 1, position: [0, 0, 0], baseHeight: 0, height: Math.max(2 * project.domain.gridDelta, 0.5), retainedRegion: 'inside' }), layer: gdsLayer, datatype } })); }} />}
+                      <SelectField label="保留区域" value={selectedStepObject.gdsMask?.retainedRegion ?? 'inside'} options={[{ value: 'inside', label: '保留多边形内部（正向掩膜）' }, { value: 'outside', label: '保留多边形外部（反向掩膜）' }]} onChange={value => editStep(selectedStepObject.id, step => step.gdsMask ? { ...step, gdsMask: { ...step.gdsMask, retainedRegion: value as 'inside' | 'outside' } } : step)} hint="保留区域决定掩膜体覆盖多边形内部还是外部；差集使用反向掩膜会移除几乎全部材料" />
+                      <NumericField label="掩膜底面高度（z）" unit="µm" value={selectedStepObject.gdsMask?.baseHeight ?? 0} min={0} max={100} step="0.01" hint="相对版图 z 框架；与版图图层底面配合可只切上层材料（必须 ≥ 0）" onChange={value => editStep(selectedStepObject.id, step => step.gdsMask ? { ...step, gdsMask: { ...step.gdsMask, baseHeight: value } } : step)} />
+                      <NumericField label="掩膜厚度（z）" unit="µm" value={selectedStepObject.gdsMask?.height ?? Math.max(2 * project.domain.gridDelta, 0.5)} min={2 * project.domain.gridDelta} max={100} step="0.01" hint={`至少两个网格间距（${(2 * project.domain.gridDelta).toFixed(4)} µm）`} onChange={value => editStep(selectedStepObject.id, step => step.gdsMask ? { ...step, gdsMask: { ...step.gdsMask, height: value } } : step)} />
+                      {[{ index: 0, label: '掩膜 x 偏移', unit: 'µm' }, { index: 1, label: '掩膜 y 偏移', unit: 'µm' }, { index: 2, label: '掩膜 z 偏移', unit: 'µm' }].map(axis => <NumericField key={axis.label} label={axis.label} unit={axis.unit} value={(selectedStepObject.gdsMask?.position ?? [0, 0, 0])[axis.index]} min={-40} max={40} step="0.01" onChange={value => editStep(selectedStepObject.id, step => {
+                        const mask = step.gdsMask; if (!mask) return step;
+                        const position: [number, number, number] = [...mask.position]; position[axis.index] = value;
+                        return { ...step, gdsMask: { ...mask, position } };
+                      })} />)}
+                      <NumericField label="版图缩放系数" value={selectedStepObject.gdsMask?.unitScale ?? 1} min={0.000001} max={1000000} step="0.01" hint="与项目 GDS 放置的单位缩放相乘" onChange={value => editStep(selectedStepObject.id, step => step.gdsMask ? { ...step, gdsMask: { ...step.gdsMask, unitScale: value } } : step)} />
+                      <label className="visibility-option"><input type="checkbox" aria-label="GDS 布尔应用到所有材料界面" checked={selectedStepObject.applyToAll ?? true} onChange={event => editStep(selectedStepObject.id, step => ({ ...step, applyToAll: event.target.checked }))} /><span><strong>应用到所有材料界面</strong><small>关闭时只修改顶层材料，可能造成下层超过上层；仅在你确认要这样做时关闭</small></span></label>
+                    </>}
+                </>}
                 <div className="not-applicable"><strong>几何操作</strong><span>没有工艺速率、物理持续时间、随机种子或通量引擎。此步骤直接修改前一步的 ViennaPS Domain。</span></div>
               </div>}
               {(isGeometryStep(selectedStepObject) || selectedStepObject.model === 'specialized') && <div className="step-tab-panel" data-step-tab-panel="physics"><div className="inline-note">{isGeometryStep(selectedStepObject) ? '几何操作没有工艺物理参数。' : '此模型的时间条件和计算参数位于“原生参数”页签。'}</div></div>}
@@ -3007,7 +3178,7 @@ export default function App() {
           <div className="validation-foot"><span>工艺步骤上限</span><strong>{capabilities?.resourcePolicy?.run?.maximumSteps == null ? '不限' : `${capabilities.resourcePolicy.run.maximumSteps} 步`}</strong></div>
           <div className="validation-foot" title="主机 GPU 能力来自 /api/gpu-devices，表示本机能否运行 CUDA 通量；不代表所选运行使用的引擎。"><span>主机 GPU 能力</span><strong>{gpuExposed ? 'GPU_DISK · 可选择' : gpuStatus === 'unverified-outside-sandbox' ? '设备不可用' : gpuStatus}</strong></div>
           <div className="validation-foot" title={runEngineTitle}><span>本次运行引擎</span><strong>{runEngine}{selectedStepEngine ? ` · 本步 ${selectedStepEngine}` : ''}</strong></div>
-          {artifactEstimate && <div className={`validation-foot artifact-foot ${artifactEstimate.risk}`} title={`运行产物预检估算；当前配置上限 ${artifactEstimate.capMiB} MiB，超限的运行会在启动前被拒绝。`}><span>运行产物预估</span><strong>{formatEstimateMiB(artifactEstimate.estimatedMiB)} / {artifactEstimate.capMiB} MiB · {ARTIFACT_RISK_LABELS[artifactEstimate.risk]}</strong></div>}
+          {artifactEstimate && (artifactEstimate.estimatedMiB > 0 || artifactEstimate.risk !== 'ok') && <div className={`validation-foot artifact-foot ${artifactEstimate.risk}`} title={`运行产物预检估算；当前配置上限 ${artifactEstimate.capMiB} MiB，超限的运行会在启动前被拒绝。`}><span>运行产物预估</span><strong>{formatEstimateMiB(artifactEstimate.estimatedMiB)} / {artifactEstimate.capMiB} MiB · {ARTIFACT_RISK_LABELS[artifactEstimate.risk]}</strong></div>}
         </section>
       </Inspector>
     </main>
