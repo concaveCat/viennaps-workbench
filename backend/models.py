@@ -1349,8 +1349,392 @@ class ParticleShapeStepV7(StrictModel):
         return self
 
 
+class StepCellSetV7(StrictModel):
+    """The native ``DenseCellSet`` a cell-set field step runs on.
+
+    ``viennaps.Domain.generateCellSet(position, coverMaterial, isAboveSurface)``
+    is the only native constructor available (verified on 4.7.0); ``height`` is
+    the distance from the highest surface point to the top of the grid, exactly
+    like ``outputSettings.cellSet``. The grid is generated once, at the first
+    cell-set step, and every later implant/anneal/analysis step reuses the same
+    native grid so the dopant fields stay on one cell topology.
+    """
+
+    height: Annotated[Number, Field(gt=0, le=1000)]
+    #: Depth of the finite substrate below the deepest surface point. A
+    #: ViennaLS level set only stores a narrow band around the surface, so the
+    #: native DenseCellSet would contain one substrate row without this. The
+    #: worker widens the band on a deep copy of the Domain (the simulated
+    #: surface itself is unchanged) before the native grid is generated.
+    substrateDepth: Annotated[Number, Field(gt=0, le=1000)] | None = None
+    coverMaterial: Annotated[str, Field(min_length=1, max_length=64)] = "GAS"
+    periodic: bool = False
+    format: Literal["vtu", "json", "both"] = "both"
+    scalarLabels: list[str] | None = None
+
+    @model_validator(mode="after")
+    def check_scalar_labels(self) -> "StepCellSetV7":
+        if self.scalarLabels is not None:
+            if not self.scalarLabels:
+                raise ValueError("scalarLabels must be omitted or a non-empty list")
+            if len(set(self.scalarLabels)) != len(self.scalarLabels):
+                raise ValueError("scalarLabels must not contain duplicates")
+            for label in self.scalarLabels:
+                if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,47}", label):
+                    raise ValueError(f"scalarLabels entry {label!r} is not a valid cell-set label")
+        return self
+
+
+class PearsonIVParametersV7(StrictModel):
+    """The installed ``viennaps.PearsonIVParameters`` fields, in length units.
+
+    ``mu``/``sigma`` use the project length unit (um); the native constructor
+    stores exactly these values. ``beta`` and ``gamma`` are the fourth and third
+    standardized moments the native ``PearsonIV`` function expects.
+    """
+
+    mu: Annotated[Number, Field(ge=0, le=10000)]
+    sigma: Annotated[Number, Field(gt=0, le=10000)]
+    beta: Annotated[Number, Field(gt=0, le=1000)]
+    gamma: Annotated[Number, Field(ge=-1000, le=1000)]
+
+
+class ManualImplantProfileV7(StrictModel):
+    """A manually specified analytical profile.
+
+    ViennaPS 4.7.0 ships no model database in the wheel, so the only proven
+    profile source is an explicit moment set. ``kind`` selects the native
+    constructor: ``ImplantPearsonIV``, ``ImplantDualPearsonIV`` or
+    ``ImplantPearsonIVChanneling``. Moments are substrate-depth moments in the
+    project length unit (um) and are *not* corrected for a screen oxide.
+    """
+
+    source: Literal["manual"]
+    kind: Literal["pearsonIV", "dualPearsonIV", "pearsonIVChanneling"]
+    head: PearsonIVParametersV7
+    lateralMu: Number = 0
+    lateralSigma: Annotated[Number, Field(gt=0, le=10000)] = 5
+    tail: PearsonIVParametersV7 | None = None
+    headFraction: Annotated[Number, Field(ge=0, le=1)] | None = None
+    tailLateralMu: Number | None = None
+    tailLateralSigma: Annotated[Number, Field(gt=0, le=10000)] | None = None
+    tailFraction: Annotated[Number, Field(ge=0, le=1)] | None = None
+    tailStartDepth: Annotated[Number, Field(ge=0, le=10000)] | None = None
+    tailDecayLength: Annotated[Number, Field(gt=0, le=10000)] | None = None
+    tailBlendWidth: Annotated[Number, Field(ge=0, le=10000)] = 0
+
+    @model_validator(mode="after")
+    def check_kind_fields(self) -> "ManualImplantProfileV7":
+        dual_values = (self.tail, self.headFraction, self.tailLateralMu, self.tailLateralSigma)
+        channeling_values = (self.tailFraction, self.tailStartDepth, self.tailDecayLength)
+        # Validate values, not ``model_fields_set``: a project is re-parsed from
+        # its own ``model_dump`` (which materialises defaults) before the worker
+        # starts, so a harmless default such as tailBlendWidth=0 must stay valid.
+        if self.kind == "pearsonIV":
+            if any(value is not None for value in dual_values + channeling_values):
+                raise ValueError("pearsonIV does not accept tail/channeling parameters; "
+                                 "use kind=dualPearsonIV or pearsonIVChanneling")
+            if float(self.tailBlendWidth) != 0.0:
+                raise ValueError("tailBlendWidth applies only to pearsonIVChanneling")
+        elif self.kind == "dualPearsonIV":
+            missing = [name for name, value in zip(("tail", "headFraction", "tailLateralMu",
+                                                    "tailLateralSigma"), dual_values) if value is None]
+            if missing:
+                raise ValueError("dualPearsonIV requires " + ", ".join(missing))
+            if any(value is not None for value in channeling_values) or float(self.tailBlendWidth) != 0.0:
+                raise ValueError("dualPearsonIV does not accept channeling parameters")
+        else:
+            missing = [name for name, value in zip(("tailFraction", "tailStartDepth",
+                                                    "tailDecayLength"), channeling_values) if value is None]
+            if missing:
+                raise ValueError("pearsonIVChanneling requires " + ", ".join(missing))
+            if any(value is not None for value in dual_values):
+                raise ValueError("pearsonIVChanneling does not accept dual-Pearson parameters")
+        return self
+
+
+class ImplantDamageV7(StrictModel):
+    """The installed ``viennaps.ImplantDamageHobler`` constructor arguments."""
+
+    kind: Literal["hobler"]
+    projectedRange: Annotated[Number, Field(gt=0, le=10000)]
+    verticalSigma: Annotated[Number, Field(gt=0, le=10000)]
+    lambdaValue: Annotated[Number, Field(gt=0, le=100000)]
+    defectsPerIon: Annotated[Number, Field(ge=0, le=100000)]
+    lateralSigma: Annotated[Number, Field(gt=0, le=10000)]
+    lateralDeltaSigma: Annotated[Number, Field(ge=-10000, le=10000)] = 0
+
+
+class ImplantLabelsV7(StrictModel):
+    concentration: str | None = None
+    damage: str | None = None
+    lastDamage: str | None = None
+
+    @model_validator(mode="after")
+    def check_labels(self) -> "ImplantLabelsV7":
+        for name in ("concentration", "damage", "lastDamage"):
+            value = getattr(self, name)
+            if value is not None and not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,47}", value):
+                raise ValueError(f"{name} must be a valid cell-set label")
+        return self
+
+
+class ImplantStepV7(StrictModel):
+    """Native ``viennaps.IonImplantation`` applied to the domain cell set.
+
+    The model never moves the level sets; ``ps.Process(domain, implant, 0.0)``
+    only stamps the concentration (and optional damage) fields into the cell
+    set. ``energyKeV``/``rotationDeg`` are recorded request metadata: the
+    manual Pearson IV path has no native energy or rotation parameter (only
+    ``ImplantTableModel`` consumes them), so a nonzero rotation is refused
+    instead of being silently dropped.
+    """
+
+    id: Annotated[str, Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")]
+    name: Annotated[str, Field(min_length=1, max_length=80)]
+    enabled: bool
+    model: Literal["implant"]
+    species: Annotated[str, Field(min_length=1, max_length=24, pattern=r"^[A-Za-z][A-Za-z0-9_-]*$")]
+    material: Annotated[str, Field(min_length=1, max_length=64)]
+    energyKeV: Annotated[Number, Field(gt=0, le=100000)]
+    doseCm2: Annotated[Number, Field(gt=0, le=1e19)]
+    tiltDeg: Annotated[Number, Field(ge=0, le=90)]
+    rotationDeg: Annotated[Number, Field(ge=0, le=360)] = 0
+    doseControl: Literal["Off", "WaferDose", "BeamDose"] = "WaferDose"
+    profile: ManualImplantProfileV7
+    damage: ImplantDamageV7 | None = None
+    maskMaterials: list[Annotated[str, Field(min_length=1, max_length=64)]] = Field(default_factory=list)
+    screenMaterials: list[Annotated[str, Field(min_length=1, max_length=64)]] = Field(default_factory=list)
+    labels: ImplantLabelsV7 | None = None
+    damageFactor: Annotated[Number, Field(gt=0, le=1000000)] = 1
+    cellSet: StepCellSetV7
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_unproven_sources(cls, data):
+        if isinstance(data, dict):
+            profile = data.get("profile")
+            if isinstance(profile, dict) and profile.get("source") == "table":
+                raise ValueError(
+                    "implant profile.source=table is not exposed: the installed ViennaPS 4.7.0 wheel "
+                    "ships no model database (viennaps.getModelDbRoot() is empty) and the workbench does "
+                    "not bundle one, so a table lookup would fail at the native layer; use "
+                    "profile.source=manual with explicit Pearson IV moments")
+        return data
+
+    @model_validator(mode="after")
+    def check_implant_fields(self) -> "ImplantStepV7":
+        if float(self.rotationDeg) != 0.0:
+            raise ValueError(
+                "rotationDeg is only consumed by the native ImplantTableModel; the manual Pearson IV "
+                "path has no rotation parameter, so only rotationDeg=0 is accepted")
+        for name in ("maskMaterials", "screenMaterials"):
+            values = getattr(self, name)
+            if len(set(values)) != len(values):
+                raise ValueError(f"{name} must not contain duplicates")
+        if set(self.maskMaterials) & set(self.screenMaterials):
+            raise ValueError("maskMaterials and screenMaterials must be disjoint")
+        if self.material in set(self.maskMaterials) | set(self.screenMaterials):
+            raise ValueError("material must not also be a mask or screen material")
+        resolved = self.labels or ImplantLabelsV7()
+        stem = re.sub(r"[^A-Za-z0-9_]", "_", self.species)
+        if not re.match(r"^[A-Za-z]", stem):
+            stem = "dopant_" + stem
+        concentration = resolved.concentration or f"{stem}_total"
+        damage = resolved.damage
+        last_damage = resolved.lastDamage
+        if self.damage is None:
+            if damage is not None or last_damage is not None:
+                raise ValueError("labels.damage/lastDamage require a damage model")
+        else:
+            damage = damage or f"{stem}_damage"
+            last_damage = last_damage or f"{damage}_last"
+        if len({concentration, damage, last_damage} - {None}) != len(
+                [value for value in (concentration, damage, last_damage) if value is not None]):
+            raise ValueError("implant labels must be distinct")
+        object.__setattr__(self, "labels", ImplantLabelsV7(
+            concentration=concentration, damage=damage, lastDamage=last_damage))
+        return self
+
+
+class IsothermalScheduleV7(StrictModel):
+    kind: Literal["isothermal"]
+    temperatureK: Annotated[Number, Field(gt=0, le=5000)]
+    durationSeconds: Annotated[Number, Field(ge=0, le=1000000)]
+
+
+class StepScheduleV7(StrictModel):
+    """``Anneal.setTemperatureSchedule(durations, temperatures)``.
+
+    Native accepts N durations with N isothermal temperatures or N+1 ramp
+    endpoint temperatures (the 4.7.0 example uses three ramp/soak steps).
+    """
+
+    kind: Literal["schedule"]
+    durations: Annotated[list[Annotated[Number, Field(ge=0, le=1000000)]], Field(min_length=1, max_length=32)]
+    temperatures: Annotated[list[Annotated[Number, Field(gt=0, le=5000)]], Field(min_length=1, max_length=33)]
+
+    @model_validator(mode="after")
+    def check_lengths(self) -> "StepScheduleV7":
+        if len(self.temperatures) not in (len(self.durations), len(self.durations) + 1):
+            raise ValueError(
+                "schedule.temperatures must contain N isothermal values or N+1 ramp endpoints "
+                f"for {len(self.durations)} duration(s)")
+        return self
+
+
+AnnealScheduleV7 = Annotated[Union[IsothermalScheduleV7, StepScheduleV7], Field(discriminator="kind")]
+
+
+class ArrheniusDiffusivityV7(StrictModel):
+    kind: Literal["arrhenius"]
+    D0: Annotated[Number, Field(gt=0, le=1e40)]
+    Ea_eV: Annotated[Number, Field(ge=0, le=100)]
+
+
+class ConstantDiffusivityV7(StrictModel):
+    kind: Literal["constant"]
+    value: Annotated[Number, Field(ge=0, le=1e40)]
+
+
+AnnealDiffusivityV7 = Annotated[Union[ArrheniusDiffusivityV7, ConstantDiffusivityV7], Field(discriminator="kind")]
+
+
+class ImplicitSolverOptionsV7(StrictModel):
+    maxIterations: Annotated[Integer, Field(ge=1, le=100000)] = 400
+    relativeTolerance: Annotated[Number, Field(gt=0, le=1)] = 1e-6
+    relaxation: Annotated[Number, Field(gt=0, le=2)] = 1.0
+
+
+class SolidActivationV7(StrictModel):
+    """``enableSolidActivation(True)`` + ``setSolidSolubilityArrhenius``.
+
+    The native activation model writes ``C_active = C_SS·C/(C_SS+C)`` with
+    ``C_SS = C0·exp(-Ea/kT)``. Without this block the anneal would diffuse the
+    dopant but never produce an electrically active field.
+    """
+
+    solubilityC0: Annotated[Number, Field(gt=0, le=1e40)]
+    solubilityEa_eV: Annotated[Number, Field(ge=0, le=100)]
+
+
+class AnnealStepV7(StrictModel):
+    """Native ``viennaps.Anneal`` on the cell set produced by an implant.
+
+    Only the parameters proven to run on the installed 4.7.0 runtime are
+    exposed. Defect coupling, TED/Fermi enhancement, trapping/segregation,
+    clustering and source-field injection are intentionally absent: they are
+    separate calibrated models whose parameter provenance the workbench cannot
+    validate.
+    """
+
+    id: Annotated[str, Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")]
+    name: Annotated[str, Field(min_length=1, max_length=80)]
+    enabled: bool
+    model: Literal["anneal"]
+    mode: Literal["GaussSeidel", "Explicit"] = "GaussSeidel"
+    schedule: AnnealScheduleV7
+    diffusivity: AnnealDiffusivityV7
+    timeStep: Annotated[Number, Field(gt=0, le=1000000)] | None = None
+    stabilityFactor: Annotated[Number, Field(ge=0.01, le=1)] | None = None
+    implicitSolver: ImplicitSolverOptionsV7 | None = None
+    diffusionMaterials: list[Annotated[str, Field(min_length=1, max_length=64)]] = Field(default_factory=list)
+    blockingMaterials: list[Annotated[str, Field(min_length=1, max_length=64)]] = Field(default_factory=list)
+    speciesLabel: Annotated[str, Field(min_length=1, max_length=48)]
+    activeLabel: Annotated[str, Field(min_length=1, max_length=48)]
+    solidActivation: SolidActivationV7
+    activationOnly: bool = False
+    cellSet: StepCellSetV7
+
+    @model_validator(mode="after")
+    def check_anneal_fields(self) -> "AnnealStepV7":
+        for name in ("speciesLabel", "activeLabel"):
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,47}", getattr(self, name)):
+                raise ValueError(f"{name} must be a valid cell-set label")
+        if self.speciesLabel == self.activeLabel:
+            raise ValueError("speciesLabel and activeLabel must be different cell-set fields")
+        if set(self.diffusionMaterials) & set(self.blockingMaterials):
+            raise ValueError("diffusionMaterials and blockingMaterials must be disjoint")
+        if len(set(self.diffusionMaterials)) != len(self.diffusionMaterials):
+            raise ValueError("diffusionMaterials must not contain duplicates")
+        if len(set(self.blockingMaterials)) != len(self.blockingMaterials):
+            raise ValueError("blockingMaterials must not contain duplicates")
+        if self.mode == "Explicit" and self.implicitSolver is not None:
+            raise ValueError("implicitSolver applies only to mode=GaussSeidel")
+        return self
+
+
+class NetDopingV7(StrictModel):
+    """Native ``viennaps.NetDoping`` on the current cell set."""
+
+    donorLabels: Annotated[list[Annotated[str, Field(min_length=1, max_length=48)]], Field(max_length=8)] = Field(default_factory=list)
+    acceptorLabels: Annotated[list[Annotated[str, Field(min_length=1, max_length=48)]], Field(max_length=8)] = Field(default_factory=list)
+    outputLabel: Annotated[str, Field(min_length=1, max_length=48)] = "net_doping"
+    surfacePosition: Number | None = None
+
+    @model_validator(mode="after")
+    def check_net_doping(self) -> "NetDopingV7":
+        if not self.donorLabels and not self.acceptorLabels:
+            raise ValueError("netDoping requires at least one donor or acceptor label")
+        for name in ("outputLabel", *self.donorLabels, *self.acceptorLabels):
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,47}", name):
+                raise ValueError(f"{name!r} is not a valid cell-set label")
+        labels = [*self.donorLabels, *self.acceptorLabels]
+        if len(set(labels)) != len(labels):
+            raise ValueError("netDoping labels must be unique across donors and acceptors")
+        if self.outputLabel in labels:
+            raise ValueError("netDoping.outputLabel must not overwrite an input field")
+        return self
+
+
+class SheetResistanceEntryV7(StrictModel):
+    """One native ``viennaps.SheetResistance`` evaluation.
+
+    ``computeElectron`` uses the Masetti-Severi n-type mobility (donors) and
+    ``computeHole`` the p-type mobility (acceptors). The native length unit is
+    fixed at 1e-4 cm (the workbench's um), which also sets the matching
+    concentration unit 1e12 cm^-3.
+    """
+
+    concentrationLabel: Annotated[str, Field(min_length=1, max_length=48)]
+    carrier: Literal["electron", "hole"]
+    surfacePosition: Number | None = None
+
+    @model_validator(mode="after")
+    def check_label(self) -> "SheetResistanceEntryV7":
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,47}", self.concentrationLabel):
+            raise ValueError("concentrationLabel is not a valid cell-set label")
+        return self
+
+
+class AnalysisStepV7(StrictModel):
+    """Native ``NetDoping`` / ``SheetResistance`` analysis of the cell set.
+
+    This step never changes geometry. ``netDoping`` writes its output field into
+    the cell set; ``sheetResistance`` only reports the native scalar.
+    """
+
+    id: Annotated[str, Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")]
+    name: Annotated[str, Field(min_length=1, max_length=80)]
+    enabled: bool
+    model: Literal["analysis"]
+    netDoping: NetDopingV7 | None = None
+    sheetResistance: Annotated[list[SheetResistanceEntryV7], Field(max_length=8)] = Field(default_factory=list)
+    scanDepth: Annotated[Number, Field(ge=0, le=10000)] | None = None
+    cellSet: StepCellSetV7
+
+    @model_validator(mode="after")
+    def check_analysis_fields(self) -> "AnalysisStepV7":
+        if self.netDoping is None and not self.sheetResistance:
+            raise ValueError("analysis requires netDoping or at least one sheetResistance entry")
+        if self.scanDepth is not None and self.netDoping is None:
+            raise ValueError("scanDepth is the NetDoping lateral scan and requires netDoping")
+        return self
+
+
 StepV7 = Annotated[Union[StepV5, MultiParticleStepV7, SpecializedStepV7, GdsBooleanStepV7, CsvProcessStepV7,
-                         ParticleShapeStepV7], Field(discriminator="model")]
+                         ParticleShapeStepV7, ImplantStepV7, AnnealStepV7, AnalysisStepV7],
+                   Field(discriminator="model")]
 
 
 class DomainStateRef(StrictModel):
@@ -1654,6 +2038,48 @@ class ProjectV7(ProjectV6):
                 raise ValueError(
                     f"cellSet.height would create at least {estimate:,} cells, above the "
                     f"{MAX_CELL_SET_CELLS:,}-cell limit; reduce cellSet.height or coarsen gridDelta")
+        delta = float(self.domain.gridDelta)
+        domain_periodic = (self.domain.boundaryXY == "periodic" if self.dimension == 3
+                           else self.domain.xBoundary == "periodic")
+        nx = max(1, math.ceil(float(self.domain.xExtent) / delta))
+        ny = (max(1, math.ceil(float(self.domain.yExtent) / delta))
+              if self.dimension == 3 else 1)
+        lateral = (nx + 2) * (ny + 2)
+        for index, step in enumerate(self.steps):
+            settings = getattr(step, "cellSet", None)
+            if settings is None:
+                continue
+            height = float(settings.height)
+            if height + 1e-12 < delta:
+                raise ValueError(
+                    f"steps[{index}].cellSet.height must span at least one grid interval "
+                    f"({delta:g} um); the installed DenseCellSet generator crashes on a thinner band")
+            if height / delta > 1_000_000:
+                raise ValueError(f"steps[{index}].cellSet.height exceeds the application coordinate budget")
+            if bool(settings.periodic) != domain_periodic:
+                raise ValueError(
+                    f"steps[{index}].cellSet.periodic must match the domain lateral boundary; the "
+                    "cell set is generated from the domain's level sets and only the native "
+                    "neighbor topology can be marked periodic")
+            rows = math.ceil(height / delta) + 4
+            estimate = lateral * max(rows, 2)
+            if estimate > MAX_CELL_SET_CELLS:
+                raise ValueError(
+                    f"steps[{index}].cellSet.height would create at least {estimate:,} cells, above "
+                    f"the {MAX_CELL_SET_CELLS:,}-cell limit; reduce the height or coarsen gridDelta")
+            substrate_depth = settings.substrateDepth
+            if substrate_depth is not None:
+                if float(substrate_depth) + 1e-12 < 2 * delta:
+                    raise ValueError(
+                        f"steps[{index}].cellSet.substrateDepth must span at least two grid intervals "
+                        f"({2 * delta:g} um) so the substrate has interior cells")
+                rows = math.ceil((height + float(substrate_depth)) / delta) + 4
+                estimate = lateral * max(rows, 2)
+                if estimate > MAX_CELL_SET_CELLS:
+                    raise ValueError(
+                        f"steps[{index}].cellSet.height + substrateDepth would create at least "
+                        f"{estimate:,} cells, above the {MAX_CELL_SET_CELLS:,}-cell limit; reduce the "
+                        "depth or coarsen gridDelta")
         return self
 
 

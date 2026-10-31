@@ -20,6 +20,7 @@ import sys
 import time
 import traceback
 import xml.etree.ElementTree as ET
+from array import array
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any
@@ -3335,6 +3336,657 @@ def describe_intermediate_vtp(path: Path, *, step_id: str, run_id: str,
             "associationPolicy": "native VTP pointData/cellData retained; not projected onto the domain surface"}
 
 
+CELL_SET_PROCESS_MODELS = ("implant", "anneal", "analysis")
+INJECTION_MOMENT_UNIT = "um"
+LENGTH_UNIT_NAME = "um"
+
+
+def _scalar_digest(values: list[float]) -> str:
+    """Deterministic digest of a native scalar field (little-endian float64).
+
+    The worker records this for every published label, so a replay can prove
+    that the native field is bit-identical without storing the field twice.
+    """
+    return hashlib.sha256(array("d", values).tobytes()).hexdigest()
+
+
+def _finite_or_none(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _field_integral(values: list[float], *, grid_delta: float, dimension: int) -> float:
+    """Native concentration integral over the cell grid.
+
+    Native 3D cells are cubes with volume ``delta^3`` and native 2D cells are
+    quads with area ``delta^2`` (nominal unit thickness). The integral is in
+    ``length^(D-1)`` normalised concentration units; it is reported with an
+    explicit unit and never converted to an areal cm^-2 dose, because a 2D
+    native grid has no physical depth.
+    """
+    return sum(values) * (float(grid_delta) ** int(dimension))
+
+
+def _material_field_rows(values: list[float], materials: list[float],
+                         names: dict[int, str]) -> dict[str, dict[str, float]]:
+    rows: dict[str, dict[str, float]] = {}
+    for value, material in zip(values, materials):
+        key = int(material)
+        row = rows.setdefault(str(key), {"count": 0, "max": 0.0, "sum": 0.0,
+                                         "materialName": names.get(key, "unknown")})
+        row["count"] += 1
+        row["sum"] += float(value)
+        row["max"] = max(row["max"], float(value))
+    return rows
+
+
+def ensure_field_cell_set(ps: Any, domain: Any, project: dict[str, Any],
+                          step: dict[str, Any],
+                          state: dict[str, Any]) -> tuple[Any, Any, dict[str, Any]]:
+    """Return ``(field_domain, cell_set, setup_record)`` for a field step.
+
+    All implant/anneal/analysis steps share one native ``DenseCellSet`` so the
+    dopant fields stay on a single topology. A ViennaLS level set only stores a
+    narrow band around the surface, so the substrate is widened *on a deep copy
+    of the Domain* (``viennals.Expand`` on every level set, which reinitialises
+    the band without moving the zero contour) before the grid is generated. The
+    simulated Domain, and therefore every surface snapshot, is untouched. The
+    cell-count bound is computed from the widened copy before allocation.
+    """
+    if state.get("cellSet") is not None:
+        return state["domain"], state["cellSet"], state["setup"]
+    settings = step.get("cellSet")
+    if not isinstance(settings, dict):
+        raise RuntimeError(f"cell-set step {step.get('id')!r} has no cellSet settings")
+    height = float(settings["height"])
+    delta = float(domain.getGridDelta())
+    if height + 1e-12 < delta:
+        raise RuntimeError(
+            f"cellSet.height {height:g} um is below one grid interval ({delta:g} um); "
+            "the installed DenseCellSet generator would crash")
+    field_domain = ps.Domain(domain)
+    substrate = settings.get("substrateDepth")
+    if substrate is None:
+        raise RuntimeError(
+            "the first enabled cell-set field step must declare cellSet.substrateDepth; a narrow-band "
+            "level set would otherwise produce a single substrate row")
+    substrate = float(substrate)
+    if substrate + 1e-12 < 2 * delta:
+        raise RuntimeError(f"cellSet.substrateDepth must span at least two grid intervals ({2 * delta:g} um)")
+    # ``Expand(width)`` widens the stored band symmetrically to ``width`` grid
+    # points, so a half-band of ``ceil(depth/delta)`` cells needs twice that.
+    expand_cells = 2 * int(math.ceil(substrate / delta)) + 2
+    original_points = sum(int(level_set.getNumberOfPoints()) for level_set in domain.getLevelSets())
+    for level_set in field_domain.getLevelSets():
+        ps.ls.Expand(level_set, expand_cells).apply()
+    is3d = project["dimension"] == 3
+    mesh = field_domain.getSurfaceMesh(addInterfaces=True, sharpCorners=False, minNodeDistanceFactor=0.01)
+    top, bottom = _surface_vertical_bounds(mesh.getNodes(), is3d=is3d)
+    bound = _cell_set_upper_bound(project, height=height, top=top, bottom=bottom,
+                                  delta=delta, domain=field_domain)
+    if bound > MAX_CELL_SET_CELLS:
+        raise RuntimeError(
+            f"cell-set grid needs at least {bound:,} cells, above the {MAX_CELL_SET_CELLS:,}-cell "
+            "limit; reduce cellSet.height/substrateDepth or coarsen gridDelta")
+    cover_name = str(settings.get("coverMaterial") or "GAS")
+    cover = ps.Material.GAS if cover_name == "GAS" else material_handle(ps, cover_name)
+    field_domain.generateCellSet(height, cover, True)
+    cell_set = field_domain.getCellSet()
+    if cell_set is None:
+        raise RuntimeError("Domain.generateCellSet did not store a native cell set")
+    cells = int(cell_set.getNumberOfCells())
+    if cells <= 0 or cells > bound:
+        raise RuntimeError(
+            f"DenseCellSet generation produced {cells} cells, outside the pre-allocation bound {bound}")
+    cell_set.buildNeighborhood()
+    periodic = bool(settings.get("periodic", False))
+    cell_set.setPeriodicBoundary([periodic, periodic, False] if is3d else [periodic, False])
+    setup = {
+        "generated": True,
+        "numberOfCells": cells,
+        "cellsUpperBound": bound,
+        "surfaceTop": top,
+        "surfaceBottom": bottom,
+        "heightAboveSurface": height,
+        "substrateDepth": substrate,
+        "substrateBandExpandCells": expand_cells,
+        "substrateConstruction": "viennals.Expand on a deep Domain copy; the simulated surface is unchanged",
+        "sourceLevelSetPoints": original_points,
+        "coverMaterial": cover_name,
+        "coverMaterialId": int(cover),
+        "periodic": periodic,
+        "periodicBoundary": [periodic, periodic, False] if is3d else [periodic, False],
+    }
+    state.update({"domain": field_domain, "cellSet": cell_set, "setup": setup})
+    return field_domain, cell_set, setup
+
+
+def build_implant_profile(ps: Any, profile: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
+    """Build the native profile model and return an exact-readback record."""
+    def moments(row: dict[str, Any]) -> Any:
+        params = ps.PearsonIVParameters()
+        params.mu = float(row["mu"])
+        params.sigma = float(row["sigma"])
+        params.beta = float(row["beta"])
+        params.gamma = float(row["gamma"])
+        return params, {"mu": params.mu, "sigma": params.sigma,
+                        "beta": params.beta, "gamma": params.gamma}
+
+    head, head_readback = moments(profile["head"])
+    kind = str(profile["kind"])
+    record: dict[str, Any] = {
+        "source": "manual",
+        "kind": kind,
+        "momentUnit": INJECTION_MOMENT_UNIT,
+        "head": head_readback,
+        "lateralMu": float(profile.get("lateralMu", 0.0)),
+        "lateralSigma": float(profile["lateralSigma"]),
+    }
+    if kind == "pearsonIV":
+        model = ps.ImplantPearsonIV(head, record["lateralMu"], record["lateralSigma"])
+        record["nativeConstructor"] = "viennaps.ImplantPearsonIV"
+    elif kind == "dualPearsonIV":
+        tail, tail_readback = moments(profile["tail"])
+        record.update({
+            "tail": tail_readback,
+            "headFraction": float(profile["headFraction"]),
+            "tailLateralMu": float(profile["tailLateralMu"]),
+            "tailLateralSigma": float(profile["tailLateralSigma"]),
+        })
+        model = ps.ImplantDualPearsonIV(
+            head, tail, record["headFraction"], record["lateralMu"], record["lateralSigma"],
+            record["tailLateralMu"], record["tailLateralSigma"])
+        record["nativeConstructor"] = "viennaps.ImplantDualPearsonIV"
+    else:
+        record.update({
+            "tailFraction": float(profile["tailFraction"]),
+            "tailStartDepth": float(profile["tailStartDepth"]),
+            "tailDecayLength": float(profile["tailDecayLength"]),
+            "tailBlendWidth": float(profile.get("tailBlendWidth", 0.0)),
+        })
+        model = ps.ImplantPearsonIVChanneling(
+            head, record["lateralMu"], record["lateralSigma"], record["tailFraction"],
+            record["tailStartDepth"], record["tailDecayLength"], record["tailBlendWidth"])
+        record["nativeConstructor"] = "viennaps.ImplantPearsonIVChanneling"
+    return model, record
+
+
+def apply_implant_step(ps: Any, domain: Any, project: dict[str, Any],
+                       step: dict[str, Any], *, run_dir: Path, run_id: str,
+                       state: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Run native ``IonImplantation`` on the field cell set (duration 0)."""
+    from backend.implant_models import LENGTH_UNIT_CM
+    field_domain, cell_set, cell_set_record = ensure_field_cell_set(ps, domain, project, step, state)
+    profile_model, profile_record = build_implant_profile(ps, step["profile"])
+    implant = ps.IonImplantation()
+    implant.setImplantModel(profile_model)
+    damage_record = None
+    damage = step.get("damage")
+    if damage is not None:
+        damage_model = ps.ImplantDamageHobler(
+            float(damage["projectedRange"]), float(damage["verticalSigma"]),
+            float(damage["lambdaValue"]), float(damage["defectsPerIon"]),
+            float(damage["lateralSigma"]), float(damage["lateralDeltaSigma"]))
+        implant.setDamageModel(damage_model)
+        damage_record = {
+            "nativeConstructor": "viennaps.ImplantDamageHobler",
+            "kind": damage["kind"],
+            "projectedRange": float(damage["projectedRange"]),
+            "verticalSigma": float(damage["verticalSigma"]),
+            "lambdaValue": float(damage["lambdaValue"]),
+            "defectsPerIon": float(damage["defectsPerIon"]),
+            "lateralSigma": float(damage["lateralSigma"]),
+            "lateralDeltaSigma": float(damage["lateralDeltaSigma"]),
+        }
+    implant.setDose(float(step["doseCm2"]))
+    implant.setTiltAngle(float(step["tiltDeg"]))
+    # The workbench declares ``units.length = um``; the native implant model
+    # needs the same unit in centimetres (1 um = 1e-4 cm) so the tabulated /
+    # analytical profile and the deposited concentration are dimensionally
+    # consistent with the cell grid.
+    implant.setLengthUnit(LENGTH_UNIT_CM)
+    implant.setDoseControl(getattr(ps.ImplantDoseControl, str(step["doseControl"])))
+    mask_names = list(step.get("maskMaterials") or [])
+    screen_names = list(step.get("screenMaterials") or [])
+    implant.setMaskMaterials([material_handle(ps, name) for name in mask_names])
+    implant.setScreenMaterials([material_handle(ps, name) for name in screen_names])
+    labels = step["labels"]
+    implant.setConcentrationLabel(str(labels["concentration"]))
+    if labels.get("damage"):
+        implant.setDamageLabel(str(labels["damage"]))
+    if labels.get("lastDamage"):
+        implant.setLastDamageLabel(str(labels["lastDamage"]))
+    if float(step.get("damageFactor", 1.0)) != 1.0:
+        implant.setDamageFactor(float(step["damageFactor"]))
+
+    process = ps.Process(field_domain, implant, 0.0)
+    # The native model does not consume a ray flux engine; pin CPU_DISK so the
+    # Process default never attempts CUDA initialization.
+    process.setFluxEngineType(ps.FluxEngineType.CPU_DISK)
+    started = time.perf_counter()
+    process.apply()
+    elapsed = time.perf_counter() - started
+
+    known = set(str(label) for label in cell_set.getScalarDataLabels())
+    expected = [str(labels["concentration"])] + [
+        str(labels[key]) for key in ("damage", "lastDamage") if labels.get(key)]
+    missing = [label for label in expected if label not in known]
+    if missing:
+        raise RuntimeError("native IonImplantation did not write cell-set field(s): " + ", ".join(missing))
+
+    record: dict[str, Any] = {
+        "nativeModel": "viennaps.IonImplantation",
+        "nativeProcess": "ps.Process(domain, model, 0.0); the level sets are not advanced",
+        "requested": {
+            "species": step["species"], "material": step["material"],
+            "energyKeV": float(step["energyKeV"]), "doseCm2": float(step["doseCm2"]),
+            "tiltDeg": float(step["tiltDeg"]), "rotationDeg": float(step["rotationDeg"]),
+            "doseControl": step["doseControl"],
+            "maskMaterials": mask_names, "screenMaterials": screen_names,
+        },
+        "effective": {
+            "doseCm2": float(step["doseCm2"]), "tiltDeg": float(step["tiltDeg"]),
+            "lengthUnitCm": LENGTH_UNIT_CM,
+            "doseControl": step["doseControl"],
+            "maskMaterialIds": [MATERIAL_IDS.get(name) for name in mask_names],
+            "screenMaterialIds": [MATERIAL_IDS.get(name) for name in screen_names],
+            "damageFactor": float(step.get("damageFactor", 1.0)),
+            "concentrationLabel": str(labels["concentration"]),
+            "damageLabel": labels.get("damage"),
+            "lastDamageLabel": labels.get("lastDamage"),
+        },
+        # The manual Pearson IV path has no native energy/rotation argument;
+        # both are recorded as request metadata, never as native inputs.
+        "energyKeVNativeEffect": False,
+        "rotationDegNativeEffect": False,
+        "nativeDoseControl": f"viennaps.ImplantDoseControl.{step['doseControl']}",
+        "profile": profile_record,
+        "damage": damage_record,
+        "cellSet": cell_set_record,
+        "processSeconds": elapsed,
+    }
+    record["fields"] = _selected_field_rows(cell_set, project, step)
+    record["fieldDigests"] = _selected_field_digests(cell_set, project, step)
+    outputs = write_cell_set_field_outputs(
+        ps, field_domain, cell_set, project, step, {"implant": record}, cell_set_record,
+        run_dir=run_dir, run_id=run_id, field_rows=record["fields"],
+        digests=record["fieldDigests"])
+    return record, outputs
+
+
+def apply_anneal_step(ps: Any, domain: Any, project: dict[str, Any],
+                      step: dict[str, Any], *, run_dir: Path, run_id: str,
+                      state: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Run native ``Anneal`` (or its zero-time activation) on the cell set."""
+    field_domain, cell_set, cell_set_record = ensure_field_cell_set(ps, domain, project, step, state)
+    species_label = str(step["speciesLabel"])
+    known = set(str(label) for label in cell_set.getScalarDataLabels())
+    if species_label not in known:
+        raise RuntimeError(
+            f"anneal speciesLabel {species_label!r} is not present in the native cell set; "
+            "an earlier implant step must produce it")
+    anneal = ps.Anneal()
+    schedule = step["schedule"]
+    if schedule["kind"] == "isothermal":
+        anneal.setTemperature(float(schedule["temperatureK"]))
+        anneal.setDuration(float(schedule["durationSeconds"]))
+        schedule_record = {"kind": "isothermal",
+                           "temperatureK": float(schedule["temperatureK"]),
+                           "durationSeconds": float(schedule["durationSeconds"]),
+                           "nativeCall": "setTemperature + setDuration"}
+    else:
+        durations = [float(value) for value in schedule["durations"]]
+        temperatures = [float(value) for value in schedule["temperatures"]]
+        anneal.setTemperatureSchedule(durations, temperatures)
+        schedule_record = {"kind": "schedule", "durations": durations,
+                           "temperatures": temperatures,
+                           "nativeCall": "setTemperatureSchedule"}
+    diffusivity = step["diffusivity"]
+    if diffusivity["kind"] == "arrhenius":
+        anneal.setArrheniusParameters(float(diffusivity["D0"]), float(diffusivity["Ea_eV"]))
+        diffusivity_record = {"kind": "arrhenius", "D0": float(diffusivity["D0"]),
+                              "Ea_eV": float(diffusivity["Ea_eV"]),
+                              "nativeCall": "setArrheniusParameters"}
+    else:
+        anneal.setDiffusionCoefficient(float(diffusivity["value"]))
+        diffusivity_record = {"kind": "constant", "value": float(diffusivity["value"]),
+                              "nativeCall": "setDiffusionCoefficient"}
+    mode = str(step["mode"])
+    anneal.setMode(getattr(ps.AnnealMode, mode))
+    solver_record: dict[str, Any] = {"mode": mode, "nativeCall": f"setMode(viennaps.AnnealMode.{mode})"}
+    if step.get("implicitSolver") is not None:
+        options = step["implicitSolver"]
+        anneal.setImplicitSolverOptions(int(options["maxIterations"]),
+                                        float(options["relativeTolerance"]),
+                                        float(options["relaxation"]))
+        solver_record["implicitSolver"] = {
+            "maxIterations": int(options["maxIterations"]),
+            "relativeTolerance": float(options["relativeTolerance"]),
+            "relaxation": float(options["relaxation"]),
+        }
+    if step.get("timeStep") is not None:
+        anneal.setTimeStep(float(step["timeStep"]))
+        solver_record["timeStep"] = float(step["timeStep"])
+    if step.get("stabilityFactor") is not None:
+        anneal.setStabilityFactor(float(step["stabilityFactor"]))
+        solver_record["stabilityFactor"] = float(step["stabilityFactor"])
+    diffusion_names = list(step.get("diffusionMaterials") or [])
+    blocking_names = list(step.get("blockingMaterials") or [])
+    anneal.setDiffusionMaterials([material_handle(ps, name) for name in diffusion_names])
+    anneal.setBlockingMaterials([material_handle(ps, name) for name in blocking_names])
+    anneal.setSpeciesLabel(species_label)
+    active_label = str(step["activeLabel"])
+    anneal.setActiveLabel(active_label)
+    activation = step["solidActivation"]
+    anneal.enableSolidActivation(True)
+    anneal.setSolidSolubilityArrhenius(float(activation["solubilityC0"]),
+                                       float(activation["solubilityEa_eV"]))
+    activation_only = bool(step.get("activationOnly", False))
+    started = time.perf_counter()
+    if activation_only:
+        anneal.applyActivation(field_domain)
+        elapsed = time.perf_counter() - started
+        native_call = "Anneal.applyActivation(domain)"
+    else:
+        process = ps.Process(field_domain, anneal, 0.0)
+        process.setFluxEngineType(ps.FluxEngineType.CPU_DISK)
+        process.apply()
+        elapsed = time.perf_counter() - started
+        native_call = "ps.Process(domain, model, 0.0)"
+    known = set(str(label) for label in cell_set.getScalarDataLabels())
+    if active_label not in known:
+        raise RuntimeError(
+            f"native Anneal did not write the active-concentration field {active_label!r}")
+    record: dict[str, Any] = {
+        "nativeModel": "viennaps.Anneal",
+        "nativeProcess": native_call,
+        "activationOnly": activation_only,
+        "requested": {
+            "mode": mode, "speciesLabel": species_label, "activeLabel": active_label,
+            "diffusionMaterials": diffusion_names, "blockingMaterials": blocking_names,
+        },
+        "effective": {
+            "diffusionMaterialIds": [MATERIAL_IDS.get(name) for name in diffusion_names],
+            "blockingMaterialIds": [MATERIAL_IDS.get(name) for name in blocking_names],
+            "solidActivation": {"solubilityC0": float(activation["solubilityC0"]),
+                                "solubilityEa_eV": float(activation["solubilityEa_eV"]),
+                                "nativeCall": "enableSolidActivation + setSolidSolubilityArrhenius"},
+        },
+        "schedule": schedule_record,
+        "diffusivity": diffusivity_record,
+        "solver": solver_record,
+        "cellSet": cell_set_record,
+        "processSeconds": elapsed,
+    }
+    record["fields"] = _selected_field_rows(cell_set, project, step)
+    record["fieldDigests"] = _selected_field_digests(cell_set, project, step)
+    species_values = [float(value) for value in cell_set.getScalarData(species_label)]
+    active_values = [float(value) for value in cell_set.getScalarData(active_label)]
+    total = sum(species_values)
+    record["activation"] = {
+        "speciesLabel": species_label,
+        "activeLabel": active_label,
+        "totalConcentrationSum": total,
+        "activeConcentrationSum": sum(active_values),
+        "activeFractionOfTotal": (sum(active_values) / total) if total > 0.0 else None,
+        "note": "sums are over every native cell; activeFraction is a global ratio, not a local activation model",
+    }
+    outputs = write_cell_set_field_outputs(
+        ps, field_domain, cell_set, project, step, {"anneal": record}, cell_set_record,
+        run_dir=run_dir, run_id=run_id, field_rows=record["fields"],
+        digests=record["fieldDigests"])
+    return record, outputs
+
+
+def apply_analysis_step(ps: Any, domain: Any, project: dict[str, Any],
+                        step: dict[str, Any], *, run_dir: Path, run_id: str,
+                        state: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Run native ``NetDoping`` and ``SheetResistance`` on the current cell set."""
+    from backend.implant_models import LENGTH_UNIT_CM
+    field_domain, cell_set, cell_set_record = ensure_field_cell_set(ps, domain, project, step, state)
+    known = set(str(label) for label in cell_set.getScalarDataLabels())
+    record: dict[str, Any] = {"nativeModel": "viennaps.NetDoping" if step.get("netDoping") else None,
+                              "cellSet": cell_set_record}
+    net = step.get("netDoping")
+    if net is not None:
+        inputs = [*(net.get("donorLabels") or []), *(net.get("acceptorLabels") or [])]
+        missing = [label for label in inputs if label not in known]
+        if missing:
+            raise RuntimeError("native NetDoping input field(s) are missing: " + ", ".join(missing))
+        net_doping = ps.NetDoping()
+        net_doping.setCellSet(cell_set)
+        for label in net.get("donorLabels") or []:
+            net_doping.addDonorLabel(str(label))
+        for label in net.get("acceptorLabels") or []:
+            net_doping.addAcceptorLabel(str(label))
+        net_doping.setOutputLabel(str(net["outputLabel"]))
+        surface_position = net.get("surfacePosition")
+        if surface_position is not None:
+            net_doping.setSurfacePosition(float(surface_position))
+        net_doping.apply()
+        output_label = str(net["outputLabel"])
+        if output_label not in set(str(label) for label in cell_set.getScalarDataLabels()):
+            raise RuntimeError(f"native NetDoping did not write {output_label!r}")
+        values = [float(value) for value in cell_set.getScalarData(output_label)]
+        scan = step.get("scanDepth")
+        lateral = None
+        if scan is not None:
+            lateral = _finite_or_none(net_doping.lateralJunctionPosition(float(scan)))
+        record["netDoping"] = {
+            "donorLabels": list(net.get("donorLabels") or []),
+            "acceptorLabels": list(net.get("acceptorLabels") or []),
+            "outputLabel": output_label,
+            "surfacePosition": float(surface_position) if surface_position is not None else 0.0,
+            "surfacePositionSource": "request" if surface_position is not None else "native-default-0",
+            "junctionDepth": _finite_or_none(net_doping.junctionDepth()),
+            "junctionDepths": [_finite_or_none(value) for value in net_doping.junctionDepths()],
+            "junctionCount": int(net_doping.junctionCount()),
+            "scanDepth": float(scan) if scan is not None else None,
+            "lateralJunctionPosition": lateral,
+            "outputField": {"count": len(values), "min": min(values), "max": max(values),
+                            "sum": sum(values),
+                            "integralNative": _field_integral(values, grid_delta=float(domain.getGridDelta()),
+                                                              dimension=int(project["dimension"]))},
+            "junctionDepthNote": "depth in the project length unit (um); inf means no sign change",
+        }
+        record["nativeModel"] = "viennaps.NetDoping"
+    sheet_rows: list[dict[str, Any]] = []
+    for entry in step.get("sheetResistance") or []:
+        label = str(entry["concentrationLabel"])
+        if label not in known:
+            raise RuntimeError(f"native SheetResistance input field {label!r} is missing")
+        resistance = ps.SheetResistance()
+        resistance.setCellSet(cell_set)
+        resistance.setLengthUnit(LENGTH_UNIT_CM)
+        resistance.setConcentrationLabel(label)
+        surface_position = entry.get("surfacePosition")
+        if surface_position is not None:
+            resistance.setSurfacePosition(float(surface_position))
+        value = (resistance.computeElectron() if entry["carrier"] == "electron"
+                 else resistance.computeHole())
+        sheet_rows.append({
+            "concentrationLabel": label,
+            "carrier": entry["carrier"],
+            "nativeMethod": ("viennaps.SheetResistance.computeElectron" if entry["carrier"] == "electron"
+                             else "viennaps.SheetResistance.computeHole"),
+            "lengthUnitCm": LENGTH_UNIT_CM,
+            "concentrationUnitCm3": 1e12,
+            "surfacePosition": float(surface_position) if surface_position is not None else 0.0,
+            "surfacePositionSource": "request" if surface_position is not None else "native-default-0",
+            "sheetResistanceOhmPerSquare": _finite_or_none(value),
+        })
+    if sheet_rows:
+        record["sheetResistance"] = sheet_rows
+        if record["nativeModel"] is None:
+            record["nativeModel"] = "viennaps.SheetResistance"
+    record["fields"] = _selected_field_rows(cell_set, project, step)
+    record["fieldDigests"] = _selected_field_digests(cell_set, project, step)
+    outputs = write_cell_set_field_outputs(
+        ps, field_domain, cell_set, project, step, {"analysis": record}, cell_set_record,
+        run_dir=run_dir, run_id=run_id, field_rows=record["fields"],
+        digests=record["fieldDigests"])
+    return record, outputs
+
+
+def _selected_labels(cell_set: Any, step: dict[str, Any]) -> list[str]:
+    labels = [str(label) for label in cell_set.getScalarDataLabels()]
+    settings = step.get("cellSet") or {}
+    selected = settings.get("scalarLabels")
+    if selected is None:
+        return labels
+    missing = sorted(set(selected) - set(labels))
+    if missing:
+        raise RuntimeError("native cell set is missing requested scalar label(s): " + ", ".join(missing))
+    return [str(label) for label in selected]
+
+
+def _selected_field_rows(cell_set: Any, project: dict[str, Any], step: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    # GAS (3) and Air (2) are native enum values that the curated workbench
+    # material catalog does not list; the cover cells carry one of them.
+    material_names = {**MATERIAL_NAMES, 2: "Air", 3: "GAS"}
+    material_values = [float(value) for value in cell_set.getScalarData("Material")]
+    rows: dict[str, dict[str, Any]] = {}
+    for label in _selected_labels(cell_set, step):
+        if label == "Material":
+            rows[label] = _cell_set_field_row(label, material_values, material_names)
+            continue
+        if label == "FillingFraction":
+            values = [float(value) for value in cell_set.getFillingFractions()]
+        else:
+            values = [float(value) for value in cell_set.getScalarData(label)]
+        row = _cell_set_field_row(label, values, material_names)
+        if len(values) > 200_000:
+            # ``_cell_set_field_row`` builds a Python set of every value for
+            # distinctCount; above this size the memory/time cost outweighs the
+            # information, so the compact summary omits it.
+            row.pop("distinctCount", None)
+        row["integralNative"] = _field_integral(
+            values, grid_delta=float(cell_set.getGridDelta()), dimension=int(project["dimension"]))
+        if label not in ("FillingFraction",):
+            row["byMaterial"] = _material_field_rows(values, material_values, material_names)
+        rows[label] = row
+    return rows
+
+
+def _selected_field_digests(cell_set: Any, project: dict[str, Any], step: dict[str, Any]) -> dict[str, str]:
+    digests: dict[str, str] = {}
+    for label in _selected_labels(cell_set, step):
+        if label == "FillingFraction":
+            values = [float(value) for value in cell_set.getFillingFractions()]
+        else:
+            values = [float(value) for value in cell_set.getScalarData(label)]
+        digests[label] = _scalar_digest(values)
+    return digests
+
+
+def write_cell_set_field_outputs(ps: Any, domain: Any, cell_set: Any, project: dict[str, Any],
+                                 step: dict[str, Any], record: dict[str, Any],
+                                 cell_set_record: dict[str, Any], *, run_dir: Path,
+                                 run_id: str, field_rows: dict[str, dict[str, Any]],
+                                 digests: dict[str, str]) -> list[dict[str, Any]]:
+    """Write the native field cell set as a VTU and a compact JSON summary.
+
+    Both artifacts are budgeted before the VTU is written, so an oversized grid
+    is refused instead of being silently truncated or written past the cap.
+    """
+    settings = step.get("cellSet") or {}
+    format_ = str(settings.get("format") or "both")
+    if format_ not in {"vtu", "json", "both"}:
+        raise RuntimeError(f"unsupported cellSet.format {format_!r}")
+    dimension = int(project["dimension"])
+    delta = float(domain.getGridDelta())
+    cells = int(cell_set.getNumberOfCells())
+    step_id = str(step["id"])
+    if cells <= 0:
+        raise RuntimeError("native cell set has no cells")
+    artifact_dir = run_dir / "artifacts"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    target_paths: list[Path] = []
+    if format_ in {"vtu", "both"}:
+        target_paths.append(artifact_dir / f"{step_id}-cell-set-fields.vtu")
+    if format_ in {"json", "both"}:
+        target_paths.append(artifact_dir / f"{step_id}-cell-set-fields.json")
+    estimate = 0
+    if format_ in {"vtu", "both"}:
+        estimate += cells * CELL_SET_VTU_BYTES_PER_CELL + 8192
+    if format_ in {"json", "both"}:
+        # The summary carries per-label statistics plus a per-material breakdown
+        # and a 64-byte digest per selected label; 64 KiB is the generic cell-set
+        # JSON bound and is conservative for these compact rows.
+        estimate += CELL_SET_JSON_BYTES
+    replaced = sum(path.stat().st_size for path in target_paths if path.is_file())
+    cap = artifact_limit_bytes()
+    used = artifact_bytes_used(run_dir) - replaced
+    if used + estimate > cap:
+        raise RuntimeError(
+            f"cell-set field output would need about {estimate / (1024 * 1024):.1f} MiB but only "
+            f"{(cap - used) / (1024 * 1024):.1f} MiB remain under the {artifact_limit_label()} cap; "
+            "reduce cellSet.height, use format=json, or coarsen gridDelta")
+
+    labels = _selected_labels(cell_set, step)
+    bounds = json.loads(json.dumps(cell_set.getBoundingBox(), default=float))
+    association = ("native Domain cell set shared by every implant/anneal/analysis step; "
+                   "separate from the returned surface mesh")
+    rows: list[dict[str, Any]] = []
+    if format_ in {"vtu", "both"}:
+        path = artifact_dir / f"{step_id}-cell-set-fields.vtu"
+        cell_set.writeVTU(str(path))
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise RuntimeError("native DenseCellSet.writeVTU did not produce a nonempty VTU file")
+        rows.append(output_artifact(
+            path, run_dir, run_id, step_id, "cellSetFields", "VTU",
+            association=association, dimension=dimension, gridDelta=delta,
+            numberOfCells=cells, coverMaterial=settings.get("coverMaterial", "GAS"),
+            heightAboveSurface=float(settings["height"]), periodic=bool(settings.get("periodic", False)),
+            scalarLabels=labels))
+    if format_ in {"json", "both"}:
+        payload = {
+            "schemaVersion": 1,
+            "source": "viennaps.Domain.getCellSet() after the native process",
+            "nativeType": "DenseCellSet",
+            "dimension": dimension,
+            "association": association,
+            "stepId": step_id,
+            "nativeModel": (next(iter(record.values())) or {}).get("nativeModel") if record else None,
+            "setup": {
+                "heightAboveSurface": float(settings["height"]),
+                "coverMaterial": settings.get("coverMaterial", "GAS"),
+                "periodic": bool(settings.get("periodic", False)),
+                "scalarLabels": labels,
+                "nativeScalarLabels": [str(label) for label in cell_set.getScalarDataLabels()],
+            },
+            "numberOfCells": cells,
+            "numberOfNodes": len(cell_set.getNodes()),
+            "grid": {
+                "gridDelta": delta,
+                "nodes": len(cell_set.getNodes()),
+                "elements": len(cell_set.getElements()),
+                "elementNodes": len(cell_set.getElement(0)),
+                "nativeElementType": "tetra" if dimension == 2 else "hexahedron",
+                "logicalCellShape": "quad" if dimension == 2 else "hexahedron",
+                "bounds": bounds,
+            },
+            "fields": field_rows,
+            "fieldDigests": digests,
+            "cellSetSetup": cell_set_record,
+            "concentrationUnit": f"1/{LENGTH_UNIT_NAME}^{dimension}",
+            "integralUnit": f"1/{LENGTH_UNIT_NAME}^{dimension - 1}",
+            "process": record,
+        }
+        path = artifact_dir / f"{step_id}-cell-set-fields.json"
+        atomic_json(path, payload)
+        rows.append(output_artifact(
+            path, run_dir, run_id, step_id, "cellSetFieldsSummary", "JSON",
+            association=association, dimension=dimension, gridDelta=delta,
+            numberOfCells=cells, coverMaterial=settings.get("coverMaterial", "GAS"),
+            heightAboveSurface=float(settings["height"]), periodic=bool(settings.get("periodic", False)),
+            scalarLabels=labels))
+    return rows
+
+
 def execute(input_path: Path, run_dir: Path) -> None:
     input_path = input_path.resolve()
     run_dir = run_dir.resolve()
@@ -3418,6 +4070,12 @@ def execute(input_path: Path, run_dir: Path) -> None:
     ls_version = version("viennals")
     if ps_version != config["expectedVersions"]["viennaps"] or ls_version != config["expectedVersions"]["viennals"]:
         raise RuntimeError(f"installed package version changed: ViennaPS {ps_version}, ViennaLS {ls_version}")
+    if (ps_version != "4.7.0"
+            and any(step.get("model") in CELL_SET_PROCESS_MODELS
+                    for step in project["steps"] if step.get("enabled"))):
+        raise RuntimeError(
+            f"ViennaPS {ps_version} does not provide the native IonImplantation / Anneal / NetDoping / "
+            "SheetResistance classes; cell-set field steps require the ViennaPS 4.7.0 runtime")
     configure_native_materials(ps, config.get("customMaterials", []))
     if project.get("schemaVersion") == 7 and project.get("outputSettings", {}).get("nativeMetadata"):
         metadata_level = ps.MetaDataLevel.FULL
@@ -3520,6 +4178,9 @@ def execute(input_path: Path, run_dir: Path) -> None:
         initial["nativeState"] = save_native_state(ps, domain, run_dir, project=project, run_id=run_id,
                                                    step_id="initial", viennaps_version=ps_version, viennals_version=ls_version)
     snapshots = [initial]
+    # The native field cell set lives on a widened deep copy of the Domain and
+    # is shared by every implant/anneal/analysis step of this run.
+    field_state: dict[str, Any] = {}
     actual_execution: list[dict[str, Any]] = []
     intermediate_outputs: list[dict[str, Any]] = []
     event(run_dir, {"type": "snapshot", **initial})
@@ -3677,7 +4338,45 @@ def execute(input_path: Path, run_dir: Path) -> None:
         event(run_dir, {"type": "step-started", "stepId": step["id"], "index": index, "total": len(actual_steps), "name": step["name"]})
         geometry_step = is_geometry_step(step)
         no_op = not geometry_step and not has_motion(step)
-        if geometry_step:
+        if step.get("model") in CELL_SET_PROCESS_MODELS:
+            # Native 4.7.0 cell-set field steps. They never advance the level
+            # sets; the surface snapshot is the unchanged Domain and the real
+            # output is the native DenseCellSet plus its compact summary.
+            from backend.implant_models import numeric_guard_messages
+            guard_messages = numeric_guard_messages(
+                step, dimension=project["dimension"],
+                grid_delta=float(domain.getGridDelta()))
+            if guard_messages:
+                # Defense in depth: a hand-edited input.json bypasses the API
+                # validator, but must never reach a native constructor with a
+                # value the schema would reject.
+                raise RuntimeError(" ".join(guard_messages))
+            cell_set_applied = {
+                "implant": apply_implant_step,
+                "anneal": apply_anneal_step,
+                "analysis": apply_analysis_step,
+            }[step["model"]]
+            record, cell_set_outputs = cell_set_applied(
+                ps, domain, project, step, run_dir=run_dir, run_id=run_id,
+                state=field_state)
+            event(run_dir, {"type": "step-configured", "stepId": step["id"],
+                            "operation": "native", "model": step["model"], "noOp": False,
+                            "actualEngine": "not-applicable",
+                            "engineSelectionReason": "native cell-set field model; no ray flux engine or surface advection",
+                            "requestedEnginePreference": engine_preference,
+                            "actualSeed": None, "actualRate": None,
+                            "duration": 0.0, "actualParameters": record})
+            previous_tops = snapshots[-1].get("materialTops")
+            metadata = save_snapshot(ps, domain, run_dir, run_id=run_id, step_id=step["id"],
+                                     step_name=step["name"], step_index=index, requested=project,
+                                     step=step, previous_tops=previous_tops,
+                                     extra={"cellSetProcess": record},
+                                     extra_outputs=cell_set_outputs,
+                                     defer_payload=LAZY_SNAPSHOTS)
+            metadata["nativeState"] = save_native_state(ps, domain, run_dir, project=project, run_id=run_id,
+                                                        step_id=step["id"], viennaps_version=ps_version, viennals_version=ls_version)
+            actual_execution.append({"stepId": step["id"], "engine": "not-applicable", "seed": None})
+        elif geometry_step:
             previous_tops = snapshots[-1].get("materialTops")
             actual_parameters = apply_geometry_operation(ps, domain, project, step,
                                                          previous_tops=previous_tops,

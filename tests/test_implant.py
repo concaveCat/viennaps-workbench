@@ -1,0 +1,478 @@
+"""Schema-7 implant / anneal / analysis capability (ViennaPS 4.7.0 only).
+
+The native classes ``IonImplantation``, ``Anneal``, ``NetDoping`` and
+``SheetResistance`` exist only in the 4.7.0 wheel, operate on the Domain cell
+set (never on the level sets) and have no model database in the public wheel.
+These tests pin the additive schema, the pure-Python rejection paths that keep a
+bad request away from a native constructor, and a real 2D/3D native run.
+
+Native evidence (``worker/probe_implant_native.py``, quoted in
+``docs/capability-implant.md``):
+
+* 4.7.0 / ViennaLS 5.10.0 expose exactly the setters used by the worker;
+* an unmodified Domain cell set contains a single substrate row (100 Si cells
+  next to 2000 cover cells on a flat 1 um plane), so the worker widens the band
+  on a deep Domain copy and the simulated surface stays byte-identical;
+* 2D and 3D implant + anneal + NetDoping + SheetResistance run and repeat
+  bit-identically;
+* ``viennaps.getModelDbRoot()`` is empty and the wheel ships no model database.
+"""
+from __future__ import annotations
+
+import asyncio
+import copy
+import json
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+
+from backend import preflight, storage  # noqa: E402
+from backend.hashing import requested_input_hash  # noqa: E402
+from backend.main import app  # noqa: E402
+from backend.models import ImplantStepV7, parse_project  # noqa: E402
+from backend.validation import ProjectInputError, validate_project  # noqa: E402
+from tests.test_api_integration import asgi_request, json_body  # noqa: E402
+from tests.test_engine_cellset import HISTORICAL_HASH, project as cellset_project  # noqa: E402
+import backend.snapshots as snapshot_store  # noqa: E402
+
+
+def solver() -> dict:
+    return {
+        "timeStepRatio": 0.25, "raysPerPoint": 16, "cpuThreads": 1,
+        "random": {"mode": "fixed", "seed": 1234}, "enginePreference": "cpu",
+        "timeoutSeconds": 120,
+        "advection": {"spatialScheme": "ENGQUIST_OSHER_1ST_ORDER",
+                      "temporalScheme": "FORWARD_EULER",
+                      "adaptiveTimeStepping": False, "adaptiveTimeStepSubdivisions": 20,
+                      "calculateIntermediateVelocities": False, "checkDissipation": True,
+                      "dissipationAlpha": 1.0, "ignoreVoids": False, "velocityOutput": False},
+        "rayTracing": {"diskRadius": 0.0, "ignoreFluxBoundaries": False,
+                       "maxBoundaryHits": 80, "maxReflections": 3,
+                       "minNodeDistanceFactor": 0.05,
+                       "normalizationType": "SOURCE", "smoothingNeighbors": 1},
+    }
+
+
+def cell_set(**overrides) -> dict:
+    value = {"height": 0.5, "substrateDepth": 0.4, "coverMaterial": "GAS",
+             "periodic": False, "format": "both"}
+    value.update(overrides)
+    return value
+
+
+def implant_step(**overrides) -> dict:
+    value = {
+        "id": "implant_step_01", "name": "P implant", "enabled": True, "model": "implant",
+        "species": "P", "material": "Si", "energyKeV": 10.0, "doseCm2": 1.0e15,
+        "tiltDeg": 7.0, "doseControl": "WaferDose",
+        "profile": {"source": "manual", "kind": "pearsonIV",
+                    "head": {"mu": 0.03, "sigma": 0.012, "beta": 1.15, "gamma": 6.2},
+                    "lateralMu": 0.0, "lateralSigma": 0.005},
+        "maskMaterials": [], "screenMaterials": ["SiO2"],
+        "damage": {"kind": "hobler", "projectedRange": 0.027, "verticalSigma": 0.018,
+                   "lambdaValue": 0.024, "defectsPerIon": 142.9, "lateralSigma": 0.013,
+                   "lateralDeltaSigma": -0.02},
+        "cellSet": cell_set(),
+    }
+    value.update(overrides)
+    return value
+
+
+def anneal_step(**overrides) -> dict:
+    value = {
+        "id": "anneal_step_01", "name": "anneal", "enabled": True, "model": "anneal",
+        "mode": "GaussSeidel",
+        "schedule": {"kind": "isothermal", "temperatureK": 1273.15, "durationSeconds": 30.0},
+        "diffusivity": {"kind": "arrhenius", "D0": 1.23e13, "Ea_eV": 3.566},
+        "diffusionMaterials": ["Si"], "blockingMaterials": ["SiO2"],
+        "speciesLabel": "P_total", "activeLabel": "P_active",
+        "solidActivation": {"solubilityC0": 1.521e2, "solubilityEa_eV": 0.7102},
+        "cellSet": cell_set(),
+    }
+    value.update(overrides)
+    return value
+
+
+def analysis_step(**overrides) -> dict:
+    value = {
+        "id": "analysis_step_01", "name": "analysis", "enabled": True, "model": "analysis",
+        "netDoping": {"donorLabels": ["P_active"], "acceptorLabels": [],
+                      "outputLabel": "net_doping"},
+        "sheetResistance": [{"concentrationLabel": "P_active", "carrier": "electron"}],
+        "cellSet": cell_set(),
+    }
+    value.update(overrides)
+    return value
+
+
+def project(dimension: int = 2, *, steps: list[dict] | None = None, **overrides) -> dict:
+    value = {
+        "schemaVersion": 7, "name": f"implant {dimension}D", "dimension": dimension,
+        "units": {"length": "um", "time": "s", "rate": "um/s", "angle": "deg"},
+        "geometry": {"kind": "plane", "height": 0.0, "substrateMaterial": "Si"},
+        "steps": steps if steps is not None else [implant_step(), anneal_step(), analysis_step()],
+        "solver": solver(),
+    }
+    if dimension == 2:
+        value["domain"] = {"gridDelta": 0.01, "xExtent": 1.0, "xBoundary": "reflective"}
+        value["view"] = {"panX": 0.0, "panH": 0.0, "zoom": 1.0, "showGrid": True}
+    else:
+        value["domain"] = {"gridDelta": 0.02, "xExtent": 1.0, "yExtent": 1.0,
+                           "boundaryXY": "reflective"}
+        value["view3D"] = {"projection": "parallel", "camera": None, "displayMode": "surface",
+                           "visibleMaterialIds": [], "opacityByMaterial": {},
+                           "clip": {"enabled": False, "axis": "x", "position": 0.0,
+                                    "keep": "positive"},
+                           "section": {"enabled": False, "axis": "y", "position": 0.0}}
+    value.update(overrides)
+    return value
+
+
+def normalized(value: dict) -> dict:
+    return validate_project(value)[0].model_dump(mode="json", exclude_none=True)
+
+
+class ImplantSchema(unittest.TestCase):
+    def test_labels_resolve_and_are_recorded(self) -> None:
+        step = parse_project(project(2)).steps[0]
+        self.assertIsInstance(step, ImplantStepV7)
+        self.assertEqual(step.labels.concentration, "P_total")
+        self.assertEqual(step.labels.damage, "P_damage")
+        self.assertEqual(step.labels.lastDamage, "P_damage_last")
+        without_damage = implant_step(damage=None)
+        parsed = normalized(project(2, steps=[without_damage]))
+        self.assertEqual(set(parsed["steps"][0]["labels"]), {"concentration"})
+
+    def test_unknown_keys_and_invalid_values_are_rejected(self) -> None:
+        cases = [
+            (implant_step(extra=1), "extra"),
+            (implant_step(doseCm2=0.0), "dose"),
+            (implant_step(tiltDeg=120.0), "tilt"),
+            (implant_step(rotationDeg=7.0), "rotation"),
+            (implant_step(profile={"source": "manual", "kind": "pearsonIV",
+                                   "head": {"mu": 1.0, "sigma": 0.0, "beta": 1.0,
+                                            "gamma": 0.0},
+                                   "lateralMu": 0.0, "lateralSigma": 0.005}), "sigma"),
+            (implant_step(profile={"source": "manual", "kind": "dualPearsonIV",
+                                   "head": {"mu": 1.0, "sigma": 1.0, "beta": 1.0,
+                                            "gamma": 0.0}, "lateralSigma": 0.005}), "tail"),
+            (implant_step(damage=None,
+                          labels={"concentration": "P_total", "damage": "P_damage"}), "damage"),
+            (anneal_step(schedule={"kind": "schedule", "durations": [1.0, 2.0],
+                                   "temperatures": [300.0]}), "N+1"),
+            (anneal_step(mode="Explicit", implicitSolver={"maxIterations": 10}), "GaussSeidel"),
+            (analysis_step(scanDepth=0.1, netDoping=None), "scanDepth"),
+            (analysis_step(netDoping=None, sheetResistance=[]), "netDoping"),
+        ]
+        for step, fragment in cases:
+            with self.subTest(fragment=fragment):
+                steps = [implant_step(), anneal_step(), analysis_step()]
+                steps = [step if item["model"] == step["model"] else item for item in steps]
+                with self.assertRaises(ProjectInputError) as context:
+                    validate_project(project(2, steps=steps))
+                self.assertIn(fragment.lower(), str(context.exception).lower())
+
+    def test_non_finite_numbers_are_rejected(self) -> None:
+        for mutation in ({"doseCm2": float("inf")}, {"energyKeV": float("nan")}):
+            steps = [implant_step(**mutation), anneal_step(), analysis_step()]
+            with self.subTest(mutation=mutation), self.assertRaises(ProjectInputError):
+                validate_project(project(2, steps=steps))
+
+    def test_table_model_source_is_refused_with_reason(self) -> None:
+        steps = [implant_step(profile={"source": "table", "assetId": "0" * 64}),
+                 anneal_step(), analysis_step()]
+        with self.assertRaises(ProjectInputError) as context:
+            validate_project(project(2, steps=steps))
+        message = str(context.exception)
+        self.assertIn("model database", message)
+        self.assertIn("manual", message)
+
+    def test_ordering_and_label_provenance(self) -> None:
+        analysis_first = [analysis_step(), implant_step(), anneal_step()]
+        with self.assertRaises(ProjectInputError) as context:
+            validate_project(project(2, steps=analysis_first))
+        self.assertIn("earlier", str(context.exception))
+
+        moved = [implant_step(), {
+            "id": "etch_step_0001", "name": "etch", "enabled": True, "operation": "etch",
+            "model": "isotropic", "rateMagnitude": 0.1, "duration": 0.1,
+            "rateMode": "uniform"}, anneal_step()]
+        with self.assertRaises(ProjectInputError) as context:
+            validate_project(project(2, steps=moved))
+        self.assertIn("surface-moving", str(context.exception))
+
+        wrong_label = [implant_step(), anneal_step(activeLabel="B_active"),
+                       analysis_step(netDoping={"donorLabels": ["B_active"],
+                                                "acceptorLabels": []})]
+        with self.assertRaises(ProjectInputError) as context:
+            validate_project(project(2, steps=wrong_label))
+        self.assertIn("not produced by an earlier", str(context.exception))
+
+    def test_substrate_depth_and_cell_set_limits(self) -> None:
+        missing = [implant_step(cellSet=cell_set(substrateDepth=None)), anneal_step(),
+                   analysis_step()]
+        with self.assertRaises(ProjectInputError) as context:
+            validate_project(project(2, steps=missing))
+        self.assertIn("substrateDepth", str(context.exception))
+
+        mismatch = [implant_step(), anneal_step(cellSet=cell_set(substrateDepth=0.2)),
+                    analysis_step()]
+        with self.assertRaises(ProjectInputError) as context:
+            validate_project(project(2, steps=mismatch))
+        self.assertIn("must match", str(context.exception))
+
+        height_mismatch = [implant_step(), anneal_step(cellSet=cell_set(height=0.3)),
+                           analysis_step()]
+        with self.assertRaises(ProjectInputError) as context:
+            validate_project(project(2, steps=height_mismatch))
+        self.assertIn("height must match", str(context.exception))
+
+        thin = [implant_step(cellSet=cell_set(substrateDepth=0.005)), anneal_step(),
+                analysis_step()]
+        with self.assertRaises(ProjectInputError):
+            validate_project(project(2, steps=thin))
+
+        huge = [implant_step(cellSet=cell_set(height=1000.0, substrateDepth=1000.0)),
+                anneal_step(), analysis_step()]
+        with self.assertRaises((ProjectInputError, Exception)) as context:
+            validate_project(project(3, steps=huge))
+        self.assertIn("limit", str(context.exception))
+
+    def test_periodic_cell_set_must_match_the_domain(self) -> None:
+        steps = [implant_step(cellSet=cell_set(periodic=True)), anneal_step(), analysis_step()]
+        with self.assertRaises(ProjectInputError) as context:
+            validate_project(project(2, steps=steps))
+        self.assertIn("periodic", str(context.exception))
+
+    def test_generic_cell_set_output_cannot_be_combined(self) -> None:
+        value = project(2)
+        value["outputSettings"] = {"cellSet": {"enabled": True, "height": 0.5}}
+        with self.assertRaises(ProjectInputError) as context:
+            validate_project(value)
+        self.assertIn("outputSettings.cellSet", str(context.exception))
+
+    def test_v462_runtime_rejects_every_cell_set_step(self) -> None:
+        with patch("backend.validation.engine_version", return_value="4.6.2"):
+            with self.assertRaises(ProjectInputError) as context:
+                validate_project(project(2))
+        message = str(context.exception)
+        self.assertIn("4.6.2", message)
+        self.assertIn("IonImplantation", message)
+        self.assertIn("steps[0].model", message)
+
+    def test_v470_runtime_accepts_the_native_steps(self) -> None:
+        with patch("backend.validation.engine_version", return_value="4.7.0"):
+            parsed, warnings = validate_project(project(2))
+        self.assertEqual([step["model"] for step in
+                          parsed.model_dump(mode="json")["steps"]],
+                         ["implant", "anneal", "analysis"])
+        self.assertEqual(warnings, [])
+
+    def test_omitting_the_new_steps_keeps_the_historical_hash(self) -> None:
+        # The cell-set schema-7 project predates this capability; its request
+        # hash must not move when no implant/anneal/analysis step is present.
+        self.assertEqual(requested_input_hash(validate_project(cellset_project(2))[0]),
+                         HISTORICAL_HASH)
+
+    def test_adding_a_step_changes_the_hash(self) -> None:
+        base = project(2, steps=[implant_step()])
+        extra = project(2, steps=[implant_step(), anneal_step()])
+        self.assertNotEqual(requested_input_hash(validate_project(base)[0]),
+                            requested_input_hash(validate_project(extra)[0]))
+
+    def test_preflight_counts_each_step_cell_set(self) -> None:
+        estimate = preflight.estimate_artifacts(normalized(project(2)))
+        kinds = {row["kind"] for row in estimate["contributors"]}
+        self.assertIn("optionalOutputs", kinds)
+        detail = next(row["detail"] for row in estimate["contributors"]
+                      if row["kind"] == "optionalOutputs")
+        self.assertIn("implant/anneal/analysis", detail)
+        self.assertGreater(estimate["cellSetCellsUpperBound"], 0)
+
+
+class ImplantWorkflow(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.lifespan = app.router.lifespan_context(app)
+        await self.lifespan.__aenter__()
+
+    async def asyncTearDown(self) -> None:
+        await self.lifespan.__aexit__(None, None, None)
+
+    async def wait(self, run_id: str) -> dict:
+        for _ in range(2400):
+            result = json_body(await asgi_request("/api/runs/" + run_id))
+            if result["status"] in ("succeeded", "failed", "cancelled", "timed_out", "interrupted"):
+                return result
+            await asyncio.sleep(0.05)
+        self.fail("native child exceeded acceptance timeout")
+
+    async def run_project(self, value: dict) -> tuple[str, dict]:
+        response = await asgi_request("/api/runs", method="POST",
+                                      payload={"kind": "simulate", "project": value})
+        self.assertEqual(response[0], 202, response[2])
+        run_id = json_body(response)["runId"]
+        result = await self.wait(run_id)
+        self.assertEqual(result["status"], "succeeded", result.get("failureReason"))
+        return run_id, storage.read_json(storage.run_path(run_id) / "manifest.json")
+
+    def snapshot(self, run_id: str, step_id: str) -> dict:
+        snapshot_store.ensure_materialized(storage.run_path(run_id), step_id)
+        return storage.read_json(storage.run_path(run_id) / f"{step_id}.json")
+
+    def outputs(self, manifest: dict, step_id: str) -> list[dict]:
+        row = next(item for item in manifest["snapshots"] if item["stepId"] == step_id)
+        return row.get("outputs") or []
+
+    async def test_two_dimensional_manual_implant_anneal_and_analysis(self) -> None:
+        run_id, manifest = await self.run_project(project(2))
+        for step_id, model in (("implant_step_01", "viennaps.IonImplantation"),
+                               ("anneal_step_01", "viennaps.Anneal"),
+                               ("analysis_step_01", "viennaps.NetDoping")):
+            rows = self.outputs(manifest, step_id)
+            kinds = [row["kind"] for row in rows]
+            self.assertEqual(kinds.count("cellSetFields"), 1, rows)
+            self.assertEqual(kinds.count("cellSetFieldsSummary"), 1, rows)
+            payload = self.snapshot(run_id, step_id)
+            record = payload["cellSetProcess"]
+            self.assertEqual(record["nativeModel"], model)
+            vtu = next(row for row in rows if row["kind"] == "cellSetFields")
+            self.assertGreater(vtu["sizeBytes"], 0)
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring((storage.run_path(run_id) / vtu["fileName"]).read_text(encoding="utf-8"))
+            arrays = {node.attrib.get("Name")
+                      for node in root.findall("UnstructuredGrid/Piece/CellData/DataArray")}
+            self.assertIn("P_total", arrays)
+            self.assertIn("P_total", vtu["scalarLabels"])
+            if step_id == "implant_step_01":
+                self.assertIn("P_damage", vtu["scalarLabels"])
+                self.assertIn("P_damage_last", vtu["scalarLabels"])
+            else:
+                self.assertIn("P_active", vtu["scalarLabels"])
+
+        implant = self.snapshot(run_id, "implant_step_01")["cellSetProcess"]
+        self.assertEqual(implant["profile"]["nativeConstructor"],
+                         "viennaps.ImplantPearsonIV")
+        self.assertEqual(implant["effective"]["lengthUnitCm"], 1e-4)
+        self.assertFalse(implant["energyKeVNativeEffect"])
+        self.assertGreater(implant["fields"]["P_total"]["max"], 0.0)
+        totals = implant["fields"]["P_total"]["byMaterial"]
+        self.assertGreater(totals["10"]["max"], 0.0)
+        self.assertEqual(totals["3"]["max"], 0.0)  # cover cells stay undoped
+        self.assertGreater(implant["cellSet"]["numberOfCells"], 0)
+        self.assertGreater(implant["cellSet"]["substrateDepth"], 0.0)
+
+        anneal = self.snapshot(run_id, "anneal_step_01")["cellSetProcess"]
+        self.assertEqual(anneal["schedule"]["nativeCall"], "setTemperature + setDuration")
+        self.assertEqual(anneal["solver"]["mode"], "GaussSeidel")
+        self.assertGreater(anneal["activation"]["activeConcentrationSum"], 0.0)
+        self.assertGreater(anneal["activation"]["activeFractionOfTotal"], 0.0)
+        self.assertLessEqual(anneal["activation"]["activeFractionOfTotal"], 1.0)
+
+        analysis = self.snapshot(run_id, "analysis_step_01")["cellSetProcess"]
+        net = analysis["netDoping"]
+        self.assertEqual(net["outputLabel"], "net_doping")
+        self.assertGreater(net["outputField"]["max"], 0.0)
+        self.assertIn("net_doping", analysis["fieldDigests"])
+        sheet = analysis["sheetResistance"][0]
+        self.assertEqual(sheet["nativeMethod"],
+                         "viennaps.SheetResistance.computeElectron")
+        self.assertGreater(sheet["sheetResistanceOhmPerSquare"], 0.0)
+
+        # The surface itself must be untouched: the same project without the
+        # cell-set steps produces an identical surface payload.
+        baseline_id, _baseline = await self.run_project(project(
+            2, steps=[{"id": "etch_step_0001", "name": "noop", "enabled": True,
+                       "operation": "etch", "model": "isotropic", "rateMagnitude": 0.0,
+                       "duration": 0.1, "rateMode": "uniform"}]))
+        produced = self.snapshot(run_id, "initial")
+        baseline = self.snapshot(baseline_id, "initial")
+        for key in ("points", "cellData", "surfaceBounds", "materialTops"):
+            self.assertEqual(produced.get(key), baseline.get(key), key)
+        produced = self.snapshot(run_id, "analysis_step_01")
+        baseline = self.snapshot(baseline_id, "etch_step_0001")
+        self.assertEqual(produced["points"], baseline["points"])
+        self.assertEqual(produced["cellData"], baseline["cellData"])
+
+    async def test_json_only_output_skips_the_vtu(self) -> None:
+        value = project(2)
+        for step in value["steps"]:
+            step["cellSet"]["format"] = "json"
+        run_id, manifest = await self.run_project(value)
+        rows = self.outputs(manifest, "implant_step_01")
+        self.assertEqual([row["kind"] for row in rows], ["cellSetFieldsSummary"])
+        summary = storage.read_json(storage.run_path(run_id) / "artifacts" /
+                                    "implant_step_01-cell-set-fields.json")
+        self.assertIn("P_damage", summary["fields"])
+        self.assertIn("P_damage", summary["fieldDigests"])
+
+    async def test_three_dimensional_implant_uses_the_same_native_path(self) -> None:
+        value = project(3)
+        for step in value["steps"]:
+            step["cellSet"]["height"] = 0.2
+            step["cellSet"]["substrateDepth"] = 0.3
+        run_id, manifest = await self.run_project(value)
+        analysis = self.snapshot(run_id, "analysis_step_01")["cellSetProcess"]
+        self.assertEqual(analysis["cellSet"]["periodicBoundary"], [False, False, False])
+        self.assertGreater(analysis["cellSet"]["numberOfCells"], 0)
+        summary = storage.read_json(storage.run_path(run_id) / "artifacts" /
+                                    "analysis_step_01-cell-set-fields.json")
+        self.assertEqual(summary["dimension"], 3)
+        self.assertEqual(summary["grid"]["nativeElementType"], "hexahedron")
+        self.assertTrue(summary["process"]["analysis"]["fieldDigests"])
+        self.assertGreater(len(summary["grid"]["bounds"]), 0)
+
+    async def test_replay_reproduces_every_field_digest(self) -> None:
+        run_id, _manifest = await self.run_project(project(2))
+        original = storage.read_json(storage.run_path(run_id) / "artifacts" /
+                                     "analysis_step_01-cell-set-fields.json")
+        replay = json_body(await asgi_request(f"/api/runs/{run_id}/replay-project"))
+        submit = await asgi_request("/api/runs/replay", method="POST", payload=replay)
+        self.assertEqual(submit[0], 202, submit[2])
+        replay_id = json_body(submit)["runId"]
+        result = await self.wait(replay_id)
+        self.assertEqual(result["status"], "succeeded", result.get("failureReason"))
+        replayed = storage.read_json(storage.run_path(replay_id) / "artifacts" /
+                                     "analysis_step_01-cell-set-fields.json")
+        self.assertEqual(original["fieldDigests"], replayed["fieldDigests"])
+        self.assertEqual(original["process"]["analysis"]["sheetResistance"],
+                         replayed["process"]["analysis"]["sheetResistance"])
+
+    async def test_rejected_requests_never_start_a_worker(self) -> None:
+        with patch("backend.validation.engine_version", return_value="4.6.2"):
+            response = await asgi_request("/api/runs", method="POST",
+                                          payload={"kind": "simulate", "project": project(2)})
+        self.assertEqual(response[0], 422)
+        self.assertIn("4.7.0", response[2].decode("utf-8", errors="replace"))
+
+
+class ImplantWorkerGuards(unittest.TestCase):
+    def test_shared_guard_matches_the_schema(self) -> None:
+        from backend.implant_models import numeric_guard_messages
+        parsed = normalized(project(2))
+        for step in parsed["steps"]:
+            self.assertEqual(numeric_guard_messages(step, dimension=2, grid_delta=0.01), [])
+        broken = copy.deepcopy(parsed["steps"][0])
+        broken["cellSet"]["height"] = 0.001
+        self.assertIn("one grid interval",
+                      numeric_guard_messages(broken, dimension=2, grid_delta=0.01)[0])
+        broken = copy.deepcopy(parsed["steps"][0])
+        broken["profile"]["head"]["sigma"] = -1.0
+        self.assertTrue(numeric_guard_messages(broken, dimension=2, grid_delta=0.01))
+
+    def test_shared_guard_is_finite_safe(self) -> None:
+        from backend.implant_models import numeric_guard_messages
+        broken = {
+            "model": "implant", "doseCm2": float("nan"), "tiltDeg": 7.0,
+            "profile": {"source": "manual", "kind": "pearsonIV",
+                        "head": {"mu": 1.0, "sigma": 1.0, "beta": 1.0, "gamma": 0.0},
+                        "lateralSigma": 1.0},
+            "cellSet": {"height": 0.5, "substrateDepth": 0.4},
+        }
+        messages = numeric_guard_messages(broken, dimension=2, grid_delta=0.01)
+        self.assertTrue(any("doseCm2" in message for message in messages))
+
+
+if __name__ == "__main__":
+    unittest.main()

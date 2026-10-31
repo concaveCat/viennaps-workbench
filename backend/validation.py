@@ -198,6 +198,7 @@ def validate_project(payload: Any, *, kind: str = "project") -> tuple[Project, l
             warnings.extend(csv_warnings)
             issues.extend(_validate_particle_shape_steps(project))
             warnings.extend(_particle_shape_warnings(project))
+            issues.extend(_validate_implant_steps(project))
         if project.dimension == 3:
             issues.extend(_validate_v3_3d_geometry(project))
         else:
@@ -1184,6 +1185,163 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
                     f"steps[{index}].surfaceDiffusion.radius",
                     f"must not exceed 8 grid intervals ({limit:g} um for gridDelta="
                     f"{float(project.domain.gridDelta):g}); use radius=0 with kNeighbors for a bounded stencil"))
+    return issues
+
+
+def _validate_implant_steps(project: ProjectV7) -> list[FieldIssue]:
+    """Validate the 4.7.0 cell-set implant / anneal / analysis capability.
+
+    Everything here is a pure-Python check: a rejected request never reaches a
+    native constructor, so an unsupported runtime, a missing material or a
+    label that no earlier step produces cannot turn into a worker crash.
+    """
+    from .implant_models import (
+        CELL_SET_STEP_MODELS, cell_set_output_conflict,
+        label_provenance_issues, numeric_guard_messages, ordering_issues,
+        produced_labels, step_cell_set, step_value,
+    )
+
+    issues: list[FieldIssue] = []
+    steps = [step if isinstance(step, dict) else step.model_dump(mode="json", exclude_none=True)
+             for step in project.steps]
+    cell_set_steps = [(index, step) for index, step in enumerate(steps)
+                      if step_value(step, "model") in CELL_SET_STEP_MODELS]
+    if not cell_set_steps:
+        return issues
+
+    runtime = engine_version()
+    if runtime != "4.7.0":
+        for index, _step in cell_set_steps:
+            issues.append(FieldIssue(
+                f"steps[{index}].model",
+                f"ViennaPS {runtime} does not provide the native IonImplantation / Anneal / "
+                "NetDoping / SheetResistance classes; this step requires the ViennaPS 4.7.0 "
+                "runtime. The request is rejected before a worker starts instead of failing "
+                "inside the native layer"))
+        return issues
+
+    conflict = cell_set_output_conflict(project)
+    if conflict is not None:
+        issues.append(FieldIssue("outputSettings.cellSet", conflict))
+
+    try:
+        from .materials import material_catalog
+        names = {row["name"] for row in material_catalog()["materials"]}
+    except (OSError, ValueError, KeyError, TypeError):
+        names = set()
+
+    available: set[str] = {"Material", "FillingFraction"}
+    first_field_substrate: float | None = None
+    first_field_geometry: dict[str, Any] | None = None
+    seen_field_step = False
+    for index, step in enumerate(steps):
+        if step_value(step, "model") not in CELL_SET_STEP_MODELS:
+            continue
+        enabled = bool(step_value(step, "enabled"))
+        for message in numeric_guard_messages(step, dimension=project.dimension,
+                                              grid_delta=float(project.domain.gridDelta)):
+            issues.append(FieldIssue(f"steps[{index}]", message))
+        settings = step_cell_set(step) or {}
+        substrate = settings.get("substrateDepth")
+        if enabled:
+            if not seen_field_step:
+                if substrate is None:
+                    issues.append(FieldIssue(
+                        f"steps[{index}].cellSet.substrateDepth",
+                        "the first enabled cell-set field step must declare substrateDepth: a native "
+                        "ViennaLS level set stores only a narrow band, so without it the DenseCellSet "
+                        "would contain a single substrate row and the dopant profile would have no depth"))
+                else:
+                    first_field_substrate = float(substrate)
+                first_field_geometry = {
+                    "height": float(settings.get("height") or 0.0),
+                    "substrateDepth": None if substrate is None else float(substrate),
+                    "coverMaterial": str(settings.get("coverMaterial") or "GAS"),
+                    "periodic": bool(settings.get("periodic", False)),
+                }
+            elif first_field_geometry is not None:
+                # The grid is generated once, at the first field step. A later
+                # step asking for a different height or cover material would be
+                # silently ignored, so it is refused instead.
+                observed = {
+                    "height": float(settings.get("height") or 0.0),
+                    "substrateDepth": None if substrate is None else float(substrate),
+                    "coverMaterial": str(settings.get("coverMaterial") or "GAS"),
+                    "periodic": bool(settings.get("periodic", False)),
+                }
+                for key in ("height", "coverMaterial", "periodic"):
+                    if observed[key] != first_field_geometry[key]:
+                        issues.append(FieldIssue(
+                            f"steps[{index}].cellSet.{key}",
+                            "every cell-set step shares the grid generated by the first field step; "
+                            f"{key} must match that step ({first_field_geometry[key]!r})"))
+                if substrate is not None and first_field_substrate is not None \
+                        and abs(float(substrate) - first_field_substrate) > 1e-12:
+                    issues.append(FieldIssue(
+                        f"steps[{index}].cellSet.substrateDepth",
+                        "every cell-set step shares the grid generated by the first field step; "
+                        "substrateDepth must match that step or be omitted"))
+            seen_field_step = True
+        cover = str(settings.get("coverMaterial") or "GAS")
+        if cover != "GAS" and names and cover not in names:
+            issues.append(FieldIssue(
+                f"steps[{index}].cellSet.coverMaterial",
+                f"unknown or unavailable material {cover!r}; choose GAS or a material from /api/materials"))
+        requested_labels = settings.get("scalarLabels")
+        if isinstance(requested_labels, list):
+            unknown = sorted(set(requested_labels) - (available | produced_labels(step)))
+            if unknown:
+                issues.append(FieldIssue(
+                    f"steps[{index}].cellSet.scalarLabels",
+                    "label(s) not present in this step's native cell set: " + ", ".join(unknown)))
+        model = step_value(step, "model")
+        if model == "implant":
+            if names:
+                for field_name, values in (
+                        ("material", [step_value(step, "material")]),
+                        ("maskMaterials", list(step_value(step, "maskMaterials") or [])),
+                        ("screenMaterials", list(step_value(step, "screenMaterials") or []))):
+                    for material in values:
+                        if material not in names:
+                            issues.append(FieldIssue(
+                                f"steps[{index}].{field_name}",
+                                f"unknown or unavailable material {material!r}; choose a material from /api/materials"))
+        elif model == "anneal":
+            if names:
+                for field_name in ("diffusionMaterials", "blockingMaterials"):
+                    for material in step_value(step, field_name) or []:
+                        if material not in names:
+                            issues.append(FieldIssue(
+                                f"steps[{index}].{field_name}",
+                                f"unknown or unavailable material {material!r}; choose a material from /api/materials"))
+            species = step_value(step, "speciesLabel")
+            if enabled and species not in available:
+                issues.append(FieldIssue(
+                    f"steps[{index}].speciesLabel",
+                    f"{species!r} is not produced by an earlier implant step"))
+        elif model == "analysis":
+            net = step_value(step, "netDoping")
+            if isinstance(net, dict):
+                for name in [*(net.get("donorLabels") or []), *(net.get("acceptorLabels") or [])]:
+                    if enabled and name not in available:
+                        issues.append(FieldIssue(
+                            f"steps[{index}].netDoping",
+                            f"{name!r} is not produced by an earlier implant/anneal step"))
+            for entry_index, entry in enumerate(step_value(step, "sheetResistance") or []):
+                label = entry.get("concentrationLabel") if isinstance(entry, dict) else None
+                if enabled and label not in available:
+                    issues.append(FieldIssue(
+                        f"steps[{index}].sheetResistance[{entry_index}]",
+                        f"{label!r} is not produced by an earlier implant/anneal step"))
+        if enabled:
+            # A disabled step produces nothing, so it must not satisfy a later
+            # step's label provenance check.
+            available |= produced_labels(step)
+
+    for index, message in ordering_issues(steps):
+        issues.append(FieldIssue(f"steps[{index}]", message))
+    for index, message in label_provenance_issues(steps):
+        issues.append(FieldIssue(f"steps[{index}]", message))
     return issues
 
 
