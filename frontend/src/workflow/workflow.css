@@ -273,6 +273,35 @@ button, input { font: inherit; }
 
 @keyframes wf-slide { from { transform: translateX(-20%); } to { transform: translateX(150%); } }
 
+/* 03 running banner: one live run, visible even after switching Segments. */
+.wf-running-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  margin-bottom: 10px;
+  border: 1px solid rgba(240, 179, 94, 0.45);
+  border-radius: 6px;
+  background: rgba(240, 179, 94, 0.09);
+  font-size: 12px;
+}
+
+.wf-running-dot {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--wf-amber);
+  animation: wf-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes wf-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+.wf-running-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wf-running-banner .wf-button { width: auto; flex: none; margin: 0; padding: 6px 12px; }
+.wf-running-text code { color: #26313a; font: 11px "IBM Plex Mono", ui-monospace, monospace; }
+.wf-run-notice { margin: -4px 0 10px; color: var(--wf-teal); font-size: 11px; }
+
 .wf-provenance { margin-top: 12px; display: grid; gap: 6px; }
 .wf-verify { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--wf-muted); }
 .wf-verify code { color: var(--wf-text); font: 10px "IBM Plex Mono", ui-monospace, monospace; }
@@ -347,7 +376,10 @@ button, input { font: inherit; }
 .wf-attempt { border: 1px solid var(--wf-line); border-radius: 8px; padding: 8px; background: rgba(18,37,58,0.45); }
 .wf-attempt-title { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; color: var(--wf-muted); margin-bottom: 5px; }
 .wf-attempt-title strong { color: var(--wf-text); font: 10px "IBM Plex Mono", ui-monospace, monospace; }
-.wf-segment-row { display: flex; align-items: center; gap: 7px; padding: 3px 0; font-size: 10px; }
+.wf-segment-row { display: flex; align-items: center; gap: 7px; padding: 3px 0; font-size: 10px; cursor: pointer; border-radius: 4px; }
+.wf-segment-row:hover { background: rgba(141, 166, 189, 0.08); }
+.wf-segment-row.selected { background: rgba(53, 214, 194, 0.08); box-shadow: inset 2px 0 0 var(--wf-teal); }
+.wf-segment-row.selected code { color: #26313a; }
 .wf-segment-row code { color: var(--wf-muted); font: 10px "IBM Plex Mono", ui-monospace, monospace; }
 
 .wf-recipe { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 10px; padding: 8px; border: 1px solid var(--wf-line); border-radius: 9px; }

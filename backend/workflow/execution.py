@@ -17,6 +17,8 @@ from .store import WorkflowConflict, WorkflowNotFound, WorkflowStore
 
 
 TERMINAL = {"succeeded", "failed", "cancelled", "timed_out", "interrupted"}
+CANCEL_POLL_INTERVAL_SECONDS = 0.2
+CANCEL_TIMEOUT_SECONDS = 30.0
 
 
 def _load_continuation(segment: SegmentV1) -> dict[str, Any] | None:
@@ -131,6 +133,60 @@ class SegmentBusy(WorkflowConflict):
     """The supervisor is already running another job; retry later."""
 
 
+def _run_status(supervisor: Any, run_id: str) -> str:
+    try:
+        return str(supervisor.get_run(run_id).get("status"))
+    except (FileNotFoundError, OSError, ValueError):
+        # A run directory that disappeared can never reach a terminal state
+        # again; the monitor thread records it as interrupted.
+        return "interrupted"
+
+
+def _stop_active_run(supervisor: Any, run_id: str) -> bool:
+    """Cancel the run holding the single supervisor slot and wait for it.
+
+    The old Segment is left to its own monitor thread: touching its status here
+    would race with that thread's terminal transition. Returns False when the
+    run is still active after the timeout so the caller can report a busy slot
+    instead of starting a second worker.
+    """
+
+    try:
+        supervisor.cancel(run_id)
+    except Exception as exc:
+        raise SegmentBusy("上一个运行未能停止，请稍后重试") from exc
+    deadline = time.monotonic() + CANCEL_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if _run_status(supervisor, run_id) in TERMINAL:
+            return True
+        time.sleep(CANCEL_POLL_INTERVAL_SECONDS)
+    return False
+
+
+def _start_run(supervisor: Any, project: dict[str, Any]) -> dict[str, Any]:
+    """Start the project, preempting the run that currently holds the slot.
+
+    One supervisor slot is a process-wide resource; a user who starts another
+    Segment means "replace the old run", not "fail with an English conflict".
+    The old run is cancelled and awaited first, then exactly one retry starts
+    the new run. A still-busy slot after that is a real conflict.
+    """
+
+    try:
+        return supervisor.start("simulate", project)
+    except ActiveRunError as exc:
+        if not _stop_active_run(supervisor, exc.run_id):
+            raise SegmentBusy(f"上一个运行停止超时：{exc.run_id}") from exc
+        try:
+            return supervisor.start("simulate", project)
+        except ActiveRunError as retry_exc:
+            raise SegmentBusy("上一个运行未能停止，请稍后重试") from retry_exc
+        except Exception as exc:
+            raise WorkflowConflict(f"segment run could not start: {exc}") from exc
+    except Exception as exc:
+        raise WorkflowConflict(f"segment run could not start: {exc}") from exc
+
+
 def execute_segment(store: WorkflowStore, supervisor: Any, segment_id: str) -> tuple[SegmentV1, str]:
     segment = store.get_segment(segment_id)
     if segment.status != "planned":
@@ -145,12 +201,7 @@ def execute_segment(store: WorkflowStore, supervisor: Any, segment_id: str) -> t
         raise WorkflowConflict(f"route compatibility verification failed: {exc}") from exc
     project = build_segment_project(store, segment_id)
     normalized = project.model_dump(mode="json", exclude_none=True)
-    try:
-        started = supervisor.start("simulate", normalized)
-    except ActiveRunError as exc:
-        raise SegmentBusy(f"segment run could not start: {exc}") from exc
-    except Exception as exc:
-        raise WorkflowConflict(f"segment run could not start: {exc}") from exc
+    started = _start_run(supervisor, normalized)
     run_id = started["runId"]
     store.mark_segment_started(segment_id, run_id, full_project_hash(project))
     thread = threading.Thread(target=_monitor, args=(store, supervisor, segment_id, run_id), daemon=True)

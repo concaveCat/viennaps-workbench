@@ -1020,7 +1020,11 @@ const BACKEND_ERROR_PATTERNS: Array<[RegExp, (match: RegExpMatchArray) => string
   [/^legacy unverified route cannot be executed$/, () => '旧版未验证 Route 不能执行；请重新创建 Route。'],
   [/^route compatibility verification failed: (.+)$/, match => `Route 与当前编译不兼容：${translateBackendError(match[1])}`],
   [/^Segment project is invalid: (.+)$/, match => `Segment 工程无效：${match[1]}`],
+  [/^segment run could not start: a workbench run is already active$/, () => '已有运行中的任务；已尝试自动停止，请重试。'],
   [/^segment run could not start: (.+)$/, match => `Segment 无法启动：${match[1]}`],
+  [/^a workbench run is already active$/, () => '已有运行中的任务；已尝试自动停止，请重试。'],
+  [/^上一个运行停止超时：(.+)$/, match => `上一个运行停止超时（Run ${match[1]}）；请稍后重试。`],
+  [/^上一个运行未能停止，请稍后重试$/, () => '上一个运行未能停止，请稍后重试。'],
   // Pydantic validation messages are English API text; the user gets a Chinese
   // sentence instead of "List should have at most 4 items after validation".
   [/^List should have at most (\d+) items after validation, not (\d+)$/, match => `数量超出上限：最多 ${match[1]} 个，当前 ${match[2]} 个。`],
@@ -1689,6 +1693,8 @@ function materialColor(materials: MaterialRow[], name: string): string {
 
 export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => void }) {
   const [health, setHealth] = useState<Health | null>(null);
+  const [stoppingRun, setStoppingRun] = useState(false);
+  const [runNotice, setRunNotice] = useState('');
   const [gds, setGds] = useState<GdsAsset | null>(null);
   const [project, setProject] = useState<ProjectDoc | null>(null);
   const [projectGeometrySource, setProjectGeometrySource] = useState<ProjectGeometrySource>({ kind: 'parametric' });
@@ -2707,18 +2713,48 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  /**
+   * Reload the whole Route, not just the Segment the user is looking at.
+   * Starting a new Segment cancels the previous run server-side, and that old
+   * Segment can only show its new terminal status after a full Route refresh.
+   */
+  const refreshRoutePlan = async (routeId: string) => {
+    const data = await api<{ plan: RoutePlan }>(`/api/v1/workflow/routes/${routeId}`);
+    setRoute(data.plan);
+    setSegment(previous => previous
+      ? data.plan.segments.find(item => item.segmentId === previous.segmentId) ?? previous
+      : data.plan.segments[data.plan.segments.length - 1] ?? null);
+    return data.plan;
+  };
+
+  // Any active Segment — even one the user has navigated away from — keeps the
+  // banner and the status poll alive. `/api/health.activeRunId` also covers a
+  // run whose Segment is not part of the Route currently shown.
+  const anyActiveSegment = (route?.segments ?? [])
+    .some(item => ['running', 'queued', 'cancelling'].includes(item.status));
+  const activeRunId = health?.activeRunId ?? null;
   useEffect(() => {
-    if (!segment || segment.status !== 'running') return;
-    const timer = window.setInterval(() => {
-      void api<RoutePlan['segments'][number]>(`/api/v1/workflow/segments/${segment.segmentId}`)
-        .then(next => {
-          setSegment(next);
-          setRoute(previous => previous ? { ...previous, segments: previous.segments.map(item => item.segmentId === next.segmentId ? next : item) } : previous);
-        })
-        .catch(() => undefined);
-    }, 600);
-    return () => window.clearInterval(timer);
-  }, [segment]);
+    if (!anyActiveSegment && !activeRunId) return;
+    const routeId = route?.route.routeId;
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const nextHealth = await api<Health>('/api/health');
+        if (cancelled) return;
+        setHealth(nextHealth);
+        if (routeId) {
+          const plan = await refreshRoutePlan(routeId);
+          if (!cancelled) recordRoute(plan);
+        }
+      } catch {
+        // A transient poll failure must not clear the running banner.
+      }
+    };
+    void tick();
+    const timer = window.setInterval(() => { void tick(); }, 1000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [anyActiveSegment, activeRunId, route?.route.routeId]);
 
   useEffect(() => {
     const routeId = route?.route.routeId;
@@ -2969,6 +3005,12 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     const authored = authoredSteps.find(step => step.id === authoredId);
     return compiled?.name ?? authored?.name ?? stepId.slice(0, 10);
   }, [compile, authoredByCompiled, authoredSteps]);
+
+  /** The one Segment that currently owns the supervisor slot, if any. */
+  const runningSegment = (route?.segments ?? [])
+    .find(item => ['running', 'queued', 'cancelling'].includes(item.status)) ?? null;
+  const runningSegmentName = runningSegment ? stepDisplayName(runningSegment.throughStepId) : '';
+  const shortId = (id: string | null | undefined) => (id ? id.slice(-6) : '');
 
   const structureDimension: 2 | 3 = compile?.dimension === 3 || project?.dimension === 3 ? 3 : 2;
 
@@ -3581,12 +3623,59 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     const result = await postJson<{ segment: RoutePlan['segments'][number]; runId: string }>(
       `/api/v1/workflow/segments/${segment.segmentId}/execute`, {},
     );
-    setSegment(result.segment);
-    const nextPlan = route
-      ? { ...route, segments: route.segments.map(item => item.segmentId === result.segment.segmentId ? result.segment : item) }
-      : null;
-    if (nextPlan) { setRoute(nextPlan); recordRoute(nextPlan); }
+    setRunNotice('');
+    // The backend may have cancelled the previous run to free the single
+    // supervisor slot. Only a full Route refresh shows that old Segment as
+    // cancelled instead of leaving a stale "running" row behind.
+    const plan = route ? await refreshRoutePlan(route.route.routeId) : null;
+    if (plan) {
+      recordRoute(plan);
+      setSegment(plan.segments.find(item => item.segmentId === result.segment.segmentId) ?? result.segment);
+    } else {
+      setSegment(result.segment);
+    }
   });
+
+  /**
+   * Stop the live run from the 03 banner. A Segment cancel targets its Run;
+   * a Run that has no Segment in the current Route falls back to the
+   * supervisor endpoint. Both paths poll until the run is terminal before
+   * claiming "已停止".
+   */
+  const stopRunningRun = async () => {
+    const target = runningSegment;
+    const orphanRunId = target ? null : (health?.activeRunId ?? null);
+    if (!target && !orphanRunId) return;
+    setStoppingRun(true);
+    setError('');
+    setRunNotice('');
+    try {
+      if (target) {
+        await postJson(`/api/v1/workflow/segments/${target.segmentId}/cancel`, {});
+        const done = await waitSegment(target.segmentId);
+        setSegment(previous => previous && previous.segmentId === done.segmentId ? done : previous);
+      } else if (orphanRunId) {
+        await postJson(`/api/runs/${orphanRunId}/cancel`, {});
+        const deadline = Date.now() + 30000;
+        while (Date.now() < deadline) {
+          const next = await api<Health>('/api/health');
+          setHealth(next);
+          if (!next.activeRunId || next.activeRunId !== orphanRunId) break;
+          await sleep(500);
+        }
+      }
+      if (route) recordRoute(await refreshRoutePlan(route.route.routeId));
+      setHealth(await api<Health>('/api/health'));
+      setRunNotice('已停止');
+      setActivityLog(previous => [...previous.slice(-79), `${clockTime()}  已停止运行`]);
+    } catch (exc) {
+      const raw = exc instanceof Error ? exc.message : String(exc);
+      setError(translateBackendError(raw));
+      setActivityLog(previous => [...previous.slice(-79), `${clockTime()}  停止运行失败：${translateBackendError(raw)}`]);
+    } finally {
+      setStoppingRun(false);
+    }
+  };
 
   /**
    * "执行前序并运行": a continued Segment needs a successful predecessor
@@ -6914,6 +7003,19 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
 
         <section className={`wf-card wf-run ${zone === 'run' ? '' : 'wf-hidden'}`}>
           <div className="wf-card-head"><span>03</span><h2>运行与测量</h2></div>
+          {(runningSegment || health?.activeRunId) && <div className="wf-running-banner" role="status" aria-label="正在运行">
+            <span className="wf-running-dot" aria-hidden="true" />
+            <span className="wf-running-text">
+              {runningSegment
+                ? <>正在运行：<strong>{runningSegmentName}</strong> · Segment <code title={runningSegment.segmentId}>{shortId(runningSegment.segmentId)}</code></>
+                : <>有运行中的任务 · Run <code title={health?.activeRunId ?? ''}>{shortId(health?.activeRunId)}</code></>}
+              {runningSegment?.status === 'cancelling' && <span className="wf-muted"> · 停止中</span>}
+            </span>
+            <button type="button" className="wf-button" disabled={stoppingRun} onClick={() => void stopRunningRun()}>
+              {stoppingRun ? '停止中…' : '停止运行'}
+            </button>
+          </div>}
+          {runNotice && <div className="wf-run-notice" role="status" aria-label="运行提示">{runNotice}</div>}
           {!route && <div className="wf-empty">在 02 编译流程并创建 Route 后，这里执行 Segment 与测量。</div>}
           {route && <div className="wf-summary success">
             <strong>Route 已创建</strong>
@@ -7078,14 +7180,26 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 {route.reuse.filter(item => item.attemptId === attempt.attemptId).map(item => <div key={item.reuseId} className="wf-segment-row"><span className="wf-status verified">复用</span><code>{stepDisplayName(item.fromStepId)} → {stepDisplayName(item.toStepId)}</code></div>)}
                 {route.segments.filter(item => item.attemptId === attempt.attemptId).map(item => {
                   const structureRow = runStructureSteps.find(row => row.runId === item.runId && row.stepId === item.throughStepId);
-                  return <div key={item.segmentId} className="wf-segment-row">
+                  return <div key={item.segmentId}
+                    className={`wf-segment-row${segment?.segmentId === item.segmentId ? ' selected' : ''}`}
+                    role="button" tabIndex={0}
+                    aria-current={segment?.segmentId === item.segmentId ? 'true' : undefined}
+                    title="选中该 Segment（可查看状态并执行/停止）"
+                    onClick={() => { setSegment(item); setRunNotice(''); }}
+                    onKeyDown={event => {
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        setSegment(item);
+                        setRunNotice('');
+                      }
+                    }}>
                     <span className={`wf-status ${item.status}`}>{statusLabel(item.status)}</span>
                     <code>{item.startAfterStepId ? `自 ${stepDisplayName(item.startAfterStepId)} 之后` : '从首步'} → {stepDisplayName(item.throughStepId)}</code>
                     {(item.status === 'planned' && routeStale) || (item.status === 'succeeded' && routeStale) ? <span className="wf-rerun">待重跑</span> : null}
                     <button type="button" className="wf-link wf-segment-structure"
                       disabled={!structureRow}
                       title={structureRow ? `查看 ${stepDisplayName(item.throughStepId)} 的结构` : '先执行该 Segment'}
-                      onClick={() => { if (structureRow) setStructurePick(`${structureRow.runId}:${structureRow.stepId}`); }}>
+                      onClick={event => { event.stopPropagation(); if (structureRow) setStructurePick(`${structureRow.runId}:${structureRow.stepId}`); }}>
                       查看结构
                     </button>
                   </div>;
@@ -7101,6 +7215,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 {busy === 'execute' ? '启动中…' : needsPredecessors ? '执行前序并运行' : '执行当前 Segment'}
               </button>
               <button className="wf-button" disabled={!route || !!busy || compileStale || routeStale} onClick={() => void executeAll()}>执行全部 Segment</button>
+              {runningSegment && runningSegment.segmentId !== segment?.segmentId && segment?.status === 'planned' && (
+                <span className="wf-muted" aria-label="自动停止提示">将自动停止上一个运行</span>
+              )}
               {segment?.status === 'planned' && needsPredecessors && <span className="wf-muted" aria-label="前序 Segment 提示">
                 前序 {blockingPredecessors.length} 个 Segment 尚未成功：会按顺序执行到当前 Segment，失败即停止。
               </span>}
