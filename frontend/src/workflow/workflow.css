@@ -1035,8 +1035,10 @@ body {
 
 /* Material swatch inside library rows and layer pickers. */
 .spx-library-swatch { display: inline-block; width: 9px; height: 9px; border: 1px solid #8a949c; margin-right: 4px; vertical-align: baseline; }
-.spx-layer-pick { display: grid; grid-template-columns: 14px auto minmax(70px, 1fr) 12px; align-items: center; gap: 4px; }
-.spx-layer-pick select { height: 20px; border: 1px solid var(--spx-line); background: #fff; font-size: 10px; padding: 0 2px; }
+.spx-layer-pick { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.spx-layer-pick select { height: 20px; min-width: 70px; border: 1px solid var(--spx-line); background: #fff; font-size: 10px; padding: 0 2px; }
+.spx-layer-pick .spx-layer-height { display: flex; align-items: center; gap: 3px; color: var(--wf-muted); }
+.spx-layer-pick .spx-layer-height input { width: 62px; height: 20px; border: 1px solid var(--spx-line); background: #fff; font-size: 10px; padding: 0 3px; }
 .spx-layer-pick i { width: 11px; height: 11px; border: 1px solid #8a949c; }
 .wf-table tbody tr.material-match { background: #f2fbf4; }
 .wf-table tbody tr.material-match td:first-child { box-shadow: inset 2px 0 0 var(--spx-green); }

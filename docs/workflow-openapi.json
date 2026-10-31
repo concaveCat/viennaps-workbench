@@ -1200,7 +1200,19 @@
       },
       "ClipLayerV1": {
         "additionalProperties": false,
+        "description": "One GDS layer→material mapping; 3D clips also carry a z placement.",
         "properties": {
+          "baseHeight": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Baseheight"
+          },
           "datatype": {
             "anyOf": [
               {
@@ -1213,6 +1225,18 @@
               }
             ],
             "title": "Datatype"
+          },
+          "height": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Height"
           },
           "layer": {
             "maximum": 65535.0,

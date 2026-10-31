@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import uuid
 from functools import lru_cache
 from pathlib import Path
@@ -323,9 +324,24 @@ class ClipBoundsV1(StrictModel):
 
 
 class ClipLayerV1(StrictModel):
+    """One GDS layer→material mapping; 3D clips also carry a z placement."""
+
     layer: Annotated[int, Field(ge=0, le=65535)]
     datatype: Annotated[int, Field(ge=0, le=32767)] | None = None
     material: str = "Si"
+    # 2D clips omit both fields. 3D clips must supply them (checked on compile,
+    # where the grid — and therefore the minimum thickness — is known).
+    baseHeight: float | None = None
+    height: Annotated[float, Field(gt=0)] | None = None
+
+    @model_validator(mode="after")
+    def layer_height_pair(self) -> "ClipLayerV1":
+        if (self.baseHeight is None) != (self.height is None):
+            raise ValueError("baseHeight and height must be provided together")
+        for value in (self.baseHeight, self.height):
+            if value is not None and not math.isfinite(value):
+                raise ValueError("baseHeight and height must be finite")
+        return self
 
 
 class ClipAnnotationV1(StrictModel):
@@ -1391,7 +1407,9 @@ async def create_clip(request: ClipCreateRequest) -> ClipV1:
     def operation():
         layout = get_store().get_layout(request.layoutId)
         data = storage.resolve_gds_asset(layout["assetId"]).read_bytes()
-        layer_payload = [item.model_dump(mode="json") for item in request.layers]
+        # 2D clips stay byte-for-byte identical to the pre-3D documents: no
+        # `baseHeight`/`height` keys at all, so their clipHash is unchanged.
+        layer_payload = [item.model_dump(mode="json", exclude_none=True) for item in request.layers]
         extracted = extract_clip_polygons(
             data, structure=request.structure, layers=layer_payload,
             bbox=request.bbox.model_dump(mode="json"),
@@ -1452,29 +1470,74 @@ async def add_clip_annotation(clip_id: str, request: ClipAnnotationRequest) -> C
 async def compile_clip(clip_id: str, request: ClipCompileRequest) -> AdoptProjectResponse:
     def operation():
         clip = get_store().get_clip(clip_id)
-        if request.project.dimension != 2:
-            raise HTTPException(status_code=422, detail="layout clips currently compile 2D projects only")
+        dimension = request.project.dimension
         grid = request.gridDelta or request.project.domain.gridDelta
+        if dimension == 2:
+            # 2D behaviour is frozen: layer→material only, no z placement.
+            geometry_layers = [
+                {"layer": item["layer"], "material": item["material"]}
+                for item in clip["layers"]
+            ]
+            domain = {
+                "gridDelta": grid,
+                "xExtent": max(float(clip["width"]) + 2 * grid, 4 * grid),
+                "xBoundary": "reflective",
+            }
+        else:
+            geometry_layers = []
+            for index, item in enumerate(clip["layers"]):
+                label = f"第 {index + 1} 层（GDS layer {item['layer']}）"
+                base_height = item.get("baseHeight")
+                height = item.get("height")
+                if base_height is None or height is None:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(f"3D Clip {label}缺少 baseHeight/height：请在 01 的 GDS/Layout "
+                                f"页签为每层填写基底高度与厚度后重新保存 Clip"),
+                    )
+                base_height = float(base_height)
+                height = float(height)
+                if not math.isfinite(base_height) or not math.isfinite(height):
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"3D Clip {label}的 baseHeight/height 必须是有限数值",
+                    )
+                minimum = 2 * grid
+                if height < minimum:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(f"3D Clip {label}的厚度 {height:g} µm 小于两个网格步长 "
+                                f"（{minimum:g} µm，gridDelta={grid:g}）：请增大厚度或减小 gridDelta"),
+                    )
+                geometry_layers.append({
+                    "layer": item["layer"], "material": item["material"],
+                    "baseHeight": base_height, "height": height,
+                })
+            domain = {
+                "gridDelta": grid,
+                "xExtent": max(float(clip["width"]) + 2 * grid, 4 * grid),
+                "yExtent": max(float(clip["height"]) + 2 * grid, 4 * grid),
+                "boundaryXY": "reflective",
+            }
         payload = request.project.model_dump(mode="json", exclude_none=True)
         payload["geometry"] = {
             "kind": "gds", "assetId": clip["gdsAssetId"], "fileName": clip["gdsFileName"],
             "structure": "CLIP", "unitScale": 1, "position": [0, 0, 0],
-            "layers": [{"layer": item["layer"], "material": item["material"]} for item in clip["layers"]],
+            "layers": geometry_layers,
         }
-        payload["domain"] = {
-            "gridDelta": grid,
-            "xExtent": max(float(clip["width"]) + 2 * grid, 4 * grid),
-            "xBoundary": "reflective",
-        }
+        payload["domain"] = domain
         source = {
             "kind": "layout", "layoutId": clip["layoutId"], "clipId": clip["clipId"],
             "clipHash": clip["clipHash"], "structure": clip["structure"], "bbox": clip["bbox"],
             "polygonCount": clip["polygonCount"], "pointCount": clip["pointCount"],
             "annotations": clip["annotations"],
         }
-        flow, binding, compiled = adopt_project(
-            payload, flow_id=request.flowId, geometry_source=source,
-        )
+        try:
+            flow, binding, compiled = adopt_project(
+                payload, flow_id=request.flowId, geometry_source=source,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         get_store().register_binding(binding)
         get_store().register_compile(compiled)
         return AdoptProjectResponse(

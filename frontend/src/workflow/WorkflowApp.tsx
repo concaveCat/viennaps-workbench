@@ -257,7 +257,7 @@ type Clip = ClipCanvas & {
   clipId: string;
   name: string;
   layoutId: string;
-  layers: Array<{ layer: number; datatype: number | null; material: string }>;
+  layers: Array<{ layer: number; datatype: number | null; material: string; baseHeight?: number | null; height?: number | null }>;
   annotations: Array<{ annotationId: string; text: string; x: number; y: number }>;
   clipHash: string;
   gdsAssetId: string;
@@ -637,11 +637,17 @@ function compileInfoFromEnvelope(envelope: CompiledEnvelope): CompileInfo {
 }
 
 /** ProjectV7 geometry binding for one saved Clip (same shape the server stores). */
-function clipGeometryBinding(clip: Clip) {
+function clipGeometryBinding(clip: Clip, dimension: number) {
   return {
     kind: 'gds', assetId: clip.gdsAssetId, fileName: clip.gdsFileName,
     structure: 'CLIP', unitScale: 1, position: [0, 0, 0],
-    layers: clip.layers.map(item => ({ layer: item.layer, material: item.material || 'Si' })),
+    layers: clip.layers.map(item => dimension === 3
+      // 3D GDS needs a z placement per layer; the backend rejects a missing one.
+      ? {
+        layer: item.layer, material: item.material || 'Si',
+        baseHeight: item.baseHeight ?? 0, height: item.height ?? 0.2,
+      }
+      : { layer: item.layer, material: item.material || 'Si' }),
   };
 }
 
@@ -1655,6 +1661,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [replaceTemplateArmed, setReplaceTemplateArmed] = useState(false);
   const [materialTarget, setMaterialTarget] = useState<{ itemName: string; material: string; target: string; stepName?: string } | null>(null);
   const [layerMaterials, setLayerMaterials] = useState<Record<string, string>>({});
+  // Per GDS layer z placement for 3D clips; kept as strings so partial input
+  // ("0.") is not silently collapsed to 0 while typing.
+  const [layerHeights, setLayerHeights] = useState<Record<string, { baseHeight: string; height: string }>>({});
   const [clipNotice, setClipNotice] = useState('');
   const [draft, setDraft] = useState({
     name: 'New Project', dimension: 2 as 2 | 3, geometry: 'plane' as 'plane' | 'trench' | 'hole' | 'fin',
@@ -1872,9 +1881,23 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     const fileName = typeof geometry.fileName === 'string' ? geometry.fileName : '';
     try {
       const data = await api<{ clips: Clip[] }>('/api/v1/workflow/clips');
-      const clip = data.clips.find(item => item.gdsAssetId === assetId
+      const candidates = data.clips.filter(item => item.gdsAssetId === assetId
         || item.gdsFileName === fileName
         || item.clipId === fileName.replace(/\.gds$/i, ''));
+      // Two clips can share one generated GDS asset (same polygons/layer
+      // materials). Prefer the one whose z placement matches the saved
+      // geometry so a 3D project reopens with its own layer heights.
+      const geometryLayers = Array.isArray(geometry.layers)
+        ? geometry.layers as Array<Record<string, unknown>>
+        : [];
+      const matchesGeometry = (clip: Clip) => geometryLayers.length === clip.layers.length
+        && clip.layers.every((item, index) => {
+          const row = geometryLayers[index];
+          return item.layer === Number(row?.layer)
+            && (item.baseHeight ?? null) === (row?.baseHeight ?? null)
+            && (item.height ?? null) === (row?.height ?? null);
+        });
+      const clip = candidates.find(matchesGeometry) ?? candidates[0];
       if (clip) {
         return { kind: 'layout', clipId: clip.clipId, clipName: clip.name, layoutId: clip.layoutId, clipHash: clip.clipHash };
       }
@@ -2223,7 +2246,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     const clip = (activeClip && activeClip.clipId === projectGeometrySource.clipId ? activeClip : null)
       ?? clips.find(item => item.clipId === projectGeometrySource.clipId)
       ?? null;
-    if (clip) return { ...project, geometry: clipGeometryBinding(clip) };
+    if (clip) return { ...project, geometry: clipGeometryBinding(clip, project.dimension ?? 2) };
     const geometry = (project.geometry ?? {}) as Record<string, unknown>;
     if (geometry.kind !== 'gds') throw new Error('先选择或保存一个 Clip 作为工程几何');
     return project;
@@ -3083,7 +3106,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setDraft(previous => ({
       ...previous,
       dimension,
-      source: dimension === 3 ? 'parametric' : previous.source,
+      // Both dimensions accept parametric and GDS sources now.
+      source: previous.source,
       geometry: dimension === 2
         ? (previous.geometry === 'trench' ? 'trench' : 'plane')
         : (previous.geometry === 'fin' ? 'fin' : 'hole'),
@@ -3091,7 +3115,6 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   };
 
   const chooseDraftSource = (source: 'parametric' | 'layout') => {
-    if (source === 'layout' && draft.dimension === 3) return;
     setDraft(prev => ({ ...prev, source }));
   };
 
@@ -3113,6 +3136,13 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     }
     const dimension = draft.dimension;
     const is3d = dimension === 3;
+    if (is3d && draft.source === 'layout' && activeClip) {
+      const missing = activeClip.layers.find(item => item.baseHeight == null || item.height == null);
+      if (missing) {
+        setError(`Clip 的图层 L${missing.layer} 缺少 baseHeight/height：先在下方为每层填写层高并保存 Clip`);
+        return;
+      }
+    }
     const name = draft.name.trim() || 'New Project';
     const gridDelta = Math.max(0.01, Number(draft.gridDelta) || 0.2);
     const xExtent = Math.max(gridDelta * 4, Number(draft.xExtent) || 4);
@@ -3131,12 +3161,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         : draft.geometry === 'fin'
           ? { kind: 'fin', width: Number(draft.width) || 1, height: Number(draft.finHeight) || 1.2, ...common, construction: 'native' }
           : { kind: 'plane', height: Number(draft.height) || 0, substrateMaterial: draft.substrateMaterial || 'Si' };
-    const layout = !is3d && draft.source === 'layout' && activeClip
-      ? {
-        kind: 'gds', assetId: activeClip.gdsAssetId, fileName: activeClip.gdsFileName,
-        structure: 'CLIP', unitScale: 1, position: [0, 0, 0],
-        layers: activeClip.layers.map(item => ({ layer: item.layer, material: item.material || 'Si' })),
-      }
+    const layout = draft.source === 'layout' && activeClip
+      ? clipGeometryBinding(activeClip, dimension)
       : null;
     const projectPayload: ProjectDoc = {
       schemaVersion: 7, name, dimension,
@@ -3786,12 +3812,27 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     return data.layouts;
   };
 
+  const DEFAULT_LAYER_HEIGHT = { baseHeight: '0', height: '0.2' };
+
+  /** The Clip editor follows the dimension of the project (or new-project draft). */
+  const clipDimension = (): 2 | 3 => (
+    setupMode === 'new' ? draft.dimension : (project?.dimension === 3 ? 3 : 2)
+  );
+
+  /** Grid used to validate 3D layer thickness before the Clip is saved. */
+  const clipGridDelta = (): number => {
+    if (setupMode === 'new') return Number(draft.gridDelta) || 0.2;
+    const domain = (project?.domain ?? {}) as Record<string, unknown>;
+    return Number(domain.gridDelta) || 0.2;
+  };
+
   const selectStructure = (layout: LayoutDetail, name: string) => {
     const structure = layout.structures.find(item => item.name === name);
     setLayoutStructure(name);
     const pairs = (structure?.layerDatatypes ?? []).map(([layer, datatype]) => `${layer}:${datatype}`);
     setSelectedPairs(pairs);
     setLayerMaterials(previous => Object.fromEntries(pairs.map(key => [key, previous[key] ?? 'Si'])));
+    setLayerHeights(previous => Object.fromEntries(pairs.map(key => [key, previous[key] ?? DEFAULT_LAYER_HEIGHT])));
     setClipNotice('');
     if (structure?.bounds) {
       setClipBounds({ ...structure.bounds });
@@ -3801,8 +3842,29 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
 
   const clipLayers = () => selectedPairs.map(key => {
     const [layer, datatype] = key.split(':').map(Number);
-    return { layer, datatype, material: layerMaterials[key] || 'Si' };
+    const base = { layer, datatype, material: layerMaterials[key] || 'Si' };
+    if (clipDimension() !== 3) return base;
+    const heights = layerHeights[key] ?? DEFAULT_LAYER_HEIGHT;
+    return { ...base, baseHeight: Number(heights.baseHeight), height: Number(heights.height) };
   });
+
+  /** 3D layer heights must be finite and at least two grid intervals thick. */
+  const validateClipLayerHeights = (layers: Array<{ layer: number; baseHeight?: number; height?: number }>) => {
+    if (clipDimension() !== 3) return;
+    const grid = clipGridDelta();
+    const minimum = 2 * grid;
+    for (const row of layers) {
+      const baseHeight = Number(row.baseHeight);
+      const height = Number(row.height);
+      if (!Number.isFinite(baseHeight) || !Number.isFinite(height)) {
+        throw new Error(`图层 L${row.layer} 的 baseHeight/height 必须是有限数值`);
+      }
+      if (height <= 0) throw new Error(`图层 L${row.layer} 的厚度必须大于 0 µm`);
+      if (height < minimum) {
+        throw new Error(`图层 L${row.layer} 的厚度 ${height} µm 小于两个网格步长（${minimum} µm，gridDelta=${grid}）：请增大厚度或减小 gridDelta`);
+      }
+    }
+  };
 
   const registerLayout = () => run('layout', async () => {
     if (!gds) throw new Error('先上传 GDS');
@@ -3840,20 +3902,26 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setClipNotice('');
   });
 
-  const sameClipContent = (clip: Clip, layers: Array<{ layer: number; datatype: number | null; material: string }>) => {
+  const sameClipContent = (
+    clip: Clip,
+    layers: Array<{ layer: number; datatype: number | null; material: string; baseHeight?: number; height?: number }>,
+  ) => {
     if (clip.layoutId !== activeLayout?.layoutId) return false;
     if (clip.structure !== layoutStructure) return false;
     if (['x0', 'y0', 'x1', 'y1'].some(key => Math.abs(Number(clip.bbox[key as keyof Clip['bbox']]) - clipBounds[key as keyof typeof clipBounds]) > 1e-9)) return false;
     if (clip.layers.length !== layers.length) return false;
     return clip.layers.every((item, index) => item.layer === layers[index].layer
       && item.datatype === layers[index].datatype
-      && item.material === layers[index].material);
+      && item.material === layers[index].material
+      && (item.baseHeight ?? null) === (layers[index].baseHeight ?? null)
+      && (item.height ?? null) === (layers[index].height ?? null));
   };
 
   const saveClip = () => run('clip', async () => {
     if (!activeLayout) throw new Error('先注册 Layout');
     const layers = clipLayers();
     if (!layers.length) throw new Error('至少选择一个层');
+    validateClipLayerHeights(layers);
     const name = (clipName || `clip ${clips.length + 1}`).trim();
     const existing = clips.filter(item => item.name === name);
     const duplicate = existing.find(item => sameClipContent(item, layers));
@@ -3892,12 +3960,19 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setClipBounds({ ...clip.bbox });
     setLayerMaterials(previous => Object.fromEntries(clip.layers.map(item => [`${item.layer}:${item.datatype ?? 0}`, item.material || 'Si'])
       .map(([key, value]) => [key, previous[key] ?? value])));
+    setLayerHeights(previous => Object.fromEntries(clip.layers.map(item => {
+      const key = `${item.layer}:${item.datatype ?? 0}`;
+      const fallback = previous[key] ?? DEFAULT_LAYER_HEIGHT;
+      return [key, {
+        baseHeight: String(item.baseHeight ?? fallback.baseHeight),
+        height: String(item.height ?? fallback.height),
+      }];
+    })));
   };
 
   /** 01 project tab: selecting a clip only binds the source; save writes geometry. */
   const chooseClipForProject = (clip: Clip) => {
     selectClip(clip);
-    if (project?.dimension === 3) return;
     setProjectGeometrySource({ kind: 'layout', clipId: clip.clipId, clipName: clip.name, layoutId: clip.layoutId, clipHash: clip.clipHash });
     setCompileStale(true);
   };
@@ -3960,16 +4035,16 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
 
   const useClipAsGeometry = (clip: Clip, compileNow: boolean) => run('clip-use', async () => {
     if (!project) throw new Error('先创建或导入工程');
-    if (project.dimension === 3) throw new Error('GDS 版图几何仅支持 2D 工程');
+    const dimension = project.dimension ?? 2;
+    if (dimension === 3) {
+      const missing = clip.layers.find(item => item.baseHeight == null || item.height == null);
+      if (missing) throw new Error(`Clip 的图层 L${missing.layer} 缺少 baseHeight/height：请在上方为每层填写层高并重新保存 Clip`);
+    }
     setProjectGeometrySource({
       kind: 'layout', clipId: clip.clipId, clipName: clip.name,
       layoutId: clip.layoutId, clipHash: clip.clipHash,
     });
-    const geometry = {
-      kind: 'gds', assetId: clip.gdsAssetId, fileName: clip.gdsFileName,
-      structure: 'CLIP', unitScale: 1, position: [0, 0, 0],
-      layers: clip.layers.map(item => ({ layer: item.layer, material: item.material || 'Si' })),
-    };
+    const geometry = clipGeometryBinding(clip, dimension);
     const nextProject: ProjectDoc = { ...project, geometry };
     setProject(nextProject);
     if (!compileNow) {
@@ -4405,7 +4480,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   };
 
   const chooseLayoutGeometry = () => {
-    if (!project || project.dimension === 3) return;
+    if (!project) return;
     const clip = activeClip ?? clips.find(item => item.clipId === projectGeometrySource.clipId) ?? null;
     setProjectGeometrySource(clip
       ? { kind: 'layout', clipId: clip.clipId, clipName: clip.name, layoutId: clip.layoutId, clipHash: clip.clipHash }
@@ -5405,6 +5480,12 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
 
   const clipLabel = (clip: Clip) => clip.name;
 
+  /** Saved 3D clips carry a z placement per layer; show it wherever a clip is listed. */
+  const clipHasLayerHeights = (clip: Clip) => clip.layers.some(item => item.height != null);
+  const clipLayerHeightText = (clip: Clip) => clip.layers
+    .map(item => `L${item.layer} ${item.baseHeight ?? '—'}→${item.height ?? '—'} µm`)
+    .join(' · ');
+
   const renderClipCanvas = (source: ClipCanvas) => {
     const unit = 'µm';
     const xTicks = axisTicks(source.bbox.x0, source.bbox.x1);
@@ -5538,16 +5619,27 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
           {(activeLayout.structures.find(item => item.name === layoutStructure)?.layerDatatypes ?? []).map(([layer, datatype]) => {
             const key = `${layer}:${datatype}`;
             const material = layerMaterials[key] || 'Si';
-            return <label key={key} className="spx-layer-pick">
-              <input type="checkbox" checked={selectedPairs.includes(key)}
+            const heights = layerHeights[key] ?? DEFAULT_LAYER_HEIGHT;
+            return <div key={key} className="spx-layer-pick">
+              <input type="checkbox" aria-label={`图层 ${layer}/${datatype}`} checked={selectedPairs.includes(key)}
                 onChange={event => setSelectedPairs(previous => event.target.checked ? [...previous, key] : previous.filter(item => item !== key))} />
               <span>L{layer}/{datatype}</span>
               <select aria-label={`图层 ${layer} 材料`} value={material}
                 onChange={event => setLayerMaterials(previous => ({ ...previous, [key]: event.target.value }))}>
                 {materialCatalog.map(row => <option key={row.name} value={row.name}>{row.name}</option>)}
               </select>
+              {clipDimension() === 3 && <>
+                <span className="spx-layer-height"><span>基底高度 baseHeight (µm)</span>
+                  <input aria-label={`图层 ${layer} 基底高度`} type="number" step="0.01" value={heights.baseHeight}
+                    onChange={event => setLayerHeights(previous => ({ ...previous, [key]: { ...heights, baseHeight: event.target.value } }))} />
+                </span>
+                <span className="spx-layer-height"><span>厚度 height (µm)</span>
+                  <input aria-label={`图层 ${layer} 厚度`} type="number" step="0.01" value={heights.height}
+                    onChange={event => setLayerHeights(previous => ({ ...previous, [key]: { ...heights, height: event.target.value } }))} />
+                </span>
+              </>}
               <i style={{ background: materialColor(materialCatalog, material) }} aria-hidden="true" />
-            </label>;
+            </div>;
           })}
         </div>
         <div className="wf-bounds">
@@ -5575,6 +5667,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         {clips.map(clip => <button key={clip.clipId} type="button" title={`${clip.clipId} · ${clip.gdsFileName}`} className={activeClip?.clipId === clip.clipId ? 'active' : ''} onClick={() => selectClip(clip)}>
           <strong>{clipLabel(clip)}</strong>
           <span>{clip.layers.length} 层 · {clip.polygonCount} 多边形</span>
+          {clipHasLayerHeights(clip) && <span>{clipLayerHeightText(clip)}</span>}
           <span>x {clip.bbox.x0}…{clip.bbox.x1} · y {clip.bbox.y0}…{clip.bbox.y1} µm</span>
         </button>)}
       </div>}
@@ -5989,11 +6082,11 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 <div className="spx-group-title">几何来源</div>
                 <div className="spx-segment spx-source-pick">
                   <button type="button" className={draft.source === 'parametric' ? 'active' : ''} onClick={() => chooseDraftSource('parametric')}>参数化</button>
-                  <button type="button" className={draft.source === 'layout' ? 'active' : ''} disabled={draft.dimension === 3}
-                    title={draft.dimension === 3 ? 'GDS 版图几何仅支持 2D 工程' : '从 GDS 版图 Clip 构建几何'}
-                    onClick={() => chooseDraftSource('layout')}>{draft.dimension === 3 ? '🔒 ' : ''}GDS / Layout</button>
+                  <button type="button" className={draft.source === 'layout' ? 'active' : ''}
+                    title="从 GDS 版图 Clip 构建几何"
+                    onClick={() => chooseDraftSource('layout')}>GDS / Layout</button>
                 </div>
-                {draft.dimension === 3 && <p className="spx-lock-note">3D 工程不支持 GDS 版图几何：图层→材料映射只在 2D 中定义，请切回 2D 或使用参数化几何。</p>}
+                {draft.dimension === 3 && draft.source === 'layout' && <p className="spx-help">3D 版图几何：为每个图层填写基底高度与厚度（至少两个网格步长）。</p>}
                 {draft.source === 'parametric' && <>
                   <div className="spx-geometry-picks">
                     {(draft.dimension === 2 ? ['plane', 'trench'] : ['hole', 'fin']).map(kind => <button
@@ -6093,6 +6186,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                   >
                     <strong>{clipLabel(clip)}</strong>
                     <span>{clip.layers.length} 层 · {clip.polygonCount} 多边形</span>
+                    {clipHasLayerHeights(clip) && <span>{clipLayerHeightText(clip)}</span>}
                     <span>x {clip.bbox.x0}…{clip.bbox.x1} · y {clip.bbox.y0}…{clip.bbox.y1} µm</span>
                   </button>)}
                 </div>}
@@ -6244,11 +6338,12 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               <div className="spx-segment spx-source-pick">
                 <button type="button" className={projectGeometrySource.kind === 'parametric' ? 'active' : ''}
                   onClick={chooseParametricGeometry}>参数化</button>
-                <button type="button" className={projectGeometrySource.kind === 'layout' ? 'active' : ''} disabled={project.dimension === 3}
-                  title={project.dimension === 3 ? 'GDS 版图几何仅支持 2D 工程' : '使用 GDS 版图 Clip 作为工程几何'}
-                  onClick={chooseLayoutGeometry}>{project.dimension === 3 ? '🔒 ' : ''}GDS / Layout</button>
+                <button type="button" className={projectGeometrySource.kind === 'layout' ? 'active' : ''}
+                  title="使用 GDS 版图 Clip 作为工程几何"
+                  onClick={chooseLayoutGeometry}>GDS / Layout</button>
               </div>
-              {project.dimension === 3 && <p className="spx-lock-note">3D 工程不支持 GDS 版图几何，图层材料映射仅用于 2D。</p>}
+              {project.dimension === 3 && projectGeometrySource.kind === 'layout'
+                && <p className="spx-help">3D 版图几何：每个图层需要基底高度 baseHeight 与厚度 height（至少两个网格步长）。</p>}
               {projectGeometrySource.kind === 'parametric'
                 ? <div className="wf-muted">几何类型：{projectGeometryKind || '—'}</div>
                 : <>
@@ -6260,6 +6355,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                     >
                       <strong>{clipLabel(clip)}</strong>
                       <span>{clip.layers.length} 层 · {clip.polygonCount} 多边形</span>
+                    {clipHasLayerHeights(clip) && <span>{clipLayerHeightText(clip)}</span>}
                       <span>x {clip.bbox.x0}…{clip.bbox.x1} · y {clip.bbox.y0}…{clip.bbox.y1} µm</span>
                     </button>)}
                   </div>}

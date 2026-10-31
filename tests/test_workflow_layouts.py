@@ -12,8 +12,39 @@ import asyncio  # noqa: E402
 
 from backend import storage  # noqa: E402
 from backend.main import app  # noqa: E402
+from backend.models import ProjectV7  # noqa: E402
 from tests.test_api_integration import asgi_request, json_body  # noqa: E402
 from tests.test_workflow_adoption import project  # noqa: E402
+
+
+def project_3d() -> dict:
+    """A 3D project with parametric geometry; compile_clip replaces geometry."""
+    value = project()
+    value["name"] = "adoption 3D"
+    value["dimension"] = 3
+    value["domain"] = {"gridDelta": 0.2, "xExtent": 4.0, "yExtent": 4.0, "boundaryXY": "reflective"}
+    value["geometry"] = {
+        "kind": "hole", "radius": 1.0, "depth": 2.0, "taperAngle": 0.0,
+        "maskHeight": 0.0, "maskTaperAngle": 0.0,
+        "substrateMaterial": "Si", "maskMaterial": "Mask",
+    }
+    value.pop("view", None)
+    value["view3D"] = {
+        "projection": "parallel", "camera": None, "displayMode": "surface",
+        "visibleMaterialIds": [], "opacityByMaterial": {},
+        "clip": {"enabled": False, "axis": "x", "position": 0.0, "keep": "positive"},
+        "section": {"enabled": False, "axis": "y", "position": 0.0},
+    }
+    return value
+
+
+def _without_none(value):
+    """Response models keep optional keys as null; ProjectV7 rejects that."""
+    if isinstance(value, dict):
+        return {key: _without_none(item) for key, item in value.items() if item is not None}
+    if isinstance(value, list):
+        return [_without_none(item) for item in value]
+    return value
 
 
 class LayoutClipTests(unittest.IsolatedAsyncioTestCase):
@@ -252,6 +283,96 @@ class LayoutClipTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(listing[0], 200, listing[2])
         listed_ids = {clip["clipId"] for clip in json_body(listing)["clips"]}
         self.assertTrue({clip_a["clipId"], clip_b["clipId"], clip_c["clipId"]} <= listed_ids)
+
+
+    async def _clip_layers(self, name: str, structure: str, layers: list[dict], bbox: dict) -> dict:
+        response = await asgi_request(
+            "/api/v1/workflow/clips", method="POST",
+            payload={
+                "layoutId": self.layout["layoutId"], "name": name, "structure": structure,
+                "layers": layers, "bbox": bbox, "annotations": [],
+            },
+        )
+        self.assertEqual(response[0], 201, response[2])
+        return json_body(response)
+
+    async def test_3d_clip_roundtrip_hash_and_compile(self):
+        bbox = {"x0": -0.1, "y0": -0.1, "x1": 2.1, "y1": 1.1}
+        clip = await self._clip_layers(
+            "3d clip", "CELL_A",
+            [{"layer": 1, "material": "Si", "baseHeight": 0.0, "height": 0.6}], bbox,
+        )
+        self.assertEqual(clip["layers"][0]["baseHeight"], 0.0)
+        self.assertEqual(clip["layers"][0]["height"], 0.6)
+        fetched = json_body(await asgi_request(f"/api/v1/workflow/clips/{clip['clipId']}"))
+        self.assertEqual(fetched["layers"][0]["height"], 0.6)
+        self.assertEqual(fetched["clipHash"], clip["clipHash"])
+
+        # The layer height is part of the clip hash: same polygons, new stack.
+        taller = await self._clip_layers(
+            "3d clip taller", "CELL_A",
+            [{"layer": 1, "material": "Si", "baseHeight": 0.0, "height": 0.8}], bbox,
+        )
+        self.assertNotEqual(clip["clipHash"], taller["clipHash"])
+
+        compiled = await asgi_request(
+            f"/api/v1/workflow/clips/{clip['clipId']}/compile", method="POST",
+            payload={"project": project_3d(), "flowId": "flow_clip_3d"},
+        )
+        self.assertEqual(compiled[0], 201, compiled[2])
+        body = json_body(compiled)
+        self.assertEqual(body["dimension"], 3)
+        self.assertEqual(body["binding"]["dimension"], 3)
+        self.assertEqual(body["binding"]["geometrySource"]["clipId"], clip["clipId"])
+        project_body = body["compile"]["project"]
+        ProjectV7.model_validate(_without_none(project_body))
+        self.assertEqual(project_body["geometry"]["kind"], "gds")
+        self.assertEqual(project_body["geometry"]["assetId"], clip["gdsAssetId"])
+        self.assertEqual(
+            project_body["geometry"]["layers"],
+            [{"layer": 1, "material": "Si", "baseHeight": 0.0, "height": 0.6}],
+        )
+        grid = 0.2
+        self.assertEqual(
+            project_body["domain"],
+            {
+                "gridDelta": grid,
+                "xExtent": max(clip["width"] + 2 * grid, 4 * grid),
+                "yExtent": max(clip["height"] + 2 * grid, 4 * grid),
+                "boundaryXY": "reflective",
+            },
+        )
+
+    async def test_3d_clip_compile_rejects_missing_and_thin_layers(self):
+        bbox = {"x0": -0.1, "y0": -0.1, "x1": 2.1, "y1": 1.1}
+        flat = await self._clip("3d clip without heights", "CELL_A", 1, bbox)
+        self.assertIsNone(flat["layers"][0]["baseHeight"])
+        self.assertIsNone(flat["layers"][0]["height"])
+        missing = await asgi_request(
+            f"/api/v1/workflow/clips/{flat['clipId']}/compile", method="POST",
+            payload={"project": project_3d(), "flowId": "flow_clip_3d_missing"},
+        )
+        self.assertEqual(missing[0], 422, missing[2])
+        self.assertIn("baseHeight", json_body(missing)["detail"])
+
+        thin = await self._clip_layers(
+            "3d clip too thin", "CELL_A",
+            [{"layer": 1, "material": "Si", "baseHeight": 0.0, "height": 0.1}], bbox,
+        )
+        rejected = await asgi_request(
+            f"/api/v1/workflow/clips/{thin['clipId']}/compile", method="POST",
+            payload={"project": project_3d(), "flowId": "flow_clip_3d_thin"},
+        )
+        self.assertEqual(rejected[0], 422, rejected[2])
+        self.assertIn("厚度", json_body(rejected)["detail"])
+
+        # A 2D compile of the same height-less clip still succeeds unchanged.
+        two_d = await asgi_request(
+            f"/api/v1/workflow/clips/{flat['clipId']}/compile", method="POST",
+            payload={"project": project(), "flowId": "flow_clip_2d_regression"},
+        )
+        self.assertEqual(two_d[0], 201, two_d[2])
+        self.assertEqual(json_body(two_d)["dimension"], 2)
 
 
 if __name__ == "__main__":

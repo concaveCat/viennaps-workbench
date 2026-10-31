@@ -86,8 +86,9 @@ try {
   await page.locator('.spx-command').filter({ hasText: '新建工程' }).click();
   await page.getByLabel('新工程名称').fill(savedName);
   await page.getByRole('button', { name: '3D', exact: true }).click();
-  await page.locator('.spx-lock-note').filter({ hasText: '3D 工程不支持 GDS 版图几何' }).waitFor();
-  assert.equal(await page.getByRole('button', { name: /GDS \/ Layout/ }).isDisabled(), true);
+  // 3D projects now accept GDS / Layout geometry (per-layer baseHeight/height).
+  assert.equal(await page.getByRole('button', { name: /GDS \/ Layout/ }).isDisabled(), false);
+  assert.equal(await page.locator('.spx-lock-note').filter({ hasText: '3D 工程不支持 GDS 版图几何' }).count(), 0);
   await page.getByRole('button', { name: '2D', exact: true }).click();
   await page.getByLabel('新工程基底材料').selectOption('SiO2');
   await page.getByRole('button', { name: '创建工程草稿' }).click();
