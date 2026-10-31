@@ -20,19 +20,42 @@ import asyncio
 import copy
 import hashlib
 import json
+import shutil
+import subprocess
+import tempfile
 import unittest
 from array import array
+from importlib.metadata import version
 from itertools import product
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
 
 from backend.field_remap import (CellGrid, GridRemapError,  # noqa: E402
                                  check_captured_grid, remap_cell_fields)
 from backend.main import app  # noqa: E402
-from backend.validation import validate_project  # noqa: E402
+from backend.validation import ProjectInputError, validate_project  # noqa: E402
 from tests.test_api_integration import asgi_request, json_body  # noqa: E402
 from tests.test_implant import (anneal_step, analysis_step,  # noqa: E402
                                 implant_step, project)
 from backend import storage  # noqa: E402
 import backend.snapshots as snapshot_store  # noqa: E402
+
+
+def field_settings(**overrides) -> dict:
+    value = {"height": 0.5, "substrateDepth": 0.4, "coverMaterial": "GAS",
+             "periodic": False, "format": "json"}
+    value.update(overrides)
+    return value
+
+
+def boolean_step(**overrides) -> dict:
+    value = {"id": "boolean_step_01", "name": "grow", "enabled": True,
+             "model": "boolean", "booleanOperation": "union",
+             "position": [0.0, -0.1, 0.0], "width": 4.0, "height": 2.1,
+             "applyToAll": True}
+    value.update(overrides)
+    return value
 
 
 def make_grid(*, dimension: int = 2, delta: float = 0.5,
@@ -218,6 +241,23 @@ class FieldRemapUnitTests(unittest.TestCase):
                          {"dopant": hashlib.sha256(
                              array("d", values).tobytes()).hexdigest()})
 
+    def test_pre_allocation_bound_covers_the_known_repro_grids(self) -> None:
+        from worker.simulate import _field_grid_cell_bound
+        # Repro 1: 1 um / 0.05 um = 20 lateral cells (+2 slack) and
+        # 2.0 - (-0.45) = 2.45 um = 49 rows (+4 slack) -> 1,166 >= 980.
+        bound = _field_grid_cell_bound(
+            {"dimension": 2, "domain": {"gridDelta": 0.05, "xExtent": 1.0}},
+            top=2.0, bottom=-0.45, delta=0.05)
+        self.assertGreaterEqual(bound, 20 * 49)
+        self.assertEqual(bound, 22 * 53)
+        # Repro 2: the 0.4 x 0.4 / 0.02 3D grid over the whole band is far
+        # above the 2M construction limit once the surface is at 99.9 um.
+        bound3 = _field_grid_cell_bound(
+            {"dimension": 3, "domain": {"gridDelta": 0.02, "xExtent": 0.4,
+                                        "yExtent": 0.4}},
+            top=99.9, bottom=-0.42, delta=0.02)
+        self.assertGreater(bound3, 2_000_000)
+
 
 class FieldRemapWorkflow(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
@@ -384,6 +424,157 @@ class FieldRemapWorkflow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(original["fieldDigests"], replayed["fieldDigests"])
         self.assertEqual(original["process"]["analysis"]["sheetResistance"],
                          replayed["process"]["analysis"]["sheetResistance"])
+
+    async def test_boolean_growth_between_field_steps_stays_within_the_bound(self) -> None:
+        settings = field_settings()
+        value = project(2, steps=[implant_step(cellSet=dict(settings)),
+                                  boolean_step(),
+                                  anneal_step(cellSet=dict(settings)),
+                                  analysis_step(cellSet=dict(settings))])
+        value["domain"] = {"gridDelta": 0.05, "xExtent": 1.0,
+                           "xBoundary": "reflective"}
+        run_id, _manifest = await self.run_project(value)
+        payload = self.summary(run_id)
+        setup = payload["cellSetSetup"]
+        record = setup["remaps"][0]
+        self.assertEqual(record["sourceStepId"], "boolean_step_01")
+        self.assertEqual(record["remapOfStepId"], "implant_step_01")
+        # The union box lifts the surface to 2.0 um. The regenerated grid keeps
+        # the captured bottom (-0.45) and spans up to the new top.
+        self.assertEqual(record["oldCellCount"], 380)
+        self.assertEqual(record["newCellCount"], 980)
+        self.assertEqual(record["newGrid"]["top"], 2.0)
+        self.assertEqual(record["newGrid"]["bottom"], -0.45)
+        self.assertEqual(record["method"],
+                         "conservative-axis-aligned-integer-overlap")
+        self.assertEqual(record["cellOffset"], {"x": 0, "y": 0, "z": 0})
+        self.assertEqual(record["newCells"], 600)
+        self.assertEqual(record["removedCells"], 0)
+        self.assertGreater(record["reactivatedCells"], 0)
+        self.assertEqual(record["mass"]["P_total"]["lost"], 0.0)
+        self.assert_mass_balance(record)
+        # The pre-allocation bound covers the real native allocation.
+        self.assertEqual(setup["numberOfCells"], 980)
+        self.assertGreaterEqual(setup["cellsUpperBound"], 980)
+
+    async def test_grid_growth_above_the_construction_limit_is_refused_before_allocation(self) -> None:
+        settings = field_settings()
+        value = project(3, steps=[implant_step(cellSet=dict(settings)),
+                                  boolean_step(height=100.0, depth=4.0),
+                                  anneal_step(cellSet=dict(settings)),
+                                  analysis_step(cellSet=dict(settings))])
+        value["domain"] = {"gridDelta": 0.02, "xExtent": 0.4, "yExtent": 0.4,
+                           "boundaryXY": "reflective"}
+        response = await asgi_request("/api/runs", method="POST",
+                                      payload={"kind": "simulate", "project": value})
+        self.assertEqual(response[0], 202, response[2])
+        run_id = json_body(response)["runId"]
+        result = await self.wait(run_id)
+        self.assertEqual(result["status"], "failed")
+        log = (storage.run_path(run_id) / "run.log").read_text(encoding="utf-8",
+                                                               errors="replace")
+        self.assertIn("construction limit", log)
+        self.assertIn("2,000,000", log)
+        # The rejection happens before the dense allocation, not against a
+        # post-allocation bound.
+        self.assertNotIn("DenseCellSet generation produced", log)
+        artifacts = storage.run_path(run_id) / "artifacts"
+        self.assertFalse((artifacts / "analysis_step_01-cell-set-fields.json").exists())
+        self.assertFalse((artifacts / "boolean_step_01-cell-set-fields.json").exists())
+
+
+class FieldRemapGeometryLimitTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.lifespan = app.router.lifespan_context(app)
+        await self.lifespan.__aenter__()
+
+    async def asyncTearDown(self) -> None:
+        await self.lifespan.__aexit__(None, None, None)
+
+    def test_three_dimensional_surface_above_the_field_height_is_a_422(self) -> None:
+        settings = field_settings()
+        value = project(3, steps=[implant_step(cellSet=dict(settings)),
+                                  anneal_step(cellSet=dict(settings)),
+                                  analysis_step(cellSet=dict(settings))])
+        value["domain"] = {"gridDelta": 0.02, "xExtent": 0.4, "yExtent": 0.4,
+                           "boundaryXY": "reflective"}
+        value["geometry"] = {"kind": "plane", "height": 101.0,
+                             "substrateMaterial": "Si"}
+        with self.assertRaises(ProjectInputError) as context:
+            validate_project(value)
+        message = str(context.exception)
+        self.assertIn("below the highest initial surface point", message)
+        self.assertIn("101", message)
+        self.assertIn("steps[0].cellSet.height", message)
+
+    def test_deep_initial_surface_is_refused_by_the_static_cell_bound(self) -> None:
+        from backend.implant_models import field_geometry_issues
+        steps = [implant_step(cellSet=field_settings(height=0.6, substrateDepth=0.4))]
+        issues = field_geometry_issues(
+            steps, geometry={"kind": "trench", "depth": 100.0, "maskHeight": 0.2},
+            dimension=3, grid_delta=0.02, x_extent=0.4, y_extent=0.4)
+        self.assertTrue(any("construction limit" in message
+                            for _index, _path, message in issues), issues)
+
+    def test_height_below_the_surface_is_refused_but_a_gds_extent_is_left_to_the_worker(self) -> None:
+        from backend.implant_models import field_geometry_issues
+        steps = [implant_step(cellSet=field_settings())]
+        issues = field_geometry_issues(
+            steps, geometry={"kind": "plane", "height": 5.0}, dimension=2,
+            grid_delta=0.01, x_extent=1.0, y_extent=0.0)
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0][1], "cellSet.height")
+        self.assertEqual(field_geometry_issues(
+            steps, geometry={"kind": "gds", "assetId": "0" * 64}, dimension=2,
+            grid_delta=0.01, x_extent=1.0, y_extent=0.0), [])
+        self.assertEqual(field_geometry_issues(
+            steps, geometry={"kind": "plane", "height": 5.0}, dimension=2,
+            grid_delta=0.01, x_extent=1.0, y_extent=0.0, from_domain_state=True), [])
+
+
+class FieldRemapDirectWorkerBounds(unittest.TestCase):
+    """A hand-edited input.json cannot bypass the pre-allocation checks."""
+
+    def run_worker(self, project: dict, timeout: int = 240) -> tuple[int, str, dict, Path]:
+        workdir = Path(tempfile.mkdtemp(prefix="field-bound-", dir=str(ROOT / "var")))
+        self.addCleanup(shutil.rmtree, workdir, ignore_errors=True)
+        config = {
+            "kind": "simulate", "runId": "field-bound", "project": project,
+            "runSeed": 271828,
+            "expectedVersions": {"viennaps": version("viennaps"),
+                                 "viennals": version("viennals")},
+        }
+        input_path = workdir / "input.json"
+        input_path.write_text(json.dumps(config), encoding="utf-8")
+        run_dir = workdir / "run"
+        run_dir.mkdir()
+        completed = subprocess.run(
+            [str(ROOT / ".venv/bin/python"), str(ROOT / "worker/simulate.py"),
+             str(input_path), str(run_dir)],
+            cwd=ROOT, capture_output=True, text=True, timeout=timeout)
+        result_path = run_dir / "worker-result.json"
+        result = json.loads(result_path.read_text()) if result_path.is_file() else {}
+        return completed.returncode, completed.stdout + completed.stderr, result, run_dir
+
+    def test_direct_worker_refuses_height_below_the_surface_before_allocating(self) -> None:
+        settings = field_settings()
+        value = project(3, steps=[implant_step(cellSet=dict(settings)),
+                                  anneal_step(cellSet=dict(settings)),
+                                  analysis_step(cellSet=dict(settings))])
+        value["domain"] = {"gridDelta": 0.02, "xExtent": 0.4, "yExtent": 0.4,
+                           "boundaryXY": "reflective"}
+        value = copy.deepcopy(validate_project(value)[0].model_dump(mode="json",
+                                                                    exclude_none=True))
+        value["geometry"] = {"kind": "plane", "height": 101.0,
+                             "substrateMaterial": "Si"}
+        code, output, result, run_dir = self.run_worker(value)
+        self.assertNotEqual(code, 0, output)
+        self.assertNotIn("WORKER_COMPLETE", output)
+        self.assertEqual(result, {})
+        self.assertIn("below the highest", output)
+        self.assertIn("initial surface point", output)
+        self.assertNotIn("DenseCellSet generation produced", output)
+        self.assertFalse((run_dir / "artifacts").exists())
 
 
 class FieldRemapSchemaTests(unittest.TestCase):

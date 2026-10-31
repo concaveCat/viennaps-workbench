@@ -308,6 +308,37 @@ new grid); new cells contribute `0`. The per-label `lost` is therefore the
 amount physically removed by the etch (`removedCells`) and not a numerical
 residual.
 
+### 3.2 Pre-allocation bounds
+
+`Domain.generateCellSet(position, ...)` allocates the dense grid before any
+post-check can run, so the worker computes the extent **before** the native
+call. The required grid is fully determined by the current surface and the
+captured grid:
+
+```
+top_node       = ceil(highest_surface / delta) * delta
+bottom_node    = floor(lowest_surface / delta) * delta
+required_top   = max(captured.top, top_node)
+required_bottom= captured.bottom            if captured.bottom <= bottom_node - delta
+                 bottom_node - delta        otherwise        (native minimum band)
+band_cells     = 2 * round((bottom_node - required_bottom) / delta), min 2
+rows           = ceil((required_top - required_bottom) / delta) + 4
+lateral        = (ceil(xExtent/delta) + 2) * (ceil(yExtent/delta) + 2)   # +2 is 2D
+bound          = lateral * max(rows, 2)
+```
+
+`bound` is checked against `MAX_CELL_SET_CELLS` (2,000,000) before
+`generateCellSet`; the bound carries two lateral cells of slack per axis and
+four spare rows, which covers the measured native extent for plane, trench,
+fin, stack and Boolean-grown surfaces. On the first field step the native
+top is the absolute `cellSet.height`, so a `height` below the highest surface
+point is refused before allocation instead of letting the native generator
+walk the whole surface band between the requested position and the surface.
+For parametric geometries (plane/trench/hole/fin/stack) the API performs the
+same check statically from the geometry, so the 101 um plane/0.5 um height
+case is a 422 before a worker starts; GDS geometry and Domain continuations
+have no project-level vertical extent and are left to the worker's live check.
+
 ## 4. Rejection rules (HTTP 422, no worker, no native call)
 
 | condition | message theme |
@@ -326,6 +357,9 @@ residual.
 | `periodic` differs from the domain | the cell set can only mirror the domain boundary |
 | analysis before any implant/anneal | `analysis requires an earlier implant or anneal step` |
 | consumed label not produced earlier | `cell-set label(s) not produced by an earlier step` |
+| `cellSet.height` below the initial surface top (parametric geometry) | `cellSet.height ... is below the highest initial surface point ... the native generateCellSet position is an absolute coordinate` |
+| surface-aware grid above 2,000,000 cells (API) | `the field grid would need about N cells ... above the 2,000,000-cell construction limit` |
+| regenerated grid above 2,000,000 cells (worker) | `field cell grid needs at least N cells ... above the 2,000,000-cell construction limit` (before allocation) |
 | a regenerated grid off the captured lattice | `conservative grid remap not implemented` (worker, no native process call) |
 | `outputSettings.cellSet` together with field steps | the generic output cannot carry dopant fields |
 | material not in `/api/materials` | same material gate as every other step |
@@ -403,18 +437,27 @@ residual.
 * `_field_integral` unit regression: `C=2 um^-3`, `delta=2 um` gives
   `8 um^-1` in 2D and the exported 2D `integralUnit` is `1/um` (3D omits it).
 
-`tests/test_field_remap.py` (18 tests):
+`tests/test_field_remap.py` (25 tests):
 
 * pure-Python mapping: `CellGrid` round-trip from native node points, ordered
   same-grid copy (`O(N)`, exact digests), integer-shift overlap, grid growth
   (new cells `0`), shrink (`removedByGrid`), solid→cover mass loss with no
-  redistribution, cover→solid reactivation, deterministic record, and refusals
-  for a non-integer offset, a lateral/spacing change and a gapped lattice;
+  redistribution, cover→solid reactivation, deterministic record, the
+  pre-allocation bound formula, and refusals for a non-integer offset, a
+  lateral/spacing change and a gapped lattice;
 * real runs: 2D and 3D `implant → etch → anneal → analysis` (same-grid remap,
   recorded `sourceStepId`, per-label mass balance, labels preserved, Rsh still
   computed), `implant → deposit → anneal` (grid unchanged, `mass.lost = 0`),
-  a deep etch that grows the grid downwards conservatively, and replay
-  reproducing the remap record and every field digest bit-identically;
+  a deep etch that grows the grid downwards conservatively, a Boolean union
+  that lifts the surface from 0 to 2 um (380 → 980 cells inside the
+  pre-allocation bound), replay reproducing the remap record and every field
+  digest bit-identically;
+* limits: a Boolean growth whose regenerated grid would need ~2.4 M cells
+  fails with the construction-limit message *before* allocation (`run.log`
+  never contains `DenseCellSet generation produced`); the 3D 101 um
+  plane/0.5 um height request is a 422, a hand-edited worker input is refused
+  by the same preflight check, and GDS/continuation geometry is left to the
+  worker's live check;
 * schema: a surface step between field steps is accepted, a later step with a
   different `height` is still rejected, and analysis before an implant is still
   rejected.

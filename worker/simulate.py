@@ -3407,21 +3407,58 @@ def _field_material_map(domain: Any) -> list[int]:
     return [int(value) for value in values]
 
 
+def _field_surface_bounds(domain: Any, *, is3d: bool) -> tuple[float, float]:
+    """Return the current ``(highest, lowest)`` surface coordinate."""
+    mesh = domain.getSurfaceMesh(addInterfaces=True, sharpCorners=False,
+                                 minNodeDistanceFactor=0.01)
+    return _surface_vertical_bounds(mesh.getNodes(), is3d=is3d)
+
+
+def _field_grid_cell_bound(requested: dict[str, Any], *, top: float, bottom: float,
+                           delta: float) -> int:
+    """Conservative cell count for a field grid spanning ``[bottom, top]``.
+
+    The native generator allocates the full lateral domain grid between the
+    widened level-set band bottom and the requested position. The lateral
+    counts carry the same two-cell slack as the generic cell-set bound and the
+    row count carries four spare rows, so the bound is never below the native
+    allocation for a regular box.
+    """
+    x_extent = float(requested["domain"]["xExtent"])
+    nx = max(1, math.ceil(x_extent / delta))
+    if int(requested["dimension"]) == 3:
+        ny = max(1, math.ceil(float(requested["domain"]["yExtent"]) / delta))
+        lateral = (nx + 2) * (ny + 2)
+    else:
+        lateral = nx + 2
+    rows = math.ceil((float(top) - float(bottom)) / delta) + 4
+    return lateral * max(rows, 2)
+
+
 def _generate_field_cell_set(ps: Any, source_domain: Any, project: dict[str, Any], *,
                              height: float, band_cells: int, cover: Any,
-                             periodic: bool) -> tuple[Any, Any, Any, dict[str, Any]]:
+                             periodic: bool,
+                             surface_bounds: tuple[float, float] | None = None,
+                             ) -> tuple[Any, Any, Any, dict[str, Any]]:
     """Build one native cell set on a widened copy of ``source_domain``.
 
     A ViennaLS level set only stores a narrow band around the surface, so the
     substrate is widened *on a deep copy of the Domain* (``viennals.Expand`` on
     every level set, which reinitialises the band without moving the zero
     contour). The simulated Domain, and therefore every surface snapshot, is
-    untouched. The cell-count bound is computed from the widened copy before
-    allocation.
+    untouched.
+
+    Measured on 4.7.0, ``generateCellSet(position, ...)`` uses ``position`` as
+    the absolute top of the grid and the widened band bottom as the lower
+    bound. The required top/bottom and a conservative cell bound are therefore
+    known *before* the native allocation; the request is refused above the
+    construction limit and a ``height`` below the current surface is refused
+    instead of letting the native generator walk the whole band.
     """
     from backend.field_remap import CellGrid
 
     delta = float(source_domain.getGridDelta())
+    is3d = project["dimension"] == 3
     if height + 1e-12 < delta:
         raise RuntimeError(
             f"cellSet.height {height:g} um is below one grid interval ({delta:g} um); "
@@ -3432,21 +3469,33 @@ def _generate_field_cell_set(ps: Any, source_domain: Any, project: dict[str, Any
             f"current surface (a {band_cells}-point band is below the native minimum of 2); the "
             "surface moved below the captured substrateDepth. Increase cellSet.substrateDepth on "
             "the first field step or reduce the etch depth")
-    is3d = project["dimension"] == 3
+    if surface_bounds is None:
+        surface_bounds = _field_surface_bounds(source_domain, is3d=is3d)
+    surface_top, surface_bottom = float(surface_bounds[0]), float(surface_bounds[1])
+    top_node = math.ceil(surface_top / delta - 1e-9) * delta
+    if height + 1e-9 < top_node:
+        raise RuntimeError(
+            f"cellSet.height {height:g} um is below the highest surface point "
+            f"({surface_top:g} um); the native generateCellSet position is an absolute "
+            "coordinate, so the field grid would clip the surface (and, below the surface "
+            "band, the native generator allocates the whole band between them). Set "
+            "cellSet.height above the surface or lower the geometry")
+    planned_top = float(height)
+    planned_bottom = (math.floor(surface_bottom / delta + 1e-9) * delta
+                      - (int(band_cells) // 2) * delta)
+    bound = _field_grid_cell_bound(project, top=planned_top, bottom=planned_bottom,
+                                   delta=delta)
+    if bound > MAX_CELL_SET_CELLS:
+        raise RuntimeError(
+            f"field cell grid needs at least {bound:,} cells between "
+            f"{planned_bottom:g} and {planned_top:g} um, above the "
+            f"{MAX_CELL_SET_CELLS:,}-cell construction limit; raise cellSet.height above the "
+            "surface only as needed, reduce cellSet.substrateDepth, or coarsen gridDelta")
     field_domain = ps.Domain(source_domain)
     original_points = sum(int(level_set.getNumberOfPoints())
                           for level_set in source_domain.getLevelSets())
     for level_set in field_domain.getLevelSets():
         ps.ls.Expand(level_set, int(band_cells)).apply()
-    mesh = field_domain.getSurfaceMesh(addInterfaces=True, sharpCorners=False,
-                                       minNodeDistanceFactor=0.01)
-    top, bottom = _surface_vertical_bounds(mesh.getNodes(), is3d=is3d)
-    bound = _cell_set_upper_bound(project, height=height, top=top, bottom=bottom,
-                                  delta=delta, domain=field_domain)
-    if bound > MAX_CELL_SET_CELLS:
-        raise RuntimeError(
-            f"cell-set grid needs at least {bound:,} cells, above the {MAX_CELL_SET_CELLS:,}-cell "
-            "limit; reduce cellSet.height/substrateDepth or coarsen gridDelta")
     field_domain.generateCellSet(height, cover, True)
     cell_set = field_domain.getCellSet()
     if cell_set is None:
@@ -3467,8 +3516,8 @@ def _generate_field_cell_set(ps: Any, source_domain: Any, project: dict[str, Any
     info = {
         "numberOfCells": cells,
         "cellsUpperBound": bound,
-        "surfaceTop": top,
-        "surfaceBottom": bottom,
+        "surfaceTop": surface_top,
+        "surfaceBottom": surface_bottom,
         "heightAboveSurface": height,
         "substrateBandExpandCells": int(band_cells),
         "sourceLevelSetPoints": original_points,
@@ -3546,31 +3595,29 @@ def remap_field_cell_set(ps: Any, domain: Any, project: dict[str, Any],
     # ``Domain.generateCellSet(position, ...)`` takes the *absolute* top
     # coordinate of the grid, not a height above the surface (measured on
     # 4.7.0: a plane at 0.05 with position 0.5 produced top 0.5). The grid
-    # bottom always comes from the widened level-set band. Keeping the
-    # captured top therefore only needs the captured coordinate; the bottom is
-    # pinned by choosing the band width.
-    default_band = int(state["bandCells"])
-    height = float(captured.top)
-    band_cells = default_band
-    field_domain, cell_set, grid, info = _generate_field_cell_set(
-        ps, domain, project, height=height, band_cells=band_cells,
-        cover=cover, periodic=bool(state["settings"].get("periodic", False)))
+    # bottom is the widened band bottom, so the target extent is fully known
+    # from the current surface before any native allocation:
+    #   top    = max(captured top, highest lattice surface node)
+    #   bottom = the captured bottom, or the shallowest reachable band bottom
+    #            (two-point native band) when an etch went deeper.
+    is3d = int(project["dimension"]) == 3
+    surface_top, surface_bottom = _field_surface_bounds(domain, is3d=is3d)
+    top_node = math.ceil(surface_top / delta - 1e-9) * delta
+    bottom_node = math.floor(surface_bottom / delta + 1e-9) * delta
     requested_height = float(captured.top)
-    required_top = max(float(captured.top),
-                       math.ceil(float(info["surfaceTop"]) / delta - 1e-9) * delta)
-    # A band of ``2`` points is the native minimum: its bottom is the highest
-    # the grid can start. A deeper etch has to grow the grid downwards.
-    lowest_reachable = float(grid.bottom) + ((default_band - 2) // 2) * delta
+    required_top = max(float(captured.top), top_node)
+    lowest_reachable = bottom_node - delta
     if float(captured.bottom) <= lowest_reachable + 1e-9:
         required_bottom = float(captured.bottom)
+        band_cells = max(2, 2 * int(round((bottom_node - required_bottom) / delta)))
     else:
         required_bottom = lowest_reachable
-        # The surface moved below the captured substrate. Keep the native
-        # minimum band and let the grid grow downwards.
         band_cells = 2
-        field_domain, cell_set, grid, info = _generate_field_cell_set(
-            ps, domain, project, height=height, band_cells=band_cells,
-            cover=cover, periodic=bool(state["settings"].get("periodic", False)))
+    height = required_top
+    field_domain, cell_set, grid, info = _generate_field_cell_set(
+        ps, domain, project, height=height, band_cells=band_cells,
+        cover=cover, periodic=bool(state["settings"].get("periodic", False)),
+        surface_bounds=(surface_top, surface_bottom))
     for _attempt in range(4):
         if (abs(float(grid.bottom) - required_bottom) <= 1e-9
                 and abs(float(grid.top) - required_top) <= 1e-9):
@@ -3580,11 +3627,12 @@ def remap_field_cell_set(ps: Any, domain: Any, project: dict[str, Any],
         height += float(required_top) - float(grid.top)
         field_domain, cell_set, grid, info = _generate_field_cell_set(
             ps, domain, project, height=height, band_cells=band_cells,
-            cover=cover, periodic=bool(state["settings"].get("periodic", False)))
+            cover=cover, periodic=bool(state["settings"].get("periodic", False)),
+            surface_bounds=(surface_top, surface_bottom))
     else:
         raise GridRemapError(
             "conservative grid remap not implemented: the regenerated cell grid could not be "
-            f"aligned to the captured grid (bottom {captured.bottom:g}/{grid.bottom:g} um, "
+            f"aligned to the captured grid (bottom {required_bottom:g}/{grid.bottom:g} um, "
             f"top {required_top:g}/{grid.top:g} um)")
 
     check_captured_grid(captured, grid)
@@ -3660,12 +3708,6 @@ def ensure_field_cell_set(ps: Any, domain: Any, project: dict[str, Any],
         field_domain, cell_set, grid, info = _generate_field_cell_set(
             ps, domain, project, height=height, band_cells=band_cells,
             cover=cover, periodic=bool(settings.get("periodic", False)))
-        if float(grid.top) + 1e-9 < float(info["surfaceTop"]):
-            raise RuntimeError(
-                f"cellSet.height {height:g} um is below the highest surface point "
-                f"({float(info['surfaceTop']):g} um): the native generator takes an absolute "
-                "grid top, so the captured field grid would clip the surface; raise "
-                "cellSet.height above the surface or lower the initial geometry")
         state.update({
             "domain": field_domain,
             "cellSet": cell_set,
@@ -4233,11 +4275,11 @@ def execute(input_path: Path, run_dir: Path) -> None:
     actual_steps = [step for step in project["steps"] if step["enabled"]] if kind == "simulate" else []
     step_engines = dict(config.get("stepEngines", {}))
     if kind == "simulate" and any(step.get("model") in CELL_SET_PROCESS_MODELS for step in actual_steps):
-        # The native cell grid is generated once and reused by every later
-        # field step. A hand-edited input.json never passes through the API
-        # validator, so the shared-grid and ordering rules run here, before the
-        # first native call, instead of silently reusing a stale grid.
-        from backend.implant_models import field_sequence_issues
+        # The native cell grid is captured once and reused by every later field
+        # step. A hand-edited input.json never passes through the API validator,
+        # so the shared-grid and pre-allocation rules run here, before any
+        # native call.
+        from backend.implant_models import field_geometry_issues, field_sequence_issues
         domain = project.get("domain") or {}
         domain_periodic = bool(domain.get("boundaryXY") == "periodic" if project["dimension"] == 3
                                else domain.get("xBoundary") == "periodic")
@@ -4246,6 +4288,14 @@ def execute(input_path: Path, run_dir: Path) -> None:
                 actual_steps, grid_delta=float(domain["gridDelta"]),
                 domain_periodic=domain_periodic)
         ]
+        preflight_messages.extend(
+            message for _index, _path, message in field_geometry_issues(
+                actual_steps, geometry=project.get("geometry"),
+                dimension=int(project["dimension"]), grid_delta=float(domain["gridDelta"]),
+                x_extent=float(domain["xExtent"]),
+                y_extent=float(domain.get("yExtent", 0.0)),
+                from_domain_state=project.get("continuationState") is not None)
+        )
         if preflight_messages:
             raise RuntimeError("; ".join(preflight_messages))
     # Resolve every particle step before CUDA setup. This makes an omitted

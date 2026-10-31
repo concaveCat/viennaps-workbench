@@ -344,6 +344,120 @@ def field_grid_signature(step: Any) -> dict[str, Any]:
     }
 
 
+def initial_geometry_vertical_bounds(geometry: Any,
+                                     dimension: int) -> tuple[float, float] | None:
+    """Return the initial surface ``(top, bottom)`` for a parametric geometry.
+
+    ``Domain.generateCellSet(position, ...)`` takes the *absolute* top of the
+    grid, so a field ``cellSet.height`` below the initial surface top would
+    either clip the surface or (measured on 4.7.0) make the native generator
+    walk the whole surface band down to the requested position and allocate a
+    huge grid. The API can reject such a request statically for every geometry
+    whose vertical extent is fully described by the project.
+
+    ``None`` means the vertical extent is not knowable from the project alone
+    (GDS layout or a saved Domain continuation); the worker still performs the
+    same check against the real surface before allocating.
+    """
+    if not isinstance(geometry, dict):
+        geometry = geometry.model_dump(mode="json", exclude_none=True)
+    kind = geometry.get("kind")
+    if kind == "plane":
+        height = float(geometry.get("height", 0.0))
+        return height, height
+    if kind in {"trench", "hole"}:
+        # MakeTrench/MakeHole: substrate at z=0, opening down to -depth, mask
+        # above z=0 up to maskHeight.
+        return float(geometry.get("maskHeight", 0.0)), -float(geometry.get("depth", 0.0))
+    if kind == "fin":
+        # MakeFin: the fin sits on z=0, the mask on its top.
+        return (float(geometry.get("height", 0.0)) + float(geometry.get("maskHeight", 0.0)),
+                0.0)
+    if kind == "stack":
+        base = float(geometry.get("baseHeight", 0.0))
+        top = base + sum(abs(float(row.get("thickness", 0.0)))
+                         for row in geometry.get("layers") or [])
+        bottom = base
+        mask = geometry.get("gdsMask")
+        if isinstance(mask, dict):
+            position = mask.get("position") or [0.0, 0.0, 0.0]
+            mask_bottom = float(mask.get("baseHeight", 0.0)) + float(position[2])
+            top = max(top, mask_bottom + float(mask.get("height", 0.0)))
+            bottom = min(bottom, mask_bottom)
+        return top, bottom
+    return None
+
+
+def field_geometry_issues(steps: Iterable[Any], *, geometry: Any, dimension: int,
+                          grid_delta: float, x_extent: float, y_extent: float,
+                          from_domain_state: bool = False) -> list[tuple[int, str, str]]:
+    """Return static pre-allocation issues for the first cell-set grid.
+
+    * ``cellSet.height`` is the native **absolute** grid top. A value below the
+      highest initial surface point is rejected instead of letting the native
+      generator build a band from that position up to the surface.
+    * The cell count implied by the surface top/bottom, ``substrateDepth`` and
+      the domain's lateral grid is checked against ``MAX_CELL_SET_CELLS`` before
+      the worker allocates the dense grid.
+
+    GDS geometry and Domain continuations have no project-level vertical extent
+    and are left to the worker's live check.
+    """
+    from .runtime_limits import MAX_CELL_SET_CELLS
+
+    bounds = None if from_domain_state else initial_geometry_vertical_bounds(
+        geometry, dimension)
+    if bounds is None:
+        return []
+    first: tuple[int, Any] | None = None
+    for index, step in enumerate(steps):
+        if step_value(step, "enabled") and step_value(step, "model") in CELL_SET_STEP_MODELS:
+            first = (index, step)
+            break
+    if first is None:
+        return []
+    index, step = first
+    settings = step_cell_set(step) or {}
+    if settings.get("height") is None:
+        return []
+    delta = float(grid_delta)
+    height = float(settings["height"])
+    surface_top, surface_bottom = float(bounds[0]), float(bounds[1])
+    top_node = math.ceil(surface_top / delta - 1e-9) * delta
+    issues: list[tuple[int, str, str]] = []
+    if height + 1e-9 < top_node:
+        issues.append((
+            index, "cellSet.height",
+            f"cellSet.height {height:g} um is below the highest initial surface point "
+            f"{surface_top:g} um; the native generateCellSet position is an absolute coordinate, "
+            "so the field grid would clip the surface (and, below the surface band, the native "
+            "generator allocates the whole band between them). Set cellSet.height above the "
+            "surface or lower the geometry"))
+    substrate = settings.get("substrateDepth")
+    if substrate is None:
+        return issues
+    substrate = float(substrate)
+    nx = max(1, math.ceil(float(x_extent) / delta))
+    ny = (max(1, math.ceil(float(y_extent) / delta)) if int(dimension) == 3 else 1)
+    lateral = (nx + 2) * (ny + 2)
+    bottom_node = math.floor(surface_bottom / delta + 1e-9) * delta
+    band_half = math.ceil(substrate / delta) + 1
+    required_top = max(height, top_node)
+    required_bottom = bottom_node - band_half * delta
+    rows = math.ceil((required_top - required_bottom) / delta) + 4
+    estimate = lateral * max(rows, 2)
+    if estimate > MAX_CELL_SET_CELLS:
+        issues.append((
+            index, "cellSet",
+            f"the field grid would need about {estimate:,} cells between the highest surface "
+            f"point ({surface_top:g} um) and substrateDepth below the deepest point "
+            f"({surface_bottom:g} um), above the {MAX_CELL_SET_CELLS:,}-cell construction limit; "
+            "raise cellSet.height above the surface only as needed, reduce substrateDepth, or "
+            "coarsen gridDelta"))
+    return issues
+
+
+
 def field_sequence_issues(steps: Iterable[Any], *, grid_delta: float,
                           domain_periodic: bool | None = None) -> list[tuple[int, str, str]]:
     """Return ``(step_index, field_path, message)`` for grid-sequence violations.
