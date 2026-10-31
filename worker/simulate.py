@@ -3510,12 +3510,16 @@ def _generate_field_cell_set(ps: Any, source_domain: Any, project: dict[str, Any
                       - band_half * delta)
     bound = _field_grid_cell_bound(project, top=planned_top, bottom=planned_bottom,
                                    delta=delta)
-    if bound > MAX_CELL_SET_CELLS:
+    # GDS/multi-level-set bands can be wider than the analytic band estimate.
+    # Use a conservative guard for the pre-allocation construction limit, then
+    # enforce the hard cell cap on the measured native grid after generation.
+    guard_bound = int(math.ceil(bound * 2.5))
+    if guard_bound > MAX_CELL_SET_CELLS:
         raise RuntimeError(
             f"field cell grid needs at least {bound:,} cells between "
-            f"{planned_bottom:g} and {planned_top:g} um, above the "
-            f"{MAX_CELL_SET_CELLS:,}-cell construction limit; raise cellSet.height above the "
-            "surface only as needed, reduce cellSet.substrateDepth, or coarsen gridDelta")
+            f"{planned_bottom:g} and {planned_top:g} um ({guard_bound:,} with band safety margin), "
+            f"above the {MAX_CELL_SET_CELLS:,}-cell construction limit; raise cellSet.height above "
+            "the surface only as needed, reduce cellSet.substrateDepth, or coarsen gridDelta")
     field_domain = ps.Domain(source_domain)
     original_points = sum(int(level_set.getNumberOfPoints())
                           for level_set in source_domain.getLevelSets())
@@ -3526,9 +3530,10 @@ def _generate_field_cell_set(ps: Any, source_domain: Any, project: dict[str, Any
     if cell_set is None:
         raise RuntimeError("Domain.generateCellSet did not store a native cell set")
     cells = int(cell_set.getNumberOfCells())
-    if cells <= 0 or cells > bound:
+    if cells <= 0 or cells > MAX_CELL_SET_CELLS:
         raise RuntimeError(
-            f"DenseCellSet generation produced {cells} cells, outside the pre-allocation bound {bound}")
+            f"DenseCellSet generation produced {cells} cells, above the hard "
+            f"{MAX_CELL_SET_CELLS:,}-cell limit (pre-allocation estimate {bound})")
     cell_set.buildNeighborhood()
     cell_set.setPeriodicBoundary([bool(periodic), bool(periodic), False] if is3d
                                  else [bool(periodic), False])
@@ -3540,7 +3545,9 @@ def _generate_field_cell_set(ps: Any, source_domain: Any, project: dict[str, Any
             "the generated grid is not a single regular box")
     info = {
         "numberOfCells": cells,
-        "cellsUpperBound": bound,
+        "cellsUpperBound": max(bound, cells),
+        "preAllocationBound": bound,
+        "constructionGuardBound": guard_bound,
         "surfaceTop": surface_top,
         "surfaceBottom": surface_bottom,
         "heightAboveSurface": height,
