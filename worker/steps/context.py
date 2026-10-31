@@ -18,18 +18,30 @@ from typing import Any
 def simulate_module() -> Any:
     """Return the worker module that owns the shared native helpers.
 
-    ``worker/simulate.py`` runs both as an imported module (tests, snapshot
-    materialisers) and as the bounded child script. In script mode the
-    canonical module is ``__main__``; importing it again as ``worker.simulate``
-    would execute the whole worker module a second time and duplicate its
-    module-level state.
+    ``worker/simulate.py`` is reached through three entry points, and each one
+    leaves it in ``sys.modules`` under a different key:
+
+    * ``worker.simulate`` -- tests and snapshot materialisers import it by path;
+    * ``simulate`` -- fixtures and probes put ``worker/`` on ``sys.path`` and use
+      the top-level spelling, which is a *separate* module object carrying its
+      own module-level state (``MATERIAL_IDS``, registered native materials, ...);
+    * ``__main__`` -- the bounded child executes the file as a script.
+
+    Every already-loaded candidate is accepted only when its resolved
+    ``__file__`` is this worker's ``simulate.py``; identity is decided on the
+    resolved path rather than the basename, so an unrelated script that happens
+    to be called ``simulate.py`` cannot win. Only when none matches do we import
+    the canonical name; importing while another entry is live would execute the
+    whole worker module a second time and duplicate its module-level state.
     """
-    main = sys.modules.get("__main__")
-    if main is not None and Path(getattr(main, "__file__", "") or "").name == "simulate.py":
-        return main
-    module = sys.modules.get("worker.simulate")
-    if module is not None:
-        return module
+    target = Path(__file__).resolve().parents[1] / "simulate.py"
+    for name in ("worker.simulate", "simulate", "__main__"):
+        module = sys.modules.get(name)
+        if module is None:
+            continue
+        source = getattr(module, "__file__", None)
+        if source and Path(source).resolve() == target:
+            return module
     return import_module("worker.simulate")
 
 

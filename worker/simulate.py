@@ -954,22 +954,6 @@ def material_map(domain: Any) -> list[int]:
     return [int(mapping.getMaterialIdAtIdx(index)) for index in range(mapping.size())]
 
 
-def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def output_artifact(path: Path, run_dir: Path, run_id: str, step_id: str, kind: str, fmt: str,
-                    **details: Any) -> dict[str, Any]:
-    relative = path.resolve().relative_to(run_dir.resolve()).as_posix()
-    return {"kind": kind, "fileName": relative,
-            "url": f"/api/runs/{run_id}/artifacts/{step_id}?fileName={relative}",
-            "format": fmt, "sizeBytes": path.stat().st_size, "sha256": file_sha256(path), **details}
-
-
 def _levelset_index(path: Path) -> int:
     match = re.search(r"_layer(\d+)\.(?:lvst|vtp)$", path.name)
     if not match:
