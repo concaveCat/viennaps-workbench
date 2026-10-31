@@ -41,7 +41,7 @@ from .routes import (
 from .verification import prefix_compatibility, verify_route_plan_compiles
 
 
-SCHEMA_VERSION = "12"
+SCHEMA_VERSION = "13"
 
 # Reports are HTML documents, not build artifacts: they are small enough to keep
 # in SQLite, but a single report may not grow into a blob and one project may not
@@ -90,7 +90,7 @@ class WorkflowStore:
                         "SELECT value FROM schema_meta WHERE key = 'schema_version'"
                     ).fetchone()
                     if row is not None and row[0] not in {
-                        "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", SCHEMA_VERSION,
+                        "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", SCHEMA_VERSION,
                     }:
                         raise RuntimeError(
                             f"unsupported workflow schema version {row[0]!r}; "
@@ -419,7 +419,7 @@ class WorkflowStore:
                     "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
                     (SCHEMA_VERSION,),
                 )
-            elif version_row["value"] in {"3", "4", "5", "6", "7", "8", "9", "10", "11"}:
+            elif version_row["value"] in {"3", "4", "5", "6", "7", "8", "9", "10", "11", "12"}:
                 connection.execute(
                     "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
                     (SCHEMA_VERSION,),
@@ -2496,7 +2496,7 @@ class WorkflowStore:
                 raise WorkflowNotFound(f"project {project_id!r} does not exist")
 
     # ------------------------------------------------------------------
-    # Per-project workflow state (schema 11)
+    # Per-project workflow state (schema 11; compileBasis added by schema 13)
     # ------------------------------------------------------------------
 
     def get_project_workflow_state(self, project_id: str) -> ProjectWorkflowStateV1:

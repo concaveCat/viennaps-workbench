@@ -21,6 +21,7 @@ from backend.main import app  # noqa: E402
 from backend.workflow.api import get_store  # noqa: E402
 from backend.workflow.metrology import MeasurementResultV1  # noqa: E402
 from backend.workflow.project_state import (  # noqa: E402
+    MAX_COMPILE_BASIS_CHARS,
     MAX_EXPERIMENT_IDS,
     MAX_MEASUREMENT_IDS,
     MAX_SEGMENT_RUNS,
@@ -92,6 +93,7 @@ class ProjectStateStoreTests(unittest.TestCase):
         payload = {
             "schemaVersion": 1,
             "compileId": self.base.compileRecord.compileId,
+            "compileBasis": '{"dimension":2,"steps":[]}',
             "routeId": self.plan.route.routeId,
             "segmentRuns": [
                 {
@@ -109,6 +111,7 @@ class ProjectStateStoreTests(unittest.TestCase):
     def test_unset_state_reads_as_an_empty_document(self) -> None:
         state = self.store.get_project_workflow_state(self.project_id)
         self.assertEqual(state.compileId, None)
+        self.assertIsNone(state.compileBasis)
         self.assertEqual(state.routeId, None)
         self.assertEqual(state.segmentRuns, [])
         self.assertEqual(state.measurementIds, [])
@@ -133,6 +136,52 @@ class ProjectStateStoreTests(unittest.TestCase):
                 (self.project_id,),
             ).fetchone()
         self.assertEqual(count, 1)
+
+    def test_compile_basis_is_stored_verbatim(self) -> None:
+        basis = '{"dimension":2,"domain":{"xExtent":4},"steps":[{"id":"0.01","duration":0.01}]}'
+        saved = self.store.save_project_workflow_state(
+            self.project_id, self.state(compileBasis=basis)
+        )
+        self.assertEqual(saved.compileBasis, basis)
+        self.assertEqual(saved.content()["compileBasis"], basis)
+        loaded = self.store.get_project_workflow_state(self.project_id)
+        self.assertEqual(loaded.compileBasis, basis)
+        with sqlite3.connect(self.store.path) as connection:
+            (raw,) = connection.execute(
+                "SELECT state_json FROM project_workflow_state WHERE project_id = ?",
+                (self.project_id,),
+            ).fetchone()
+        self.assertEqual(json.loads(raw)["compileBasis"], basis)
+
+    def test_legacy_state_without_a_compile_basis_reads_as_null(self) -> None:
+        # Schema 12 states were written before the basis existed.
+        self.store.save_project_workflow_state(self.project_id, self.state())
+        with sqlite3.connect(self.store.path) as connection:
+            (raw,) = connection.execute(
+                "SELECT state_json FROM project_workflow_state WHERE project_id = ?",
+                (self.project_id,),
+            ).fetchone()
+        legacy = json.loads(raw)
+        legacy.pop("compileBasis", None)
+        with sqlite3.connect(self.store.path) as connection:
+            connection.execute(
+                "UPDATE project_workflow_state SET state_json = ? WHERE project_id = ?",
+                (json.dumps(legacy), self.project_id),
+            )
+        loaded = self.store.get_project_workflow_state(self.project_id)
+        self.assertIsNone(loaded.compileBasis)
+        self.assertEqual(loaded.compileId, self.base.compileRecord.compileId)
+
+    def test_compile_basis_length_is_bounded(self) -> None:
+        with self.assertRaises(ValueError):
+            ProjectWorkflowStateV1(compileBasis="x" * (MAX_COMPILE_BASIS_CHARS + 1))
+        accepted = ProjectWorkflowStateV1(compileBasis="x" * MAX_COMPILE_BASIS_CHARS)
+        self.assertEqual(len(accepted.compileBasis or ""), MAX_COMPILE_BASIS_CHARS)
+        with self.assertRaises(ValueError):
+            self.store.save_project_workflow_state(
+                self.project_id,
+                self.state(compileBasis="x" * (MAX_COMPILE_BASIS_CHARS + 1)),
+            )
 
     def test_repeated_identical_put_keeps_updated_at(self) -> None:
         first = self.store.save_project_workflow_state(self.project_id, self.state())
@@ -396,6 +445,72 @@ class ProjectStateMigrationTests(unittest.TestCase):
         )
         self.assertIsNotNone(saved.updatedAt)
 
+    def test_schema_12_database_keeps_its_state_and_gains_the_basis(self) -> None:
+        suffix = uuid.uuid4().hex[:8]
+        path = storage.VAR / f"test-project-state-basis-migrate-{suffix}.sqlite3"
+        store = WorkflowStore(path)
+        store.initialize(seed=False)
+        record, _ = store.create_project(project(f"migrate basis {suffix}"))
+        store.save_project_workflow_state(
+            record["projectId"],
+            {
+                "schemaVersion": 1,
+                "compileId": None,
+                "routeId": None,
+                "segmentRuns": [],
+                "measurementIds": [],
+                "experimentIds": [],
+            },
+        )
+        # A schema-12 row predates compileBasis: strip the field and stamp the
+        # old version. The 12 → 13 migration only updates schema_meta.
+        with sqlite3.connect(path) as connection:
+            (raw,) = connection.execute(
+                "SELECT state_json FROM project_workflow_state WHERE project_id = ?",
+                (record["projectId"],),
+            ).fetchone()
+            document = json.loads(raw)
+            document.pop("compileBasis", None)
+            connection.execute(
+                "UPDATE project_workflow_state SET state_json = ? WHERE project_id = ?",
+                (json.dumps(document), record["projectId"]),
+            )
+            connection.execute(
+                "UPDATE schema_meta SET value = '12' WHERE key = 'schema_version'"
+            )
+        self.assertNotEqual(SCHEMA_VERSION, "12")
+
+        upgraded = WorkflowStore(path)
+        upgraded.initialize(seed=False)
+        self.assertEqual(upgraded.schema_version(), SCHEMA_VERSION)
+        with sqlite3.connect(path) as connection:
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+        self.assertIn("project_workflow_state", tables)
+        loaded = upgraded.get_project_workflow_state(record["projectId"])
+        self.assertIsNone(loaded.compileBasis)
+        saved = upgraded.save_project_workflow_state(
+            record["projectId"],
+            {
+                "schemaVersion": 1,
+                "compileId": None,
+                "compileBasis": "basis-after-migration",
+                "routeId": None,
+                "segmentRuns": [],
+                "measurementIds": [],
+                "experimentIds": [],
+            },
+        )
+        self.assertEqual(saved.compileBasis, "basis-after-migration")
+        self.assertEqual(
+            upgraded.get_project_workflow_state(record["projectId"]).compileBasis,
+            "basis-after-migration",
+        )
+
 
 class ProjectStateApiTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
@@ -443,6 +558,7 @@ class ProjectStateApiTests(unittest.IsolatedAsyncioTestCase):
         payload = {
             "schemaVersion": 1,
             "compileId": self.base.compileRecord.compileId,
+            "compileBasis": '{"dimension":2,"steps":[]}',
             "routeId": self.plan.route.routeId,
             "segmentRuns": [
                 {
@@ -464,6 +580,7 @@ class ProjectStateApiTests(unittest.IsolatedAsyncioTestCase):
         body = json_body(response)
         self.assertEqual(body["schemaVersion"], 1)
         self.assertIsNone(body["compileId"])
+        self.assertIsNone(body["compileBasis"])
         self.assertIsNone(body["routeId"])
         self.assertEqual(body["segmentRuns"], [])
         self.assertEqual(body["measurementIds"], [])
@@ -476,6 +593,7 @@ class ProjectStateApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first[0], 200, first[2])
         saved = json_body(first)
         self.assertEqual(saved["compileId"], self.base.compileRecord.compileId)
+        self.assertEqual(saved["compileBasis"], '{"dimension":2,"steps":[]}')
         self.assertEqual(saved["routeId"], self.plan.route.routeId)
         self.assertIsNotNone(saved["updatedAt"])
 
@@ -486,6 +604,24 @@ class ProjectStateApiTests(unittest.IsolatedAsyncioTestCase):
         repeated = await self.put(f"{PROJECTS}/{project_id}/state", self.state())
         self.assertEqual(repeated[0], 200, repeated[2])
         self.assertEqual(json_body(repeated)["updatedAt"], saved["updatedAt"])
+
+    async def test_compile_basis_round_trip_and_clearing(self) -> None:
+        project_id = await self.new_project()
+        basis = "sha256:" + "a" * 64
+        saved = json_body(await self.put(
+            f"{PROJECTS}/{project_id}/state", self.state(compileBasis=basis)
+        ))
+        self.assertEqual(saved["compileBasis"], basis)
+        # Omitting the field clears it again: null is a legal value.
+        cleared = json_body(await self.put(
+            f"{PROJECTS}/{project_id}/state", self.state(compileBasis=None)
+        ))
+        self.assertIsNone(cleared["compileBasis"])
+        too_long = await self.put(
+            f"{PROJECTS}/{project_id}/state",
+            self.state(compileBasis="x" * (MAX_COMPILE_BASIS_CHARS + 1)),
+        )
+        self.assertEqual(too_long[0], 422, too_long[2])
 
     async def test_dangling_reference_is_422_with_the_id(self) -> None:
         project_id = await self.new_project()

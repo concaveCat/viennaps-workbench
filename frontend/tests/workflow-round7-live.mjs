@@ -17,6 +17,7 @@ import { mkdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
+import { executionCompileBasis } from '../src/workflow/fingerprint.ts';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const baseUrl = (process.env.WORKBENCH_URL ?? 'http://127.0.0.1:8991').replace(/\/$/, '');
@@ -89,6 +90,7 @@ const routeA = await postJson('/api/v1/workflow/routes/from-compile', {
 await putJson(`/api/v1/workflow/projects/${recordA.projectId}/state`, {
   schemaVersion: 1,
   compileId: compiledA.compileId,
+  compileBasis: executionCompileBasis(staleProject),
   routeId: routeA.plan.route.routeId,
   segmentRuns: [],
   measurementIds: [],
@@ -140,7 +142,8 @@ const measurementB = finishedB.variants[0].replicates[0].measurementId;
 assert.ok(measurementB, 'the experiment must produce a measurement');
 const recordB = await postJson('/api/v1/workflow/projects', projectB);
 await putJson(`/api/v1/workflow/projects/${recordB.projectId}/state`, {
-  schemaVersion: 1, compileId: compiledB.compileId, routeId: routeB.plan.route.routeId,
+  schemaVersion: 1, compileId: compiledB.compileId,
+  compileBasis: executionCompileBasis(projectB), routeId: routeB.plan.route.routeId,
   segmentRuns: [], measurementIds: [measurementB], experimentIds: [experimentB.experimentId],
 });
 

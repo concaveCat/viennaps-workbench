@@ -1,6 +1,7 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import './workflow.css';
 import { SAMPLE_2D_PLANE, SAMPLE_2D_TRENCH, SAMPLE_3D_HOLE } from './samples';
+import { executionCompileBasis } from './fingerprint';
 import WorkflowViewer3D from './viewer3d/WorkflowViewer3D';
 import type { Viewer3DMarker, Viewer3DStats } from './viewer3d/types';
 
@@ -42,6 +43,8 @@ type ProjectRecord = {
 type ProjectWorkflowState = {
   schemaVersion: 1;
   compileId: string | null;
+  /** Opaque fingerprint of the authored project when the saved Compile ran. */
+  compileBasis: string | null;
   routeId: string | null;
   segmentRuns: Array<{ segmentId: string; runId: string; measurementId: string | null }>;
   measurementIds: string[];
@@ -603,7 +606,10 @@ const LIBRARY_CATEGORY_SHORT: Record<LibraryCategory, string> = {
 
 /** Empty `ProjectWorkflowStateV1`; unset server state reads exactly like this. */
 function emptyWorkflowState(): ProjectWorkflowState {
-  return { schemaVersion: 1, compileId: null, routeId: null, segmentRuns: [], measurementIds: [], experimentIds: [] };
+  return {
+    schemaVersion: 1, compileId: null, compileBasis: null, routeId: null,
+    segmentRuns: [], measurementIds: [], experimentIds: [],
+  };
 }
 
 /** Strip server-owned timestamps so a re-save of identical content stays a no-op. */
@@ -611,6 +617,7 @@ function workflowStatePayload(state: ProjectWorkflowState) {
   return {
     schemaVersion: 1 as const,
     compileId: state.compileId,
+    compileBasis: state.compileBasis,
     routeId: state.routeId,
     segmentRuns: state.segmentRuns,
     measurementIds: state.measurementIds,
@@ -752,117 +759,6 @@ const COMPARE_CANDIDATE_LIMIT = 4;
 
 function candidateKey(row: { runId: string; stepId: string }): string {
   return `${row.runId}:${row.stepId}`;
-}
-
-/**
- * Solver fields the backend fills in when a project is saved or compiled
- * (`SolverV7` defaults). A raw imported project omits them, so both sides of a
- * fingerprint comparison are padded before hashing; otherwise an unchanged
- * project would look edited right after its first save.
- */
-const SOLVER_EXECUTION_DEFAULTS = {
-  timeoutSeconds: 0,
-  advection: {
-    spatialScheme: 'ENGQUIST_OSHER_1ST_ORDER',
-    temporalScheme: 'FORWARD_EULER',
-    adaptiveTimeStepping: false,
-    adaptiveTimeStepSubdivisions: 20,
-    calculateIntermediateVelocities: false,
-    checkDissipation: true,
-    dissipationAlpha: 1.0,
-    ignoreVoids: false,
-    velocityOutput: false,
-  },
-  rayTracing: {
-    diskRadius: 0.0,
-    ignoreFluxBoundaries: false,
-    maxBoundaryHits: 1000,
-    maxReflections: 4294967295,
-    minNodeDistanceFactor: 0.05,
-    normalizationType: 'SOURCE',
-    smoothingNeighbors: 1,
-  },
-};
-
-function normalizeSolverForFingerprint(solver: unknown): Record<string, unknown> {
-  const raw = (solver && typeof solver === 'object' ? solver : {}) as Record<string, unknown>;
-  const advection = (raw.advection && typeof raw.advection === 'object' ? raw.advection : {}) as Record<string, unknown>;
-  const rayTracing = (raw.rayTracing && typeof raw.rayTracing === 'object' ? raw.rayTracing : {}) as Record<string, unknown>;
-  return {
-    ...SOLVER_EXECUTION_DEFAULTS,
-    ...raw,
-    advection: { ...SOLVER_EXECUTION_DEFAULTS.advection, ...advection },
-    rayTracing: { ...SOLVER_EXECUTION_DEFAULTS.rayTracing, ...rayTracing },
-  };
-}
-
-/**
- * Execution fingerprint of a project: only the fields that change what a
- * Compile/Run actually does. Labels (name/view/timestamps) are ignored, null
- * defaults are dropped, and a compiled envelope's generated step ids are
- * mapped back to their authored ids through the source map. A fresh Compile of
- * the same project therefore compares equal, while an edited duration does not.
- */
-function executionProjectFingerprint(
-  document: ProjectDoc | CompiledEnvelope['project'] | null | undefined,
-  sourceMap?: Array<{ stepId: string; authoredStepId: string }>,
-): string {
-  if (!document) return '';
-  const authoredByCompiled = new Map((sourceMap ?? []).map(entry => [entry.stepId, entry.authoredStepId]));
-  const normalize = (value: unknown): unknown => {
-    if (Array.isArray(value)) return value.map(normalize);
-    if (value && typeof value === 'object') {
-      const result: Record<string, unknown> = {};
-      for (const key of Object.keys(value as Record<string, unknown>).sort()) {
-        const item = (value as Record<string, unknown>)[key];
-        if (item === null || item === undefined) continue;
-        result[key] = normalize(item);
-      }
-      return result;
-    }
-    return value;
-  };
-  const raw = document as Record<string, unknown>;
-  const steps = Array.isArray(raw.steps) ? raw.steps as Array<Record<string, unknown>> : [];
-  const normalizedSteps = steps.map(step => {
-    const copy: Record<string, unknown> = { ...step };
-    if (typeof copy.id === 'string') copy.id = authoredByCompiled.get(copy.id) ?? copy.id;
-    delete copy.name;
-    return normalize(copy);
-  });
-  return JSON.stringify(normalize({
-    dimension: raw.dimension,
-    domain: raw.domain,
-    geometry: raw.geometry,
-    steps: normalizedSteps,
-    solver: normalizeSolverForFingerprint(raw.solver),
-  }));
-}
-
-/** True when a restored Compile still describes exactly what the project will run. */
-function compileMatchesProject(document: ProjectDoc | null | undefined, compile: CompileInfo | null): boolean {
-  if (!document || !compile) return false;
-  return executionProjectFingerprint(document)
-    === executionProjectFingerprint(compile.compile.project as ProjectDoc, compile.compile.sourceMap);
-}
-
-/**
- * A module/definition Compile expands its own steps: the source map's authored
- * ids do not exist in `project.steps`, so a project fingerprint comparison is
- * meaningless. Such a Compile is trusted on restore and invalidated only by the
- * edit actions that call `setCompileStale(true)`.
- */
-function isDefinitionCompile(
-  document: ProjectDoc | null | undefined,
-  sourceMap: Array<{ stepId: string; authoredStepId: string }> | undefined,
-): boolean {
-  const authoredIds = new Set((document?.steps ?? []).map(step => step.id));
-  const entries = sourceMap ?? [];
-  if (!authoredIds.size || !entries.length) return false;
-  // A normal Compile maps authored ids that still exist in project.steps (a
-  // deleted step leaves the others). A definition Compile has no overlap at
-  // all, because its authored ids are module step ids.
-  return entries.every(entry => !authoredIds.has(entry.authoredStepId));
 }
 
 function metricMethodLabel(method: string): string {
@@ -1936,6 +1832,10 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     const next: ProjectWorkflowState = {
       ...emptyWorkflowState(),
       compileId: stored.compileId ?? null,
+      // Only a non-empty string is a basis; older states stored no field at all.
+      compileBasis: typeof stored.compileBasis === 'string' && stored.compileBasis
+        ? stored.compileBasis
+        : null,
       routeId: stored.routeId ?? null,
       segmentRuns: stored.segmentRuns ?? [],
       measurementIds: stored.measurementIds ?? [],
@@ -1994,47 +1894,38 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
           : null;
         // A branch attempt keeps the base Route but compiles a derived project
         // (e.g. the tail step 0.01 → 0.04). The head attempt's Compile is the
-        // one that will run, so it must not be judged against the base project.
+        // one that will run, so restore that one to keep the branch executable.
+        // Whether it is stale is decided by the compile basis alone.
         const branchCompileId = headAttempt && baseAttempt
           && headAttempt.compileId !== baseAttempt.compileId
           ? headAttempt.compileId
           : '';
         let info = compileInfoFromEnvelope(envelope);
-        let matches: boolean;
         if (branchCompileId) {
           if (branchCompileId !== next.compileId) {
             const branchEnvelope = await api<CompiledEnvelope>(`/api/v1/workflow/compiles/${branchCompileId}`);
             info = compileInfoFromEnvelope(branchEnvelope);
           }
-          // The reused prefix still has to describe the current project; the
-          // changed tail is expected to differ from the base project.
-          matches = true;
-          if (baseAttempt && baseAttempt.compileId !== branchCompileId) {
-            try {
-              const baseEnvelope = await api<CompiledEnvelope>(`/api/v1/workflow/compiles/${baseAttempt.compileId}`);
-              matches = !!currentDocument
-                && executionProjectFingerprint(currentDocument)
-                  === executionProjectFingerprint(baseEnvelope.project, baseEnvelope.sourceMap);
-            } catch { /* the base Compile was pruned: trust the branch attempt */ }
-          }
           next.compileId = branchCompileId;
-        } else if (isDefinitionCompile(currentDocument, envelope.sourceMap)) {
-          // A definition Compile expands steps that are not in project.steps.
-          matches = true;
-        } else {
-          // The saved Compile only describes the project as it was compiled.
-          // If 01/02 changed afterwards (and was saved), restoring it as
-          // "fresh" would route and execute the stale durations.
-          matches = !!currentDocument
-            && executionProjectFingerprint(currentDocument)
-              === executionProjectFingerprint(envelope.project, envelope.sourceMap);
         }
         setCompile(info);
-        setCompileStale(!matches);
-        if (!matches) notices.push('工程在编译后有修改，需重新编译。');
+        // The basis is the fingerprint of the authored project at compile
+        // time, so it is the only input to staleness. A definition/branch
+        // Compile expands or rewrites steps, so comparing its envelope with
+        // project.steps is exactly the guesswork this field replaces.
+        if (!next.compileBasis) {
+          setCompileStale(true);
+          notices.push('旧状态缺少编译基线，请重新编译。');
+        } else {
+          const fresh = !!currentDocument
+            && next.compileBasis === executionCompileBasis(currentDocument);
+          setCompileStale(!fresh);
+          if (!fresh) notices.push('工程在编译后有修改，需重新编译。');
+        }
       } catch (exc) {
         if ((exc as { status?: number }).status === 404) {
           next.compileId = null;
+          next.compileBasis = null;
           notices.push('上次编译记录已不可用，已清空编译状态。');
         } else {
           notices.push(`编译记录恢复失败：${exc instanceof Error ? exc.message : String(exc)}`);
@@ -2120,9 +2011,14 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   };
 
   /** Replace the 03 pointer set after a compile/route/segment/measurement change. */
-  const recordCompile = (compileId: string) => {
+  /**
+   * Point the state at a fresh Compile and record its basis: the fingerprint
+   * of the authored project that was sent to the compiler, never of the
+   * Compile's expanded/derived steps.
+   */
+  const recordCompile = (compileId: string, basis: string) => {
     setProjectState(previous => ({
-      ...previous, compileId, routeId: null, segmentRuns: [],
+      ...previous, compileId, compileBasis: basis, routeId: null, segmentRuns: [],
     }));
   };
 
@@ -2211,13 +2107,13 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   /**
    * A saved edit must invalidate the Compile immediately: otherwise 02 keeps
    * offering "去 03" and the old Compile silently runs the previous durations.
-   * Definition Compiles expand steps that are not in `project.steps`, so they
-   * are left to the edit actions instead of being compared by fingerprint.
+   * Saving never moves the basis — only a recompile does — so the stored basis
+   * is compared with the server-normalized document that was just saved.
    */
   const refreshCompileStaleness = (document: ProjectDoc) => {
     if (!compile) return;
-    if (isDefinitionCompile(document, compile.compile.sourceMap)) return;
-    setCompileStale(!compileMatchesProject(document, compile));
+    const basis = projectState.compileBasis;
+    setCompileStale(!basis || basis !== executionCompileBasis(document));
   };
 
   /** The document that actually goes to the server: geometry follows the 01 source tab. */
@@ -3120,7 +3016,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setCompile(result);
     setCompileStale(false);
     setRestoreNotice('');
-    recordCompile(result.compileId);
+    recordCompile(result.compileId, executionCompileBasis(document));
     setProject(previous => previous
       ? { ...previous, steps: (result.authoredSteps ?? previous.steps ?? []) as ProjectStep[] }
       : previous);
@@ -3162,7 +3058,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     });
     if (compile) setPreviousCompile(compile);
     setCompile(result); setCompileStale(false); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);
-    recordCompile(result.compileId);
+    recordCompile(result.compileId, executionCompileBasis(project));
     setProject(previous => previous ? { ...previous, steps: (result.authoredSteps ?? previous.steps ?? []) as ProjectStep[] } : previous);
   });
 
@@ -3427,7 +3323,11 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     const adopted = await postJson<CompileInfo>('/api/v1/workflow/flows/from-project', { project: cloned, flowId: compile.flowId });
     setCompile(adopted);
     setCompileStale(false);
-    setProjectState(previous => ({ ...previous, compileId: adopted.compileId }));
+    // The branch Compile rewrites the tail duration; the basis still describes
+    // the authored project, so an unchanged save keeps the branch runnable.
+    setProjectState(previous => ({
+      ...previous, compileId: adopted.compileId, compileBasis: executionCompileBasis(project),
+    }));
     const result = await postJson<{ plan: RoutePlan }>(`/api/v1/workflow/routes/${route.route.routeId}/branches`, {
       compileId: adopted.compileId, startAfterStepId: prefix.id, changedStepIds: [tail.id],
     });
@@ -3866,7 +3766,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     });
     if (compile) setPreviousCompile(compile);
     setCompile(result); setCompileStale(false); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);
-    recordCompile(result.compileId);
+    recordCompile(result.compileId, executionCompileBasis(nextProject));
     setProject(previous => previous
       ? { ...previous, steps: (result.authoredSteps ?? previous.steps ?? []) as ProjectStep[] }
       : previous);
@@ -3930,7 +3830,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     );
     if (compile) setPreviousCompile(compile);
     setCompile(result); setCompileStale(false); setRoute(null); setSegment(null); setMeasurement(null); setProvenance(null);
-    recordCompile(result.compileId);
+    recordCompile(result.compileId, executionCompileBasis(project));
     setModuleStatus(`模块化流程已编译 · ${result.stepCount} 步`);
   });
 

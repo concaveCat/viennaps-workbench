@@ -20,6 +20,7 @@ import { mkdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
+import { executionCompileBasis } from '../src/workflow/fingerprint.ts';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const baseUrl = (process.env.WORKBENCH_URL ?? 'http://127.0.0.1:8991').replace(/\/$/, '');
@@ -118,6 +119,7 @@ assert.equal(branchSegment.sourceCompileId, derived.compileId);
 await putJson(`/api/v1/workflow/projects/${recordB.projectId}/state`, {
   schemaVersion: 1,
   compileId: compiledBase.compileId,
+  compileBasis: executionCompileBasis(projectB),
   routeId: routeB.plan.route.routeId,
   segmentRuns: [{ segmentId: prefixSegment.segmentId, runId: prefixDone.runId, measurementId: null }],
   measurementIds: [],
@@ -158,7 +160,8 @@ const localStepIds = new Set(projectC.steps.map(step => step.id));
 assert.ok(compiledC.compile.sourceMap.some(entry => !localStepIds.has(entry.authoredStepId)),
   'the definition Compile must expand steps outside project.steps');
 await putJson(`/api/v1/workflow/projects/${recordC.projectId}/state`, {
-  schemaVersion: 1, compileId: compiledC.compileId, routeId: null,
+  schemaVersion: 1, compileId: compiledC.compileId,
+  compileBasis: executionCompileBasis(projectC), routeId: null,
   segmentRuns: [], measurementIds: [], experimentIds: [],
 });
 
@@ -202,7 +205,8 @@ const measurementD = finishedD.variants[0].replicates[0].measurementId;
 assert.ok(measurementD, 'the experiment must produce a measurement');
 const recordD = await postJson('/api/v1/workflow/projects', projectD);
 await putJson(`/api/v1/workflow/projects/${recordD.projectId}/state`, {
-  schemaVersion: 1, compileId: compiledD.compileId, routeId: routeD.plan.route.routeId,
+  schemaVersion: 1, compileId: compiledD.compileId,
+  compileBasis: executionCompileBasis(projectD), routeId: routeD.plan.route.routeId,
   segmentRuns: [], measurementIds: [measurementD], experimentIds: [experimentD.experimentId],
 });
 

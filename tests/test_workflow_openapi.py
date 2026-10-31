@@ -98,6 +98,7 @@ class WorkflowOpenApiTests(unittest.TestCase):
         for field in (
             "schemaVersion",
             "compileId",
+            "compileBasis",
             "routeId",
             "segmentRuns",
             "measurementIds",
@@ -105,6 +106,9 @@ class WorkflowOpenApiTests(unittest.TestCase):
             "updatedAt",
         ):
             self.assertIn(field, project_state["properties"])
+        self.assertEqual(
+            project_state["properties"]["compileBasis"]["anyOf"][0]["maxLength"], 128
+        )
         segment_run = schema["components"]["schemas"]["ProjectWorkflowSegmentRunV1"]
         self.assertFalse(segment_run.get("additionalProperties", False))
         for field in ("segmentId", "runId", "measurementId"):
