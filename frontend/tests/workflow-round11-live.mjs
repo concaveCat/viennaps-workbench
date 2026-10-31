@@ -331,6 +331,14 @@ try {
   await lastChip.click();
   await page.locator('.wf-structure-canvas').waitFor({ timeout: 60000 });
   assert.match(await page.locator('.wf-structure-head .wf-structure-step').innerText(), /five/);
+  // The 2D structure labels are screen-sized: no 30–40px world-unit text.
+  const round11Text = await page.locator('.wf-structure-canvas').first().evaluate(svg => {
+    const heights = Array.from(svg.querySelectorAll('.wf-tick-label, .wf-axis-title--x, .wf-scale-label'))
+      .map(node => node.getBoundingClientRect().height).filter(height => height > 0);
+    return { maxHeight: heights.length ? Math.max(...heights) : 0, count: heights.length };
+  });
+  assert.ok(round11Text.count >= 4 && round11Text.maxHeight > 0 && round11Text.maxHeight <= 14,
+    `03 structure labels must stay <= 14px on screen, got ${JSON.stringify(round11Text)}`);
   await page.screenshot({ path: path.join(shotDir, 'round11-timeline-executed.png'), fullPage: true });
 
   // ---- C fallback: a Compile that drops an enabled step blocks Route ------

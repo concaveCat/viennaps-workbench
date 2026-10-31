@@ -1,4 +1,5 @@
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
+import type { PointerEvent as ReactPointerEvent } from 'react';
 import './workflow.css';
 import { SAMPLE_2D_PLANE, SAMPLE_2D_TRENCH, SAMPLE_3D_HOLE } from './samples';
 import { executionCompileBasis } from './fingerprint';
@@ -1314,7 +1315,40 @@ function structureFillPolygons(view: CandidateView, points: Array<[number, numbe
   return fills;
 }
 
-function StructureCanvas({ view, frame, axis = 'xy', marker = null, note = null, label, className = 'wf-structure-canvas', showAxes = true }: {
+/** Rendered pixels per world unit for the 2D structure SVG.
+ *
+ * The SVG is stretched to its container, so a font size expressed in world
+ * coordinates grows with the container. Text, ticks and strokes therefore have
+ * to be solved from the *rendered* size: pick a font that measures `targetPx`
+ * on screen, then let the margins follow the font. Since
+ * `scale = min(width / (data + margins))` and the margins are proportional to
+ * `1 / scale`, a few fixed-point iterations converge quickly.
+ */
+function structureCanvasScale(
+  width: number, height: number, dataWidth: number, dataHeight: number,
+  targetPx: number, marginX: number, marginY: number,
+): number {
+  if (!(width > 0) || !(height > 0) || !(dataWidth > 0) || !(dataHeight > 0)) return 0;
+  let scale = Math.min(width / dataWidth, height / dataHeight);
+  for (let step = 0; step < 6; step += 1) {
+    if (!(scale > 0) || !Number.isFinite(scale)) return 0;
+    const font = targetPx / scale;
+    const next = Math.min(width / (dataWidth + marginX * font), height / (dataHeight + marginY * font));
+    if (!(next > 0) || !Number.isFinite(next)) return 0;
+    if (Math.abs(next - scale) <= scale * 1e-6) return next;
+    scale = next;
+  }
+  return scale;
+}
+
+// 10.5px keeps the measured text box (font ascent + descent) at ~14px while
+// still reading as the intended 11px label size.
+const STRUCTURE_FONT_PX = 10.5;
+const STRUCTURE_COMPACT_FONT_PX = 8;
+const STRUCTURE_MIN_ZOOM = 0.5;
+const STRUCTURE_MAX_ZOOM = 20;
+
+function StructureCanvas({ view, frame, axis = 'xy', marker = null, note = null, label, className = 'wf-structure-canvas', showAxes = true, compact = false, interactive = true }: {
   view: CandidateView;
   frame: StructureFrame;
   axis?: StructureAxis;
@@ -1324,27 +1358,175 @@ function StructureCanvas({ view, frame, axis = 'xy', marker = null, note = null,
   label: string;
   className?: string;
   showAxes?: boolean;
+  /** Candidate cards in 05: smaller labels, no second set of zoom controls. */
+  compact?: boolean;
+  /** 03 only: wheel zoom, drag pan, double-click reset and compact buttons. */
+  interactive?: boolean;
 }) {
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const clipId = `wf-structure-clip-${useId().replace(/[^a-zA-Z0-9_-]/g, '')}`;
+  const [rendered, setRendered] = useState({ width: 0, height: 0 });
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [dragging, setDragging] = useState(false);
+  const viewRef = useRef({ zoom: 1, pan: { x: 0, y: 0 } });
+  const dragRef = useRef<{ x: number; y: number; panX: number; panY: number } | null>(null);
+  const rafRef = useRef<number | null>(null);
+  const pendingRef = useRef<{ zoom: number; pan: { x: number; y: number } } | null>(null);
+
+  // Measure the stretched SVG so the font is derived from real pixels instead
+  // of the world span (a wide container must not produce 40px labels).
+  useEffect(() => {
+    const node = svgRef.current;
+    if (!node) return;
+    const measure = () => {
+      const width = node.clientWidth || node.getBoundingClientRect().width;
+      const height = node.clientHeight || node.getBoundingClientRect().height;
+      setRendered(previous => (Math.abs(previous.width - width) < 0.5 && Math.abs(previous.height - height) < 0.5)
+        ? previous
+        : { width, height });
+    };
+    measure();
+    if (typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+
+  const applyView = useCallback((next: { zoom: number; pan: { x: number; y: number } }) => {
+    viewRef.current = next;
+    setZoom(next.zoom);
+    setPan(next.pan);
+  }, []);
+
+  const resetView = useCallback(() => {
+    if (pendingRef.current !== null) pendingRef.current = null;
+    if (rafRef.current !== null) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
+    if (viewRef.current.zoom === 1 && viewRef.current.pan.x === 0 && viewRef.current.pan.y === 0) return;
+    applyView({ zoom: 1, pan: { x: 0, y: 0 } });
+  }, [applyView]);
+
+  // A different step, snapshot or view axis must not inherit the old zoom.
+  useEffect(() => { resetView(); }, [view, axis, resetView]);
+
+  // Wheel/drag updates are coalesced into one state commit per animation frame.
+  const queueView = useCallback((next: { zoom: number; pan: { x: number; y: number } }) => {
+    pendingRef.current = next;
+    if (rafRef.current !== null) return;
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = null;
+      const pending = pendingRef.current;
+      pendingRef.current = null;
+      if (pending) applyView(pending);
+    });
+  }, [applyView]);
+
+  useEffect(() => () => {
+    if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+  }, []);
+
+  useEffect(() => {
+    const node = svgRef.current;
+    if (!node || !interactive) return;
+    const onWheel = (event: WheelEvent) => {
+      event.preventDefault();
+      const delta = event.deltaMode === 1
+        ? event.deltaY * 16
+        : event.deltaMode === 2 ? event.deltaY * 400 : event.deltaY;
+      if (!delta) return;
+      const current = pendingRef.current ?? viewRef.current;
+      const nextZoom = Math.min(STRUCTURE_MAX_ZOOM, Math.max(STRUCTURE_MIN_ZOOM, current.zoom * Math.exp(-delta * 0.0015)));
+      if (Math.abs(nextZoom - current.zoom) < 1e-9) return;
+      queueView({ zoom: nextZoom, pan: current.pan });
+    };
+    node.addEventListener('wheel', onWheel, { passive: false });
+    return () => node.removeEventListener('wheel', onWheel);
+  }, [interactive, queueView]);
+
+  const zoomBy = (factor: number) => {
+    const current = viewRef.current;
+    queueView({
+      zoom: Math.min(STRUCTURE_MAX_ZOOM, Math.max(STRUCTURE_MIN_ZOOM, current.zoom * factor)),
+      pan: current.pan,
+    });
+  };
+
+  const onPointerDown = (event: ReactPointerEvent<SVGSVGElement>) => {
+    if (!interactive || (event.pointerType === 'mouse' && event.button !== 0)) return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    dragRef.current = {
+      x: event.clientX, y: event.clientY,
+      panX: viewRef.current.pan.x, panY: viewRef.current.pan.y,
+    };
+    setDragging(true);
+  };
+  const onPointerMove = (event: ReactPointerEvent<SVGSVGElement>) => {
+    const drag = dragRef.current;
+    if (!drag || !interactive) return;
+    const current = pendingRef.current ?? viewRef.current;
+    queueView({
+      zoom: current.zoom,
+      pan: { x: drag.panX + (event.clientX - drag.x), y: drag.panY + (event.clientY - drag.y) },
+    });
+  };
+  const endDrag = (event: ReactPointerEvent<SVGSVGElement>) => {
+    if (!dragRef.current) return;
+    dragRef.current = null;
+    setDragging(false);
+    if (event.currentTarget.hasPointerCapture?.(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  };
+
   const axes = structureAxes(view, axis);
   const span = Math.max(frame.maxU - frame.minU, frame.maxV - frame.minV);
-  const fontSize = span / 32;
-  const strokeWidth = span / 220;
+  const dataWidth = Math.max(frame.maxU - frame.minU, 1e-9);
+  const dataHeight = Math.max(frame.maxV - frame.minV, 1e-9);
+  const targetPx = compact ? STRUCTURE_COMPACT_FONT_PX : STRUCTURE_FONT_PX;
+  // Total margin factors (left + right / top + bottom) in font-size units.
+  const marginXFactor = showAxes ? 5.2 + 0.6 : 0.6;
+  const marginYFactor = showAxes ? 1.9 + 3.9 : 0.6;
+  const baseScale = structureCanvasScale(
+    rendered.width, rendered.height, dataWidth, dataHeight, targetPx, marginXFactor, marginYFactor,
+  );
+  // Zoom shrinks the world extent; the font shrinks with it so the rendered
+  // text keeps its screen size. A zero-width container falls back to a sane
+  // world-space size instead of the old span/32 giant labels.
+  const fontSize = baseScale > 0 ? targetPx / (baseScale * zoom) : span / 90;
+  // 1 CSS pixel expressed in world units: strokes stay ~1–1.5px on screen.
+  const unitPx = baseScale > 0 ? 1 / (baseScale * zoom) : span / 900;
+  const strokeWidth = unitPx;
+  const tickHalo = unitPx * 1.8;
   const colorOf = (materialId: number | undefined): string => {
     const entry = materialId === undefined ? undefined : view.materials?.[String(materialId)];
     return isHexColor(entry?.color ?? '') ? String(entry?.color) : '#9aa3ab';
   };
-  const uTicks = showAxes ? axisTicks(frame.minU, frame.maxU) : [];
-  const vTicks = showAxes ? axisTicks(frame.minV, frame.maxV) : [];
   const points = view.points.map(point => structurePoint(point, axes));
   const fills = structureFillPolygons(view, points);
+  // Zoom keeps the plot center fixed; the pan offset is expressed in screen
+  // pixels and converted to world units with the *current* rendered scale.
+  const centerU = (frame.minU + frame.maxU) / 2;
+  const centerV = (frame.minV + frame.maxV) / 2;
+  const currentScale = baseScale > 0 ? baseScale * zoom : 0;
+  const panU = currentScale > 0 ? pan.x / currentScale : 0;
+  const panV = currentScale > 0 ? pan.y / currentScale : 0;
+  const viewFrame: StructureFrame = {
+    minU: centerU - dataWidth / zoom / 2 - panU,
+    maxU: centerU + dataWidth / zoom / 2 - panU,
+    minV: centerV - dataHeight / zoom / 2 + panV,
+    maxV: centerV + dataHeight / zoom / 2 + panV,
+    unit: frame.unit,
+    flatV: frame.flatV,
+  };
+  const uTicks = showAxes ? axisTicks(viewFrame.minU, viewFrame.maxU) : [];
+  const vTicks = showAxes ? axisTicks(viewFrame.minV, viewFrame.maxV) : [];
   // Plot area in SVG coordinates (y grows downwards). `fillBottom` stays in data
   // coordinates because the fills are mapped with `-y`.
-  const plotLeft = frame.minU;
-  const plotRight = frame.maxU;
-  const plotTop = -frame.maxV;
-  const plotBottom = -frame.minV;
-  const fillBottom = frame.minV;
-  const tickHalo = fontSize * 0.1;
+  const plotLeft = viewFrame.minU;
+  const plotRight = viewFrame.maxU;
+  const plotTop = -viewFrame.maxV;
+  const plotBottom = -viewFrame.minV;
+  const fillBottom = viewFrame.minV;
   // Margins live outside the plot so the axis titles, the tick labels, the
   // scale bar and the depth/surface note never sit on the structure or on each
   // other (N7).
@@ -1353,7 +1535,7 @@ function StructureCanvas({ view, frame, axis = 'xy', marker = null, note = null,
   const marginTop = showAxes ? fontSize * 1.9 : fontSize * 0.3;
   const marginBottom = showAxes ? fontSize * 3.9 : fontSize * 0.3;
   const barLength = (() => {
-    const ticks = uTicks.length > 1 ? uTicks : [frame.minU, frame.maxU];
+    const ticks = uTicks.length > 1 ? uTicks : [viewFrame.minU, viewFrame.maxU];
     return Math.abs(ticks[1] - ticks[0]) || span / 4;
   })();
   const barRight = plotRight;
@@ -1363,16 +1545,30 @@ function StructureCanvas({ view, frame, axis = 'xy', marker = null, note = null,
   const xTitleY = plotBottom + fontSize * 3.35;
   const vTitleX = plotLeft - fontSize * 4.3;
   const vTitleY = (plotTop + plotBottom) / 2;
-  const axisTitle = `${axes.verticalLabel} (${frame.unit})`;
-  const horizontalTitle = axes.is2D ? `X (${frame.unit})` : `${axis.toUpperCase().charAt(0)} (${frame.unit})`;
+  const axisTitle = `${axes.verticalLabel} (${viewFrame.unit})`;
+  const horizontalTitle = axes.is2D ? `X (${viewFrame.unit})` : `${axis.toUpperCase().charAt(0)} (${viewFrame.unit})`;
   // The origin is labelled once: a vertical `0` on top of the horizontal one
   // reads as `00`.
   const uHasOrigin = uTicks.some(tick => Math.abs(tick) < 1e-9);
   const markerOnRight = marker ? marker.value > (plotLeft + plotRight) / 2 : false;
   const markerNearTop = marker ? -marker.value < plotTop + (plotBottom - plotTop) * 0.25 : false;
-  return <svg viewBox={frameViewBox(frame, { left: marginLeft, right: marginRight, top: marginTop, bottom: marginBottom })}
-    className={className} role="img" aria-label={label}
-    data-dimension={view.dimension} data-flat={frame.flatV ? '1' : '0'}>
+  return <div className={`wf-structure-canvas-shell${interactive ? ' is-interactive' : ''}`}>
+    <svg ref={svgRef}
+      viewBox={frameViewBox(viewFrame, { left: marginLeft, right: marginRight, top: marginTop, bottom: marginBottom })}
+      className={`${className}${dragging ? ' is-dragging' : ''}`} role="img" aria-label={label}
+      data-dimension={view.dimension} data-flat={viewFrame.flatV ? '1' : '0'}
+      onPointerDown={interactive ? onPointerDown : undefined}
+      onPointerMove={interactive ? onPointerMove : undefined}
+      onPointerUp={interactive ? endDrag : undefined}
+      onPointerCancel={interactive ? endDrag : undefined}
+      onDoubleClick={interactive ? resetView : undefined}>
+    <defs>
+      {/* Zoom/pan must not let the material fill bleed under the axis labels:
+          geometry is clipped to the plot area, the axes stay outside the clip. */}
+      <clipPath id={clipId}>
+        <rect x={plotLeft} y={plotTop} width={plotRight - plotLeft} height={plotBottom - plotTop} />
+      </clipPath>
+    </defs>
     <rect x={plotLeft} y={plotTop} width={plotRight - plotLeft} height={plotBottom - plotTop} fill="#f8fafb" />
     {showAxes && uTicks.map(tick => <line key={`ug-${tick}`} className="wf-axes wf-axes-grid"
       x1={tick} y1={plotBottom} x2={tick} y2={plotTop} stroke="#e6eaee" strokeWidth={strokeWidth} />)}
@@ -1383,6 +1579,7 @@ function StructureCanvas({ view, frame, axis = 'xy', marker = null, note = null,
         ? fill.coords
         : [...fill.coords, [fill.coords[fill.coords.length - 1][0], fillBottom], [fill.coords[0][0], fillBottom]];
       return <polygon key={`f-${index}`} className="wf-fill" data-material={fill.materialId}
+        clipPath={`url(#${clipId})`}
         points={coords.map(([x, y]) => `${x},${-y}`).join(' ')}
         fill={colorOf(fill.materialId)} fillOpacity={0.3} stroke="none" />;
     })}
@@ -1393,10 +1590,12 @@ function StructureCanvas({ view, frame, axis = 'xy', marker = null, note = null,
           const b = points[line[1]];
           if (!a || !b) return null;
           return <line key={`l-${index}`} className="wf-interface"
+            clipPath={`url(#${clipId})`}
             x1={a[0]} y1={-a[1]} x2={b[0]} y2={-b[1]}
             stroke={colorOf(view.lineMaterialIds[index])} strokeWidth={1.5} vectorEffect="non-scaling-stroke" />;
         })
         : points.map((point, index) => <circle key={`p-${index}`} cx={point[0]} cy={-point[1]}
+          clipPath={`url(#${clipId})`}
           r={strokeWidth * 2} fill={colorOf(view.materialIds[index])} />))
       : (view.triangles.length
         ? view.triangles.map((triangle, index) => {
@@ -1405,12 +1604,14 @@ function StructureCanvas({ view, frame, axis = 'xy', marker = null, note = null,
           const c = points[triangle[2]];
           if (!a || !b || !c) return null;
           return <polygon key={`t-${index}`}
+            clipPath={`url(#${clipId})`}
             points={`${a[0]},${-a[1]} ${b[0]},${-b[1]} ${c[0]},${-c[1]}`}
             fill={colorOf(view.triangleMaterialIds[index])} fillOpacity="0.9" stroke="none" />;
         })
         : points.map((point, index) => <circle key={`p-${index}`} cx={point[0]} cy={-point[1]}
+          clipPath={`url(#${clipId})`}
           r={strokeWidth * 2} fill={colorOf(view.materialIds[index])} />))}
-    {marker && <g className="wf-marker">
+    {marker && <g className="wf-marker" clipPath={`url(#${clipId})`}>
       {marker.orientation === 'vertical'
         ? <line x1={marker.value} y1={plotTop} x2={marker.value} y2={plotBottom} strokeWidth={strokeWidth * 2} />
         : <line x1={plotLeft} y1={-marker.value} x2={plotRight} y2={-marker.value} strokeWidth={strokeWidth * 2} />}
@@ -1448,7 +1649,13 @@ function StructureCanvas({ view, frame, axis = 'xy', marker = null, note = null,
       {note && <text className="wf-structure-note" x={plotLeft} y={plotTop - fontSize * 0.55} fontSize={fontSize} textAnchor="start"
         stroke="#ffffff" strokeWidth={tickHalo} paintOrder="stroke">{note}</text>}
     </g>}
-  </svg>;
+    </svg>
+    {interactive && <div className="wf-structure-zoom" role="group" aria-label="结构视图缩放">
+      <button type="button" aria-label="放大" title="放大" onClick={() => zoomBy(1.25)}>＋</button>
+      <button type="button" aria-label="缩小" title="缩小" onClick={() => zoomBy(0.8)}>−</button>
+      <button type="button" aria-label="重置视图" title="重置视图" onClick={resetView}>重置</button>
+    </div>}
+  </div>;
 }
 
 function structureLegend(view: CandidateView): Array<{ id: string; name: string; color: string; count: number }> {
@@ -7401,6 +7608,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                     note={view.dimension === 2 ? structureSurfaceNote(view, syncAxis) : null}
                     className="wf-compare-canvas"
                     label={`候选 ${index + 1} 结构视图`}
+                    compact
+                    interactive={false}
                   /> : <div className="wf-empty">{viewError ? `视图加载失败：${viewError}` : '视图加载中…'}</div>}
                   {view && <div className="wf-compare-legend">
                     {structureLegend(view).map(row => <span key={row.id}><i style={{ background: row.color }} aria-hidden="true" />{row.name}<em>{row.count}</em></span>)}

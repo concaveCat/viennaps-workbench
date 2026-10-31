@@ -9,6 +9,8 @@ const baseUrl = (process.env.WORKBENCH_URL ?? 'http://127.0.0.1:8816').replace(/
 const projectPath = process.env.WORKFLOW_PROJECT ?? path.join(here, 'fixtures', 'workflow-2d-etch.json');
 const calibrationPath = process.env.WORKFLOW_CALIBRATION ?? path.join(here, 'fixtures', 'calibration.csv');
 const screenshot = process.env.WORKFLOW_SCREENSHOT ?? '/tmp/workflow-p3.png';
+const structureShot = process.env.WORKFLOW_STRUCTURE_SCREENSHOT ?? '/tmp/workflow-p3-structure.png';
+const structureShotVariant = suffix => structureShot.replace(/\.png$/, `-${suffix}.png`);
 
 const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
 const page = await browser.newPage({ viewport: { width: 1600, height: 1500 } });
@@ -131,10 +133,101 @@ try {
   assert.equal(structureLayout.zeroCount, 1, `the origin must be labelled once, got ${structureLayout.zeroCount}`);
   assert.equal(structureLayout.tickColor, 'rgb(38, 49, 58)', `tick text must stay dark, got ${structureLayout.tickColor}`);
   assert.equal(await structureSvg.locator('.wf-structure-note').count(), 1, 'the depth/surface note must stay visible');
-  await page.screenshot({
-    path: process.env.WORKFLOW_STRUCTURE_SCREENSHOT ?? '/tmp/workflow-p3-structure.png',
-    fullPage: true,
+
+  // ---- 2D labels are sized in screen pixels, not world units ------------
+  // A stretched SVG used to scale `span / 32` up to 30–40px; the font must now
+  // be derived from the rendered width and stay around 11px.
+  const structureText = await structureSvg.evaluate(svg => {
+    const nodes = Array.from(svg.querySelectorAll('.wf-tick-label, .wf-axis-title--x, .wf-scale-label, .wf-structure-note'));
+    const heights = nodes.map(node => node.getBoundingClientRect().height).filter(height => height > 0);
+    const axisTitle = svg.querySelector('.wf-axis-title--x');
+    return { maxHeight: heights.length ? Math.max(...heights) : 0, count: heights.length, fontSize: axisTitle ? getComputedStyle(axisTitle).fontSize : null };
   });
+  assert.ok(structureText.count >= 4, `2D structure must render labels, got ${JSON.stringify(structureText)}`);
+  assert.ok(structureText.maxHeight > 0 && structureText.maxHeight <= 14,
+    `2D structure labels must be <= 14px on screen, got ${JSON.stringify(structureText)}`);
+
+  // ---- wheel zoom, drag pan and reset view ------------------------------
+  const readViewBox = svg => {
+    const box = svg.viewBox.baseVal;
+    return { x: box.x, y: box.y, width: box.width, height: box.height };
+  };
+  const zoomInButton = page.getByRole('button', { name: '放大', exact: true });
+  const zoomOutButton = page.getByRole('button', { name: '缩小', exact: true });
+  const resetButton = page.getByRole('button', { name: '重置视图', exact: true });
+  assert.equal(await zoomInButton.count(), 1, '03 must expose a 放大 button');
+  assert.equal(await zoomOutButton.count(), 1, '03 must expose a 缩小 button');
+  assert.equal(await resetButton.count(), 1, '03 must expose a 重置视图 button');
+
+  const baseViewBox = await structureSvg.evaluate(readViewBox);
+  await structureSvg.hover();
+  await page.mouse.wheel(0, -420);
+  await page.waitForFunction(base => {
+    const svg = document.querySelector('.wf-structure-canvas');
+    const box = svg?.viewBox?.baseVal;
+    return !!box && box.width < base.width * 0.98;
+  }, baseViewBox);
+  const zoomedViewBox = await structureSvg.evaluate(readViewBox);
+  assert.ok(zoomedViewBox.width < baseViewBox.width,
+    `wheel must zoom the 2D viewBox (${baseViewBox.width} -> ${zoomedViewBox.width})`);
+  await structureSvg.screenshot({ path: structureShotVariant('zoom') });
+
+  const svgBox = await structureSvg.boundingBox();
+  await page.mouse.move(svgBox.x + svgBox.width / 2, svgBox.y + svgBox.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(svgBox.x + svgBox.width / 2 + 80, svgBox.y + svgBox.height / 2 + 36, { steps: 6 });
+  await page.mouse.up();
+  await page.waitForFunction(previous => {
+    const svg = document.querySelector('.wf-structure-canvas');
+    const box = svg?.viewBox?.baseVal;
+    return !!box
+      && (Math.abs(box.x - previous.x) > previous.width * 0.01 || Math.abs(box.y - previous.y) > previous.height * 0.01);
+  }, zoomedViewBox);
+  const pannedViewBox = await structureSvg.evaluate(readViewBox);
+  assert.ok(Math.abs(pannedViewBox.x - zoomedViewBox.x) > zoomedViewBox.width * 0.01
+    || Math.abs(pannedViewBox.y - zoomedViewBox.y) > zoomedViewBox.height * 0.01,
+    `drag must pan the 2D viewBox (${JSON.stringify(zoomedViewBox)} -> ${JSON.stringify(pannedViewBox)})`);
+  await structureSvg.screenshot({ path: structureShotVariant('pan') });
+
+  await resetButton.click();
+  await page.waitForFunction(base => {
+    const svg = document.querySelector('.wf-structure-canvas');
+    const box = svg?.viewBox?.baseVal;
+    return !!box && Math.abs(box.width - base.width) < 1e-6 && Math.abs(box.x - base.x) < 1e-6
+      && Math.abs(box.y - base.y) < 1e-6;
+  }, baseViewBox);
+  const resetViewBox = await structureSvg.evaluate(readViewBox);
+  assert.ok(Math.abs(resetViewBox.width - baseViewBox.width) < 1e-6
+    && Math.abs(resetViewBox.x - baseViewBox.x) < 1e-6
+    && Math.abs(resetViewBox.y - baseViewBox.y) < 1e-6,
+    `重置视图 must restore the original viewBox (${JSON.stringify(resetViewBox)} vs ${JSON.stringify(baseViewBox)})`);
+  await structureSvg.screenshot({ path: structureShotVariant('reset') });
+
+  // ---- switching the step resets zoom/pan ------------------------------
+  await stepChips.last().click();
+  await page.locator('.wf-marker').first().waitFor();
+  const stepViewBox = await structureSvg.evaluate(readViewBox);
+  await structureSvg.hover();
+  await page.mouse.wheel(0, -300);
+  await page.waitForFunction(base => {
+    const svg = document.querySelector('.wf-structure-canvas');
+    const box = svg?.viewBox?.baseVal;
+    return !!box && box.width < base.width * 0.98;
+  }, stepViewBox);
+  await initialChip.click();
+  await stepChips.last().click();
+  await page.waitForFunction(base => {
+    const svg = document.querySelector('.wf-structure-canvas');
+    const box = svg?.viewBox?.baseVal;
+    return !!box && Math.abs(box.width - base.width) < 1e-6 && Math.abs(box.x - base.x) < 1e-6;
+  }, stepViewBox);
+  const stepResetViewBox = await structureSvg.evaluate(readViewBox);
+  assert.ok(Math.abs(stepResetViewBox.width - stepViewBox.width) < 1e-6,
+    `switching steps must reset the zoom (${JSON.stringify(stepViewBox)} -> ${JSON.stringify(stepResetViewBox)})`);
+  await initialChip.click();
+  await page.locator('.wf-structure-canvas').waitFor();
+
+  await page.screenshot({ path: structureShot, fullPage: true });
 
   await page.getByRole('button', { name: '04 实验', exact: true }).click();
   for (const index of [1, 2, 3]) {

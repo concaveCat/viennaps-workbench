@@ -209,6 +209,22 @@ try {
   assert.equal(candidateLayout.vTitleHitsTicks, false, 'candidate height title must not overlap a tick label');
   assert.equal(candidateLayout.zeros, 1, `candidate origin must be labelled once, got ${candidateLayout.zeros}`);
   assert.equal(candidateLayout.tickColor, 'rgb(38, 49, 58)', `candidate tick text must stay dark, got ${candidateLayout.tickColor}`);
+
+  // ---- compact candidate labels share one viewBox and no extra zoom -----
+  const candidateViewBoxes = await page.locator('.wf-compare-canvas')
+    .evaluateAll(svgs => svgs.map(svg => svg.getAttribute('viewBox')));
+  assert.equal(new Set(candidateViewBoxes).size, 1,
+    `candidate views must share the synced viewBox: ${JSON.stringify(candidateViewBoxes)}`);
+  assert.equal(await page.locator('.wf-compare-grid .wf-structure-zoom, .wf-compare-grid button[aria-label="放大"], .wf-compare-grid button[aria-label="重置视图"]').count(), 0,
+    '05 candidate cards must not add a second set of zoom controls');
+  const candidateLabelSize = await page.locator('.wf-compare-canvas').first().evaluate(svg => {
+    const heights = Array.from(svg.querySelectorAll('.wf-tick-label, .wf-axis-title--x, .wf-scale-label, .wf-structure-note'))
+      .map(node => node.getBoundingClientRect().height).filter(height => height > 0);
+    return { maxHeight: heights.length ? Math.max(...heights) : 0, count: heights.length };
+  });
+  assert.ok(candidateLabelSize.count >= 4 && candidateLabelSize.maxHeight > 0 && candidateLabelSize.maxHeight <= 11,
+    `candidate labels must stay compact (~8px on screen), got ${JSON.stringify(candidateLabelSize)}`);
+
   const legend = await page.locator('.wf-compare-legend').first().innerText();
   assert.match(legend, /Si|材料/);
 
