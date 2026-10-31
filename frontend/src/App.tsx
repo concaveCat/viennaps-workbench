@@ -36,6 +36,7 @@ import { usePanelLayout } from './hooks/usePanelLayout';
 import { useGdsImport } from './hooks/useGdsImport';
 import { useWorkbenchBootstrap } from './hooks/useWorkbenchBootstrap';
 import { useSnapshotViewer } from './hooks/useSnapshotViewer';
+import { useRunLogPolling } from './hooks/useRunLogPolling';
 import { defaultDirection, defaultIonSpecies, defaultMultiParticleFields, defaultNeutralSpecies, defaultProject, initialVisibleMaterialIds, normalizeGdsMaskLayer, promoteProjectToV5, promoteProjectToV7 } from './project/defaults';
 
 // Ray count is the dominant cost knob for stochastic flux steps: measured on
@@ -99,8 +100,6 @@ export default function App() {
   const [fluxResult, setFluxResult] = useState<FluxResult | null>(null);
   const [fluxResultRunId, setFluxResultRunId] = useState<string | null>(null);
   const [selectedFluxField, setSelectedFluxField] = useState('');
-  const [runLog, setRunLog] = useState('');
-  const [logCursor, setLogCursor] = useState(0);
   const [displayRunId, setDisplayRunId] = useState<string | null>(null);
   const [selectedStep, setSelectedStep] = useState<string | null>(null);
   const [autoFollow, setAutoFollow] = useState(true);
@@ -114,10 +113,8 @@ export default function App() {
   const { panelWidths, setPanelWidths, isResizingPanels, workspaceRef, beginPanelResize, movePanelResize, endPanelResize, adjustPanelWidth } = usePanelLayout();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const csvInputRef = useRef<HTMLInputElement>(null);
-  const cursorRef = useRef(0);
   const shownRunErrorRef = useRef<string | null>(null);
   const validationSequence = useRef(0);
-  const polling = useRef(false);
 
   const updateProject = useCallback((updater: (previous: Project) => Project) => setProject(previous => {
     const next = updater(previous);
@@ -128,6 +125,13 @@ export default function App() {
 
   const fetchRunInfo = useCallback(async (runId: string, cursor = 0) => {
     return api<RunInfo>(`/api/runs/${runId}?cursor=${cursor}`);
+  }, []);
+
+  const fetchFluxResult = useCallback(async (runId: string, expectedMeshIdentity?: string) => {
+    const result = await api<FluxResult>(`/api/runs/${runId}/flux-result`);
+    if (expectedMeshIdentity && result.meshIdentity !== expectedMeshIdentity) throw new Error('通量数据的网格身份与运行记录不一致。');
+    setFluxResult(result); setFluxResultRunId(runId);
+    setSelectedFluxField(previous => result.fields.some(field => `${field.association}:${field.name}` === previous) ? previous : result.fields[0] ? `${result.fields[0].association}:${result.fields[0].name}` : '');
   }, []);
 
   const {
@@ -143,6 +147,23 @@ export default function App() {
     fetchSnapshot, loadComparison, changeView, changeView3D, exportSvg,
     view2D, view3D, displayDimension, compatibleCompare,
   } = useSnapshotViewer({ project, updateProject, displayRunId, latestRunId, fetchRunInfo, setDisplayRunId, setNotice });
+
+  const { runLog, setRunLog, logCursor, setLogCursor, cursorRef } = useRunLogPolling({
+    latestRunId,
+    runInfo,
+    displayRunId,
+    autoFollow,
+    selectedStepId,
+    fluxResultRunId,
+    fetchRunInfo,
+    fetchSnapshot,
+    fetchFluxResult,
+    refreshLists,
+    setRunInfo,
+    setDisplayInfo,
+    setHealth,
+    setNotice,
+  });
 
   const {
     gdsAsset, setGdsAsset,
@@ -295,44 +316,6 @@ export default function App() {
     }, 350);
     return () => window.clearTimeout(timeout);
   }, [project]);
-
-  const fetchFluxResult = useCallback(async (runId: string, expectedMeshIdentity?: string) => {
-    const result = await api<FluxResult>(`/api/runs/${runId}/flux-result`);
-    if (expectedMeshIdentity && result.meshIdentity !== expectedMeshIdentity) throw new Error('通量数据的网格身份与运行记录不一致。');
-    setFluxResult(result); setFluxResultRunId(runId);
-    setSelectedFluxField(previous => result.fields.some(field => `${field.association}:${field.name}` === previous) ? previous : result.fields[0] ? `${result.fields[0].association}:${result.fields[0].name}` : '');
-  }, []);
-
-  useEffect(() => {
-    if (!latestRunId || !runInfo || terminalStates.has(runInfo.status)) return undefined;
-    let mounted = true;
-    const poll = async () => {
-      if (polling.current) return;
-      polling.current = true;
-      try {
-        const info = await fetchRunInfo(latestRunId, cursorRef.current);
-        if (!mounted) return;
-        setRunInfo(info);
-        if (displayRunId === latestRunId) setDisplayInfo(info);
-        if (info.log.nextCursor > cursorRef.current) {
-          cursorRef.current = info.log.nextCursor; setLogCursor(info.log.nextCursor);
-          if (info.log.text) setRunLog(previous => (previous + info.log.text).slice(-250_000));
-        }
-        if (displayRunId === latestRunId && autoFollow && info.snapshots.length) {
-          const newest = info.snapshots[info.snapshots.length - 1];
-          if (selectedStepId !== newest.stepId) await fetchSnapshot(latestRunId, newest.stepId);
-        }
-        if (displayRunId === latestRunId && info.kind === 'flux' && info.status === 'succeeded' && info.fluxResult && fluxResultRunId !== latestRunId) {
-          await fetchFluxResult(latestRunId, info.fluxResult.meshIdentity);
-        }
-        if (terminalStates.has(info.status)) { setHealth('ready'); void refreshLists(); }
-      } catch (error) { if (mounted) setNotice(prettyError(error)); }
-      finally { polling.current = false; }
-    };
-    void poll();
-    const timer = window.setInterval(() => void poll(), 1000);
-    return () => { mounted = false; window.clearInterval(timer); };
-  }, [latestRunId, runInfo?.status, fetchRunInfo, fetchSnapshot, fetchFluxResult, refreshLists, displayRunId, autoFollow, selectedStepId, fluxResultRunId]);
 
   useEffect(() => {
     if (!displayInfo || !errorRunStates.has(displayInfo.status)) return;
