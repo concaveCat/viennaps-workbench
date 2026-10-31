@@ -307,6 +307,103 @@ def ibe_fields() -> list[dict[str, Any]]:
             rates("materialPlaneWaferRateByMaterial", 0.0, label="材料平面晶圆速率表")]
 
 
+IBE_ENERGY_MODELS = frozenset({"ionBeam", "faradayCage"})
+
+
+def ibe_energy_issues(parameters: Any) -> list[tuple[str, str]]:
+    """Shared ``thresholdEnergy < meanEnergy`` rule for both IBE models.
+
+    ViennaPS 4.6.2 normalizes the IBE yield by comparing the sampled energy
+    with ``thresholdEnergy``. At ``thresholdEnergy >= meanEnergy`` that native
+    comparison changes the sign of the flux, so an ``etch`` step deposits:
+
+    * threshold 200 / mean 100 / sigmaEnergy 500 grew a 2D stack from
+      0.8 um to 0.969595 um (also in 3D: 0.8 -> 0.974824 um);
+    * threshold == mean aborts the ray trace ("No geometry was passed to
+      rayTrace") when sigmaEnergy > 0, and empties the top level set when
+      sigmaEnergy == 0;
+    * threshold > mean with a small sigmaEnergy can also silently no-op
+      (0.8 um unchanged) instead of etching.
+
+    Every probed combination with ``thresholdEnergy < meanEnergy``, including
+    sigmaEnergy up to the catalog maximum, etched normally.
+
+    The values must already be JSON numbers. They are deliberately not passed
+    through ``float()``: ``ProjectV7.nativeParameters`` is a ``dict[str, Any]``
+    and accepts ``"200"``, but the worker later calls ``float(p[key])``, so a
+    numeric string would otherwise reach the native constructor and grow the
+    surface. Booleans, numeric strings, missing keys, and non-finite values are
+    rejected here so the worker can stop before any native object exists. Both
+    API validation and ``build_specialized_model`` call this function.
+    """
+    if not isinstance(parameters, dict):
+        return [("nativeParameters", "must be a JSON object")]
+    issues: list[tuple[str, str]] = []
+    values: dict[str, float] = {}
+    for key in ("meanEnergy", "thresholdEnergy"):
+        if key not in parameters:
+            issues.append((f"nativeParameters.{key}",
+                           "is required for the IBE energy-order check"))
+            continue
+        value = parameters[key]
+        if isinstance(value, bool):
+            issues.append((f"nativeParameters.{key}",
+                           "must be a JSON number; booleans are not accepted"))
+            continue
+        if not isinstance(value, (int, float)):
+            issues.append((f"nativeParameters.{key}",
+                           "must be a finite JSON number; numeric strings are not coerced"))
+            continue
+        if not math.isfinite(float(value)):
+            issues.append((f"nativeParameters.{key}", "must be a finite JSON number"))
+            continue
+        values[key] = float(value)
+    if issues:
+        return issues
+    if values["thresholdEnergy"] < values["meanEnergy"]:
+        return []
+    return [(
+        "nativeParameters.thresholdEnergy",
+        f"must be less than meanEnergy ({values['meanEnergy']:g}); ViennaPS {engine_version()} compares the "
+        f"sampled energy with thresholdEnergy when it normalizes the IonBeamEtching/FaradayCageEtching yield, "
+        f"and thresholdEnergy >= meanEnergy reverses the native flux sign. An etch step then grows the surface "
+        f"(threshold 200 with mean 100 and sigmaEnergy 500 grew 0.8 um to 0.969595 um), aborts the ray trace "
+        f"when thresholdEnergy equals meanEnergy with sigmaEnergy > 0, or empties the top level set when "
+        f"sigmaEnergy is 0. Keep thresholdEnergy below meanEnergy.")]
+
+
+# 2D FaradayCageEtching is only exposed on the pinned CPU disk flux engine.
+# ``worker/probe_faraday_2d.py --matrix safe-2d`` runs every catalog
+# cageAngle/tiltAngle pair (13 x 9 = 117) plus the key IBEParameters, geometry,
+# grid, duration, ray and thread variants through the real worker model builder
+# with a 60 s per-case timeout: every case completes in well under 0.02 s and
+# every level set stays populated. The same matrix on AUTO/GPU_DISK hangs
+# indefinitely for a large region (e.g. cageAngle 0.2/10/30/45 at tiltAngle
+# 0/30), which is the "2D hang" the original audit observed: those probes never
+# pinned an engine, so ``Process`` resolved AUTO to the GPU kernel. Pin CPU_DISK
+# and reject every other engine instead of guessing a cage/tilt sub-region.
+FARADAY_CAGE_2D_ENGINES = frozenset({"CPU_DISK"})
+FARADAY_CAGE_2D_ENGINE_NOTE = (
+    "The ViennaPS 4.6.2 2D FaradayCageEtching kernel only completes on the CPU_DISK flux engine; "
+    "AUTO/GPU_DISK/GPU_TRIANGLE hang indefinitely for a large cageAngle/tiltAngle region "
+    "(e.g. cageAngle 0.2/10/30/45 with tiltAngle 0/30) while the CPU_DISK sweep over the whole "
+    "catalog range (cageAngle 0-180 deg, tiltAngle -90-180 deg) finishes for every combination")
+
+
+def faraday_cage_2d_engine_error(flux_engine: str | None) -> str | None:
+    """Strict shared 2D FaradayCage gate used by API validation and the worker.
+
+    Returns ``None`` only for an explicitly pinned CPU disk engine. ``None``
+    (no engine supplied) is rejected as well: a direct worker caller must state
+    the engine it is about to pin instead of inheriting AUTO.
+    """
+    if flux_engine in FARADAY_CAGE_2D_ENGINES:
+        return None
+    resolved = "no explicit flux engine" if flux_engine is None else f"the {flux_engine} flux engine"
+    return (f"2D FaradayCageEtching requires the pinned CPU_DISK flux engine; this request resolves to "
+            f"{resolved}. {FARADAY_CAGE_2D_ENGINE_NOTE}. Set solver.enginePreference to \"cpu\".")
+
+
 def advanced_number(key: str, default: float, *, minimum: float = 0.0, maximum: float = 1_000_000.0,
                     step: float = 0.01, unit: str | None = None) -> dict[str, Any]:
     return {"key": key, "kind": "number", "default": default, "minimum": minimum,
@@ -615,11 +712,13 @@ CATALOG: list[dict[str, Any]] = [
     # tests/test_engine_batch1_specialized.py, but no Stage 8/9 direct-reference
     # acceptance row has been archived for this model yet. Validation warns
     # instead of claiming verified CPU coverage; GPU coverage stays unclaimed.
-    # ViennaPS 4.6.2 binds FaradayCageEtching in both dimensions, but the 2D
-    # native model does not return for the controlled probe, so only the 3D
-    # constructor path is exposed.
+    # ViennaPS 4.6.2/4.7.0 binds FaradayCageEtching in both dimensions. 2D is
+    # exposed only behind the strict CPU_DISK engine gate below: the probe in
+    # worker/probe_faraday_2d.py completes every 2D cage/tilt combination on
+    # CPU_DISK, while AUTO/GPU hangs for part of the same matrix.
     {"id": "faradayCage", "label": "法拉第笼离子束刻蚀", "nativeClass": "FaradayCageEtching", "operation": "etch",
-     "usesFlux": True, "experimental": True, "dimensions": [3],
+     "usesFlux": True, "experimental": True, "dimensions": [2, 3],
+     "fluxEnginesByDimension": {"2": ["CPU_DISK"], "3": None},
      "fields": [number("cageAngle", 0, maximum=180)] + ibe_fields()},
     {"id": "wetEtch", "label": "晶向湿法刻蚀", "nativeClass": "WetEtching", "operation": "etch", "usesFlux": False,
      "fields": [rates("materialRates", 0.0),

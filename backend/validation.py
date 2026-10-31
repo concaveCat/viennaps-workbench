@@ -14,8 +14,10 @@ from pydantic import ValidationError
 from .models import Domain3D, Project, ProjectV3, ProjectV4, ProjectV5, ProjectV6, ProjectV7, parse_project
 from .materials import attach_and_reconcile_project_materials, geometry_mask_material_names
 from .rates import has_motion, is_geometry_step, uses_flux, value as step_value
-from .specialized_models import (FLUOROCARBON_MATERIAL_DEFAULTS, geometric_trench_issues,
-                                 nv_factors_issues, model_spec, oxidation_advanced_spec)
+from .specialized_models import (FLUOROCARBON_MATERIAL_DEFAULTS, IBE_ENERGY_MODELS,
+                                 faraday_cage_2d_engine_error, geometric_trench_issues,
+                                 ibe_energy_issues, nv_factors_issues, model_spec,
+                                 oxidation_advanced_spec)
 from .runtime_limits import available_cpu_threads
 from .engine import (EVIDENCE_ENGINE_VERSION, OXIDATION_ADVANCED_RESTRICTED,
                      ald_surface_diffusion_error, ald_surface_diffusion_supported,
@@ -366,6 +368,22 @@ def _specialized_model_warnings(project: Any) -> list[str]:
                     f"steps[{index}].nativeModel: ViennaPS {engine_version()} FaradayCageEtching builds a periodic cage source "
                     f"and requires periodic lateral boundaries; this project uses {boundary!r}. The native run "
                     f"still executes but does not represent a periodic Faraday cage.")
+            if project.dimension == 2:
+                # 2D is newly exposed. A negative tiltAngle is accepted and is
+                # NOT a no-op for small values: cage 45 / tilt -0.2 still
+                # lowered the surface (0.8 -> 0.782019 um in the probe). The
+                # etch depth falls toward zero as the tilt becomes more
+                # negative (tilt -30 produced no measurable etch at the same
+                # settings), so warn about the asymmetry without claiming an
+                # unchanged surface. 3D keeps its existing response.
+                tilt = step_value(step_value(step, "nativeParameters", {}), "tiltAngle", None)
+                if isinstance(tilt, (int, float)) and float(tilt) < 0.0:
+                    warnings.append(
+                        f"steps[{index}].nativeParameters.tiltAngle: the installed native FaradayCageEtching "
+                        f"accepts a negative tiltAngle, but the cage source is not symmetric between positive "
+                        f"and negative tilt. A small negative tilt can still etch (tiltAngle -0.2 deg with "
+                        f"cageAngle 45 deg lowered the 2D surface), and the etch depth falls toward zero as the "
+                        f"tilt becomes more negative. Do not assume the surface stays flat.")
         if model_id == "geometricTrenchDeposition":
             warnings.append(
                 f"steps[{index}].nativeModel: GeometricTrenchDeposition is a ViennaLS geometric-advection "
@@ -950,6 +968,21 @@ def _validate_advanced_parameters(prefix: str, spec: dict[str, Any], advanced: A
     return issues
 
 
+def _specialized_flux_engine(project: Any) -> str:
+    """Resolve the schema-7 engine the supervisor will pin for a specialized step.
+
+    Mirrors ``select_engine`` for schema 7: ``cpu`` pins CPU_DISK, ``gpu`` pins
+    the requested GPU engine (or GPU_DISK), and ``auto`` keeps the historical
+    GPU_DISK-first policy for flux models.
+    """
+    preference = project.solver.enginePreference
+    if preference == "cpu":
+        return "CPU_DISK"
+    if preference == "gpu":
+        return str(project.solver.gpuEngine or "GPU_DISK")
+    return "GPU_DISK"
+
+
 def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
     issues: list[FieldIssue] = []
     material_names = {row["name"] for row in _catalog_names()}
@@ -997,6 +1030,12 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
                 f"steps[{index}].nativeModel",
                 f"{step.nativeModel} is only available in {available}; this project is {project.dimension}D"))
             continue
+        if step.enabled and step.nativeModel == "faradayCage" and project.dimension == 2:
+            # Shared with the worker (build_specialized_model) so a direct
+            # worker input cannot reach the hanging AUTO/GPU path either.
+            gate_message = faraday_cage_2d_engine_error(_specialized_flux_engine(project))
+            if gate_message is not None:
+                issues.append(FieldIssue("solver.enginePreference", gate_message))
         # Material tables describe the stack the process sees: the initial
         # geometry plus everything earlier enabled deposition steps added.
         # A disabled draft step is checked against the same chain with disabled
@@ -1009,6 +1048,11 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
             # Shared with the worker: a direct worker input cannot bypass the
             # dimension/geometry/depth/reach checks.
             for suffix, message in geometric_trench_issues(project, step):
+                issues.append(FieldIssue(f"steps[{index}].{suffix}", message))
+        if step.nativeModel in IBE_ENERGY_MODELS:
+            # Shared with the worker: thresholdEnergy >= meanEnergy reverses
+            # the native IBE flux and turns an etch step into growth.
+            for suffix, message in ibe_energy_issues(params):
                 issues.append(FieldIssue(f"steps[{index}].{suffix}", message))
         for field in spec["fields"]:
             key = field["key"]

@@ -48,15 +48,20 @@ data on the local disk, and never calls an external API. Verified against
 - Ray-traced single-particle etch/deposition (`singleParticle`), with CPU or GPU
   flux engines.
 - Native specialized models: SF6/O2, CF4/O2, HBr/O2, SF6/C4F8, fluorocarbon,
-  ion-beam etching, Faraday-cage ion-beam etching (experimental, 3D only), geometric
-  trench deposition (experimental, 2D/3D), wet etch, TEOS deposition, TEOS PECVD,
-  ALD, oxidation, oxide regrowth, selective epitaxy, neutral transport, and
-  multi-particle. The two experimental models have real native construction and
-  CPU smoke tests but no archived Stage 8/9 direct-reference acceptance row, so
-  their runs are reported with a validation warning. The 2D FaradayCage path
-  never returns in bounded probes and is rejected; GeometricTrenchDeposition runs
-  in both dimensions for plane, trench, hole, fin and stack geometry, while GDS
-  inputs are rejected because the native radius needs a bounded vertical span.
+  ion-beam etching, Faraday-cage ion-beam etching (experimental, 2D/3D, 2D pinned
+  to the CPU flux engine), geometric trench deposition (experimental, 2D/3D), wet
+  etch, TEOS deposition, TEOS PECVD, ALD, oxidation, oxide regrowth, selective
+  epitaxy, neutral transport, and multi-particle. The two experimental models have
+  real native construction and CPU smoke tests but no archived Stage 8/9
+  direct-reference acceptance row, so their runs are reported with a validation
+  warning. The 2D FaradayCage halt the original audit saw belongs to the unpinned
+  AUTO/GPU kernel; with CPU_DISK every catalog cage/tilt combination completes, so
+  2D is admitted only when `solver.enginePreference` is `cpu` (AUTO/GPU requests
+  are a 422 before the worker starts). The IBE models also require
+  `thresholdEnergy < meanEnergy`; at or above the mean the native yield sign
+  reverses and an etch grows the surface. GeometricTrenchDeposition runs in both
+  dimensions for plane, trench, hole, fin and stack geometry, while GDS inputs
+  are rejected because the native radius needs a bounded vertical span.
 - Optional native controls: `nvFactors` on selective epitaxy, `coverageTolerance`
   on the four plasma models, and the `advanced` plasma parameter object.
 - Directional rate model and selectivity comparisons.

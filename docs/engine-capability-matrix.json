@@ -610,23 +610,26 @@
     },
     {
       "className": "FaradayCageEtching",
-      "nativeModule": "viennaps.d2",
+      "nativeModule": "viennaps.d2 / viennaps.d3",
       "kind": "process-model",
       "dimensions": [
+        2,
         3
       ],
       "constructor": "FaradayCageEtching(parameters: FaradayCageParameters, maskMaterials: Sequence[Material])",
       "docSummary": "Ion-beam etch with a Faraday-cage angular filter (uses IBEParameters plus cageAngle).",
-      "classification": "engine-model-not-exposed",
-      "exposedBy": [],
-      "notes": "Probe 2026-10-30: 3D completes in <0.1 s; the same model applied to a 2D domain did not return within 40 s (engine-side hang, reproduced with plane-only and trench geometry, with and without planeWaferRate). Treat as 3D-only until upstream fixes it.",
+      "classification": "exposed",
+      "exposedBy": [
+        "model:specialized/faradayCage"
+      ],
+      "notes": "2D and 3D. The original 2026-10-30 probe left Process on AUTO, which resolves to the GPU kernel; that run hangs for part of the cage/tilt matrix. With CPU_DISK pinned, worker/probe_faraday_2d.py --matrix safe-2d completes all 117 cageAngle/tiltAngle pairs plus the key IBE, geometry, grid, duration, ray and thread variants within the 60 s bound. 2D is therefore admitted only when solver.enginePreference is cpu; AUTO/GPU is a 422 before the worker starts. 3D keeps its previous behaviour. Negative tiltAngle is accepted but is not symmetric to positive tilt (a small negative tilt still etches); thresholdEnergy must stay below meanEnergy in both dimensions or the native yield sign reverses.",
       "members": {
-        "exposed": [],
-        "notExposed": [
+        "exposed": [
           "cageAngle",
           "embedded IBEParameters",
           "maskMaterials"
-        ]
+        ],
+        "notExposed": []
       }
     },
     {
@@ -1319,19 +1322,22 @@
       "nativeModule": "viennaps._core",
       "kind": "parameter-object",
       "dimensions": [
+        2,
         3
       ],
       "constructor": "FaradayCageParameters()",
       "docSummary": "cageAngle plus an embedded IBEParameters object.",
-      "classification": "engine-model-not-exposed",
-      "exposedBy": [],
-      "notes": "Unlocked together with FaradayCageEtching (batch A1).",
+      "classification": "exposed",
+      "exposedBy": [
+        "model:specialized/faradayCage"
+      ],
+      "notes": "Unlocked together with FaradayCageEtching (batch A1). 2D is restricted to the pinned CPU_DISK flux engine.",
       "members": {
-        "exposed": [],
-        "notExposed": [
+        "exposed": [
           "cageAngle",
           "ibeParams"
-        ]
+        ],
+        "notExposed": []
       }
     },
     {
@@ -2644,20 +2650,21 @@
   "batches": [
     {
       "id": "A1",
-      "title": "FaradayCageEtching as a structured specialized model (3D)",
-      "classification": "engine-model-not-exposed",
+      "title": "FaradayCageEtching as a structured specialized model (2D CPU-only / 3D)",
+      "classification": "exposed",
       "items": [
         "FaradayCageEtching",
         "FaradayCageParameters"
       ],
       "risk": "medium",
-      "notes": "cageAngle plus the existing ionBeam parameter group (IBEParameters). Mask materials already come from geometry. The 2D path hung in a bounded probe, so the step must reject 2D at validation time.",
+      "notes": "cageAngle plus the existing ionBeam parameter group (IBEParameters). Mask materials already come from geometry. The original '2D hang' came from an unpinned AUTO/GPU Process; with CPU_DISK the full cage/tilt matrix completes, so 2D is admitted only on the pinned CPU engine and AUTO/GPU is a 422 before the worker starts. IBEParameters also requires thresholdEnergy < meanEnergy: at threshold >= mean the native yield normalization changes sign, so an etch grows the surface (mean 100/threshold 200/sigma 500 grew 0.8 -> 0.969595 um), aborts the ray trace at equality with sigma > 0, or empties the top level set at sigma = 0.",
       "acceptanceCriteria": [
-        "Validator rejects dimension=2 with a clear 422 before the worker starts.",
-        "3D single-step run against a trench + mask produces the same surface as a direct native reference within 1e-6 um (max point distance).",
+        "2D is admitted only with the pinned CPU_DISK engine; AUTO/GPU requests are a 422 before the worker starts. 3D keeps its previous engine behaviour.",
+        "2D and 3D runs match a direct native reference within 1e-6 um (max point distance).",
         "An independent native Faraday reference (cage source directions, not ordinary normal-incidence IBE) matches within 1e-6 um.",
+        "thresholdEnergy < meanEnergy is enforced before the worker in 2D and 3D; equal or higher is a 422.",
         "Replay of the recorded run reproduces the artifact hashes exactly.",
-        "specialized-models catalog documents the model with engineVersion 4.6.2 and dimension 3."
+        "specialized-models catalog documents the model with engineVersion 4.6.2, dimensions 2/3 and the 2D CPU-only engine restriction."
       ]
     },
     {

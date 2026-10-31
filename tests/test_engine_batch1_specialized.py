@@ -2,15 +2,20 @@
 
 Both experimental models are constructed with the real ViennaPS 4.6.2 bindings
 through ``worker.specialized.build_specialized_model`` and executed with a real
-native ``ps.Process``. Controlled probes showed the 2D FaradayCage path never
-returning, so validation rejects that dimension; GeometricTrenchDeposition now
-runs in 2D and 3D through the same native class (``viennaps.d{2,3}``) for the
-probed parametric geometry kinds. The tests also pin the native semantics that
-the catalog cannot change:
+native ``ps.Process``. The original audit concluded that the 2D FaradayCage
+path never returns; re-probing with the engine actually pinned showed that the
+hang belongs to the AUTO/GPU kernel, not to 2D. On CPU_DISK every cageAngle /
+tiltAngle combination in the catalog range completes (see
+``worker/probe_faraday_2d.py``), so 2D is exposed behind a strict CPU-only
+engine gate and covered by a direct native reference. The tests also pin the
+native semantics that the catalog cannot change:
 
 * ``FaradayCageEtching`` wraps ``IBEParameters`` in ``FaradayCageParameters``
   and builds a two-direction periodic cage source. Mask materials are forced
-  to a zero plane-wafer rate by the native constructor.
+  to a zero plane-wafer rate by the native constructor. Both IBE models require
+  ``thresholdEnergy < meanEnergy``: at or above the mean the native yield sign
+  reverses and an etch grows the surface (or aborts/empties at equality).
+  A small negative ``tiltAngle`` still etches; it is not a no-op.
 * ``GeometricTrenchDeposition`` is a ViennaLS geometric-advection distribution.
   It grows the selectable ``depositMaterial`` top level set, ignores
   ``trenchWidth`` and the process duration, and evaluates its local radius from
@@ -57,7 +62,8 @@ from backend.validation import ProjectInputError, select_engine, validate_projec
 from stage8_project_factory import make_project  # noqa: E402
 from tests.test_api_integration import asgi_request, json_body  # noqa: E402
 from worker.specialized import build_specialized_model  # noqa: E402
-from worker.simulate import MATERIAL_ROWS, configure_rays, make_v3_geometry  # noqa: E402
+from worker.simulate import (MATERIAL_ROWS, configure_advection, configure_rays,
+                             make_v3_geometry)  # noqa: E402
 
 FARADAY_FIELDS = {
     "cageAngle", "meanEnergy", "sigmaEnergy", "thresholdEnergy", "thetaRMin", "thetaRMax",
@@ -229,15 +235,10 @@ def run_specialized(project: dict, domain) -> tuple[object, dict]:
     if step["nativeModel"] == "selectiveEpitaxy":
         domain.duplicateTopLevelSet(ps.Material.SiGe)
     model, extra, actual, duration = build_specialized_model(
-        ps, domain, normalized, step, material_handle, {})
+        ps, domain, normalized, step, material_handle, {}, flux_engine="CPU_DISK")
     process = ps.Process(domain, model, duration)
-    if step["nativeModel"] == "faradayCage":
-        process.setFluxEngineType(ps.FluxEngineType.CPU_DISK)
-        rays = ps.RayTracingParameters()
-        rays.raysPerPoint = 32
-        rays.rngSeed = 271828
-        process.setParameters(rays)
-    if step["nativeModel"] == "sf6o2":
+    if step["nativeModel"] in {"faradayCage", "sf6o2"}:
+        # Same schema-7 ray parameters the bounded worker applies.
         process.setFluxEngineType(ps.FluxEngineType.CPU_DISK)
         rays, _ray_actual = configure_rays(ps, normalized, 271828)
         process.setParameters(rays)
@@ -260,7 +261,8 @@ class SpecializedCatalogEntries(unittest.TestCase):
         self.assertEqual(faraday["operation"], "etch")
         self.assertTrue(faraday["usesFlux"])
         self.assertTrue(faraday["experimental"])
-        self.assertEqual(faraday["dimensions"], [3])
+        self.assertEqual(faraday["dimensions"], [2, 3])
+        self.assertEqual(faraday["fluxEnginesByDimension"], {"2": ["CPU_DISK"], "3": None})
         self.assertEqual({field["key"] for field in faraday["fields"]}, FARADAY_FIELDS)
         cage_angle = next(field for field in faraday["fields"] if field["key"] == "cageAngle")
         self.assertEqual(cage_angle["default"], 0)
@@ -296,8 +298,9 @@ class SpecializedCatalogEntries(unittest.TestCase):
                 self.assertEqual(field["workbenchHistoricalDefault"], 1e-3)
                 self.assertEqual((field["minimum"], field["maximum"]), (0.0, 1.0))
 
-    def test_both_models_validate_only_in_their_supported_dimension(self):
-        for factory, dimension, engine in ((faraday_project, 3, "CPU_DISK"),
+    def test_both_models_validate_in_their_supported_dimensions(self):
+        for factory, dimension, engine in ((faraday_project, 2, "CPU_DISK"),
+                                           (faraday_project, 3, "CPU_DISK"),
                                            (geometric_project, 2, "not-applicable"),
                                            (geometric_project, 3, "not-applicable")):
             with self.subTest(model=factory.__name__, dimension=dimension):
@@ -307,13 +310,34 @@ class SpecializedCatalogEntries(unittest.TestCase):
                                     for warning in warnings))
                 normalized = parsed.model_dump(mode="json", exclude_none=True)
                 self.assertEqual(select_engine(normalized, normalized["steps"][0]), engine)
-        # The 2D FaradayCage binding never returns in controlled probes.
-        with self.assertRaises(ProjectInputError) as ctx:
-            validate_project(faraday_project(2), kind="simulate")
-        messages = [issue.message for issue in ctx.exception.issues
-                    if issue.path == "steps[0].nativeModel"]
-        self.assertTrue(messages, [issue.path for issue in ctx.exception.issues])
-        self.assertIn("only available in 3D", messages[0])
+        # Admission is dimension-gated in the catalog, not by a hidden 2D block.
+        self.assertIn(2, model_spec("faradayCage")["dimensions"])
+        self.assertIn(3, model_spec("faradayCage")["dimensions"])
+
+
+class Faraday2DProbeMatrix(unittest.TestCase):
+    """The committed probe must stay bounded and must not bypass the gate."""
+
+    def test_safe_matrix_covers_the_reported_hang_and_ok_regions_on_cpu_only(self):
+        from worker.probe_faraday_2d import _cases_for
+
+        cases = _cases_for("safe-2d")
+        pairs = {(float(case["cageAngle"]), float(case["tiltAngle"]))
+                 for case in cases if "ibe" not in case and case.get("geometry", "stack") == "stack"}
+        for cage in (0.0, 0.2, 10.0, 30.0, 45.0, 60.0, 89.0, 90.0, 180.0):
+            for tilt in (0.0, 30.0, 60.0):
+                self.assertIn((cage, tilt), pairs)
+        self.assertTrue(all(case["engine"] == "CPU_DISK" for case in cases))
+        self.assertFalse(any(case.get("probeBypassSafetyGate") for case in cases))
+
+    def test_gpu_and_engine_control_matrices_are_explicitly_probe_only(self):
+        from worker.probe_faraday_2d import _cases_for
+
+        for matrix in ("gpu-2d", "engine-control-2d"):
+            with self.subTest(matrix=matrix):
+                cases = _cases_for(matrix)
+                self.assertTrue(cases)
+                self.assertTrue(all(case["probeBypassSafetyGate"] for case in cases))
 
 
 class SpecializedValidationNegatives(unittest.TestCase):
@@ -531,6 +555,113 @@ class SpecializedValidationNegatives(unittest.TestCase):
         paths = [issue.path for issue in ctx.exception.issues]
         self.assertIn("steps[0].nativeParameters.materialPlaneWaferRateByMaterial", paths)
 
+    def test_2d_faraday_rejects_auto_and_gpu_engines_with_422(self):
+        # The GPU kernel hangs over a large cage/tilt region, and specialized
+        # AUTO resolves to GPU_DISK. Both are rejected before a worker starts.
+        for preference, gpu_engine in (("auto", None), ("gpu", None), ("gpu", "GPU_TRIANGLE")):
+            with self.subTest(preference=preference, gpuEngine=gpu_engine):
+                project = faraday_project(2)
+                project["solver"]["enginePreference"] = preference
+                if gpu_engine is not None:
+                    project["solver"]["gpuEngine"] = gpu_engine
+                with self.assertRaises(ProjectInputError) as ctx:
+                    validate_project(project, kind="simulate")
+                messages = [issue.message for issue in ctx.exception.issues
+                            if issue.path == "solver.enginePreference"]
+                self.assertTrue(messages, [issue.path for issue in ctx.exception.issues])
+                self.assertIn("CPU_DISK", messages[0])
+                self.assertIn("AUTO/GPU_DISK/GPU_TRIANGLE", messages[0])
+
+    def test_2d_faraday_engine_gate_skips_disabled_drafts_and_keeps_3d(self):
+        # A saved draft with the 2D step disabled stays readable; enabling it
+        # re-runs the gate.
+        draft = faraday_project(2)
+        draft["solver"]["enginePreference"] = "auto"
+        draft["steps"][0]["enabled"] = False
+        parsed, _warnings = validate_project(draft)
+        self.assertFalse(parsed.steps[0].enabled)
+        draft["steps"][0]["enabled"] = True
+        with self.assertRaises(ProjectInputError):
+            validate_project(draft)
+        # 3D must stay exactly as before: AUTO is still accepted and still
+        # resolves to GPU_DISK for this flux model.
+        three_d = faraday_project(3)
+        three_d["solver"]["enginePreference"] = "auto"
+        parsed, _warnings = validate_project(three_d, kind="simulate")
+        self.assertEqual(parsed.solver.enginePreference, "auto")
+        normalized = parsed.model_dump(mode="json", exclude_none=True)
+        self.assertEqual(select_engine(normalized, normalized["steps"][0]), "GPU_DISK")
+
+    def test_2d_faraday_negative_tilt_warning_is_accurate(self):
+        # -0.2 deg is not a no-op (the native run etches 0.8 -> 0.782019 um),
+        # so the warning must not promise an unchanged surface.
+        project = faraday_project(2)
+        project["steps"][0]["nativeParameters"]["tiltAngle"] = -0.2
+        _parsed, warnings = validate_project(project, kind="simulate")
+        messages = [warning for warning in warnings if "tiltAngle" in warning]
+        self.assertTrue(messages, warnings)
+        text = messages[0]
+        self.assertIn("can still etch", text)
+        self.assertIn("not symmetric", text)
+        for false_claim in ("no etch", "no-op", "unchanged surface"):
+            self.assertNotIn(false_claim, text)
+
+    def test_ibe_energy_values_reject_strings_bools_and_non_finite(self):
+        # ProjectV7.nativeParameters is dict[str, Any], so strings survive
+        # model_validate; the shared rule must still reject them instead of
+        # letting the worker coerce "200" with float().
+        for dimension in (2, 3):
+            for key, value in (("thresholdEnergy", "200"), ("meanEnergy", "100"),
+                               ("thresholdEnergy", True), ("meanEnergy", False),
+                               ("thresholdEnergy", float("nan")),
+                               ("meanEnergy", float("inf"))):
+                with self.subTest(dimension=dimension, key=key, value=value):
+                    project = faraday_project(dimension)
+                    project["steps"][0]["nativeParameters"][key] = value
+                    with self.assertRaises(ProjectInputError) as ctx:
+                        validate_project(project, kind="simulate")
+                    self.assertTrue(any(issue.path == f"steps[0].nativeParameters.{key}"
+                                        for issue in ctx.exception.issues),
+                                    [(issue.path, issue.message)
+                                     for issue in ctx.exception.issues])
+
+    def test_ibe_energy_order_rejects_threshold_at_or_above_mean(self):
+        # Native normalization reverses the flux sign at threshold >= mean, so
+        # the same rule must reject 2D and 3D before the worker.
+        for dimension in (2, 3):
+            for threshold, mean, sigma in ((200.0, 100.0, 500.0),
+                                           (100.0, 100.0, 10.0),
+                                           (100.0, 100.0, 0.0),
+                                           (101.0, 100.0, 10.0)):
+                with self.subTest(dimension=dimension, threshold=threshold,
+                                  mean=mean, sigma=sigma):
+                    project = faraday_project(dimension)
+                    project["steps"][0]["nativeParameters"].update({
+                        "meanEnergy": mean, "thresholdEnergy": threshold,
+                        "sigmaEnergy": sigma})
+                    with self.assertRaises(ProjectInputError) as ctx:
+                        validate_project(project, kind="simulate")
+                    messages = [
+                        issue.message for issue in ctx.exception.issues
+                        if issue.path == "steps[0].nativeParameters.thresholdEnergy"]
+                    self.assertTrue(messages,
+                                    [(issue.path, issue.message) for issue in ctx.exception.issues])
+                    self.assertIn("less than meanEnergy", messages[0])
+        # IonBeamEtching wraps the same native IBEParameters struct.
+        ion_beam = make_project("ionBeam", 3)
+        ion_beam["steps"][0]["nativeParameters"].update({
+            "meanEnergy": 100.0, "thresholdEnergy": 200.0})
+        with self.assertRaises(ProjectInputError) as ctx:
+            validate_project(ion_beam, kind="simulate")
+        self.assertTrue(any(issue.path == "steps[0].nativeParameters.thresholdEnergy"
+                            for issue in ctx.exception.issues))
+        # Just below the mean stays valid (the probe etched at 99.9/100).
+        valid = faraday_project(2)
+        valid["steps"][0]["nativeParameters"].update({
+            "meanEnergy": 100.0, "thresholdEnergy": 99.9, "sigmaEnergy": 500.0})
+        parsed, _warnings = validate_project(valid, kind="simulate")
+        self.assertEqual(parsed.steps[0].nativeParameters["thresholdEnergy"], 99.9)
+
 
 class WorkerSafetyPreflight(unittest.TestCase):
     """Direct worker calls must apply the same safety rules as the API."""
@@ -576,6 +707,93 @@ class WorkerSafetyPreflight(unittest.TestCase):
             build_specialized_model(ps, None, normalized, step, material_handle, {})
         self.assertIn("nvFactors", str(ctx.exception))
 
+    def test_direct_worker_rejects_unpinned_or_gpu_2d_faraday(self):
+        # Direct worker input never passes backend.validation, so the shared
+        # gate must reject before any FaradayCageParameters object is built.
+        normalized, step = self.normalized(faraday_project(2))
+        for engine in (None, "AUTO", "GPU_DISK", "GPU_TRIANGLE"):
+            with self.subTest(engine=engine):
+                with self.assertRaises(RuntimeError) as ctx:
+                    build_specialized_model(ps, native_stack(2, "periodic"), normalized, step,
+                                            material_handle, {}, flux_engine=engine)
+                message = str(ctx.exception)
+                self.assertIn("FaradayCageEtching rejected", message)
+                self.assertIn("CPU_DISK", message)
+
+    def test_direct_worker_admits_2d_faraday_on_cpu_disk(self):
+        normalized, step = self.normalized(faraday_project(2))
+        model, _extra, actual, _duration = build_specialized_model(
+            ps, native_stack(2, "periodic"), normalized, step, material_handle, {},
+            flux_engine="CPU_DISK")
+        self.assertEqual(type(model).__name__, "FaradayCageEtching")
+        self.assertEqual(type(model).__module__, "viennaps.d2")
+        container = actual["nativeParameterContainer"]
+        self.assertEqual(container["dimension"], 2)
+        self.assertEqual(container["fluxEngine"], "CPU_DISK")
+        self.assertEqual(container["fluxEngineGate"], "CPU_DISK only in 2D")
+
+    def test_direct_worker_rejects_threshold_at_or_above_mean(self):
+        # Direct worker input reaches build_specialized_model without
+        # backend.validation; the energy rule must fire before the native
+        # IBEParameters object exists (domain=None proves that).
+        for dimension in (2, 3):
+            for threshold, mean, sigma in ((200.0, 100.0, 500.0),
+                                           (100.0, 100.0, 10.0),
+                                           (100.0, 100.0, 0.0)):
+                with self.subTest(dimension=dimension, threshold=threshold,
+                                  mean=mean, sigma=sigma):
+                    project = faraday_project(dimension)
+                    project["steps"][0]["nativeParameters"].update({
+                        "meanEnergy": mean, "thresholdEnergy": threshold,
+                        "sigmaEnergy": sigma})
+                    normalized, step = self.normalized(project)
+                    with self.assertRaises(RuntimeError) as ctx:
+                        build_specialized_model(ps, None, normalized, step,
+                                                material_handle, {},
+                                                flux_engine="CPU_DISK")
+                    message = str(ctx.exception)
+                    self.assertIn("FaradayCageEtching rejected", message)
+                    self.assertIn("thresholdEnergy", message)
+                    self.assertIn("less than meanEnergy", message)
+        # IonBeamEtching shares the native struct and the same rule.
+        ion_beam = make_project("ionBeam", 3)
+        ion_beam["steps"][0]["nativeParameters"].update({
+            "meanEnergy": 100.0, "thresholdEnergy": 200.0})
+        normalized, step = self.normalized(ion_beam)
+        with self.assertRaises(RuntimeError) as ctx:
+            build_specialized_model(ps, None, normalized, step, material_handle, {})
+        self.assertIn("thresholdEnergy", str(ctx.exception))
+
+    def test_direct_worker_rejects_string_energy_before_native(self):
+        # ProjectV7 accepts these strings; the worker must reject them before
+        # float() would coerce "200" and reach the native constructor.
+        for dimension in (2, 3):
+            for key, value in (("thresholdEnergy", "200"), ("meanEnergy", "100")):
+                with self.subTest(dimension=dimension, key=key):
+                    project = faraday_project(dimension)
+                    project["steps"][0]["nativeParameters"].update({
+                        "meanEnergy": 100.0, "thresholdEnergy": 20.0,
+                        "sigmaEnergy": 500.0})
+                    project["steps"][0]["nativeParameters"][key] = value
+                    normalized, step = self.normalized(project)
+                    self.assertEqual(step["nativeParameters"][key], value)
+                    with self.assertRaises(RuntimeError) as ctx:
+                        build_specialized_model(ps, None, normalized, step,
+                                                material_handle, {},
+                                                flux_engine="CPU_DISK")
+                    message = str(ctx.exception)
+                    self.assertIn("FaradayCageEtching rejected", message)
+                    self.assertIn(key, message)
+                    self.assertIn("numeric strings are not coerced", message)
+        # IonBeamEtching shares the helper and the native struct.
+        ion_beam = make_project("ionBeam", 3)
+        ion_beam["steps"][0]["nativeParameters"]["thresholdEnergy"] = "200"
+        normalized, step = self.normalized(ion_beam)
+        with self.assertRaises(RuntimeError) as ctx:
+            build_specialized_model(ps, None, normalized, step, material_handle, {})
+        self.assertIn("numeric strings are not coerced", str(ctx.exception))
+        self.assertIn("thresholdEnergy", str(ctx.exception))
+
 
 class NativeFaradayCage(unittest.TestCase):
     def test_real_3d_cpu_run_etches_the_exposed_film(self):
@@ -591,10 +809,106 @@ class NativeFaradayCage(unittest.TestCase):
                 self.assertLess(after, before - 1e-3)
                 container = actual["nativeParameterContainer"]
                 self.assertEqual(container["nativeClass"], "FaradayCageParameters")
+                self.assertEqual(container["dimension"], 3)
+                self.assertEqual(container["fluxEngine"], "CPU_DISK")
                 self.assertEqual(container["cageAngle"], 0.0)
                 self.assertEqual(container["maskMaterials"], ["Si3N4"])
                 self.assertEqual(container["ibeParameters"]["meanEnergy"], 100.0)
                 self.assertTrue(container["maskMaterialPlaneWaferRateForcedZero"])
+
+
+class NativeFaradayCage2D(unittest.TestCase):
+    """2D is admitted only on CPU_DISK and must match a direct native reference.
+
+    The anchor pairs span the region the original audit reported as hanging
+    (cageAngle 0.2 at tiltAngle 0) and the region it reported as working
+    (cageAngle 90 at tiltAngle 0/60), so the test pins the corrected boundary
+    instead of a single lucky case.
+    """
+
+    ANCHORS = ((0.2, 0.0), (45.0, 30.0), (90.0, 0.0), (90.0, 60.0))
+
+    def direct_reference(self, project: dict, domain):
+        normalized = validate_project(project, kind="simulate")[0].model_dump(
+            mode="json", exclude_none=True)
+        params = normalized["steps"][0]["nativeParameters"]
+        ps.setDimension(2)
+        ps.setNumThreads(1)
+        ps.Length.setUnit("um")
+        ps.Time.setUnit("s")
+        parameters = ps.FaradayCageParameters()
+        for key in ("meanEnergy", "sigmaEnergy", "thresholdEnergy", "thetaRMin", "thetaRMax",
+                    "minAngle", "inflectAngle", "exponent", "n_l", "tiltAngle",
+                    "planeWaferRate", "redepositionRate", "redepositionThreshold"):
+            setattr(parameters.ibeParams, key, float(params[key]))
+        for index, key in enumerate(("cos4YieldA1", "cos4YieldA2", "cos4YieldA3", "cos4YieldA4"),
+                                     start=1):
+            setattr(parameters.ibeParams.cos4Yield, f"a{index}", float(params[key]))
+        for name, value in sorted(params["materialPlaneWaferRateByMaterial"].items()):
+            parameters.ibeParams.materialPlaneWaferRate.set(material_handle(name), float(value))
+        parameters.cageAngle = float(params["cageAngle"])
+        model = ps.FaradayCageEtching(parameters, [material_handle("Si3N4")])
+        process = ps.Process(domain, model, float(normalized["steps"][0]["duration"]))
+        process.setFluxEngineType(ps.FluxEngineType.CPU_DISK)
+        rays, _ray_actual = configure_rays(ps, normalized, 271828)
+        process.setParameters(rays)
+        advection, _advection_actual = configure_advection(ps, normalized)
+        process.setParameters(advection)
+        process.apply()
+        return domain
+
+    def test_real_2d_runs_match_a_direct_native_reference(self):
+        for cage, tilt in self.ANCHORS:
+            with self.subTest(cage=cage, tilt=tilt):
+                project = faraday_project(2)
+                project["steps"][0]["nativeParameters"]["cageAngle"] = cage
+                project["steps"][0]["nativeParameters"]["tiltAngle"] = tilt
+                product = native_stack(2, "periodic")
+                before = surface_top(product, 2)
+                model, actual = run_specialized(project, product)
+                after = surface_top(product, 2)
+                self.assertEqual(type(model).__name__, "FaradayCageEtching")
+                self.assertEqual(type(model).__module__, "viennaps.d2")
+                self.assertLess(after, before - 1e-6)
+                counts = [int(level_set.getNumberOfPoints())
+                          for level_set in product.getLevelSets()]
+                self.assertTrue(counts and all(count > 0 for count in counts), counts)
+                container = actual["nativeParameterContainer"]
+                self.assertEqual(container["dimension"], 2)
+                self.assertEqual(container["fluxEngine"], "CPU_DISK")
+                self.assertEqual(container["cageAngle"], cage)
+                self.assertEqual(container["ibeParameters"]["tiltAngle"], tilt)
+
+                reference = self.direct_reference(project, native_stack(2, "periodic"))
+                self.assertEqual(surface_signature(product, 2),
+                                 surface_signature(reference, 2))
+
+    def test_2d_small_negative_tilt_still_etches(self):
+        # Regression for the false "unchanged surface" claim: -0.2 deg etches.
+        project = faraday_project(2)
+        project["steps"][0]["nativeParameters"]["tiltAngle"] = -0.2
+        domain = native_stack(2, "periodic")
+        before = surface_top(domain, 2)
+        model, _actual = run_specialized(project, domain)
+        self.assertEqual(type(model).__name__, "FaradayCageEtching")
+        self.assertLess(surface_top(domain, 2), before - 1e-6)
+
+    def test_valid_energy_order_still_etches(self):
+        # thresholdEnergy < meanEnergy remains an ordinary etch, including at
+        # the near-boundary values that the probe measured.
+        for threshold in (20.0, 90.0, 99.9):
+            with self.subTest(threshold=threshold):
+                project = faraday_project(2)
+                project["steps"][0]["nativeParameters"].update({
+                    "meanEnergy": 100.0, "thresholdEnergy": threshold,
+                    "sigmaEnergy": 500.0})
+                domain = native_stack(2, "periodic")
+                before = surface_top(domain, 2)
+                _model, actual = run_specialized(project, domain)
+                self.assertLess(surface_top(domain, 2), before - 1e-6)
+                self.assertEqual(
+                    actual["nativeParameterContainer"]["ibeParameters"]["thresholdEnergy"],
+                    threshold)
 
 
 class NativeGeometricTrenchDeposition(unittest.TestCase):
@@ -897,6 +1211,22 @@ class NativeCoverageTolerance(unittest.TestCase):
 
 
 class SpecializedHashAndPersistence(unittest.TestCase):
+    # FARADAY_3D_BASELINE_HASH was recorded on base 18abea0 in a clean archive:
+    # this task changes no schema field, so an existing 3D project's
+    # requested-input hash must be byte-identical. The 2D value is the same
+    # canonical payload for a project the base rejected at validation, so it
+    # pins the new surface without touching the 3D input shape.
+    FARADAY_3D_BASELINE_HASH = "6d7666c44beb2a81c1fe3cfabf3281476e18748c7782ae25d6763dd27660d3fb"
+    FARADAY_2D_HASH = "77f9e483bcdd397984262ab8d112904b67840ea5ba7f389fbe237cb7b9503326"
+
+    def test_faraday_request_hashes_are_pinned_and_dimension_sensitive(self):
+        self.assertEqual(
+            requested_input_hash(validate_project(faraday_project(3))[0]),
+            self.FARADAY_3D_BASELINE_HASH)
+        self.assertEqual(
+            requested_input_hash(validate_project(faraday_project(2))[0]),
+            self.FARADAY_2D_HASH)
+
     def test_native_parameters_change_the_request_hash(self):
         project = faraday_project(3)
         first = requested_input_hash(validate_project(project)[0])
@@ -966,6 +1296,69 @@ class FaradayCpuReplay(unittest.IsolatedAsyncioTestCase):
         replay = await asgi_request("/api/runs/replay", method="POST", payload=envelope)
         self.assertEqual(replay[0], 202, replay[2])
         await self.wait(json_body(replay)["runId"])
+
+    async def test_faraday_cage_2d_cpu_run_replays(self):
+        project = faraday_project(2)
+        project["steps"][0]["nativeParameters"].update({"cageAngle": 45.0, "tiltAngle": 30.0})
+        project["name"] = "FaradayCage 2D CPU replay checkpoint"
+        project["solver"]["enginePreference"] = "cpu"
+        project["solver"]["timeoutSeconds"] = 60
+        response = await asgi_request("/api/runs", method="POST",
+                                      payload={"kind": "simulate", "project": project})
+        self.assertEqual(response[0], 202, response[2])
+        run_id = json_body(response)["runId"]
+        info = await self.wait(run_id)
+        expected_hash = requested_input_hash(validate_project(project)[0])
+        self.assertEqual(info["requestedInputHash"], expected_hash)
+        manifest = json_body(await asgi_request(f"/api/runs/{run_id}"))
+        native = manifest["actualExecution"][0]["actualParameters"]["nativeModel"]
+        self.assertEqual(native["nativeParameterContainer"]["dimension"], 2)
+        self.assertEqual(native["nativeParameterContainer"]["fluxEngine"], "CPU_DISK")
+        envelope = json_body(await asgi_request(f"/api/runs/{run_id}/replay-project"))
+        replay = await asgi_request("/api/runs/replay", method="POST", payload=envelope)
+        self.assertEqual(replay[0], 202, replay[2])
+        replay_info = await self.wait(json_body(replay)["runId"])
+        self.assertEqual(replay_info["requestedInputHash"], expected_hash)
+
+    async def test_faraday_cage_2d_auto_is_rejected_before_the_worker(self):
+        project = faraday_project(2)
+        project["solver"]["enginePreference"] = "auto"
+        response = await asgi_request("/api/runs", method="POST",
+                                      payload={"kind": "simulate", "project": project})
+        self.assertEqual(response[0], 422, response[2])
+        payload = json_body(response)["detail"]
+        self.assertTrue(any("CPU_DISK" in issue.get("message", "")
+                            for issue in payload), payload)
+
+    async def test_faraday_energy_reversal_is_rejected_before_the_worker(self):
+        # Exact codex repro: mean 100 / threshold 200 / sigma 500 grew the
+        # surface on the pre-fix build. It must now be a 422.
+        project = faraday_project(2)
+        project["steps"][0]["nativeParameters"].update({
+            "meanEnergy": 100.0, "thresholdEnergy": 200.0, "sigmaEnergy": 500.0})
+        project["solver"]["enginePreference"] = "cpu"
+        response = await asgi_request("/api/runs", method="POST",
+                                      payload={"kind": "simulate", "project": project})
+        self.assertEqual(response[0], 422, response[2])
+        detail = json_body(response)["detail"]
+        self.assertTrue(any(issue.get("path") == "steps[0].nativeParameters.thresholdEnergy"
+                            and "less than meanEnergy" in issue.get("message", "")
+                            for issue in detail), detail)
+
+    async def test_faraday_string_energy_is_rejected_before_the_worker(self):
+        # ProjectV7.nativeParameters is dict[str, Any]; a numeric string must be
+        # a 422 instead of being coerced by the worker's float().
+        project = faraday_project(2)
+        project["steps"][0]["nativeParameters"].update({
+            "meanEnergy": 100.0, "thresholdEnergy": "200", "sigmaEnergy": 500.0})
+        project["solver"]["enginePreference"] = "cpu"
+        response = await asgi_request("/api/runs", method="POST",
+                                      payload={"kind": "simulate", "project": project})
+        self.assertEqual(response[0], 422, response[2])
+        detail = json_body(response)["detail"]
+        self.assertTrue(any(issue.get("path") == "steps[0].nativeParameters.thresholdEnergy"
+                            and "finite JSON number" in issue.get("message", "")
+                            for issue in detail), detail)
 
     async def test_explicit_coverage_tolerance_cpu_run_replays(self):
         project = plasma_project(2)
