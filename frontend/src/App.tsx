@@ -1,8 +1,7 @@
 import Viewer3D from './Viewer3D';
 import NativeIntermediatePanel from './NativeIntermediatePanel';
 import { RunErrorDialog } from './RunErrorDialog';
-import { defaultView3D, snapshotDimension } from './types3d';
-import type { View3D } from './types3d';
+import { defaultView3D } from './types3d';
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { TopBar } from './app/TopBar';
@@ -28,7 +27,7 @@ import { MaterialPropertyInspector } from './components/MaterialPropertyInspecto
 import { NumericField, SelectField } from './components/fields';
 import { SvgViewer } from './viewer/SvgViewer';
 import { api, effectiveArtifactCapBytes, formatArtifactCapMiB, prettyError, saveBlob } from './api/client';
-import type { AdvectionSettings, CsvRateAsset, DirectionalMaterialRate, Domain, FluxResult, GDSGeometry, GDSMaskPattern, Geometry, GpuCapabilityRow, GpuProfileFailure, Layer, MaterialCatalogItem, OutputSettings, ParticleSpecies, Project, RayTracingSettings, RunInfo, Snapshot, Solver, StackGeometry, Step, ViewSettings } from './api/types';
+import type { AdvectionSettings, CsvRateAsset, DirectionalMaterialRate, Domain, FluxResult, GDSGeometry, GDSMaskPattern, Geometry, GpuCapabilityRow, GpuProfileFailure, Layer, MaterialCatalogItem, OutputSettings, ParticleSpecies, Project, RayTracingSettings, RunInfo, Solver, StackGeometry, Step } from './api/types';
 import { gdsAssetIdFromProject, gdsLayerIds, gdsMaskPairs, gdsPairs } from './lib/gds';
 import { fitPanelWidths, maxPanelWidth, panelWidthLimits } from './lib/panelLayout';
 import { MATERIAL_CATEGORY_OPTIONS, configuredMaterialRates, directionalMaterialRates, geometryMaterialNames, isDirectionalMaterialMode, isGeometryStep, materialCategoryLabel, materialRateModeActive, materialRateModeAvailable, scalarMaterialRates, specializedDefaults, specializedDimensionLabel, specializedModelAvailable, stepKindLabel, stripDirectionalRateTable, stripDirectionalScalarRates, stripIsotropicMethod, usesFlux } from './lib/projectRules';
@@ -36,6 +35,7 @@ import { ARTIFACT_RISK_LABELS, NOT_APPLICABLE_ENGINE, artifactEstimateFromError,
 import { usePanelLayout } from './hooks/usePanelLayout';
 import { useGdsImport } from './hooks/useGdsImport';
 import { useWorkbenchBootstrap } from './hooks/useWorkbenchBootstrap';
+import { useSnapshotViewer } from './hooks/useSnapshotViewer';
 import { defaultDirection, defaultIonSpecies, defaultMultiParticleFields, defaultNeutralSpecies, defaultProject, initialVisibleMaterialIds, normalizeGdsMaskLayer, promoteProjectToV5, promoteProjectToV7 } from './project/defaults';
 
 // Ray count is the dominant cost knob for stochastic flux steps: measured on
@@ -60,8 +60,6 @@ function newStepId(): string { return `step_${crypto.randomUUID().replaceAll('-'
 
 export default function App() {
   const [project, setProject] = useState<Project>(() => structuredClone(defaultProject));
-  const [historyView2D, setHistoryView2D] = useState<ViewSettings>(structuredClone(defaultProject.view!));
-  const [historyView3D, setHistoryView3D] = useState<View3D>(structuredClone(defaultView3D));
   const [projectId, setProjectId] = useState<string | null>(null);
   const [savedProjectJson, setSavedProjectJson] = useState<string | null>(null);
   const [savedSelection, setSavedSelection] = useState('');
@@ -104,13 +102,8 @@ export default function App() {
   const [runLog, setRunLog] = useState('');
   const [logCursor, setLogCursor] = useState(0);
   const [displayRunId, setDisplayRunId] = useState<string | null>(null);
-  const [selectedSnapshot, setSelectedSnapshot] = useState<Snapshot | null>(null);
-  const [compareRunId, setCompareRunId] = useState('');
-  const [compareInfo, setCompareInfo] = useState<RunInfo | null>(null);
-  const [compareSnapshot, setCompareSnapshot] = useState<Snapshot | null>(null);
   const [selectedStep, setSelectedStep] = useState<string | null>(null);
   const [autoFollow, setAutoFollow] = useState(true);
-  const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
   const [activity, setActivity] = useState<Activity>('structure');
   const [selection, setSelection] = useState<Selection>({ kind: 'none' });
   const [inspectorOpen, setInspectorOpen] = useState(true);
@@ -121,14 +114,35 @@ export default function App() {
   const { panelWidths, setPanelWidths, isResizingPanels, workspaceRef, beginPanelResize, movePanelResize, endPanelResize, adjustPanelWidth } = usePanelLayout();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const csvInputRef = useRef<HTMLInputElement>(null);
-  const svgRef = useRef<SVGSVGElement | null>(null);
   const cursorRef = useRef(0);
   const shownRunErrorRef = useRef<string | null>(null);
-  const snapshotSequence = useRef(0);
-  const history3DRun = useRef<string | null>(null);
-  const comparisonSequence = useRef(0);
   const validationSequence = useRef(0);
   const polling = useRef(false);
+
+  const updateProject = useCallback((updater: (previous: Project) => Project) => setProject(previous => {
+    const next = updater(previous);
+    if ((next.geometry.kind === 'fin' || next.geometry.kind === 'gds') && next.schemaVersion < 7) return { ...promoteProjectToV7(next), geometry: next.geometry };
+    if (previous.schemaVersion < 3 && (JSON.stringify(previous.geometry) !== JSON.stringify(next.geometry) || JSON.stringify(previous.steps) !== JSON.stringify(next.steps))) return { ...next, schemaVersion: Math.max(3, next.schemaVersion) as Project["schemaVersion"], solver: { ...next.solver, enginePreference: 'cpu' }, ...(next.dimension === 3 ? { view3D: { ...next.view3D!, visibleMaterialIds: materials.map(m => m.id) } } : {}) };
+    return next;
+  }), [materials]);
+
+  const fetchRunInfo = useCallback(async (runId: string, cursor = 0) => {
+    return api<RunInfo>(`/api/runs/${runId}?cursor=${cursor}`);
+  }, []);
+
+  const {
+    selectedSnapshot, setSelectedSnapshot,
+    compareRunId, setCompareRunId,
+    compareInfo, setCompareInfo,
+    compareSnapshot, setCompareSnapshot,
+    selectedStepId, setSelectedStepId,
+    historyView2D, setHistoryView2D,
+    historyView3D, setHistoryView3D,
+    snapshotSequence, comparisonSequence,
+    svgRef,
+    fetchSnapshot, loadComparison, changeView, changeView3D, exportSvg,
+    view2D, view3D, displayDimension, compatibleCompare,
+  } = useSnapshotViewer({ project, updateProject, displayRunId, latestRunId, fetchRunInfo, setDisplayRunId, setNotice });
 
   const {
     gdsAsset, setGdsAsset,
@@ -186,12 +200,6 @@ export default function App() {
     if (!selectionExists) setSelection({ kind: 'none' });
   }, [selection, project.steps, materials, runs, selectedSnapshot, displayRunId]);
 
-  const updateProject = useCallback((updater: (previous: Project) => Project) => setProject(previous => {
-    const next = updater(previous);
-    if ((next.geometry.kind === 'fin' || next.geometry.kind === 'gds') && next.schemaVersion < 7) return { ...promoteProjectToV7(next), geometry: next.geometry };
-    if (previous.schemaVersion < 3 && (JSON.stringify(previous.geometry) !== JSON.stringify(next.geometry) || JSON.stringify(previous.steps) !== JSON.stringify(next.steps))) return { ...next, schemaVersion: Math.max(3, next.schemaVersion) as Project["schemaVersion"], solver: { ...next.solver, enginePreference: 'cpu' }, ...(next.dimension === 3 ? { view3D: { ...next.view3D!, visibleMaterialIds: materials.map(m => m.id) } } : {}) };
-    return next;
-  }), [materials]);
   const editAdvection = (key: keyof AdvectionSettings, value: AdvectionSettings[keyof AdvectionSettings]) => setProject(previous => {
     const promoted = promoteProjectToV7(previous);
     return { ...promoted, solver: { ...promoted.solver, advection: { ...promoted.solver.advection!, [key]: value } as AdvectionSettings } };
@@ -287,29 +295,6 @@ export default function App() {
     }, 350);
     return () => window.clearTimeout(timeout);
   }, [project]);
-
-  const fetchSnapshot = useCallback(async (runId: string, stepId: string) => {
-    try {
-      const sequence = ++snapshotSequence.current;
-      const snapshot = await api<Snapshot>(`/api/runs/${runId}/snapshots/${encodeURIComponent(stepId)}`);
-      const dimension = snapshotDimension(snapshot);
-      if (sequence !== snapshotSequence.current) return;
-      if (dimension === 3 && history3DRun.current !== runId) {
-        // A reopened history result owns its view. The current editor can be
-        // 2D or have an unrelated material filter and camera.
-        history3DRun.current = runId;
-        setHistoryView3D({
-          ...structuredClone(defaultView3D),
-          visibleMaterialIds: [...new Set(snapshot.cellData.materialIds)],
-        });
-      }
-      setSelectedSnapshot(snapshot); setSelectedStepId(stepId); setDisplayRunId(runId);
-    } catch (error) { setNotice(prettyError(error)); }
-  }, []);
-
-  const fetchRunInfo = useCallback(async (runId: string, cursor = 0) => {
-    return api<RunInfo>(`/api/runs/${runId}?cursor=${cursor}`);
-  }, []);
 
   const fetchFluxResult = useCallback(async (runId: string, expectedMeshIdentity?: string) => {
     const result = await api<FluxResult>(`/api/runs/${runId}/flux-result`);
@@ -611,31 +596,6 @@ export default function App() {
         saveBlob(`viennaps-run-${displayRunId}.zip`, await response.blob());
       }
     } catch (error) { setNotice(prettyError(error)); }
-  };
-
-  const exportSvg = () => {
-    const svg = svgRef.current;
-    if (!svg) { setNotice('请先加载一个网格结果。'); return; }
-    const clone = svg.cloneNode(true) as SVGSVGElement;
-    clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
-    clone.setAttribute('width', String(Math.round(svg.viewBox.baseVal.width)));
-    clone.setAttribute('height', String(Math.round(svg.viewBox.baseVal.height)));
-    saveBlob(`viennaps-view-${displayRunId ?? 'snapshot'}.svg`, new Blob([new XMLSerializer().serializeToString(clone)], { type: 'image/svg+xml' }));
-  };
-
-  const loadComparison = async (runId: string, stepId?: string) => {
-    setCompareRunId(runId);
-    if (!runId) { comparisonSequence.current++; setCompareInfo(null); setCompareSnapshot(null); setSelectedStepId(selectedSnapshot?.stepId ?? null); return; }
-    try {
-      const info = await fetchRunInfo(runId, 0); setCompareInfo(info);
-      const row = info.snapshots.find(item => item.stepId === stepId) ?? info.snapshots.at(-1);
-      const sequence = ++comparisonSequence.current;
-      if (row) {
-        const snapshot = await api<Snapshot>(`/api/runs/${runId}/snapshots/${row.stepId}`);
-        snapshotDimension(snapshot);
-        if (sequence === comparisonSequence.current) setCompareSnapshot(snapshot);
-      }
-    } catch (error) { setNotice(prettyError(error)); setCompareSnapshot(null); }
   };
 
   const addStep = (model: Step['model'] = 'isotropic') => {
@@ -1015,21 +975,8 @@ export default function App() {
     setActivity('results'); setMobilePanel('structure'); setInspectorOpen(true);
     await loadRun(runId, preferLatest);
   };
-  const view2D = project.dimension === 2 ? project.view ?? defaultProject.view! : historyView2D;
-  const showingHistory3D = selectedSnapshot && snapshotDimension(selectedSnapshot) === 3 && displayRunId !== latestRunId;
-  const view3D = showingHistory3D ? historyView3D : project.dimension === 3 ? project.view3D ?? defaultView3D : historyView3D;
-  const changeView = (partial: Partial<ViewSettings>) => {
-    if (project.dimension === 2) updateProject(previous => ({ ...previous, view: { ...view2D, ...partial } }));
-    else setHistoryView2D(previous => ({ ...previous, ...partial }));
-  };
-  const changeView3D = (next: View3D) => {
-    if (project.dimension === 3 && !showingHistory3D) updateProject(previous => ({ ...previous, view3D: next }));
-    else setHistoryView3D(next);
-  };
-  const displayDimension = selectedSnapshot ? snapshotDimension(selectedSnapshot) : project.dimension;
   const layerCount = project.geometry.kind === 'stack' ? project.geometry.layers.length : 0;
   const selectedGds = project.geometry.kind === 'gds' ? project.geometry : null;
-  const compatibleCompare = selectedSnapshot && compareSnapshot && snapshotDimension(selectedSnapshot) === snapshotDimension(compareSnapshot) ? compareSnapshot : null;
   const clearDisplayedRun = () => {
     snapshotSequence.current++; comparisonSequence.current++;
     setLatestRunId(null); setRunInfo(null); setRunLog(''); setLogCursor(0);
