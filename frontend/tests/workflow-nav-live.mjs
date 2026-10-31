@@ -142,6 +142,22 @@ try {
   const errorBanner = page.locator('.wf-error.spx-error');
   await errorBanner.waitFor();
   assert.match(await errorBanner.innerText(), /无法解析/);
+  const bannerMetrics = await page.evaluate(() => {
+    const banner = document.querySelector('.wf-error.spx-error');
+    const text = banner?.querySelector('.spx-banner-text');
+    if (!banner || !text) return null;
+    text.textContent = '后端校验失败：'.repeat(200);
+    return {
+      bannerHeight: banner.getBoundingClientRect().height,
+      textClientHeight: text.clientHeight,
+      textScrollHeight: text.scrollHeight,
+    };
+  });
+  assert.ok(bannerMetrics, 'error banner must expose a text node');
+  assert.ok(bannerMetrics.bannerHeight <= 100,
+    `a long error must not take over the page (${bannerMetrics.bannerHeight}px)`);
+  assert.ok(bannerMetrics.textScrollHeight > bannerMetrics.textClientHeight,
+    'long error text must scroll inside the banner');
   const errorClose = errorBanner.getByRole('button', { name: '关闭提示' });
   assert.equal(await errorClose.count(), 1);
   await errorClose.focus();

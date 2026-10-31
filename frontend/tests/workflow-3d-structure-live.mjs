@@ -232,6 +232,16 @@ try {
   assert.equal(await page.locator('.wf-structure-info code').count(), 0, 'the current step shows its name, not the raw s_... id');
   assert.match(await page.locator('.wf-structure-side').innerText(), /第 \d+ 段 · Run 已记录/);
 
+  // The scale bar must follow wheel zoom; a static label would misreport the
+  // world length of the 72 px bar.
+  const scaleLabel = page.locator('.wb-viewer3d__scalebar-label');
+  await scaleLabel.waitFor({ timeout: 30000 });
+  const scaleBefore = (await scaleLabel.innerText()).trim();
+  await page.getByLabel('标准视角').selectOption('xz');
+  await page.waitForTimeout(1200);
+  const scaleAfter = (await scaleLabel.innerText()).trim();
+  assert.notEqual(scaleAfter, scaleBefore, `scale bar did not follow the camera (${scaleBefore} -> ${scaleAfter})`);
+
   await page.locator('.wb-viewer3d__stage').screenshot({ path: screenshot.replace(/\.png$/, '-canvas.png') });
   const canvasPng = await page.locator('.wb-viewer3d__stage').screenshot();
   const canvasPixels = analyzePng(canvasPng);

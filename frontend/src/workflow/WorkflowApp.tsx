@@ -5541,7 +5541,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         </div>
       </header>
 
-      {error && <div className="wf-error spx-error spx-banner" role="alert"><span className="spx-banner-text">{error}</span><BannerClose onClose={() => setError('')} /></div>}
+      {error && <div className="wf-error spx-error spx-banner" role="alert"><span className="spx-banner-text" title={error}>{error}</span><BannerClose onClose={() => setError('')} /></div>}
 
       <div className="spx-body">
         <aside className="spx-left">

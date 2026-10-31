@@ -538,6 +538,10 @@ body {
 .wf-muted { color: var(--spx-muted); font-size: 11px; }
 .wf-empty { border-radius: 0; border-color: var(--spx-line); color: var(--spx-muted); min-height: 90px; }
 .wf-error { border-radius: 0; background: #fdf1f0; border-color: #e3b6b2; color: var(--spx-red); padding: 7px 9px; margin: 6px 12px; }
+/* A long backend message must not push the workspace off screen: keep the
+   banner compact and let only the text scroll, so the × stays visible. */
+.spx-error { max-height: 88px; overflow: hidden; }
+.spx-error .spx-banner-text { max-height: 56px; overflow-y: auto; overscroll-behavior: contain; padding-right: 4px; }
 .wf-table { border: 1px solid var(--spx-line); border-collapse: collapse; font-size: 11px; margin-top: 6px; }
 .wf-table th, .wf-table td { border: 1px solid var(--spx-line-soft); padding: 4px 6px; }
 .wf-table th { background: #eef1f4; color: #34404b; font-weight: 600; }

@@ -268,7 +268,18 @@ export async function createVtkScene(container: HTMLElement): Promise<VtkScene> 
     recordFrame();
     // Only the camera moved: reuse the cached visible bounds.
     updateMarkerGeometry(cachedGeometryBounds);
+    // Zoom/pan also changes world-units-per-pixel; refresh the DOM scale bar.
+    emitScale();
   });
+
+  // Wheel zoom and trackpad pan modify the camera without an EndAnimation
+  // event, so watch the camera itself. emitScale() already throttles to 2%.
+  const cameraSubscription = camera.onModified(() => emitScale());
+  // Some drivers/interaction styles mutate the camera without firing either
+  // event; a cheap poll guarantees the DOM scale bar never goes stale.
+  const scaleTimer = window.setInterval(() => {
+    if (!destroyed) emitScale();
+  }, 120);
 
   const resizeObserver = new ResizeObserver(() => {
     if (destroyed) return;
@@ -712,6 +723,8 @@ export async function createVtkScene(container: HTMLElement): Promise<VtkScene> 
     if (rafId !== null) cancelAnimationFrame(rafId);
     rafId = null;
     frameSubscription.unsubscribe();
+    cameraSubscription.unsubscribe();
+    window.clearInterval(scaleTimer);
     resizeObserver.disconnect();
     widget.setEnabled(false);
     widget.delete();
