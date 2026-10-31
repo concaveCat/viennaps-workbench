@@ -42,6 +42,7 @@ from .runtime_limits import (artifact_limit_bytes, artifact_limit_label,
                              artifact_limit_startup_message, deployment_limit_status,
                              deployment_limits_startup_message, cpu_thread_limit)
 from .gpu_devices import cuda_devices
+from .engine import EngineVersionMismatch, multi_ion_gpu_error
 
 
 ROOT = storage.ROOT
@@ -689,12 +690,16 @@ async def slice_run_create(request: Request, payload: Any = Body(...)) -> dict[s
     except ValidationError as exc:
         return _validation_error(exc)
     if parsed_project.schemaVersion != 7 or parsed_project.dimension != 3:
-        raise HTTPException(status_code=422, detail={"path":"project", "message":"ViennaPS Slice requires a schema-7 3D geometry project"})
+        requested_axis = slice_request.sliceAxis or "y"
+        reason = (f"native Slice requires a schema-7 3D geometry project; {requested_axis}-normal slicing "
+                  "is not applicable to a 2D project")
+        raise HTTPException(status_code=422, detail={"path":"project", "message":reason})
     project_payload = parsed_project.model_dump(mode="python", exclude_none=True)
     project_payload["steps"] = []
     try:
         _project, normalized, _warnings = _project_or_422(project_payload)
-        return _supervisor(request).start("slice", normalized, slice_request=slice_request.model_dump(mode="json"))
+        return _supervisor(request).start("slice", normalized,
+                                          slice_request=slice_request.model_dump(mode="json", exclude_none=True))
     except HTTPException:
         raise
     except ActiveRunError as exc:
@@ -725,7 +730,14 @@ async def run_replay(request: Request, payload: Any = Body(...)) -> dict[str, An
     installed_ps = _version("viennaps")
     installed_ls = _version("viennals")
     if requirements.viennapsVersion != installed_ps or requirements.viennalsVersion != installed_ls:
-        raise HTTPException(status_code=422, detail={"path": "executionRequirements", "message": f"requires ViennaPS {requirements.viennapsVersion} / ViennaLS {requirements.viennalsVersion}; installed is {installed_ps} / {installed_ls}"})
+        raise HTTPException(status_code=422, detail={
+            "path": "executionRequirements",
+            "message": (f"requires ViennaPS {requirements.viennapsVersion} / ViennaLS {requirements.viennalsVersion}; "
+                        f"installed is {installed_ps} / {installed_ls}. Old runs are never reinterpreted under a "
+                        f"different runtime: start the matching ViennaPS {requirements.viennapsVersion} runtime to replay this run."),
+            "requiredVersions": {"viennaps": requirements.viennapsVersion,
+                                 "viennals": requirements.viennalsVersion},
+            "installedVersions": {"viennaps": installed_ps, "viennals": installed_ls}})
     if requirements.cpuThreads != project_payload["solver"]["cpuThreads"]:
         raise HTTPException(status_code=422, detail={"path": "executionRequirements.cpuThreads", "message": "thread count does not match the normalized project"})
     if project_payload["solver"]["random"]["mode"] != "fixed":
@@ -749,6 +761,13 @@ async def run_replay(request: Request, payload: Any = Body(...)) -> dict[str, An
             if requests_gpu != requires_gpu:
                 expected = "GPU" if requests_gpu else "CPU"
                 raise HTTPException(status_code=422, detail={"path": "executionRequirements.steps", "message": f"replay engine must match normalizedProject.solver.enginePreference ({expected})"})
+            requested_gpu_engine = project_payload["solver"].get("gpuEngine")
+            if requested_gpu_engine is not None and item.engine != requested_gpu_engine:
+                raise HTTPException(status_code=422, detail={
+                    "path": "executionRequirements.steps",
+                    "message": (f"replay engine {item.engine} differs from normalizedProject.solver.gpuEngine "
+                                f"{requested_gpu_engine}"),
+                })
         if envelope.schemaVersion in (2,3,4,5,6,7):
             step=next((s for s in project_payload["steps"] if s["id"]==item.stepId),None)
             replay_dimension=project_payload["dimension"]
@@ -758,6 +777,14 @@ async def run_replay(request: Request, payload: Any = Body(...)) -> dict[str, An
             ion_count = sum(row.get("kind") == "ion" for row in step.get("species", [])) if step else 0
             multi_ion_gpu = (project_payload["schemaVersion"] == 7 and item.engine == "GPU_DISK"
                              and capability_model == "multiParticle" and ion_count > 1)
+            if (project_payload["schemaVersion"] == 7 and str(item.engine).startswith("GPU_")
+                    and capability_model == "multiParticle" and ion_count > 1):
+                # Same shared policy the worker and supervisor apply, so the API
+                # never queues a replay that the worker would have to truncate.
+                policy = multi_ion_gpu_error()
+                if policy is not None:
+                    raise HTTPException(status_code=422, detail={
+                        "path": "executionRequirements.steps", "message": policy})
             valid_strategy = (
                 item.executionStrategy in {GPU_MULTIPARTICLE_SPLIT_STRATEGY, GPU_MULTIPARTICLE_NATIVE_STRATEGY}
                 and item.fluxStrategy is None if multi_ion_gpu and analysis_mode != "flux" else
@@ -769,6 +796,17 @@ async def run_replay(request: Request, payload: Any = Body(...)) -> dict[str, An
                     "path": "executionRequirements.steps",
                     "message": "GPU MultiParticle replay must record the strategy for its process or single-pass flux mode",
                 })
+            if valid_strategy and item.engine == "GPU_TRIANGLE" and (
+                    not step or not capability_verified(
+                        replay_dimension, capability_model, step["operation"], boundary, item.engine,
+                        schema_version=envelope.schemaVersion,
+                        execution_strategy=item.executionStrategy,
+                        flux_strategy=item.fluxStrategy, **signature)):
+                raise HTTPException(status_code=422, detail={
+                    "path": "executionRequirements.steps",
+                    "message": (f"GPU_TRIANGLE has no direct-reference acceptance row for {capability_model} "
+                                f"{step['operation'] if step else ''} on {boundary} in {replay_dimension}D; "
+                                "replay is refused instead of falling back to GPU_DISK or CPU_DISK"), })
             if not step or (not item.engine.startswith("GPU_")
                             and not capability_verified(replay_dimension,capability_model,step["operation"],boundary,item.engine,
                                                         schema_version=envelope.schemaVersion,
@@ -792,7 +830,7 @@ async def run_replay(request: Request, payload: Any = Body(...)) -> dict[str, An
         if replay_seed != project_payload["solver"]["random"]["seed"]:
             raise HTTPException(status_code=422, detail={"path": "normalizedProject.solver.random.seed", "message": "seed does not match the step requirements"})
         replay_engine = next(iter(replay_engines))
-        expected_preference = "gpu" if replay_engine == "GPU_DISK" else "cpu"
+        expected_preference = "gpu" if replay_engine.startswith("GPU_") else "cpu"
         if envelope.schemaVersion==1 and project_payload["solver"]["enginePreference"] != expected_preference:
             raise HTTPException(status_code=422, detail={"path": "normalizedProject.solver.enginePreference", "message": f"replay project must explicitly request {expected_preference}"})
     elif requirements.steps:
@@ -865,6 +903,8 @@ async def snapshot_get(run_id: str, step_id: str) -> dict[str, Any]:
             from . import snapshots as snapshot_store
             snapshot_store.ensure_materialized(run_dir, step_id)
         return read_json(run_dir / filename)
+    except EngineVersionMismatch as exc:
+        raise HTTPException(status_code=409, detail=exc.detail()) from exc
     except (FileNotFoundError, OSError, ValueError) as exc:
         raise HTTPException(status_code=404, detail="snapshot not found") from exc
 
@@ -1034,7 +1074,10 @@ async def continuation_package_export(payload: Any = Body(...)):
         elif (project_gds_asset(replay_project.get("geometry")) or {}).get("assetId") != gds_asset_id:
             raise HTTPException(status_code=422, detail="replay package must reference the same GDS source asset")
         if replay.executionRequirements.viennapsVersion != _version("viennaps") or replay.executionRequirements.viennalsVersion != _version("viennals"):
-            raise HTTPException(status_code=409, detail="replay engine versions do not match the installed ViennaPS/ViennaLS")
+            raise HTTPException(status_code=409, detail=(
+                f"replay requires ViennaPS {replay.executionRequirements.viennapsVersion} / "
+                f"ViennaLS {replay.executionRequirements.viennalsVersion}; installed is "
+                f"{_version('viennaps')} / {_version('viennals')}. Old runs are not reinterpreted under a different runtime."))
         replay_document = replay.model_dump(mode="json", exclude_none=True)
         if replay_document["normalizedProject"].get("continuationState") is not None:
             replay_document["normalizedProject"]["continuationState"].pop("sourceRunId", None)
@@ -1190,7 +1233,10 @@ async def continuation_package_import(request: Request) -> dict[str, Any]:
                 elif (project_gds_asset(replay.normalizedProject.model_dump(mode="json", exclude_none=True).get("geometry")) or {}).get("assetId") != asset_id:
                     raise HTTPException(status_code=422, detail="replay project must reference the packaged GDS asset")
                 if replay.executionRequirements.viennapsVersion != _version("viennaps") or replay.executionRequirements.viennalsVersion != _version("viennals"):
-                    raise HTTPException(status_code=409, detail="replay engine versions do not match the installed ViennaPS/ViennaLS")
+                    raise HTTPException(status_code=409, detail=(
+                f"replay requires ViennaPS {replay.executionRequirements.viennapsVersion} / "
+                f"ViennaLS {replay.executionRequirements.viennalsVersion}; installed is "
+                f"{_version('viennaps')} / {_version('viennals')}. Old runs are not reinterpreted under a different runtime."))
                 replay_document = replay.model_dump(mode="json", exclude_none=True)
             if state_path is not None:
                 storage.register_domain_state(state_path, state_ref["stateId"])
@@ -1298,6 +1344,8 @@ async def run_download(run_id: str):
         return StreamingResponse(stream_zip_async(entries), media_type="application/zip", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
     except HTTPException:
         raise
+    except EngineVersionMismatch as exc:
+        raise HTTPException(status_code=409, detail=exc.detail()) from exc
     except (FileNotFoundError, OSError, ValueError) as exc:
         raise HTTPException(status_code=404, detail="run not found") from exc
 

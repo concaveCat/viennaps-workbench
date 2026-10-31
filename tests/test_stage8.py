@@ -12,6 +12,20 @@ sys.path.insert(0, str(ROOT / "tests" / "fixtures"))
 
 from backend.hashing import requested_input_hash
 from backend.rates import has_motion, uses_flux
+from backend.engine import engine_version
+from contextlib import nullcontext
+from unittest.mock import patch
+
+
+def measured_engine(version: str = "4.6.2"):
+    """Pin the runtime this catalog contract was measured against.
+
+    2D FaradayCageEtching is a measured no-op on 4.7.0, so its admission is
+    version-qualified and the 4.6.2-era catalog assertion pins 4.6.2.
+    """
+    if engine_version() == version:
+        return nullcontext()
+    return patch("backend.engine.engine_version", return_value=version)
 from backend.specialized_models import specialized_catalog
 from backend.validation import ProjectInputError, capability_verified, gpu_project_signature, select_engine, validate_project
 from stage8_project_factory import make_project
@@ -20,11 +34,11 @@ from stage8_project_factory import make_project
 class Stage8SchemaContracts(unittest.TestCase):
     def test_each_installed_model_is_a_schema7_project_without_changing_schema_version(self):
         catalog = specialized_catalog()
-        self.assertEqual(catalog["engineVersion"], "4.6.2")
+        self.assertEqual(catalog["engineVersion"], engine_version())
         self.assertEqual(len(catalog["models"]), 16)
         for spec in catalog["models"]:
             for dimension in spec.get("dimensions") or (2, 3):
-                with self.subTest(model=spec["id"], dimension=dimension):
+                with self.subTest(model=spec["id"], dimension=dimension), measured_engine():
                     project, _ = validate_project(make_project(spec["id"], dimension), kind="simulate")
                     self.assertEqual(project.schemaVersion, 7)
                     self.assertEqual(project.steps[0].model, "specialized")

@@ -1,4 +1,4 @@
-# Engine capability audit — installed ViennaPS 4.6.2 vs. the Workbench
+# Engine capability audit — ViennaPS 4.6.2 (audited) / 4.7.0 (evaluated) vs. the Workbench
 
 Machine-readable companion: [`engine-capability-matrix.json`](engine-capability-matrix.json)
 (`schemaVersion: 1`, 96 native classes/enums, 8 SPX-only capability rows, 10 implementation batches).
@@ -6,6 +6,7 @@ Machine-readable companion: [`engine-capability-matrix.json`](engine-capability-
 | Item | Value |
 | --- | --- |
 | Audited engine | `viennaps` 4.6.2 + `viennals` 5.8.5 (`/root/.local/lib/python3.12/site-packages/viennaps`) |
+| Evaluated engine | `viennaps` 4.7.0 + `viennals` 5.10.0 (PyPI wheels, isolated `/root/wb-v470/.venv`) |
 | Python | 3.12.14 |
 | Workbench | app 0.1.0, project schema 7, base commit `3eacc2c` |
 | Audit date | 2026-10-30 |
@@ -27,7 +28,9 @@ behaviour changed.
 
 `dimensions` in the JSON always means *the domain dimension the class was actually exercised on*, not
 what the docstring implies. Empty `dimensions` means the class never sees a domain (`Logger`,
-`MetaDataLevel`).
+`MetaDataLevel`). The counts are the 2026-10-30 audit snapshot; later batches move individual rows
+(for example A4 moved `BoxDistribution`/`SphereDistribution` to the exposed surface as the
+`particleShape` step, no-mask deposit and geometry-mask etch) without rewriting the snapshot counts.
 
 ## 2. What the Workbench exposes today
 
@@ -39,7 +42,7 @@ what the docstring implies. Empty `dimensions` means the class never sees a doma
 | `SingleParticleProcess` | `model: singleParticle` | 2/3 | CPU_DISK / GPU_DISK, explicit seed + `raysPerPoint` |
 | `DirectionalProcess` | `model: directional` (schema 5+) | 2/3 | scalar overload by default; optional `rateSets` uses the native `Sequence[RateSet]` overload |
 | `MultiParticleProcess` | `model: multiParticle` (schema 7) | 2/3 | declarative ion/neutral species + linear rate coefficients |
-| `SF6O2Etching` | `specialized/sf6o2` | 2/3 | flat 8-argument form or `advanced` → `PlasmaEtchingParameters`; fixed coverage tolerance |
+| `SF6O2Etching` | `specialized/sf6o2` | 2/3 | flat 8-argument form or `advanced` → `PlasmaEtchingParameters`; optional `coverageTolerance` (omitted keeps 1e-3) |
 | `CF4O2Etching` | `specialized/cf4o2` | 2/3 | flat 10-argument form or `advanced` → `CF4O2Parameters` |
 | `HBrO2Etching` | `specialized/hbro2` | 2/3 | flat 8-argument form or `advanced` → `PlasmaEtchingParameters` |
 | `SF6C4F8Etching` | `specialized/sf6c4f8` | 2/3 | flat 6-argument form or `advanced` → `PlasmaEtchingParameters`; no passivation family |
@@ -51,7 +54,7 @@ what the docstring implies. Empty `dimensions` means the class never sees a doma
 | `SingleParticleALD` | `specialized/ald` | 2/3 | + `AtomicLayerProcessParameters`, selectable material |
 | `Oxidation` | `specialized/oxidation` | 2/3 | 17 of 45 `set*` methods + all four orientations (see B5) |
 | `OxideRegrowth` | `specialized/oxideRegrowth` | 2/3 | derives its own `DenseCellSet` |
-| `SelectiveEpitaxy` | `specialized/selectiveEpitaxy` | 2/3 | native `Material` enum only, no `nvFactors` |
+| `SelectiveEpitaxy` | `specialized/selectiveEpitaxy` | 2/3 | native `Material` enum only; optional `nvFactors` three-vector uses the dedicated native overload |
 | `NeutralTransport` | `specialized/neutralTransport` | 2/3 | all 12 parameters |
 
 ### Parameter objects with full coverage (9)
@@ -88,10 +91,14 @@ Fields shared with flat inputs use the flat catalog defaults (for example
 
 ### Geometry, output and material surface
 
-(62 `exposed` rows in the matrix overall, including the 18 models above.)
+(62 `exposed` rows in the matrix overall, including the 18 models above;
+the schema-7 `particleShape` step is a post-audit addition.)
 
 `MakePlane`, `MakeTrench`, `MakeHole` (`FULL` only), `MakeFin` (native + boolean construction),
-multi-layer `stack` (composed from `MakePlane` + `GeometryFactory`), `GeometryFactory`,
+multi-layer `stack` (composed from `MakePlane` + `GeometryFactory`),
+the `particleShape` geometry step (`BoxDistribution` / `SphereDistribution`, schema 7;
+no-mask deposition, geometry-mask etch — see
+[`particle-shape-distribution-contract.md`](particle-shape-distribution-contract.md)), `GeometryFactory`,
 `GDSGeometry`, `GDSReader`, `Extrude`, `Slice` (y-normal only), `Planarize` (cutoff or measured
 `stopMaterial`), `Domain`, `Process`; outputs are surface mesh VTK, snapshot JSON, native state,
 intermediate VTP/VTU, the optional generic `DenseCellSet` VTU/JSON export from
@@ -109,11 +116,10 @@ custom material catalog.
 
 | Native class | Verified dims | What it actually is | Precondition / risk |
 | --- | --- | --- | --- |
-| `FaradayCageEtching` + `FaradayCageParameters` | 3 only | Ion-beam etch with a Faraday-cage angular filter: `cageAngle` plus a full `IBEParameters` | Probe: 3D finishes in <0.1 s; the identical call on a 2D domain did not return within 40 s (plane-only and trench, with and without `planeWaferRate`) → **engine-side 2D hang**, must be rejected at validation |
-| `GeometricTrenchDeposition` | 2 only | Closed-form analytic trench fill (`trenchWidth, trenchDepth, depositionRate, bottomMed, a, b, n`), no flux engine | Probe: 3D **SIGSEGV** right after “Applying geometric model” → 2D only |
+| `FaradayCageEtching` + `FaradayCageParameters` | 2 (CPU_DISK only) / 3 | Ion-beam etch with a Faraday-cage angular filter: `cageAngle` plus a full `IBEParameters` | The original "engine-side 2D hang" was not dimensional: those probes left `Process` on AUTO, which resolves to the GPU kernel. With CPU_DISK pinned, `worker/probe_faraday_2d.py --matrix safe-2d` completes all 117 cageAngle/tiltAngle pairs (cage 0–180°, tilt −90–180°) plus the key IBE, geometry, grid, duration, ray and thread variants with no timeout, crash or empty level set; the deliberate `thresholdEnergy >= meanEnergy` probe is now rejected by the shared energy rule before the native call. The same matrix on AUTO/GPU_DISK hangs for a large region (e.g. cage 0.2/10/30/45 at tilt 0/30). 2D is therefore exposed only with `solver.enginePreference: cpu`; AUTO/GPU requests are a 422 before the worker starts. Negative `tiltAngle` is accepted but is not symmetric to positive tilt: a small negative tilt still etches (tilt −0.2° with cage 45° lowered the 2D surface 0.8 → 0.782019 µm) and the etch depth falls toward zero as the tilt becomes more negative; 2D warns about that asymmetry. `IBEParameters` also requires `thresholdEnergy < meanEnergy` in both dimensions: at `threshold >= mean` the native yield normalization changes sign, so an etch grows the surface (mean 100 / threshold 200 / sigma 500: 0.8 → 0.969595 µm), aborts the ray trace when equal with `sigmaEnergy > 0`, or empties the top level set when `sigmaEnergy == 0`. |
+| `GeometricTrenchDeposition` | 2/3 | Closed-form analytic trench fill (`trenchWidth, trenchDepth, depositionRate, bottomMed, a, b, n`), no flux engine | The 2026-10-30 3D SIGSEGV was a parameter-reach crash that also occurs in 2D; the guard now requires `depositionRate >= max(a+b, bottomMed)` because `rate < radius - 2*gridDelta` leaves an empty deposited level set. 3D plane/trench/hole/fin/stack complete and match a direct native reference. GDS stays 422 |
 | `CSVFileProcess` + `RateGrid` | 2/3 | Rate interpolated from a CSV grid with directional + isotropic components | Needs a new uploaded asset kind and an explicit interpolation mode: the engine only logs `Interpolation mode not set.` and continues. `setCustomInterpolator` is arbitrary Python |
-| `BoxDistribution` / `SphereDistribution` | 2/3 | Particle-shape distributions applied as geometric models | The mask overload requires a raw **`viennals` Domain**, not `viennaps.Domain`; without a mask the probe produced no surface change |
-| `CustomSphereDistribution` | none | Multi-radius sphere distribution | Probe: aborts in 2D and 3D with `terminate called recursively` without a mask → experimental, keep out until a bounded probe passes |
+| `CustomSphereDistribution` | none | Multi-radius sphere distribution | **Blocked (A4).** Re-probe with and without a mask aborts in 2D and 3D (`returnCode -6`): `terminate called after throwing an instance of 'std::runtime_error'` / `what(): Point ID 3 is out of bounds for CustomSphereDistribution with 3 radii!`. It indexes one radius per surface point, so no bounded project-derived parameterization exists. See [`particle-shape-distribution-contract.md`](particle-shape-distribution-contract.md) |
 
 ### 3.2 Advanced parameters and outputs (batch B)
 
@@ -123,7 +129,7 @@ custom material catalog.
 | `PlasmaEtchingParametersSubstrate` | B1: all consumed fields except `B_ie` | `B_ie` (unused by the CPU surface model) | No useful substrate-yield knob remains hidden |
 | `CF4O2Parameters` | B1: `Ions`, `Mask`, `Passivation`, `Si`, `SiGe` (`beta_sigma`/`k_sigma`/`rho`), `gamma_*`, `fluxIncludeSticking` | `SiGe.A_ie/A_sp/Eth_ie/Eth_sp/x` (ignored by native SiGe branch); `k_sigma_SiGe` method | SiGe chemistry is represented by the three fields the native branch reads |
 | `CF4O2ParametersSiGe` | B1: `beta_sigma`, `k_sigma`, `rho` | sputter/yield fields and `x`; `k_sigma_SiGe` method | A full SiGe yield editor is not available because the native branch does not read those fields |
-| `CoverageParameters` | `tolerance = 1e-3` (hard-coded) | `tolerance`, `maxIterations`, `initialized` | Convergence cannot be tightened or loosened |
+| `CoverageParameters` | optional `nativeParameters.coverageTolerance` (omitted keeps the historical `1e-3`) | `maxIterations`, `initialized` | `tolerance` is settable in [0, 1]; native default is `0.0`, which caps coverage initialization at 10 iterations |
 | `RateSet` | `model: directional` `rateSets[]`: 1–8 sets, per-set direction, velocities, masks and visibility | `print()` (debug helper) | Multiple simultaneous directions and per-set masks are now declarative |
 | `Oxidation` advanced setters | 17 of 45: the 13 historical values + `setCFLFactor`, `setMechanicsTolerance`, `setCouplingTolerance`, `setSimplePressureRelaxation` via `steps[].advancedOxidation` | iteration caps, pressure/stokes tolerances, `setSimpleVelocityRelaxation`, `setMaxGridPoints`, `setSolveBounds`, mask mechanics, `GpuMode`/`GpuPreconditioner`, model-level `saveSurfaceMesh`/`saveVolumeMesh` helpers | Each accepted setter has a native surface-hash probe; the excluded ones are inert, unsafe, GPU-only, or have no verified LOCOS output. See [`oxidation-advanced-contract.md`](oxidation-advanced-contract.md) |
 | `SiliconOrientation.Si110` | 4 of 4 (`Si100`, `Si110`, `Si111`, `PolySi`) | — | Native enum value 1; changes the Deal-Grove planar readback and produces distinct 2D/3D surface hashes |
@@ -164,24 +170,26 @@ SPX-only, and any UI that implies otherwise would be wrong.
 Each batch is independent, ships behind its own schema field, and must not change existing request
 hashes when unused.
 
-### Batch A1 — `FaradayCageEtching` (3D)
+### Batch A1 — `FaradayCageEtching` (2D CPU-only / 3D)
 
 - Model fields: `cageAngle` + the existing `ionBeam` parameter group (reuse the `IBEParameters` block).
 - Mask materials come from the geometry, exactly like `ionBeam`.
 - Acceptance:
-  1. validator rejects `dimension: 2` with a clear 422 before the worker starts;
-  2. 3D trench + mask surface equals a direct native reference within `1e-6 µm`;
+  1. 2D is admitted only with the pinned `CPU_DISK` engine (AUTO/GPU is a 422 before the worker starts); 3D keeps its previous engine behaviour;
+  2. 2D/3D surface equals a direct native reference within `1e-6 µm`;
   3. an independent native Faraday reference (cage source directions, not ordinary normal-incidence IBE) matches within `1e-6 µm`;
-  4. replay reproduces artifact hashes exactly;
-  5. `specialized-models` catalog row states `engineVersion 4.6.2`, dimension 3.
+  4. `thresholdEnergy < meanEnergy` is enforced before the worker in 2D and 3D; equal or higher is a 422 because the native yield sign reverses;
+  5. replay reproduces artifact hashes exactly;
+  6. `specialized-models` catalog row states `engineVersion 4.6.2`, dimensions 2/3 and the 2D CPU-only engine restriction.
 
-### Batch A2 — `GeometricTrenchDeposition` (2D)
+### Batch A2 — `GeometricTrenchDeposition` (2D/3D)
 
 - Acceptance:
-  1. validator rejects `dimension: 3` (engine SIGSEGV);
-  2. 2D trench profile equals a direct native reference within `1e-6 µm`;
+  1. validator rejects the parameter combinations that crash the native reach window (2D and 3D);
+  2. 2D and 3D trench profiles equal a direct native reference within `1e-6 µm`;
   3. run record reports `engine: not-applicable` (no flux engine);
-  4. degenerate parameters (zero rate/width) fail validation instead of hanging.
+  4. degenerate parameters (zero rate/width, sub-grid width/depth, zero radius) fail validation instead of hanging;
+  5. GDS geometry is rejected with 422 because the project does not describe its vertical span.
 
 ### Batch A3 — CSV rate tables (`CSVFileProcess`, `RateGrid`)
 
@@ -194,15 +202,28 @@ hashes when unused.
   4. the request hash changes with CSV content and an old hash fails replay explicitly;
   5. no API field can reach `setCustomInterpolator`.
 
-### Batch A4 — particle shape distributions
+### Batch A4 — particle shape distributions (implemented: no-mask deposit, masked etch)
 
 - These are geometry sources, not process steps (the native mask is a `viennals` Domain).
+- Implemented as schema-7 geometry step `particleShape`: `BoxDistribution` / `SphereDistribution`,
+  no duration, positive radii/half-axes with `operation` selecting the sign.
+  Contract and raw probe record: [`particle-shape-distribution-contract.md`](particle-shape-distribution-contract.md).
+- Masks are not a step field: they are the project geometry's native mask materials
+  (`protected_material_names`, the same rule as the flux/CSV steps). `operation: etch` passes
+  them through `addMaskMaterial`; `operation: deposit` cannot, because any non-empty mask with
+  positive displacement SIGSEGVs in 2D/3D on 4.6.2 and 4.7.0. The run record lists the applied
+  and omitted mask materials.
 - Acceptance:
   1. design note proves the `viennals` mask is derived from the existing project domain, with no second
-     geometry source of truth;
-  2. `Box`/`Sphere` surfaces equal direct native references;
-  3. count and magnitude of radii/half-axes are bounded;
-  4. `CustomSphereDistribution` is catalogued only after a passing 2D **and** 3D probe is archived.
+     geometry source of truth (`addMaskMaterial` over `getMaterialLevelSet`). **Masked etch is safe
+     (2D/3D, material/raw mask, `applyToSingleMaterial`); masked deposition is a native `-11` and is
+     never constructed** — the note records the whole matrix, including the upstream ViennaLS TODO;
+  2. `Box`/`Sphere` surfaces equal direct native references (2D/3D, plane/trench, deposit/etch, masked
+     etch, replay);
+  3. count and magnitude of radii/half-axes are bounded (`> 0`, `≤ 2 µm`, `≥ gridDelta`, 2 axes in 2D,
+     3 in 3D); zero/mixed-sign parameters are unreachable;
+  4. `CustomSphereDistribution` stays unexposed: it aborts in 2D **and** 3D even without a mask, because it
+     indexes one radius per surface point.
 
 ### Batch B1 — full plasma sub-parameter families (implemented backend/API)
 
@@ -320,25 +341,34 @@ for name in ("FaradayCageEtching", "GeometricTrenchDeposition", "CSVFileProcess"
 PY
 ```
 
-The two load-bearing negative results:
+The two load-bearing negative results, with the corrected FaradayCage reading:
 
 ```bash
-# FaradayCageEtching: 3D returns in <0.1 s, 2D never returns (rc=124 from timeout)
-for DIM in 3 2; do
-  timeout 40 .venv/bin/python - "$DIM" <<'PY'
-import sys, viennaps as ps
-ps.setDimension(int(sys.argv[1])); ps.Length.setUnit("um"); ps.Time.setUnit("s")
-d = ps.Domain(0.1, 1.0, 1.0) if sys.argv[1] == "3" else ps.Domain(0.1, 2.0)
+# FaradayCageEtching 2D: the 2026-10-30 audit left Process on AUTO, which
+# resolves to the GPU kernel. That AUTO/GPU run never returns for cage 0.2 at
+# tilt 0 (rc=124). Pinning CPU_DISK makes the identical call finish in <0.01 s,
+# and the whole catalog cage/tilt matrix finishes too:
+timeout 40 .venv/bin/python - <<'PY'
+import viennaps as ps
+ps.setDimension(2); ps.Length.setUnit("um"); ps.Time.setUnit("s")
+d = ps.Domain(0.1, 2.0)
 ps.MakePlane(d, 0.0, ps.Material.Si, False).apply()
 p = ps.FaradayCageParameters(); p.cageAngle = 0.2
 p.ibeParams.meanEnergy, p.ibeParams.sigmaEnergy, p.ibeParams.exponent = 100.0, 10.0, 100.0
-ps.Process(d, ps.FaradayCageEtching(p, [ps.Material.Mask]), 0.005).apply()
-print("ok", sys.argv[1])
+process = ps.Process(d, ps.FaradayCageEtching(p, [ps.Material.Mask]), 0.005)
+process.setFluxEngineType(ps.FluxEngineType.CPU_DISK)
+process.apply()
+print("ok 2 CPU_DISK")
 PY
-  echo "dim=$DIM rc=$?"
-done
+# Full bounded matrix through the real worker model builder (60 s per case):
+.venv/bin/python -m worker.probe_faraday_2d --matrix safe-2d --timeout 60
+.venv/bin/python -m worker.probe_faraday_2d --matrix control-3d --timeout 60
+.venv/bin/python -m worker.probe_faraday_2d --matrix gpu-2d --timeout 20   # known-hanging control
 
-# GeometricTrenchDeposition: 2D finishes, 3D aborts with SIGSEGV (rc=139)
+# GeometricTrenchDeposition: the 2026-10-30 3D probe aborted with SIGSEGV (rc=139).
+# 2026-10-31 re-probe: the same parameters also abort in 2D; the cause is the
+# native reach (rate 0.05 << a+b = 2.1 um), not 3D; rate >= max(a+b, bottomMed)
+# is now required centrally in validation and the worker.
 timeout 40 .venv/bin/python - <<'PY'
 import viennaps as ps
 ps.setDimension(3); ps.Length.setUnit("um"); ps.Time.setUnit("s")

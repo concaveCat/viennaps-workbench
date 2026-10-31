@@ -8,12 +8,13 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationError
 
 from . import storage
+from .engine import ENGINE_REGISTRY_VERSION, SUPPORTED_ENGINE_VERSIONS, engine_version
 
 
 BUILTIN_CATALOG = storage.ROOT / "docs" / "materials-catalog.json"
-NATIVE_IDS = storage.ROOT / "docs" / "native-material-ids-4.6.2.json"
+NATIVE_IDS = storage.ROOT / "docs" / "native-material-ids-4.6.2.json"  # historical inventory; IDs re-verified identical on 4.7.0
 CUSTOM_CATALOG = storage.VAR / "custom-materials.json"
-CUSTOM_LEGACY_ID_BASE = 177  # Native 4.6.2 probe: built-ins end at 176; first custom is 177.
+CUSTOM_LEGACY_ID_BASE = 177  # Built-ins end at 176 in both 4.6.2 and 4.7.0; first custom is 177.
 MAX_CUSTOM_MATERIALS = 64
 NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_. -]{0,63}$")
 # The complete viennaps.MaterialCategory enum exposed by ViennaPS 4.6.2.
@@ -60,7 +61,9 @@ class MaterialDefinition(BaseModel):
 def _custom_record(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict) or set(raw) != {"schemaVersion", "engineVersion", "materials"}:
         raise ValueError("custom material registry has an invalid shape")
-    if raw["schemaVersion"] != 1 or raw["engineVersion"] != "4.6.2" or not isinstance(raw["materials"], list):
+    if (raw["schemaVersion"] != 1
+            or raw["engineVersion"] not in SUPPORTED_ENGINE_VERSIONS
+            or not isinstance(raw["materials"], list)):
         raise ValueError("custom material registry header is invalid")
     rows = []
     seen: set[str] = set()
@@ -82,7 +85,7 @@ def _custom_record(raw: Any) -> dict[str, Any]:
         rows.append(row)
     if len(rows) > MAX_CUSTOM_MATERIALS:
         raise ValueError("custom material registry exceeds the installed-ID budget")
-    return {"schemaVersion": 1, "engineVersion": "4.6.2", "materials": rows}
+    return {"schemaVersion": 1, "engineVersion": ENGINE_REGISTRY_VERSION, "materials": rows}
 
 
 def custom_materials() -> list[dict[str, Any]]:
@@ -97,7 +100,7 @@ def custom_materials() -> list[dict[str, Any]]:
 
 def native_builtin_materials() -> list[dict[str, Any]]:
     raw = storage.read_json(NATIVE_IDS)
-    rows = raw.get("materials") if raw.get("engineVersion") == "4.6.2" else None
+    rows = raw.get("materials") if raw.get("engineVersion") in SUPPORTED_ENGINE_VERSIONS else None
     if not isinstance(rows, list) or raw.get("maxBuiltInLegacyId") != max((item.get("legacyId", -1) for item in rows), default=-1):
         raise ValueError("installed native material ID inventory is invalid")
     if CUSTOM_LEGACY_ID_BASE != raw["maxBuiltInLegacyId"] + 1:
@@ -107,7 +110,7 @@ def native_builtin_materials() -> list[dict[str, Any]]:
 
 def material_catalog() -> dict[str, Any]:
     catalog = storage.read_json(BUILTIN_CATALOG)
-    if catalog.get("schemaVersion") != 1 or catalog.get("engineVersion") != "4.6.2":
+    if catalog.get("schemaVersion") != 1 or catalog.get("engineVersion") not in SUPPORTED_ENGINE_VERSIONS:
         raise ValueError("installed native material catalog header is invalid")
     builtins = []
     names: set[str] = set()
@@ -125,7 +128,7 @@ def material_catalog() -> dict[str, Any]:
     if any(item["name"] in native_names or item["name"] in names or item["id"] in ids or item["id"] in native_ids for item in custom):
         raise ValueError("custom material identity collides with the installed built-in catalog")
     visible_custom = [row for row in custom if not row.get("deleted", False)]
-    return {"schemaVersion": 1, "engineVersion": "4.6.2", "materials": [*builtins, *[{**row, "isCustom": True} for row in visible_custom]]}
+    return {"schemaVersion": 1, "engineVersion": engine_version(), "materials": [*builtins, *[{**row, "isCustom": True} for row in visible_custom]]}
 
 
 def create_material(payload: Any) -> dict[str, Any]:
@@ -150,7 +153,7 @@ def create_material(payload: Any) -> dict[str, Any]:
     index = len(current)
     row = {"name": name, "id": CUSTOM_LEGACY_ID_BASE + index, "customId": index,
            **base.model_dump(mode="json", exclude_none=True)}
-    record = {"schemaVersion": 1, "engineVersion": "4.6.2", "materials": [*current, row]}
+    record = {"schemaVersion": 1, "engineVersion": ENGINE_REGISTRY_VERSION, "materials": [*current, row]}
     storage.atomic_json(CUSTOM_CATALOG, record)
     return {**row, "isCustom": True}
 
@@ -173,7 +176,7 @@ def update_material(name: str, payload: Any) -> dict[str, Any]:
         raise ValueError(str(exc)) from exc
     rows[index] = {"name": current["name"], "id": current["id"], "customId": current["customId"],
                    **metadata.model_dump(mode="json", exclude_none=True)}
-    storage.atomic_json(CUSTOM_CATALOG, {"schemaVersion": 1, "engineVersion": "4.6.2", "materials": rows})
+    storage.atomic_json(CUSTOM_CATALOG, {"schemaVersion": 1, "engineVersion": ENGINE_REGISTRY_VERSION, "materials": rows})
     return {**rows[index], "isCustom": True}
 
 
@@ -203,7 +206,7 @@ def delete_material(name: str, current_project: Any = None) -> dict[str, Any]:
         raise ValueError(f"{name!r} is used by the current project, a saved project, or run history and cannot be deleted")
 
     rows[index] = {**rows[index], "deleted": True}
-    storage.atomic_json(CUSTOM_CATALOG, {"schemaVersion": 1, "engineVersion": "4.6.2", "materials": rows})
+    storage.atomic_json(CUSTOM_CATALOG, {"schemaVersion": 1, "engineVersion": ENGINE_REGISTRY_VERSION, "materials": rows})
     return {**rows[index], "isCustom": True}
 
 
@@ -296,7 +299,7 @@ def attach_and_reconcile_project_materials(project: Any) -> None:
                 existing.append(definition.model_dump(mode="json", exclude_none=True))
             else:
                 raise ValueError("project custom material definitions are not a complete registration prefix")
-        storage.atomic_json(CUSTOM_CATALOG, {"schemaVersion": 1, "engineVersion": "4.6.2", "materials": existing})
+        storage.atomic_json(CUSTOM_CATALOG, {"schemaVersion": 1, "engineVersion": ENGINE_REGISTRY_VERSION, "materials": existing})
     names = referenced_material_names(project)
     catalog_names = {row["name"] for row in material_catalog()["materials"]}
     custom_names = {row["name"] for row in custom_materials() if not row.get("deleted", False)}

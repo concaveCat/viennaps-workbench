@@ -14,11 +14,13 @@ import math
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import time
 import traceback
 import xml.etree.ElementTree as ET
+from array import array
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any
@@ -27,13 +29,21 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from backend.rates import has_motion, is_geometry_step, uses_flux, signed_rates, signed_directional_rates, signed_directional_rate_sets
-from backend.models import normalized_geometry_v3, parse_project, project_structure_hash
+from backend.models import (normalized_geometry_v3, parse_project,
+                            project_structure_hash, strict_boolean,
+                            strict_finite_number, strict_integer)
 from backend.runtime_limits import MAX_CELL_SET_CELLS, artifact_limit_bytes, artifact_limit_label
 from backend.preflight import CELL_SET_JSON_BYTES, CELL_SET_VTU_BYTES_PER_CELL
-from backend.validation import fin_construction_decision
+from backend.validation import (capability_verified, fin_construction_decision,
+                               gpu_project_signature, slice_axis_bounds)
+from backend.engine import multi_ion_gpu_error
 from backend.gpu_devices import cuda_devices, resolve_gpu_device
+from backend.gds import MAX_GDS_BLUR_CELLS, blur_exposure_cell_count
 from worker.gds_mask import CONSTRUCTION as GDS_MASK_CONSTRUCTION
-from worker.gds_mask import build_aligned_gds_layer, build_aligned_gds_mask, planar_point_count
+from worker.gds_mask import (NATIVE_CONSTRUCTION, NATIVE_REGRID_CONSTRUCTION,
+                             apply_gds_blur, build_aligned_gds_layer,
+                             build_aligned_gds_mask, native_layer_body,
+                             planar_point_count, resolve_blur)
 from worker.specialized import build_specialized_model
 from worker.csv_process import build_csv_process
 from worker.mask_materials import protected_material_names
@@ -47,6 +57,72 @@ GPU_MULTIPARTICLE_SPLIT_STRATEGY = "symmetric-operator-splitting-v1"
 GPU_MULTIPARTICLE_FLUX_STRATEGY = "per-species-native-mesh-merge-v1"
 GPU_MULTIPARTICLE_NATIVE_STRATEGY = "native-multi-ion-v1"
 GPU_MULTIPARTICLE_NATIVE_FLUX_STRATEGY = "native-multi-ion-flux-v1"
+
+
+def requested_engine_for_step(project: dict[str, Any], step: dict[str, Any],
+                              step_engines: dict[str, Any]) -> str:
+    """Resolve one worker engine without ever contradicting solver.gpuEngine.
+
+    Direct worker input does not pass through backend.validation, so an
+    omitted ``stepEngines`` entry must not silently downgrade an explicit
+    schema-7 GPU engine to GPU_DISK. A pinned entry that disagrees with the
+    requested engine is a hard error.
+    """
+    explicit = step_engines.get(step["id"])
+    solver = project.get("solver") or {}
+    requested = solver.get("gpuEngine") if project.get("schemaVersion") == 7 else None
+    if requested is not None:
+        if solver.get("enginePreference") != "gpu":
+            raise RuntimeError(
+                "solver.gpuEngine requires solver.enginePreference=gpu in the worker input")
+        if explicit is not None and explicit != requested:
+            raise RuntimeError(
+                f"pinned engine {explicit} for step {step['id']} differs from solver.gpuEngine {requested}")
+        return str(requested)
+    if explicit is not None:
+        return str(explicit)
+    return "GPU_DISK" if solver.get("enginePreference") == "gpu" else "CPU_DISK"
+
+
+def verify_worker_engine_evidence(project: dict[str, Any], step: dict[str, Any], engine: str) -> None:
+    """Apply the API capability gate to direct worker input.
+
+    The worker is independently reachable through a bounded run directory.
+    GPU_TRIANGLE must be checked against the archived product/direct matrix
+    here too, otherwise a normalized but unproven project could still call
+    Process.setFluxEngineType(GPU_TRIANGLE).
+    """
+    if engine != "GPU_TRIANGLE":
+        return
+    model = f"specialized:{step['nativeModel']}" if step.get("model") == "specialized" else step["model"]
+    boundary = project["domain"].get("boundaryXY", project["domain"].get("xBoundary"))
+    signature = gpu_project_signature(project, step)
+    if not capability_verified(project["dimension"], model, step["operation"], boundary, engine,
+                               schema_version=project.get("schemaVersion"), **signature):
+        raise RuntimeError(
+            f"GPU_TRIANGLE has no direct-reference acceptance row for {model} "
+            f"{step['operation']} on {boundary} in {project['dimension']}D; the worker refuses "
+            "the request instead of falling back to GPU_DISK or CPU_DISK")
+
+
+def native_slice_position(position: float, grid_delta: float) -> float:
+    """Reproduce ViennaLS Slice's std::round(position/gridDelta)*gridDelta.
+
+    C++ std::round rounds exact halves away from zero. Comparing the
+    fractional part avoids ``floor(q + 0.5)`` accidentally rounding
+    0.49999999999999994 up to 1.0 when the addition itself is rounded.
+    """
+    quotient = position / grid_delta
+    if quotient >= 0.0:
+        lower = math.floor(quotient)
+        index = lower + 1.0 if quotient - lower >= 0.5 else lower
+    else:
+        upper = math.ceil(quotient)
+        index = upper - 1.0 if upper - quotient >= 0.5 else upper
+    result = index * grid_delta
+    if index == 0.0 and math.copysign(1.0, quotient) < 0.0:
+        return -0.0
+    return result
 
 
 def configure_native_materials(ps: Any, custom_rows: list[dict[str, Any]]) -> None:
@@ -183,7 +259,10 @@ def _cell_set_upper_bound(requested: dict[str, Any], *, height: float, top: floa
     else:
         lateral = nx + 2
     band = _level_set_band_half_cells(domain)
-    top_bound = max(top + height, top + band * delta)
+    # ``Domain.generateCellSet(position, ...)`` treats ``position`` as the
+    # absolute grid top, while the generic output path passes ``top + height``
+    # to ``fromLevelSets``. Keep both interpretations inside the bound.
+    top_bound = max(float(height), top + height, top + band * delta)
     bottom_bound = bottom - band * delta
     rows = math.ceil((top_bound - bottom_bound) / delta) + 2
     return lateral * max(rows, 2)
@@ -686,11 +765,20 @@ def measure_initial_geometry(mesh: dict[str, Any], geometry: dict[str, Any], del
     right_points = [x for pair in top_segments for x in pair if x > 1e-9]
     # The initial trench has only the substrate at negative h; mask points are
     # at or above the zero datum. The returned raster contour is authoritative.
-    if not left_points or not right_points:
-        raise RuntimeError("cannot measure the initial trench opening from its top interface")
-    measured_width = min(right_points) - max(left_points)
+    # A half trench retains only x>=0, so its opening is measured from the
+    # symmetry plane at x=0 to the retained Si shoulder.
+    half_trench = bool(geometry.get("halfTrench"))
+    if half_trench:
+        if not right_points:
+            raise RuntimeError("cannot measure the initial half-trench opening from its retained top interface")
+        measured_width = min(right_points)
+        requested_width = float(geometry["width"]) / 2
+    else:
+        if not left_points or not right_points:
+            raise RuntimeError("cannot measure the initial trench opening from its top interface")
+        measured_width = min(right_points) - max(left_points)
+        requested_width = float(geometry["width"])
     measured_depth = -min(point[1] for point in points)
-    requested_width = float(geometry["width"])
     requested_depth = float(geometry["depth"])
     tolerance = 2 * delta + 1e-9
     if abs(measured_width - requested_width) > tolerance:
@@ -1525,6 +1613,141 @@ def apply_gpu_multi_particle_split(ps: Any, domain: Any, project: dict[str, Any]
     }
 
 
+def _per_layer_stack_geometry(ps: Any, domain: Any,
+                              project: dict[str, Any]) -> dict[str, Any]:
+    """Build a stack through the installed native ``MaterialLayer[]`` overload.
+
+    ``MakeTrench`` clears the domain and lays the listed layers from the bottom
+    up. The first non-mask layer is created as the substrate half-space, every
+    later layer as a finite slab, and ``isMask`` cuts an opening through its
+    own layer immediately after insertion. The Workbench substrate is one
+    level set below ``baseHeight``, so it is represented by a native substrate
+    layer of ``baseHeight + 1e-4`` (the constructor's own cutout epsilon).
+    """
+    g = project["geometry"]
+    pattern = g["pattern"]
+    stack = g["layers"]
+    if g.get("gdsMask") is not None:
+        raise RuntimeError("per-layer trench cannot be combined with a GDS mask overlay")
+    if pattern.get("kind") != "trench":
+        raise RuntimeError(
+            "per-layer cutouts require a trench pattern; installed MakeHole has "
+            "no MaterialLayer[] overload")
+    entries = pattern.get("layers")
+    if not isinstance(entries, list) or not entries:
+        raise RuntimeError("per-layer trench requires a non-empty layers array")
+    if len(entries) != len(stack):
+        raise RuntimeError(
+            "per-layer trench must reference every stack layer exactly once "
+            "from bottom to top; omit no layer, including the bottom film")
+    domain_config = project.get("domain") or {}
+    grid_delta = strict_finite_number(domain_config.get("gridDelta"),
+                                      "domain.gridDelta")
+    x_extent = strict_finite_number(domain_config.get("xExtent"), "domain.xExtent")
+    if grid_delta <= 0 or x_extent <= 0:
+        raise RuntimeError("per-layer trench requires positive gridDelta and xExtent")
+    base_height = strict_finite_number(g.get("baseHeight", 0.0),
+                                       "geometry.baseHeight")
+    if base_height < 0:
+        raise RuntimeError("per-layer trench requires a non-negative baseHeight")
+    if base_height / grid_delta > 1_000_000:
+        raise RuntimeError("per-layer baseHeight exceeds the coordinate budget")
+
+    by_id = {layer.get("id"): index for index, layer in enumerate(stack)}
+    cutouts: dict[int, dict[str, Any]] = {}
+    thicknesses: list[float] = []
+    for position, (entry, layer) in enumerate(zip(entries, stack)):
+        if not isinstance(entry, dict):
+            raise RuntimeError(f"per-layer cutout {position} must be a JSON object")
+        index = entry.get("layerIndex")
+        layer_id = entry.get("layerId")
+        if (index is None) == (layer_id is None):
+            raise RuntimeError(
+                f"per-layer cutout {position} must reference exactly one stack layer")
+        if index is not None:
+            index = strict_integer(index, f"pattern.layers[{position}].layerIndex")
+        else:
+            if not isinstance(layer_id, str) or layer_id not in by_id:
+                raise RuntimeError(
+                    f"per-layer cutout {position} references unknown stack layer "
+                    f"{layer_id!r}")
+            index = by_id[layer_id]
+        if index != position:
+            raise RuntimeError(
+                "per-layer cutouts must be ordered from bottom to top and "
+                "reference every stack layer exactly once")
+        path = f"pattern.layers[{position}]"
+        width = strict_finite_number(entry.get("width"), f"{path}.width")
+        taper_angle = strict_finite_number(entry.get("taperAngle"),
+                                           f"{path}.taperAngle")
+        is_mask = strict_boolean(entry.get("isMask"), f"{path}.isMask")
+        thickness = strict_finite_number(layer.get("thickness"),
+                                         f"geometry.layers[{position}].thickness")
+        if width <= 0:
+            raise RuntimeError(f"{path}.width must be positive")
+        if not -45.0 <= taper_angle <= 45.0:
+            raise RuntimeError(f"{path}.taperAngle must be between -45 and 45 degrees")
+        if thickness <= 0:
+            raise RuntimeError(
+                f"geometry.layers[{position}].thickness must be positive")
+        change = 2.0 * thickness * math.tan(math.radians(taper_angle))
+        narrow = width + min(0.0, change)
+        wide = width + max(0.0, change)
+        if narrow < 2.0 * grid_delta - 1e-12:
+            raise RuntimeError(
+                f"{path}.taperAngle closes the opening below two grid intervals")
+        if wide >= x_extent:
+            raise RuntimeError(
+                f"{path} cutout and tapered opening must fit inside the lateral domain")
+        if layer.get("source") == "gds-mask":
+            raise RuntimeError("a GDS mask layer cannot carry a per-layer native cutout")
+        thicknesses.append(thickness)
+        cutouts[position] = {"width": width, "taperAngle": taper_angle,
+                             "isMask": is_mask}
+    if not cutouts[len(stack) - 1]["isMask"]:
+        raise RuntimeError(
+            "per-layer trench requires isMask=true on the top stack layer")
+
+    epsilon = 1e-4
+    records: list[dict[str, Any]] = []
+    native_layers: list[Any] = []
+
+    def append_layer(index: int | None, layer_id: str | None, name: str,
+                     material: str, height: float, width: float,
+                     taper_angle: float, is_mask: bool) -> None:
+        native_layers.append(ps.MakeTrench.MaterialLayer(
+            height=float(height), width=float(width),
+            taperAngle=float(taper_angle),
+            material=material_handle(ps, material), isMask=bool(is_mask)))
+        records.append({"stackLayerIndex": index, "stackLayerId": layer_id,
+                        "name": name, "material": material,
+                        "height": float(height), "width": float(width),
+                        "taperAngle": float(taper_angle), "isMask": bool(is_mask)})
+
+    append_layer(None, None, "substrate", g["substrateMaterial"],
+                 base_height + epsilon, 0.0, 0.0, False)
+    for index, layer in enumerate(stack):
+        entry = cutouts[index]
+        append_layer(index, layer.get("id"), str(layer.get("name", layer.get("id", ""))),
+                     layer["material"], thicknesses[index],
+                     entry["width"], entry["taperAngle"], entry["isMask"])
+
+    ps.MakeTrench(domain=domain, materialLayers=native_layers,
+                  halfTrench=False).apply()
+    return {
+        "stack": True,
+        "perLayerPattern": {
+            "nativeConstructor":
+                "viennaps.MakeTrench(domain, materialLayers=MaterialLayer[], halfTrench=False)",
+            "nativeLayerType": "viennaps.MakeTrench.MaterialLayer",
+            "nativeOrder": "bottom-to-top; first non-mask native layer is the substrate",
+            "baseHeight": base_height,
+            "substrateEpsilon": epsilon,
+            "layers": records,
+        },
+    }
+
+
 def _stack_geometry(ps: Any, domain: Any, project: dict[str, Any]) -> None:
     g=project["geometry"]; dim=project["dimension"]
     height=float(g.get("baseHeight",0.0))
@@ -1549,6 +1772,140 @@ def _stack_geometry(ps: Any, domain: Any, project: dict[str, Any]) -> None:
     else:
         stencil=factory.makeCylinderStencil(pos,float(pattern["radius"]),top_thickness+2*eps,angle)
     domain.applyBooleanOperation(stencil,ps.ls.BooleanOperationEnum.RELATIVE_COMPLEMENT,False)
+
+
+def _load_gds_geometry(ps: Any, dimension: int, path: Path, delta: float,
+                       lateral: Any, *, padding: float = 0.0,
+                       blur: dict[str, Any] | None = None,
+                       second_boundary: Any | None = None) -> Any:
+    """Read one filtered GDS file with the requested native frame padding.
+
+    Padding is applied through the installed `GDSGeometry.setBoundaryPadding`
+    before the reader runs; it changes the native level-set frame, not the
+    polygons, so a polygon that exactly fills the layout bounds gets a real
+    inside/outside grid pair instead of an empty level set.
+    """
+    if dimension == 3:
+        geometry = ps.d3.GDSGeometry(float(delta))
+        geometry.setBoundaryConditions(
+            [lateral, lateral, ps.BoundaryType.INFINITE_BOUNDARY])
+    else:
+        geometry = ps.d2.GDSGeometry(float(delta))
+        geometry.setBoundaryConditions(
+            [lateral, second_boundary if second_boundary is not None
+             else ps.BoundaryType.INFINITE_BOUNDARY])
+    if padding:
+        geometry.setBoundaryPadding(float(padding), float(padding))
+    apply_gds_blur(geometry, blur)
+    if dimension == 3:
+        ps.d3.GDSReader(geometry, str(path)).apply()
+    else:
+        ps.d2.GDSReader(geometry, str(path)).apply()
+    return geometry
+
+
+def _gds_planar_layers(ps: Any, path: Path, delta: float, lateral: Any,
+                       layers: list[int], *, padding: float,
+                       blur: dict[str, Any] | None,
+                       three_d_source: bool = False) -> tuple[Any, dict[int, Any]]:
+    """Read the native 2D polygon interiors used by both GDS body paths.
+
+    A 3D body source uses the same reflective second boundary as the installed
+    3D `layerToLevelSet` internal 2D read, so a non-empty planar result proves
+    that the native 3D call cannot hit its empty-interior crash path.
+    """
+    geometry = _load_gds_geometry(
+        ps, 2, path, delta, lateral, padding=padding, blur=blur,
+        # The installed blur path cannot build its 2D contour grid on an
+        # INFINITE second boundary (std::bad_alloc at delta=0.1 on a 4x4 layout).
+        # The native blurred mask itself always uses the GDS boundary pair, so a
+        # reflective second boundary is the compatible choice whenever blur is on.
+        second_boundary=(lateral if (three_d_source or blur is not None) else None))
+    if blur is not None:
+        # Validation already enforces this from the asset; repeat it here so a
+        # hand-written worker config cannot reach the native allocator.
+        bounds = [float(value) for value in geometry.getBounds()]
+        cells = blur_exposure_cell_count(
+            (bounds[0], bounds[2], bounds[1], bounds[3]),
+            grid_delta=float(delta), exposure_delta=float(blur["delta"]),
+            grid_refine=int(blur["gridRefine"]), sigma_count=len(blur["sigmas"]))
+        if cells > MAX_GDS_BLUR_CELLS:
+            raise RuntimeError(
+                f"GDS blur exposure grid would allocate {cells} cells; the limit is "
+                f"{MAX_GDS_BLUR_CELLS}. Increase delta, reduce gridRefine/sigmas, "
+                "or shrink the layout")
+    planars = {int(layer): geometry.layerToLevelSet(int(layer), True) for layer in layers}
+    return geometry, planars
+
+
+def _regrid_planar_to_domain(ps: Any, domain: Any, planar: Any) -> Any:
+    """Move a blurred 2D contour onto the simulation grid.
+
+    The installed blur always builds its contour on the GDS boundary pair, so
+    inserting it directly would replace the 2D domain's infinite second
+    boundary with a reflective one. Regridding keeps the contour and the
+    product's 2D `[lateral, INFINITE]` domain semantics.
+    """
+    mesh = ps.ls.Mesh()
+    ps.ls.d2.ToSurfaceMesh(planar, mesh).apply()
+    target = ps.ls.d2.Domain(domain.getGrid())
+    reconstruction = ps.ls.d2.FromSurfaceMesh(target, mesh)
+    reconstruction.setRemoveBoundaryTriangles(False)
+    reconstruction.apply()
+    return target
+
+
+def _gds_missing_interior_error(layers: list[int], padding: float) -> RuntimeError:
+    return RuntimeError(
+        "GDS 图层 " + ", ".join(str(layer) for layer in layers)
+        + " 在当前 GDS 边界内没有可用的多边形内部（多边形退化或小于网格间距），"
+        "无法构造实体。请检查这些图层的多边形，或减小 gridDelta 后重试。"
+        + (f"（已使用原生边界 padding={padding:g} um）" if padding else ""))
+
+
+def _require_gds_bounds_inside_domain(dimension: int, geometry: Any,
+                                      project: dict[str, Any], *,
+                                      padding: float) -> list[float]:
+    """Reject a layout that cannot be inserted into the simulation domain.
+
+    ViennaPS 4.6.2 does not clip an inserted level set: a GDS body wider than
+    the 2D/3D domain makes `insertNextLevelSetAsMaterial` crash the worker with
+    SIGSEGV. Keep the native call, but fail with a diagnostic before it.
+    """
+    delta = float(project["domain"]["gridDelta"])
+    tolerance = max(1e-7, delta * 1e-6)
+    bounds = [float(value) for value in geometry.getBounds()]
+    x_extent = float(project["domain"]["xExtent"])
+    if dimension == 3:
+        half_x = x_extent / 2.0
+        half_y = float(project["domain"]["yExtent"]) / 2.0
+        outside = (bounds[0] < -half_x - tolerance or bounds[1] > half_x + tolerance
+                   or bounds[2] < -half_y - tolerance or bounds[3] > half_y + tolerance)
+    else:
+        # ViennaPS builds the 2D Domain centered, while Stage 5 GDS layouts are
+        # authored in the absolute [0, xExtent] frame. A layout is acceptable
+        # when it fits either frame entirely; anything outside both is still
+        # rejected before the native insert can crash. The native bounds already
+        # include any boundary padding, so no extra margin is subtracted here.
+        absolute = (bounds[0] >= -tolerance and bounds[1] <= x_extent + tolerance)
+        centered = (bounds[0] >= -x_extent / 2.0 - tolerance
+                    and bounds[1] <= x_extent / 2.0 + tolerance)
+        outside = not (absolute or centered)
+    if outside:
+        domain_text = (f"xExtent={x_extent:g}"
+                       + ("；2D 允许绝对坐标 [0, xExtent] 或原生居中 [-xExtent/2, xExtent/2]"
+                          if dimension == 2 else "")
+                       + (f", yExtent={float(project['domain']['yExtent']):g}"
+                          if dimension == 3 else ""))
+        layout_text = (f"[{bounds[0]:g}, {bounds[1]:g}]"
+                       + (f" x [{bounds[2]:g}, {bounds[3]:g}]" if dimension == 3 else ""))
+        padding_text = (f"；全边界多边形需要 {padding:g} um 原生 padding，"
+                        "请扩大计算域" if padding else "")
+        raise RuntimeError(
+            f"GDS 版图边界 {layout_text} 超出当前计算域（{domain_text}）。"
+            "ViennaPS 4.6.2 插入超出计算域的 GDS level set 会直接崩溃，"
+            f"请扩大计算域或移动版图后重试{padding_text}。")
+    return bounds
 
 
 def _apply_gds_stack_mask(ps: Any, domain: Any, project: dict[str, Any], *,
@@ -1578,24 +1935,41 @@ def _apply_gds_stack_mask(ps: Any, domain: Any, project: dict[str, Any], *,
     # through the requested mask thickness along z.  GDSGeometry's native 3D
     # layerToLevelSet is bounded by the current Domain top surface, so a mask
     # positioned above an existing film stack silently disappears.  The 2D
-    # conversion plus ViennaLS Extrude preserves XY polygons and allows a real
-    # finite mask volume above the stack.
-    geometry = ps.d2.GDSGeometry(float(project["domain"]["gridDelta"]))
-    # The intermediate geometry only carries the selected polygons.  Its lateral
-    # boundaries are decoupled from the final simulation domain: regridding onto
-    # the real grid happens in build_aligned_gds_mask().
-    reflective = ps.BoundaryType.REFLECTIVE_BOUNDARY
-    geometry.setBoundaryConditions([reflective, reflective])
-    ps.d2.GDSReader(geometry, str(filtered)).apply()
+    # conversion plus the shared finite-body construction preserves XY polygons
+    # and allows a real finite mask volume above the stack.
+    delta = float(project["domain"]["gridDelta"])
+    lateral = ps.BoundaryType.REFLECTIVE_BOUNDARY
+    geometry, planars = _gds_planar_layers(
+        ps, filtered, delta, lateral, [int(mask["layer"])], padding=0.0, blur=None,
+        three_d_source=True)
     layers = sorted(int(value) for value in geometry.getAllLayers())
     if int(mask["layer"]) not in layers:
         raise RuntimeError("selected GDS layer was not read by ViennaPS")
     base_height = float(mask["baseHeight"]) + float(mask["position"][2])
-    planar_inside = geometry.layerToLevelSet(int(mask["layer"]), True)
+    planar_inside = planars[int(mask["layer"])]
+    planar_padding = 0.0
+    if planar_point_count(planar_inside) == 0:
+        # A polygon that exactly fills the filtered layout bounds has no
+        # inside/outside pair; one cell of native boundary padding recovers its
+        # real interior instead of inventing geometry.
+        planar_padding = delta
+        geometry, planars = _gds_planar_layers(
+            ps, filtered, delta, lateral, [int(mask["layer"])],
+            padding=planar_padding, blur=None, three_d_source=True)
+        planar_inside = planars[int(mask["layer"])]
+        if planar_point_count(planar_inside) == 0:
+            raise _gds_missing_interior_error([int(mask["layer"])], planar_padding)
+    gds3 = _load_gds_geometry(ps, 3, filtered, delta, lateral,
+                              padding=planar_padding, blur=None)
+    native_body = native_layer_body(
+        gds3, int(mask["layer"]), base_height=base_height,
+        height=float(mask["height"]), mask_tone=False, blur_layer=True)
     aligned_mask, diagnostics = build_aligned_gds_mask(
         ps, domain, planar_inside, base_height=base_height,
         height=float(mask["height"]), retained_region=mask["retainedRegion"],
-        layer=int(mask["layer"]))
+        layer=int(mask["layer"]), native_body=native_body)
+    diagnostics["planarGridPadding"] = planar_padding
+    diagnostics["nativeBodyUsed"] = native_body is not None
     # The regridded mask is a complete finite body on the simulation grid, so it
     # is unioned into the existing top level set (Si ∪ SiO₂ ∪ Mask) instead of
     # replacing it.
@@ -1611,13 +1985,26 @@ def _apply_gds_stack_mask(ps: Any, domain: Any, project: dict[str, Any], *,
                       "material": mask["material"], "filteredFile": filtered.name,
                       **diagnostics})
     atomic_json(run_dir / "gds-mask-transform.json", transform)
-    native_geometry = ("viennaps.d2.GDSReader + GDSGeometry.layerToLevelSet + viennals.Extrude"
-                       " + viennals.BooleanOperation(INTERSECT,RELATIVE_COMPLEMENT)"
+    native_geometry = ("viennaps.GDSReader + GDSGeometry.layerToLevelSet(3D inside body when available)"
+                       " + viennals.Extrude fallback for empty native bodies"
+                       " + viennals.BooleanOperation(RELATIVE_COMPLEMENT for outside)"
                        " + viennals.ToSurfaceMesh + viennals.FromSurfaceMesh"
-                       " + viennals.BooleanOperation(RELATIVE_COMPLEMENT)"
                        " + Domain.insertNextLevelSetAsMaterial(UNION)"
-                       f" [{GDS_MASK_CONSTRUCTION}]")
+                       f" [{NATIVE_REGRID_CONSTRUCTION} / {GDS_MASK_CONSTRUCTION}]")
     return {"nativeGeometry": native_geometry, **transform}
+
+
+def _halve_x_axis(domain: Any) -> None:
+    """Apply the native half-geometry setup before a Boolean construction.
+
+    Native MakeFin/MakeTrench call ``getSetup().halveXAxis()`` before
+    ``apply()`` rebuilds the domain. An already-allocated Domain needs the
+    halved setup re-applied, otherwise the grid keeps its full x bounds and the
+    flag is silently lost.
+    """
+    setup = domain.getSetup()
+    setup.halveXAxis()
+    domain.setup(setup)
 
 
 def _boolean_fin_2d(ps: Any, domain: Any, geometry: dict[str, Any], material: Any,
@@ -1663,6 +2050,10 @@ def make_v3_geometry(ps: Any, domain: Any, project: dict[str,Any], *, config: di
                      run_dir: Path | None = None) -> dict[str,Any] | None:
     g=project["geometry"]
     if g["kind"]=="stack":
+        if g["pattern"].get("layers") is not None:
+            # The native multi-layer constructor rebuilds the whole domain;
+            # adding the substrate plane first would be discarded.
+            return _per_layer_stack_geometry(ps, domain, project)
         # The bulk substrate is the bottom half-space; the first plane marks
         # its top interface, and subsequent planes add requested films.
         ps.MakePlane(domain,height=float(g.get("baseHeight",0.0)),material=material_handle(ps,g["substrateMaterial"]),addToExisting=False).apply()
@@ -1677,13 +2068,19 @@ def make_v3_geometry(ps: Any, domain: Any, project: dict[str,Any], *, config: di
         fallback = requested_construction != construction
         extrusion_route = construction_decision["extrusionRoute"]
         extrusion_fallback_models = construction_decision["extrusionFallbackModels"]
+        half_fin = bool(g.get("halfFin"))
         args = {"finWidth": float(g["width"]), "finHeight": float(g["height"]),
                 "finTaperAngle": float(g["taperAngle"]), "maskHeight": float(g["maskHeight"]),
-                "maskTaperAngle": float(g["maskTaperAngle"]), "halfFin": False,
+                "maskTaperAngle": float(g["maskTaperAngle"]), "halfFin": half_fin,
                 "material": material_handle(ps,g["substrateMaterial"]),
                 "maskMaterial": material_handle(ps,g["maskMaterial"])}
         if project["dimension"] == 2:
             if construction == "boolean":
+                # The native constructor halves inside MakeFin; the
+                # independently verified Boolean route must apply the same
+                # setup change explicitly so halfFin is never silently lost.
+                if half_fin:
+                    _halve_x_axis(domain)
                 _boolean_fin_2d(ps, domain, g, args["material"], args["maskMaterial"])
             else:
                 ps.d2.MakeFin(domain, **args).apply()
@@ -1705,6 +2102,8 @@ def make_v3_geometry(ps: Any, domain: Any, project: dict[str,Any], *, config: di
             y_extent = extent[1] - extent[0]
             if y_extent <= 0:
                 raise RuntimeError("Fin extrusion y extent must have positive length")
+            if half_fin:
+                _halve_x_axis(domain)
             _boolean_fin_3d(ps, domain, g, args["material"], args["maskMaterial"],
                             0.5 * (extent[0] + extent[1]), y_extent)
             return {"nativeGeometry": "viennaps.MakePlane + viennaps.d3.GeometryFactory + Domain.applyBooleanOperation (extrusion extent stencil)",
@@ -1722,6 +2121,8 @@ def make_v3_geometry(ps: Any, domain: Any, project: dict[str,Any], *, config: di
             bc = ps.BoundaryType.REFLECTIVE_BOUNDARY if project["domain"]["boundaryXY"] == "reflective" else ps.BoundaryType.PERIODIC_BOUNDARY
             input_domain = ps.d2.Domain(float(project["domain"]["gridDelta"]), float(project["domain"]["xExtent"]), bc)
             if construction == "boolean":
+                if half_fin:
+                    _halve_x_axis(input_domain)
                 _boolean_fin_2d(ps, input_domain, g, args["material"], args["maskMaterial"])
             else:
                 ps.d2.MakeFin(input_domain, **args).apply()
@@ -1748,6 +2149,8 @@ def make_v3_geometry(ps: Any, domain: Any, project: dict[str,Any], *, config: di
                     "substrateMaterial":g["substrateMaterial"],"maskMaterial":g["maskMaterial"],
                     "boundaryReadback":[str(value) for value in domain.getBoundaryConditions()]}
         if construction == "boolean":
+            if half_fin:
+                _halve_x_axis(domain)
             _boolean_fin_3d(ps, domain, g, args["material"], args["maskMaterial"],
                             0.0, float(project["domain"]["yExtent"]))
         else:
@@ -1826,142 +2229,214 @@ def make_v3_geometry(ps: Any, domain: Any, project: dict[str,Any], *, config: di
         selected_path = run_dir / "gds-selected.gds"
         selected_path.write_bytes(selected_bytes)
         if project["dimension"] == 2:
-            geometry = ps.d2.GDSGeometry(float(project["domain"]["gridDelta"]))
+            delta = float(project["domain"]["gridDelta"])
             lateral = ps.BoundaryType.REFLECTIVE_BOUNDARY if project["domain"]["xBoundary"] == "reflective" else ps.BoundaryType.PERIODIC_BOUNDARY
-            geometry.setBoundaryConditions([lateral, ps.BoundaryType.INFINITE_BOUNDARY])
-            ps.d2.GDSReader(geometry, str(selected_path)).apply()
-            native_bounds = [float(value) for value in geometry.getBounds()]
-            tolerance = max(1e-7, float(support_metadata.get("coordinateToleranceUm", 0.0)) * 1.1)
-            if support_metadata and (abs(native_bounds[0] + float(project["domain"]["xExtent"]) / 2.0) > tolerance
-                                     or abs(native_bounds[1] - float(project["domain"]["xExtent"]) / 2.0) > tolerance):
-                raise RuntimeError("native periodic 2D GDS bounds do not match the requested x period")
+            blur_spec = resolve_blur(g.get("blur"), delta)
+            if blur_spec is not None and lateral == ps.BoundaryType.PERIODIC_BOUNDARY:
+                raise RuntimeError(
+                    "GDS blur requires a reflective lateral boundary; periodic GDS layouts "
+                    "are sized to the full domain and cannot carry native blur padding")
+            # Native blur needs a real outside frame; without padding its
+            # exposure-grid sampling reads past the layout frame.
+            planar_padding = 2.0 * delta if blur_spec is not None else 0.0
+            geometry, planars = _gds_planar_layers(
+                ps, selected_path, delta, lateral, [int(row["layer"]) for row in g["layers"]],
+                padding=planar_padding, blur=blur_spec)
             actual_layers = sorted(int(value) for value in geometry.getAllLayers())
             selected_native_layers = sorted(set(actual_layers) & set(selected_layers))
             if selected_native_layers != sorted(selected_layers):
                 raise RuntimeError(f"native GDS layer readback {selected_native_layers} differs from selected layers {sorted(selected_layers)}")
-            delta = float(project["domain"]["gridDelta"])
-            planars = {int(mapping["layer"]): geometry.layerToLevelSet(
-                int(mapping["layer"]), True) for mapping in g["layers"]}
-            planar_padding = 0.0
-            if any(planar_point_count(planar) == 0 for planar in planars.values()):
-                # Same native frame defect as the 3D branch: a polygon that fills
-                # the GDS bounds has no zero crossing, so its interior reads back
-                # empty instead of covering the cell.  One cell of extra frame
-                # makes the native rasterizer report the real polygon interior.
+            empty_layers = sorted(layer for layer, planar in planars.items()
+                                  if planar_point_count(planar) == 0)
+            if empty_layers and planar_padding == 0.0:
+                # A polygon that fills the GDS bounds has no zero crossing, so
+                # its interior reads back empty. One cell of native frame
+                # padding makes the native rasterizer report the real interior.
                 planar_padding = delta
-                padded = ps.d2.GDSGeometry(delta)
-                padded.setBoundaryConditions([lateral, ps.BoundaryType.INFINITE_BOUNDARY])
-                padded.setBoundaryPadding(planar_padding, planar_padding)
-                ps.d2.GDSReader(padded, str(selected_path)).apply()
-                planars = {int(mapping["layer"]): padded.layerToLevelSet(
-                    int(mapping["layer"]), True) for mapping in g["layers"]}
-                still_empty = sorted(layer for layer, planar in planars.items()
-                                     if planar_point_count(planar) == 0)
-                if still_empty:
-                    raise RuntimeError(
-                        "GDS 图层 " + ", ".join(str(layer) for layer in still_empty)
-                        + " 在当前 GDS 边界内没有可用的多边形内部（多边形退化或小于网格间距），"
-                        "无法构造实体。请检查这些图层的多边形，或减小 gridDelta 后重试。")
+                geometry, planars = _gds_planar_layers(
+                    ps, selected_path, delta, lateral,
+                    [int(row["layer"]) for row in g["layers"]],
+                    padding=planar_padding, blur=blur_spec)
+                empty_layers = sorted(layer for layer, planar in planars.items()
+                                      if planar_point_count(planar) == 0)
+            if empty_layers:
+                raise _gds_missing_interior_error(empty_layers, planar_padding)
+            native_bounds = _require_gds_bounds_inside_domain(
+                2, geometry, project, padding=planar_padding)
+            bounds_readback = [float(value) for value in geometry.getBounds()]
+            if blur_spec is not None:
+                # Native blur contour -> simulation grid. Inserting the raw
+                # reflective-second-boundary contour would rewrite the 2D
+                # domain's infinite h boundary.
+                planars = {layer: _regrid_planar_to_domain(ps, domain, planar)
+                           for layer, planar in planars.items()}
+                empty_layers = sorted(layer for layer, planar in planars.items()
+                                      if planar_point_count(planar) == 0)
+                if empty_layers:
+                    raise _gds_missing_interior_error(empty_layers, planar_padding)
+            tolerance = max(1e-7, float(support_metadata.get("coordinateToleranceUm", 0.0)) * 1.1)
+            if support_metadata and planar_padding == 0.0 and (
+                    abs(native_bounds[0] + float(project["domain"]["xExtent"]) / 2.0) > tolerance
+                    or abs(native_bounds[1] - float(project["domain"]["xExtent"]) / 2.0) > tolerance):
+                raise RuntimeError("native periodic 2D GDS bounds do not match the requested x period")
             for mapping in g["layers"]:
                 level_set = planars[int(mapping["layer"])]
                 # All GDS layers share this native grid; cumulative wrapping keeps
                 # LS_n = LS_(n-1) union layer_n instead of replacing lower layers.
                 domain.insertNextLevelSetAsMaterial(level_set, material_handle(ps, mapping["material"]), True)
+            blur_readback = None
+            if blur_spec is not None:
+                blur_readback = {**blur_spec, "nativeMethod": "GDSGeometry.addBlur",
+                                 "blurLayer": True, "blurred": True,
+                                 "planarGridPadding": planar_padding,
+                                 "regriddedToDomain": True,
+                                 "semantics": "GDS proximity blur + threshold contour; not a resist/OPC model"}
+            layer_constructions = None
         else:
-            geometry = ps.d3.GDSGeometry(float(project["domain"]["gridDelta"]))
+            delta = float(project["domain"]["gridDelta"])
             lateral = ps.BoundaryType.REFLECTIVE_BOUNDARY if project["domain"]["boundaryXY"] == "reflective" else ps.BoundaryType.PERIODIC_BOUNDARY
-            geometry.setBoundaryConditions([lateral, lateral, ps.BoundaryType.INFINITE_BOUNDARY])
-            ps.d3.GDSReader(geometry, str(selected_path)).apply()
-            native_bounds = [float(value) for value in geometry.getBounds()]
-            tolerance = max(1e-7, float(support_metadata.get("coordinateToleranceUm", 0.0)) * 1.1)
-            if support_metadata and (abs(native_bounds[0] + float(project["domain"]["xExtent"]) / 2.0) > tolerance
-                                     or abs(native_bounds[1] - float(project["domain"]["xExtent"]) / 2.0) > tolerance
-                                     or abs(native_bounds[2] + float(project["domain"]["yExtent"]) / 2.0) > tolerance
-                                     or abs(native_bounds[3] - float(project["domain"]["yExtent"]) / 2.0) > tolerance):
-                raise RuntimeError("native periodic 3D GDS bounds do not match the requested XY periods")
-            actual_layers = sorted(int(value) for value in geometry.getAllLayers())
+            blur_spec = resolve_blur(g.get("blur"), delta)
+            if blur_spec is not None and lateral == ps.BoundaryType.PERIODIC_BOUNDARY:
+                raise RuntimeError(
+                    "GDS blur requires a reflective lateral boundary; periodic GDS layouts "
+                    "are sized to the full domain and cannot carry native blur padding")
+            planar_padding = 2.0 * delta if blur_spec is not None else 0.0
+            layers = [int(row["layer"]) for row in g["layers"]]
+            geometry, planars = _gds_planar_layers(
+                ps, selected_path, delta, lateral, layers,
+                padding=planar_padding, blur=blur_spec, three_d_source=True)
+            native_geometry = _load_gds_geometry(
+                ps, 3, selected_path, delta, lateral,
+                padding=planar_padding, blur=blur_spec)
+            actual_layers = sorted(int(value) for value in native_geometry.getAllLayers())
             selected_native_layers = sorted(set(actual_layers) & set(selected_layers))
             if selected_native_layers != sorted(selected_layers):
                 raise RuntimeError(f"native GDS layer readback {selected_native_layers} differs from selected layers {sorted(selected_layers)}")
-            # The installed 3D layerToLevelSet follows the GDS library grid and
-            # returns an empty body for some valid base/height pairs.  Read the
-            # polygon interior with the 2D API first, then build every layer with
-            # explicit caps and the simulation boundary conditions.
-            delta = float(project["domain"]["gridDelta"])
-            planar_geometry = ps.d2.GDSGeometry(delta)
-            planar_geometry.setBoundaryConditions([lateral, lateral])
-            ps.d2.GDSReader(planar_geometry, str(selected_path)).apply()
-            planars = {int(mapping["layer"]): planar_geometry.layerToLevelSet(
-                int(mapping["layer"]), True) for mapping in g["layers"]}
-            planar_padding = 0.0
             empty_layers = sorted(layer for layer, planar in planars.items()
                                   if planar_point_count(planar) == 0)
-            if empty_layers:
+            if empty_layers and planar_padding == 0.0:
                 # A polygon that fills the GDS bounds is clipped to the library
                 # frame, so the native rasterizer finds no inside/outside pair
                 # and returns an empty level set; extruding that field crashes
-                # ViennaLS.  Widen the read frame by one grid cell: the native
-                # rasterizer then reports the polygon's real interior, so no
-                # geometry is invented.  Layers whose interior is already
-                # readable are rebuilt on the same widened frame.
+                # ViennaLS.  Native boundary padding makes the rasterizer report
+                # the polygon's real interior, so no geometry is invented.
                 planar_padding = delta
-                padded = ps.d2.GDSGeometry(delta)
-                padded.setBoundaryConditions([lateral, lateral])
-                padded.setBoundaryPadding(planar_padding, planar_padding)
-                ps.d2.GDSReader(padded, str(selected_path)).apply()
-                planars = {int(mapping["layer"]): padded.layerToLevelSet(
-                    int(mapping["layer"]), True) for mapping in g["layers"]}
-                still_empty = sorted(layer for layer, planar in planars.items()
-                                     if planar_point_count(planar) == 0)
-                if still_empty:
-                    raise RuntimeError(
-                        "GDS 图层 " + ", ".join(str(layer) for layer in still_empty)
-                        + " 在当前 GDS 边界内没有可用的多边形内部（多边形退化或小于网格间距），"
-                        "无法构造实体。请检查这些图层的多边形，或减小 gridDelta 后重试。")
+                geometry, planars = _gds_planar_layers(
+                    ps, selected_path, delta, lateral, layers,
+                    padding=planar_padding, blur=blur_spec, three_d_source=True)
+                native_geometry = _load_gds_geometry(
+                    ps, 3, selected_path, delta, lateral,
+                    padding=planar_padding, blur=blur_spec)
+                empty_layers = sorted(layer for layer, planar in planars.items()
+                                      if planar_point_count(planar) == 0)
+            if empty_layers:
+                raise _gds_missing_interior_error(empty_layers, planar_padding)
+            native_bounds = _require_gds_bounds_inside_domain(
+                3, native_geometry, project, padding=planar_padding)
+            bounds_readback = [float(value) for value in native_geometry.getBounds()]
+            tolerance = max(1e-7, float(support_metadata.get("coordinateToleranceUm", 0.0)) * 1.1)
+            if support_metadata and planar_padding == 0.0 and (
+                    abs(native_bounds[0] + float(project["domain"]["xExtent"]) / 2.0) > tolerance
+                    or abs(native_bounds[1] - float(project["domain"]["xExtent"]) / 2.0) > tolerance
+                    or abs(native_bounds[2] + float(project["domain"]["yExtent"]) / 2.0) > tolerance
+                    or abs(native_bounds[3] - float(project["domain"]["yExtent"]) / 2.0) > tolerance):
+                raise RuntimeError("native periodic 3D GDS bounds do not match the requested XY periods")
             layer_constructions = []
             for mapping in g["layers"]:
                 layer = int(mapping["layer"])
                 base_height = float(mapping["baseHeight"]) + float(g["position"][2])
+                mask_tone = bool(mapping.get("mask", False))
+                # Prefer the installed native 3D body. ViennaPS 4.6.2 returns a
+                # deterministic empty level set for some valid baseHeight/height
+                # pairs, so a measured empty result falls back to the native 2D
+                # read plus ViennaLS extrusion/caps on the same GDS grid.
+                native_body = native_layer_body(
+                    native_geometry, layer, base_height=base_height,
+                    height=float(mapping["height"]), mask_tone=mask_tone,
+                    blur_layer=True)
                 aligned, diagnostics = build_aligned_gds_layer(
                     ps, domain, planars[layer], base_height=base_height,
-                    height=float(mapping["height"]), mask_tone=bool(mapping.get("mask", False)),
-                    layer=layer)
+                    height=float(mapping["height"]), mask_tone=mask_tone,
+                    layer=layer, native_body=native_body)
                 domain.insertNextLevelSetAsMaterial(
                     aligned, material_handle(ps, mapping["material"]), True)
-                layer_constructions.append({
+                item = {
                     "layer": layer, "material": mapping["material"],
                     "baseHeight": base_height, "height": float(mapping["height"]),
-                    "maskTone": bool(mapping.get("mask", False)),
-                    "planarGridPadding": planar_padding, **diagnostics})
+                    "maskTone": mask_tone, "planarGridPadding": planar_padding,
+                    "nativeBodyUsed": native_body is not None, **diagnostics}
+                if blur_spec is not None:
+                    item["blur"] = {**blur_spec, "nativeMethod": "GDSGeometry.addBlur",
+                                    "blurLayer": True, "applied": True}
+                layer_constructions.append(item)
+            blur_readback = None
+            if blur_spec is not None:
+                blur_readback = {**blur_spec, "nativeMethod": "GDSGeometry.addBlur",
+                                 "blurLayer": True, "blurred": True,
+                                 "planarGridPadding": planar_padding,
+                                 "semantics": "GDS proximity blur + threshold contour; not a resist/OPC model",
+                                 "nativeBodiesUsed": sum(row["nativeBodyUsed"]
+                                                         for row in layer_constructions)}
         transform.update({"sourceAssetId":g["assetId"],"selectedStructure":g["structure"],
                           "selectedLayers":selected_layers,"nativeLayers":actual_layers,
                           "selectedNativeLayers":selected_native_layers,
                           **support_metadata,
                           **({"layerConstructions": layer_constructions,
-                              "construction": GDS_MASK_CONSTRUCTION}
+                              "construction": (NATIVE_CONSTRUCTION
+                                               if all(row.get("nativeBodyUsed") for row in layer_constructions)
+                                               else GDS_MASK_CONSTRUCTION)}
                              if project["dimension"] == 3 else {}),
                           "supportLayers":sorted(set(actual_layers) - set(selected_layers)),
                           "planarGridPadding":planar_padding,
+                          **({"blur": blur_readback} if blur_readback is not None else {}),
                           "nativeUserUnitUm":physical_scale,"userUnitScaleAdjustment":float(g["unitScale"]),
-                          "nativeBounds":[float(value) for value in geometry.getBounds()],
+                          "nativeBounds":bounds_readback,
                           "dimension":project["dimension"],
                           "coordinateMapping":"GDS XY -> Workbench x,h in 2D; GDS XY -> x,y and mapped layer heights -> z in 3D",
                           "layerMappings":g["layers"],"filteredFile":"gds-selected.gds",
                           "filteredFileSha256":hashlib.sha256(selected_bytes).hexdigest()})
         atomic_json(run_dir / "gds-transform.json", transform)
         native_geometry = ("viennaps.GDSReader + GDSGeometry.layerToLevelSet"
+                           + (" + GDSGeometry.setBoundaryPadding" if planar_padding else "")
+                           + (" + GDSGeometry.addBlur + viennals.d2.ToSurfaceMesh"
+                              " + viennals.d2.FromSurfaceMesh(domain grid)"
+                              if blur_readback is not None else "")
                            if project["dimension"] == 2 else
-                           "viennaps.d2.GDSReader + GDSGeometry.layerToLevelSet + viennals.Extrude"
-                           " + viennals.BooleanOperation(INTERSECT,RELATIVE_COMPLEMENT)"
-                           " + viennals.ToSurfaceMesh + viennals.FromSurfaceMesh"
-                           f" + Domain.insertNextLevelSetAsMaterial(UNION) [{GDS_MASK_CONSTRUCTION}]")
+                           "viennaps.GDSReader + GDSGeometry.layerToLevelSet(3D when non-empty)"
+                           " + viennaps.d2.GDSReader + GDSGeometry.layerToLevelSet"
+                           " + viennals.Extrude/BooleanOperation fallback"
+                           " + Domain.insertNextLevelSetAsMaterial(UNION)"
+                           f" [{NATIVE_CONSTRUCTION} / {GDS_MASK_CONSTRUCTION}]")
         return {"nativeGeometry": native_geometry, **transform}
     if g["kind"]=="plane":
         ps.MakePlane(domain,height=float(g["height"]),material=material_handle(ps,g["substrateMaterial"]),addToExisting=False).apply()
+        return {"nativeGeometry":"viennaps.MakePlane",
+                "arguments":{"height":float(g["height"])},
+                "substrateMaterial":g["substrateMaterial"]}
     elif g["kind"]=="trench":
-        ps.MakeTrench(domain=domain,trenchWidth=float(g["width"]),trenchDepth=float(g["depth"]),trenchTaperAngle=float(g["taperAngle"]),maskHeight=float(g["maskHeight"]),maskTaperAngle=float(g["maskTaperAngle"]),halfTrench=False,material=material_handle(ps,g["substrateMaterial"]),maskMaterial=material_handle(ps,g.get("maskMaterial","Mask"))).apply()
+        half_trench = bool(g.get("halfTrench"))
+        ps.MakeTrench(domain=domain,trenchWidth=float(g["width"]),trenchDepth=float(g["depth"]),trenchTaperAngle=float(g["taperAngle"]),maskHeight=float(g["maskHeight"]),maskTaperAngle=float(g["maskTaperAngle"]),halfTrench=half_trench,material=material_handle(ps,g["substrateMaterial"]),maskMaterial=material_handle(ps,g.get("maskMaterial","Mask"))).apply()
+        return {"nativeGeometry":"viennaps.MakeTrench",
+                "arguments":{"width":float(g["width"]),"depth":float(g["depth"]),
+                             "taperAngle":float(g["taperAngle"]),"maskHeight":float(g["maskHeight"]),
+                             "maskTaperAngle":float(g["maskTaperAngle"]),
+                             "halfTrench":half_trench},
+                "requestedHalfTrench":g.get("halfTrench"),
+                "actualHalfTrench":half_trench,
+                "substrateMaterial":g["substrateMaterial"],"maskMaterial":g.get("maskMaterial","Mask")}
     else:
-        ps.MakeHole(domain=domain,holeRadius=float(g["radius"]),holeDepth=float(g["depth"]),holeTaperAngle=float(g["taperAngle"]),maskHeight=float(g["maskHeight"]),maskTaperAngle=float(g["maskTaperAngle"]),holeShape=ps.HoleShape.FULL,material=material_handle(ps,g["substrateMaterial"]),maskMaterial=material_handle(ps,g.get("maskMaterial","Mask"))).apply()
+        hole_shape = str(g.get("holeShape") or "FULL")
+        if hole_shape not in ("FULL", "HALF", "QUARTER"):
+            raise RuntimeError(f"unsupported native HoleShape {hole_shape!r}")
+        ps.MakeHole(domain=domain,holeRadius=float(g["radius"]),holeDepth=float(g["depth"]),holeTaperAngle=float(g["taperAngle"]),maskHeight=float(g["maskHeight"]),maskTaperAngle=float(g["maskTaperAngle"]),holeShape=getattr(ps.HoleShape,hole_shape),material=material_handle(ps,g["substrateMaterial"]),maskMaterial=material_handle(ps,g.get("maskMaterial","Mask"))).apply()
+        return {"nativeGeometry":"viennaps.MakeHole",
+                "arguments":{"radius":float(g["radius"]),"depth":float(g["depth"]),
+                             "taperAngle":float(g["taperAngle"]),"maskHeight":float(g["maskHeight"]),
+                             "maskTaperAngle":float(g["maskTaperAngle"]),
+                             "holeShape":hole_shape},
+                "requestedHoleShape":g.get("holeShape"),
+                "actualHoleShape":hole_shape,
+                "substrateMaterial":g["substrateMaterial"],"maskMaterial":g.get("maskMaterial","Mask")}
     return None
 
 
@@ -2038,7 +2513,28 @@ def save_snapshot(
     """
     v3 = requested["schemaVersion"] >= 3
     if v3:
-        render_domain, levelset_ids = domain, material_map(domain)
+        levelsets = domain.getLevelSets()
+        material_ids = material_map(domain)
+        if any(level_set.getNumberOfPoints() == 0 for level_set in levelsets):
+            # A material can be fully removed by an earlier boolean/process.
+            # The native multi-surface mesher rejects empty level sets, so
+            # render only the surviving interfaces and keep their material IDs.
+            if requested["dimension"] == 3:
+                from mesh3d import make_domain
+                render_domain = make_domain(ps, requested)
+            else:
+                render_domain = _make_render_domain_2d(ps, requested)
+            levelset_ids = []
+            for level_set, material_id in zip(levelsets, material_ids):
+                if level_set.getNumberOfPoints() == 0:
+                    continue
+                render_domain.insertNextLevelSetAsMaterial(
+                    level_set, ps.Material(material_id), False)
+                levelset_ids.append(material_id)
+            if not levelset_ids:
+                raise RuntimeError("cannot render a snapshot with no non-empty level sets")
+        else:
+            render_domain, levelset_ids = domain, material_ids
     else:
         render_domain, levelset_ids = material_surface_domain(ps, domain, requested)
     is3d = requested["dimension"] == 3
@@ -2060,7 +2556,7 @@ def save_snapshot(
         else:
             measured_geometry = measure_initial_geometry(report, requested["geometry"], requested["domain"]["gridDelta"])
     if not is3d and requested["geometry"]["kind"] == "trench" and step_id == "initial":
-        if not trench_has_two_walls(report, requested["domain"]["gridDelta"], MATERIAL_IDS[requested["geometry"]["substrateMaterial"]] if v3 else 10):
+        if not requested["geometry"].get("halfTrench") and not trench_has_two_walls(report, requested["domain"]["gridDelta"], MATERIAL_IDS[requested["geometry"]["substrateMaterial"]] if v3 else 10):
             raise RuntimeError("initial trench contour is incomplete: both positive and negative Si sidewalls are required")
     vtk_name = f"{step_id}.vtk"
     snapshot_name = f"{step_id}.json"
@@ -2294,35 +2790,40 @@ def _gds_boolean_operand(ps: Any, domain: Any, project: dict[str, Any], step: di
     filtered = run_dir / f"gds-boolean-{step['id']}-selected.gds"
     filtered.write_bytes(selected_bytes)
     reflective = ps.BoundaryType.REFLECTIVE_BOUNDARY
-    planar_geometry = ps.d2.GDSGeometry(delta)
-    planar_geometry.setBoundaryConditions([reflective, reflective])
-    ps.d2.GDSReader(planar_geometry, str(filtered)).apply()
+    planar_geometry, planars = _gds_planar_layers(
+        ps, filtered, delta, reflective, [pair[0]], padding=0.0, blur=None,
+        three_d_source=True)
     if pair[0] not in {int(value) for value in planar_geometry.getAllLayers()}:
         raise RuntimeError(f"GDS boolean layer/datatype {pair[0]}/{pair[1]} was not read by ViennaPS")
-    planar = planar_geometry.layerToLevelSet(pair[0], True)
+    planar = planars[pair[0]]
     planar_padding = 0.0
     if planar_point_count(planar) == 0:
         # Same native frame defect as the geometry builder: a polygon that fills
-        # the filtered GDS bounds has no inside/outside pair. One extra cell of
-        # frame recovers its real interior instead of inventing geometry.
+        # the filtered GDS bounds has no inside/outside pair. Native boundary
+        # padding recovers its real interior instead of inventing geometry.
         planar_padding = delta
-        padded = ps.d2.GDSGeometry(delta)
-        padded.setBoundaryConditions([reflective, reflective])
-        padded.setBoundaryPadding(planar_padding, planar_padding)
-        ps.d2.GDSReader(padded, str(filtered)).apply()
-        planar = padded.layerToLevelSet(pair[0], True)
+        planar_geometry, planars = _gds_planar_layers(
+            ps, filtered, delta, reflective, [pair[0]],
+            padding=planar_padding, blur=None, three_d_source=True)
+        planar = planars[pair[0]]
         if planar_point_count(planar) == 0:
-            raise RuntimeError(
-                f"GDS boolean layer/datatype {pair[0]}/{pair[1]} has no usable polygon interior "
-                "inside the filtered layout bounds; reduce gridDelta or adjust the layout")
+            raise _gds_missing_interior_error([pair[0]], planar_padding)
     # The step's baseHeight is relative to the geometry frame, so the geometry's
     # z placement is added as well; this keeps a zero step position aligned with
     # the mapped 3D layers.
     base_height = float(mask["baseHeight"]) + float(mask["position"][2]) + float(geometry["position"][2])
     height = float(mask["height"])
+    gds3 = _load_gds_geometry(ps, 3, filtered, delta, reflective,
+                              padding=planar_padding, blur=None)
+    native_body = native_layer_body(
+        gds3, pair[0], base_height=base_height, height=height,
+        mask_tone=False, blur_layer=True)
     operand, diagnostics = build_aligned_gds_mask(
         ps, domain, planar, base_height=base_height, height=height,
-        retained_region=str(mask["retainedRegion"]), layer=pair[0])
+        retained_region=str(mask["retainedRegion"]), layer=pair[0],
+        native_body=native_body)
+    diagnostics["planarGridPadding"] = planar_padding
+    diagnostics["nativeBodyUsed"] = native_body is not None
     transform.update({
         "sourceAssetId": geometry["assetId"], "selectedStructure": structure,
         "selectedLayers": [pair[0]], "selectedLayerDatatypes": [[pair[0], pair[1]]],
@@ -2347,11 +2848,219 @@ def _gds_boolean_operand(ps: Any, domain: Any, project: dict[str, Any], step: di
     return operand, transform
 
 
+def surface_state(domain: Any, dimension: int) -> dict[str, Any]:
+    """Return surface bounds plus an exact digest of the exposed surface mesh.
+
+    A particle-shape step is a no-op only when the surface really did not
+    change. Axis-aligned bounds are not enough: a masked sphere etch on a
+    patterned stack moved the opening floor while the protected mask top and
+    the substrate pinned every axis bound, so the bounds stayed identical and a
+    bounds-only check rejected a real etch (measured 48 -> 50 surface nodes in
+    2D and 816 -> 850 in 3D). The digest therefore covers every node
+    coordinate, the line/triangle topology, the per-cell material IDs and the
+    domain material map; an unchanged surface hashes identically, any changed
+    node, cell, material or level-set material mapping does not.
+    """
+    mesh = domain.getSurfaceMesh(addInterfaces=True, sharpCorners=False, minNodeDistanceFactor=0.01)
+    points = mesh.getNodes()
+    if not points:
+        raise RuntimeError("the native surface mesh is empty; the particle-shape offset removed every point")
+    cells = mesh.getLines() if dimension == 2 else mesh.getTriangles()
+    mapping = domain.getMaterialMap()
+    material_map = [int(mapping.getMaterialIdAtIdx(index)) for index in range(mapping.size())]
+    cell_data = mesh.getCellData()
+    labels: list[str] = []
+    material_ids: list[int] = []
+    for index in range(cell_data.getScalarDataSize()):
+        label = str(cell_data.getScalarDataLabel(index))
+        labels.append(label)
+        if label == "MaterialIds":
+            material_ids = [int(value) for value in cell_data.getScalarData(index)]
+    digest = hashlib.sha256()
+    digest.update(struct.pack("<I", int(dimension)))
+    digest.update(struct.pack("<Q", len(points)))
+    for point in points:
+        # ``+ 0.0`` folds -0.0 into 0.0 so an unchanged coordinate cannot flip
+        # the digest through a signed zero.
+        digest.update(struct.pack("<" + "d" * dimension,
+                                  *(float(point[axis]) + 0.0 for axis in range(dimension))))
+    digest.update(struct.pack("<Q", len(cells)))
+    for cell in cells:
+        digest.update(struct.pack("<Q", len(cell)))
+        for node in cell:
+            digest.update(struct.pack("<Q", int(node)))
+    digest.update(struct.pack("<Q", len(material_ids)))
+    for value in material_ids:
+        digest.update(struct.pack("<q", value))
+    digest.update(struct.pack("<Q", len(material_map)))
+    for value in material_map:
+        digest.update(struct.pack("<q", value))
+    digest.update("\x00".join(labels).encode("utf-8"))
+    return {
+        "bounds": [[float(min(point[axis] for point in points)),
+                    float(max(point[axis] for point in points))]
+                   for axis in range(dimension)],
+        "pointCount": len(points),
+        "cellCount": len(cells),
+        "digest": digest.hexdigest(),
+    }
+
+
+def apply_particle_shape(ps: Any, domain: Any, project: dict[str, Any], step: dict[str, Any]) -> dict[str, Any]:
+    """Run the native Box/Sphere geometric-advection distribution.
+
+    Measured 4.6.2/4.7.0 behaviour (one bounded subprocess per case, see
+    docs/particle-shape-distribution-contract.md):
+
+    * negative (etch) displacement plus ``addMaskMaterial`` is the officially
+      supported combination: ``GeometricProcessStrategy`` builds the mask from
+      the material level set exactly like the native FinFET example, and the
+      protected material does not move;
+    * positive (deposit) displacement plus any non-empty mask SIGSEGVs in 2D
+      and 3D, regardless of the mask construction or whether the mask overlaps
+      the surface. ViennaLS 5.8.5/5.10.0 even carries the comment "There are
+      still issues with positive box distributions if there is a mask used!".
+
+    The step therefore applies the project's native mask materials for etches
+    and records the mask it really passed. A deposition is always constructed
+    with the no-mask overload and records the omitted mask materials and the
+    crash-backed reason instead of pretending the mask was honoured.
+    """
+    dimension = int(project["dimension"])
+    grid_delta = float(project["domain"]["gridDelta"])
+    shape = str(step["shape"])
+    sign = -1.0 if step["operation"] == "etch" else 1.0
+    requested_masks = protected_material_names(project, step)
+    applied_masks: list[tuple[str, Any]] = []
+    omitted_masks: list[str] = []
+    if sign > 0.0:
+        omitted_masks = list(requested_masks)
+    else:
+        for name in requested_masks:
+            handle = material_handle(ps, name)
+            material_level_set = domain.getMaterialLevelSet(handle)
+            if material_level_set is None or int(material_level_set.getNumberOfPoints()) == 0:
+                # The geometry declared the material but the domain does not
+                # carry it (e.g. maskHeight 0). Passing it would make the
+                # native strategy log "not found" and silently stay maskless.
+                omitted_masks.append(name)
+                continue
+            applied_masks.append((name, handle))
+    requested: dict[str, Any]
+    if shape == "box":
+        axes = [float(value) for value in step["halfAxes"]]
+        if len(axes) != dimension:
+            raise RuntimeError(f"particleShape box needs {dimension} half-axes, got {axes}")
+        for axis in axes:
+            if not math.isfinite(axis) or axis <= 0.0 or axis < grid_delta - 1e-12:
+                raise RuntimeError(
+                    f"particleShape half-axis {axis} must be finite and at least one grid interval "
+                    f"({grid_delta} um); native geometric advection is unsafe below that")
+        signed = [sign * value for value in axes]
+        # The native binding always takes a fixed-size 3 array; 2D consumes
+        # only the first two entries, so the third stays outside the project
+        # surface and cannot silently select a 3D shape.
+        native_half_axes = signed + [0.0] if dimension == 2 else signed
+        model = ps.BoxDistribution(native_half_axes)
+        requested = {"halfAxes": axes}
+        native_class = "BoxDistribution"
+        expected_offset = max(axes)
+    else:
+        radius = float(step["radius"])
+        if not math.isfinite(radius) or radius <= 0.0 or radius < grid_delta - 1e-12:
+            raise RuntimeError(
+                f"particleShape radius {radius} must be finite and at least one grid interval "
+                f"({grid_delta} um); native geometric advection is unsafe below that")
+        signed_radius = sign * radius
+        model = ps.SphereDistribution(signed_radius)
+        requested = {"radius": radius}
+        native_class = "SphereDistribution"
+        native_half_axes = None
+        expected_offset = radius
+    before_state = surface_state(domain, dimension)
+    before = before_state["bounds"]
+    counts_before = [int(level_set.getNumberOfPoints()) for level_set in domain.getLevelSets()]
+    for _name, handle in applied_masks:
+        model.addMaskMaterial(handle)
+    # The geometric process strategy ignores the duration entirely; measure it
+    # as zero so the run record never implies a rate. The 4.6.2/4.7.0 Process
+    # default is AUTO, which resolves and initialises a flux engine even for a
+    # pure geometric distribution (`cuInit`); pin CPU_DISK like the other
+    # non-particle steps so a CPU-only run never touches CUDA.
+    process = ps.Process(domain, model, 0.0)
+    process.setFluxEngineType(ps.FluxEngineType.CPU_DISK)
+    process.apply()
+    after_state = surface_state(domain, dimension)
+    after = after_state["bounds"]
+    if before_state["digest"] == after_state["digest"]:
+        raise RuntimeError(
+            "native particle-shape distribution left the surface unchanged; refusing to record a "
+            "silent no-op (check that the magnitude exceeds the grid resolution"
+            + (f", and that the mask {[name for name, _ in applied_masks]} does not cover the whole "
+               "exposed surface" if applied_masks else "") + ")")
+    mapping = domain.getMaterialMap()
+    return {
+        "geometryOperation": "particleShape",
+        "nativeClass": native_class,
+        "nativeConstructor": (f"viennaps.d{dimension}.{native_class}("
+                              + ("halfAxes" if shape == "box" else "radius") + ")"),
+        "nativeMaskConstructor": ("addMaskMaterial" if applied_masks else None),
+        "dimension": dimension,
+        "operation": step["operation"],
+        "shape": shape,
+        **requested,
+        **({"nativeSignedHalfAxesUm": signed} if shape == "box" else {"nativeSignedRadiusUm": signed_radius}),
+        **({"nativeHalfAxesUm": native_half_axes} if shape == "box" else {}),
+        "expectedOffsetUm": expected_offset,
+        "surfaceBoundsBeforeUm": before,
+        "surfaceBoundsAfterUm": after,
+        "surfaceSignatureBefore": before_state["digest"],
+        "surfaceSignatureAfter": after_state["digest"],
+        "surfacePointCountBefore": before_state["pointCount"],
+        "surfacePointCountAfter": after_state["pointCount"],
+        "surfaceCellCountBefore": before_state["cellCount"],
+        "surfaceCellCountAfter": after_state["cellCount"],
+        "nativeProcessBackend": "CPU_DISK pinned; geometric distribution has no stochastic flux engine",
+        "levelSetPointCountsBefore": counts_before,
+        "levelSetPointCountsAfter": [int(level_set.getNumberOfPoints()) for level_set in domain.getLevelSets()],
+        "materialIdsByLevelSetIndex": [int(mapping.getMaterialIdAtIdx(i)) for i in range(mapping.size())],
+        "gridDeltaUm": grid_delta,
+        "nativeMask": {
+            "mode": "material" if applied_masks else "none",
+            "applied": bool(applied_masks),
+            "materials": [name for name, _ in applied_masks],
+            "omittedMaterials": omitted_masks,
+            "reason": (
+                "the etch protects the project's native mask materials through addMaskMaterial; "
+                "GeometricProcessStrategy builds the mask from their material level sets"
+                if applied_masks else
+                "ViennaPS 4.6.2/4.7.0 SIGSEGV on every non-empty mask with positive geometric "
+                "advection (2D and 3D, material and raw viennals masks, overlapping or far away), so "
+                "a deposition is always constructed with the no-mask overload and every exposed "
+                "surface, including the mask material, grows"
+                if sign > 0.0 else
+                "the etch declares mask materials but none of them is present in the domain, so the "
+                "native no-mask overload is used"
+                if omitted_masks else
+                "the project geometry declares no native mask material, so the no-mask overload is used"
+            ),
+        },
+        "nativeProcessDurationSeconds": 0.0,
+        "nativeDurationIgnored": ("the process duration is ignored: GeometricProcessStrategy calls "
+                                  "GeometricAdvect without consulting it, so the displacement equals the "
+                                  "radius/half-axes"),
+        "scopedSurface": ("the top/exposed level set only; deposition grows the top level-set material and "
+                          "etch intersects every lower level set with the new surface"),
+    }
+
+
 def apply_geometry_operation(ps: Any, domain: Any, project: dict[str, Any], step: dict[str, Any],
                              previous_tops: dict[str, Any] | None = None, *,
                              config: dict[str, Any] | None = None,
                              run_dir: Path | None = None) -> dict[str, Any]:
     model = step["model"]
+    if model == "particleShape":
+        return apply_particle_shape(ps, domain, project, step)
     if model == "removeMaterial":
         material = material_handle(ps, step["material"])
         domain.removeMaterial(material)
@@ -2423,14 +3132,19 @@ def apply_geometry_operation(ps: Any, domain: Any, project: dict[str, Any], step
         enum_name = {"union": "UNION", "intersection": "INTERSECT", "difference": "RELATIVE_COMPLEMENT"}[step["booleanOperation"]]
         operation = getattr(ps.ls.BooleanOperationEnum, enum_name)
         apply_to_all = bool(step["applyToAll"])
+        before = [int(level_set.getNumberOfPoints()) for level_set in domain.getLevelSets()]
         domain.applyBooleanOperation(operand, operation, apply_to_all)
         remaining = [int(level_set.getNumberOfPoints()) for level_set in domain.getLevelSets()]
-        if not remaining or any(points == 0 for points in remaining):
-            # A boolean that erases a level set is not a usable pattern: fail
-            # loudly rather than saving a structure with a vanished material.
+        erased = [index for index, (was, now) in enumerate(zip(before, remaining))
+                  if was > 0 and now == 0]
+        if not remaining or erased:
+            # A boolean that erases a previously non-empty level set is not a
+            # usable pattern: fail loudly. A level set that was already empty
+            # before the operation is unrelated (e.g. a material removed by an
+            # earlier step) and must not block a top-only mask operation.
             raise RuntimeError(
                 "GDS boolean operand erased a material level set; adjust the mask region, "
-                f"retained region or operation (level-set point counts: {remaining})")
+                f"retained region or operation (level-set point counts: {remaining}, erased: {erased})")
         return {"geometryOperation": "gdsBoolean", "booleanOperation": step["booleanOperation"],
                 "operand": "gds-mask", "nativeBooleanEnum": enum_name,
                 "applyToAll": apply_to_all,
@@ -2447,9 +3161,60 @@ def apply_geometry_operation(ps: Any, domain: Any, project: dict[str, Any], step
     raise RuntimeError(f"unsupported geometry operation {model!r}")
 
 
+def multi_ion_gpu_step(step: dict[str, Any], engine: str | None) -> bool:
+    """True when a step asks a GPU flux engine to convert more than one ion."""
+    if step.get("model") != "multiParticle" or not str(engine or "").startswith("GPU_"):
+        return False
+    return sum(row.get("kind") == "ion" for row in step.get("species", [])) > 1
+
+
+def require_multi_ion_gpu_policy(step: dict[str, Any], engine: str | None) -> None:
+    """Shared >= 4.7.0 multi-ion GPU policy for the single-pass flux path.
+
+    Applied before any native model or GPU flux call and independently of the
+    recorded flux strategy: on 4.7.0 every GPU flux engine converts one ion per
+    native call, so a multi-ion flux is either silently truncated (stock native
+    call) or unverified (per-species merge, which has 4.6.2 evidence only).
+    ``backend.validation`` rejects API requests and ``backend.supervisor``
+    rejects queued runs with the same helper, but a direct worker caller reaches
+    this function without either, so the gate lives here as well.
+    """
+    if not multi_ion_gpu_step(step, engine):
+        return
+    policy = multi_ion_gpu_error()
+    if policy is not None:
+        raise RuntimeError(policy)
+
+
+def require_multi_ion_flux_fields(report: dict[str, Any], step: dict[str, Any],
+                                  flux_strategy: str | None) -> None:
+    """Reject a native GPU flux mesh that dropped species fields.
+
+    Applies to the single native ``calculateFlux()`` call, including the
+    ``flux_strategy is None`` case: an unstrategised multi-ion GPU flux is not
+    "no strategy needed", it is the exact configuration where the installed
+    binding returns one ``<label><index>`` field and silently ignores the rest.
+    The per-species merge route builds its own fields and is checked by the
+    merge, not here.
+    """
+    if flux_strategy == GPU_MULTIPARTICLE_FLUX_STRATEGY:
+        return
+    expected_fields = {f"{row['label']}{index}" for index, row in enumerate(step["species"])}
+    present_fields = set(report["pointData"]["scalars"]) | set(report["cellData"]["scalars"])
+    if missing := expected_fields - present_fields:
+        raise RuntimeError(
+            f"native GPU MultiParticle flux is missing species fields: {sorted(missing)} "
+            f"(present: {sorted(present_fields)}); the installed binding returned a truncated "
+            f"multi-ion flux, so the run is rejected instead of reporting a partial result")
+
+
 def calculate_single_flux(ps: Any, domain: Any, project: dict[str, Any], step: dict[str, Any],
                           engine: str, seed: int, run_dir: Path,
                           flux_strategy: str | None = None) -> dict[str, Any]:
+    ion_count = (sum(row.get("kind") == "ion" for row in step.get("species", []))
+                 if step.get("model") == "multiParticle" else 0)
+    multi_ion_gpu = ion_count > 1 and engine in {"GPU_DISK", "GPU_TRIANGLE"}
+    require_multi_ion_gpu_policy(step, engine)
     if step["operation"] == "deposit":
         domain.duplicateTopLevelSet(material_handle(ps, step["depositMaterial"]))
     split_flux = None
@@ -2460,10 +3225,10 @@ def calculate_single_flux(ps: Any, domain: Any, project: dict[str, Any], step: d
     process_duration = float(step.get("duration") or 0.0)
     if step["model"] == "specialized":
         model, special_process_parameters, specialized_actual, process_duration = build_specialized_model(
-            ps, domain, project, step, lambda name: material_handle(ps, name), MATERIAL_IDS)
+            ps, domain, project, step, lambda name: material_handle(ps, name), MATERIAL_IDS,
+            flux_engine=engine)
         rate = None
     elif step["model"] == "multiParticle":
-        ion_count = sum(row.get("kind") == "ion" for row in step.get("species", []))
         if engine == "GPU_DISK" and ion_count > 1 and flux_strategy == GPU_MULTIPARTICLE_FLUX_STRATEGY:
             split_flux = calculate_multi_particle_flux_by_species(ps, domain, project, step, engine, seed, run_dir)
             multi_actual = multi_particle_step_summary(step)
@@ -2504,11 +3269,11 @@ def calculate_single_flux(ps: Any, domain: Any, project: dict[str, Any], step: d
         elapsed = sum(float(row["elapsedSeconds"]) for row in split_flux["species"])
     if not report["points"]:
         raise RuntimeError("ViennaPS Process.calculateFlux returned an empty mesh")
-    if flux_strategy == GPU_MULTIPARTICLE_NATIVE_FLUX_STRATEGY:
-        expected_fields = {f"{row['label']}{index}" for index, row in enumerate(step["species"])}
-        present_fields = set(report["pointData"]["scalars"]) | set(report["cellData"]["scalars"])
-        if missing := expected_fields - present_fields:
-            raise RuntimeError(f"native GPU MultiParticle flux is missing species fields: {sorted(missing)}")
+    if flux_strategy == GPU_MULTIPARTICLE_NATIVE_FLUX_STRATEGY or (multi_ion_gpu and split_flux is None):
+        # A multi-ion GPU flux that did not take the per-species merge route is
+        # one native call, whatever strategy it recorded (including None), so
+        # the species fields must all be present.
+        require_multi_ion_flux_fields(report, step, flux_strategy)
     for association in ("pointData", "cellData"):
         for kind in ("scalars", "vectors"):
             for label, values in report[association][kind].items():
@@ -2612,6 +3377,1007 @@ def describe_intermediate_vtp(path: Path, *, step_id: str, run_id: str,
             "associationPolicy": "native VTP pointData/cellData retained; not projected onto the domain surface"}
 
 
+CELL_SET_PROCESS_MODELS = ("implant", "anneal", "analysis")
+INJECTION_MOMENT_UNIT = "um"
+LENGTH_UNIT_NAME = "um"
+
+
+def _scalar_digest(values: list[float]) -> str:
+    """Deterministic digest of a native scalar field (little-endian float64).
+
+    The worker records this for every published label, so a replay can prove
+    that the native field is bit-identical without storing the field twice.
+    """
+    return hashlib.sha256(array("d", values).tobytes()).hexdigest()
+
+
+def _finite_or_none(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _field_integral(values: list[float], *, grid_delta: float, dimension: int) -> float:
+    """Native concentration integral over the cell grid (``sum · delta^D``).
+
+    The native implant concentration is volumetric in both dimensions
+    (``1/um^3``; the native cm^-3 conversion is 1e12). ``sum · delta^2`` is
+    therefore an integral over the 2D cell area with unit ``1/um`` (e.g. one
+    cell of ``2 um^-3`` with ``delta = 2 um`` gives ``8 um^-1``). The 3D value
+    ``sum · delta^3`` is dimensionless and is not given a length unit. It is
+    never converted to an areal cm^-2 dose, because a 2D native grid has no
+    physical depth.
+    """
+    return sum(values) * (float(grid_delta) ** int(dimension))
+
+
+def _material_field_rows(values: list[float], materials: list[float],
+                         names: dict[int, str]) -> dict[str, dict[str, float]]:
+    rows: dict[str, dict[str, float]] = {}
+    for value, material in zip(values, materials):
+        key = int(material)
+        row = rows.setdefault(str(key), {"count": 0, "max": 0.0, "sum": 0.0,
+                                         "materialName": names.get(key, "unknown")})
+        row["count"] += 1
+        row["sum"] += float(value)
+        row["max"] = max(row["max"], float(value))
+    return rows
+
+
+def _field_material_map(domain: Any) -> list[int]:
+    """Return the native material map as a JSON-friendly list of IDs."""
+    mapping = domain.getMaterialMap().getMaterialMap()
+    values = mapping.getMaterialMap()
+    return [int(value) for value in values]
+
+
+def _stored_band_half_cells(domain: Any) -> int:
+    """Return the exact stored level-set band half-width in grid cells.
+
+    ``viennals.Expand(width)`` only grows a band; a level set that already
+    carries a wider band (for example one produced by an earlier native
+    operation or a continuation state) keeps it. The native cell-set bottom is
+    therefore the surface minus the *stored* half-width, not the half-width
+    requested by the field step. ``getLevelSetWidth()`` is the only exposed
+    width API; take the widest level set because the dense grid spans all of
+    them.
+    """
+    widest = 2
+    for level_set in domain.getLevelSets():
+        try:
+            widest = max(widest, int(level_set.getLevelSetWidth()))
+        except (AttributeError, TypeError, ValueError):
+            continue
+    # Measured on 4.7.0: Expand(width) yields a stored band of ``width`` and a
+    # native bottom of ``floor(width / 2)`` cells below the surface (width 19
+    # and 21 both give 9 and 10 cells, 201/202 give 100/101).
+    return max(1, widest // 2)
+
+
+def _field_surface_bounds(domain: Any, *, is3d: bool) -> tuple[float, float]:
+    """Return the current ``(highest, lowest)`` surface coordinate."""
+    mesh = domain.getSurfaceMesh(addInterfaces=True, sharpCorners=False,
+                                 minNodeDistanceFactor=0.01)
+    return _surface_vertical_bounds(mesh.getNodes(), is3d=is3d)
+
+
+def _cell_grid_from_native(cell_set: Any, *, dimension: int, delta: float) -> Any:
+    """Describe a native ``DenseCellSet`` as a bounding lattice + active map.
+
+    A GDS / multi-material geometry can omit cells from the bounding lattice
+    (cover/void regions), so ``getNumberOfCells()`` is smaller than
+    ``nx * ny * nz``. Dense grids keep the cheap identity layout; sparse grids
+    get one ``getCellCenter`` call per native cell to derive the absolute
+    ``(ix, iy, iz)`` key. The native cell order is recorded, not assumed.
+    """
+    from backend.field_remap import CellGrid
+
+    grid = CellGrid.from_points(cell_set.getNodes(), dimension=int(dimension),
+                                delta=float(delta), allow_gaps=True)
+    cells = int(cell_set.getNumberOfCells())
+    if cells == grid.cell_count:
+        return grid
+    origin = grid.origin
+    nx, ny, nz = grid.shape
+    keys = array("q")
+    seen = bytearray(grid.cell_count)
+    for index in range(cells):
+        center = cell_set.getCellCenter(index)
+        i = int(round((float(center[0]) - origin[0]) / delta - 0.5))
+        j = int(round((float(center[1]) - origin[1]) / delta - 0.5))
+        k = (int(round((float(center[2]) - origin[2]) / delta - 0.5))
+             if int(dimension) == 3 else 0)
+        if not (0 <= i < nx and 0 <= j < ny and 0 <= k < nz):
+            raise RuntimeError(
+                f"native cell {index} center {center} lies outside the cell-set bounding "
+                f"lattice {grid.shape}; the native grid is not lattice aligned")
+        key = i + nx * (j + ny * k)
+        if seen[key]:
+            raise RuntimeError(
+                f"native cell {index} repeats lattice key {(i, j, k)}; the native cell "
+                "order is not a one-to-one lattice map")
+        seen[key] = 1
+        keys.append(key)
+    return grid.with_active(keys)
+
+
+def _field_grid_cell_bound(requested: dict[str, Any], *, top: float, bottom: float,
+                           delta: float) -> int:
+    """Conservative cell count for a field grid spanning ``[bottom, top]``.
+
+    The native generator allocates the full lateral domain grid between the
+    widened level-set band bottom and the requested position. The lateral
+    counts carry the same two-cell slack as the generic cell-set bound and the
+    row count carries four spare rows, so the bound is never below the native
+    allocation for a regular box.
+    """
+    x_extent = float(requested["domain"]["xExtent"])
+    nx = max(1, math.ceil(x_extent / delta))
+    if int(requested["dimension"]) == 3:
+        ny = max(1, math.ceil(float(requested["domain"]["yExtent"]) / delta))
+        lateral = (nx + 2) * (ny + 2)
+    else:
+        lateral = nx + 2
+    rows = math.ceil((float(top) - float(bottom)) / delta) + 4
+    return lateral * max(rows, 2)
+
+
+def _generate_field_cell_set(ps: Any, source_domain: Any, project: dict[str, Any], *,
+                             height: float, band_cells: int, cover: Any,
+                             periodic: bool,
+                             surface_bounds: tuple[float, float] | None = None,
+                             ) -> tuple[Any, Any, Any, dict[str, Any]]:
+    """Build one native cell set on a widened copy of ``source_domain``.
+
+    A ViennaLS level set only stores a narrow band around the surface, so the
+    substrate is widened *on a deep copy of the Domain* (``viennals.Expand`` on
+    every level set, which reinitialises the band without moving the zero
+    contour). The simulated Domain, and therefore every surface snapshot, is
+    untouched.
+
+    Measured on 4.7.0, ``generateCellSet(position, ...)`` uses ``position`` as
+    the absolute top of the grid and the widened band bottom as the lower
+    bound. The required top/bottom and a conservative cell bound are therefore
+    known *before* the native allocation; the request is refused above the
+    construction limit and a ``height`` below the current surface is refused
+    instead of letting the native generator walk the whole band.
+    """
+    delta = float(source_domain.getGridDelta())
+    is3d = project["dimension"] == 3
+    if height + 1e-12 < delta:
+        raise RuntimeError(
+            f"cellSet.height {height:g} um is below one grid interval ({delta:g} um); "
+            "the installed DenseCellSet generator would crash")
+    if band_cells < 2:
+        raise RuntimeError(
+            "conservative grid remap not implemented: the fixed field grid no longer covers the "
+            f"current surface (a {band_cells}-point band is below the native minimum of 2); the "
+            "surface moved below the captured substrateDepth. Increase cellSet.substrateDepth on "
+            "the first field step or reduce the etch depth")
+    if surface_bounds is None:
+        surface_bounds = _field_surface_bounds(source_domain, is3d=is3d)
+    surface_top, surface_bottom = float(surface_bounds[0]), float(surface_bounds[1])
+    top_node = math.ceil(surface_top / delta - 1e-9) * delta
+    if height + 1e-9 < top_node:
+        raise RuntimeError(
+            f"cellSet.height {height:g} um is below the highest surface point "
+            f"({surface_top:g} um); the native generateCellSet position is an absolute "
+            "coordinate, so the field grid would clip the surface (and, below the surface "
+            "band, the native generator allocates the whole band between them). Set "
+            "cellSet.height above the surface or lower the geometry")
+    planned_top = float(height)
+    stored_half = _stored_band_half_cells(source_domain)
+    band_half = max(int(band_cells) // 2, stored_half)
+    planned_bottom = (math.floor(surface_bottom / delta + 1e-9) * delta
+                      - band_half * delta)
+    bound = _field_grid_cell_bound(project, top=planned_top, bottom=planned_bottom,
+                                   delta=delta)
+    # GDS/multi-level-set bands can be wider than the analytic band estimate.
+    # Use a conservative guard for the pre-allocation construction limit, then
+    # enforce the hard cell cap on the measured native grid after generation.
+    guard_bound = int(math.ceil(bound * 2.5))
+    if guard_bound > MAX_CELL_SET_CELLS:
+        raise RuntimeError(
+            f"field cell grid needs at least {bound:,} cells between "
+            f"{planned_bottom:g} and {planned_top:g} um ({guard_bound:,} with band safety margin), "
+            f"above the {MAX_CELL_SET_CELLS:,}-cell construction limit; raise cellSet.height above "
+            "the surface only as needed, reduce cellSet.substrateDepth, or coarsen gridDelta")
+    field_domain = ps.Domain(source_domain)
+    original_points = sum(int(level_set.getNumberOfPoints())
+                          for level_set in source_domain.getLevelSets())
+    for level_set in field_domain.getLevelSets():
+        ps.ls.Expand(level_set, int(band_cells)).apply()
+    field_domain.generateCellSet(height, cover, True)
+    cell_set = field_domain.getCellSet()
+    if cell_set is None:
+        raise RuntimeError("Domain.generateCellSet did not store a native cell set")
+    cells = int(cell_set.getNumberOfCells())
+    if cells <= 0 or cells > MAX_CELL_SET_CELLS:
+        raise RuntimeError(
+            f"DenseCellSet generation produced {cells} cells, above the hard "
+            f"{MAX_CELL_SET_CELLS:,}-cell limit (pre-allocation estimate {bound})")
+    cell_set.buildNeighborhood()
+    cell_set.setPeriodicBoundary([bool(periodic), bool(periodic), False] if is3d
+                                 else [bool(periodic), False])
+    grid = _cell_grid_from_native(cell_set, dimension=int(project["dimension"]),
+                                  delta=delta)
+    if grid.active_count != cells:
+        raise RuntimeError(
+            f"native cell set reports {cells} cells but its active map has "
+            f"{grid.active_count}; the native grid is not a one-to-one lattice map")
+    info = {
+        "numberOfCells": cells,
+        "activeCellCount": int(grid.active_count),
+        "fullCellCount": int(grid.cell_count),
+        "missingCellCount": int(grid.missing_count),
+        "sparse": bool(grid.is_sparse),
+        "cellsUpperBound": max(bound, cells),
+        "preAllocationBound": bound,
+        "constructionGuardBound": guard_bound,
+        "surfaceTop": surface_top,
+        "surfaceBottom": surface_bottom,
+        "heightAboveSurface": height,
+        "substrateBandExpandCells": int(band_cells),
+        "storedBandHalfCells": int(stored_half),
+        "bandHalfCells": int(band_half),
+        "sourceLevelSetPoints": original_points,
+        "grid": grid,
+    }
+    return field_domain, cell_set, grid, info
+
+
+def _field_setup_record(step: dict[str, Any], state: dict[str, Any],
+                        info: dict[str, Any], *, regenerated: bool) -> dict[str, Any]:
+    """Compose the per-step ``cellSet`` record from the captured grid."""
+    settings = step.get("cellSet") or {}
+    captured = state["grid"]
+    is3d = int(captured.dimension) == 3
+    periodic = bool(settings.get("periodic", False))
+    cover_name = str(settings.get("coverMaterial") or "GAS")
+    setup = {
+        "generated": True,
+        "regenerated": bool(regenerated),
+        "grid": captured.signature(),
+        "currentGrid": (state.get("currentGrid") or captured).signature(),
+        "gridCapturedAtStepId": state.get("gridStepId"),
+        "numberOfCells": int(info["numberOfCells"]),
+        "activeCellCount": int(info.get("activeCellCount", info["numberOfCells"])),
+        "fullCellCount": int(info.get("fullCellCount", info["numberOfCells"])),
+        "missingCellCount": int(info.get("missingCellCount", 0)),
+        "sparse": bool(info.get("sparse", False)),
+        "cellsUpperBound": int(info["cellsUpperBound"]),
+        "surfaceTop": float(info["surfaceTop"]),
+        "surfaceBottom": float(info["surfaceBottom"]),
+        "heightAboveSurface": float(info["heightAboveSurface"]),
+        "substrateDepth": float(state["substrateDepth"]),
+        "substrateBandExpandCells": int(info["substrateBandExpandCells"]),
+        "storedBandHalfCells": int(info.get("storedBandHalfCells") or 0),
+        "bandHalfCells": int(info.get("bandHalfCells") or 0),
+        "substrateConstruction": "viennals.Expand on a deep Domain copy; the simulated surface is unchanged",
+        "sourceLevelSetPoints": int(info["sourceLevelSetPoints"]),
+        "coverMaterial": cover_name,
+        "coverMaterialId": int(state["coverMaterialId"]),
+        "periodic": periodic,
+        "periodicBoundary": [periodic, periodic, False] if is3d else [periodic, False],
+        "materialMap": list(state["materialMap"]),
+        "remapCount": len(state.get("remaps") or []),
+        "remaps": list(state.get("remaps") or []),
+    }
+    if state.get("remaps"):
+        setup["lastRemap"] = state["remaps"][-1]
+    return setup
+
+
+def remap_field_cell_set(ps: Any, domain: Any, project: dict[str, Any],
+                         state: dict[str, Any], source_step: dict[str, Any]) -> dict[str, Any]:
+    """Regenerate the field cell set and remap every scalar field.
+
+    The grid captured at the first field step is the reference. The regenerated
+    grid keeps the captured lateral lattice and bottom; it grows upwards when a
+    deposit lifts the surface above the captured top and downwards (at the
+    native minimum band) when an etch goes below the captured substrate. The
+    scalar arrays are then copied cell-for-cell by absolute position; cells
+    that left the solid lose their dopant and the loss is recorded.
+    """
+    from backend.field_remap import (GridRemapError, NATIVE_SYSTEM_LABELS,
+                                     check_captured_grid, remap_cell_fields)
+
+    captured = state.get("currentGrid") or state["grid"]
+    reference = state["grid"]
+    old_cell_set = state["cellSet"]
+    if old_cell_set is None:
+        raise RuntimeError("field cell-set remap requested before the grid was generated")
+    settings = state["settings"]
+    delta = float(captured.delta)
+    cover_name = str(settings.get("coverMaterial") or "GAS")
+    cover = ps.Material.GAS if cover_name == "GAS" else material_handle(ps, cover_name)
+
+    labels = [str(label) for label in old_cell_set.getScalarDataLabels()
+              if str(label) not in NATIVE_SYSTEM_LABELS]
+    old_values = {label: [float(value) for value in old_cell_set.getScalarData(label)]
+                  for label in labels}
+    old_material = [float(value) for value in old_cell_set.getScalarData("Material")]
+
+    # ``Domain.generateCellSet(position, ...)`` takes the *absolute* top
+    # coordinate of the grid, not a height above the surface (measured on
+    # 4.7.0: a plane at 0.05 with position 0.5 produced top 0.5). The grid
+    # bottom is the widened band bottom, so the target extent is fully known
+    # from the current surface before any native allocation:
+    #   top    = max(captured top, highest lattice surface node)
+    #   bottom = the captured bottom, or the shallowest reachable band bottom
+    #            (two-point native band) when an etch went deeper.
+    is3d = int(project["dimension"]) == 3
+    surface_top, surface_bottom = _field_surface_bounds(domain, is3d=is3d)
+    top_node = math.ceil(surface_top / delta - 1e-9) * delta
+    bottom_node = math.floor(surface_bottom / delta + 1e-9) * delta
+    requested_height = float(captured.top)
+    required_top = max(float(captured.top), top_node)
+    stored_half = _stored_band_half_cells(domain)
+    lowest_reachable = bottom_node - max(1, stored_half) * delta
+    if float(captured.bottom) <= lowest_reachable + 1e-9:
+        required_bottom = float(captured.bottom)
+        band_cells = max(2, 2 * int(round((bottom_node - required_bottom) / delta)))
+    else:
+        required_bottom = lowest_reachable
+        band_cells = max(2, 2 * stored_half)
+    height = required_top
+    field_domain, cell_set, grid, info = _generate_field_cell_set(
+        ps, domain, project, height=height, band_cells=band_cells,
+        cover=cover, periodic=bool(state["settings"].get("periodic", False)),
+        surface_bounds=(surface_top, surface_bottom))
+    for _attempt in range(4):
+        # Structured/GDS level sets can carry a band wider than the analytic
+        # extent, so the native bounding lattice may exceed the captured grid.
+        # Growing beyond it is conservative: the remap copies by lattice key
+        # and starts the extra cells at zero. Only a grid that does not *cover*
+        # the captured extent needs another native call.
+        covers = (float(grid.top) + 1e-9 >= required_top
+                  and float(grid.bottom) - 1e-9 <= required_bottom)
+        if covers:
+            break
+        if float(grid.top) + 1e-9 < required_top:
+            height += float(required_top) - float(grid.top)
+        if float(grid.bottom) - 1e-9 > required_bottom:
+            band_cells = max(2, band_cells + 2 * int(
+                round((float(grid.bottom) - required_bottom) / delta)))
+        field_domain, cell_set, grid, info = _generate_field_cell_set(
+            ps, domain, project, height=height, band_cells=band_cells,
+            cover=cover, periodic=bool(state["settings"].get("periodic", False)),
+            surface_bounds=(surface_top, surface_bottom))
+    else:
+        raise GridRemapError(
+            "conservative grid remap not implemented: the regenerated cell grid does not "
+            f"cover the captured extent (bottom {required_bottom:g}/{grid.bottom:g} um, "
+            f"top {required_top:g}/{grid.top:g} um)")
+
+    check_captured_grid(captured, grid)
+    new_material = [float(value) for value in cell_set.getScalarData("Material")]
+    result = remap_cell_fields(
+        captured, grid, old_values=old_values, old_material=old_material,
+        new_material=new_material, cover_material_id=int(cover), labels=labels,
+        source_step_id=str(source_step.get("id")),
+        previous_remap_count=len(state.get("remaps") or []))
+    record = result.record
+    record["remapOfStepId"] = state.get("gridStepId")
+    record["capturedGrid"] = reference.signature()
+    record["sourceStepModel"] = source_step.get("model")
+    record["sourceStepOperation"] = source_step.get("operation")
+    record["requestedHeight"] = requested_height
+    record["effectiveHeight"] = height
+    record["bandCells"] = int(band_cells)
+    record["surfaceTopAtRemap"] = float(info["surfaceTop"])
+    record["surfaceBottomAtRemap"] = float(info["surfaceBottom"])
+    record["materialMap"] = _field_material_map(domain)
+
+    for label in labels:
+        cell_set.addScalarData(label, 0.0)
+    for label in labels:
+        cell_set.setScalarData(label, result.labels[label])
+    for label, values in result.labels.items():
+        if len(values) != int(cell_set.getNumberOfCells()):
+            raise RuntimeError(f"remapped scalar {label!r} does not match the new cell count")
+
+    info["substrateBandExpandCells"] = int(band_cells)
+    state.update({"domain": field_domain, "cellSet": cell_set, "grid": reference,
+                  "currentGrid": grid, "info": info, "bandCells": int(band_cells)})
+    state.setdefault("remaps", []).append(record)
+    state["surfaceDirty"] = False
+    return record
+
+
+def ensure_field_cell_set(ps: Any, domain: Any, project: dict[str, Any],
+                          step: dict[str, Any],
+                          state: dict[str, Any]) -> tuple[Any, Any, dict[str, Any]]:
+    """Return ``(field_domain, cell_set, setup_record)`` for a field step.
+
+    All implant/anneal/analysis steps share one native ``DenseCellSet`` grid.
+    The grid captured at the first enabled field step is the reference: later
+    field steps reuse it, and a surface-moving step in between regenerates the
+    native cell set from the current level sets and conservatively remaps every
+    scalar field (see :func:`remap_field_cell_set`).
+    """
+    settings = step.get("cellSet")
+    if not isinstance(settings, dict):
+        raise RuntimeError(f"cell-set step {step.get('id')!r} has no cellSet settings")
+    if state.get("cellSet") is None:
+        height = float(settings["height"])
+        delta = float(domain.getGridDelta())
+        if height + 1e-12 < delta:
+            raise RuntimeError(
+                f"cellSet.height {height:g} um is below one grid interval ({delta:g} um); "
+                "the installed DenseCellSet generator would crash")
+        substrate = settings.get("substrateDepth")
+        if substrate is None:
+            raise RuntimeError(
+                "the first enabled cell-set field step must declare cellSet.substrateDepth; a narrow-band "
+                "level set would otherwise produce a single substrate row")
+        substrate = float(substrate)
+        if substrate + 1e-12 < 2 * delta:
+            raise RuntimeError(
+                f"cellSet.substrateDepth must span at least two grid intervals ({2 * delta:g} um)")
+        # ``Expand(width)`` widens the stored band symmetrically to ``width``
+        # grid points, so a half-band of ``ceil(depth/delta)`` cells needs twice that.
+        band_cells = 2 * int(math.ceil(substrate / delta)) + 2
+        cover_name = str(settings.get("coverMaterial") or "GAS")
+        cover = ps.Material.GAS if cover_name == "GAS" else material_handle(ps, cover_name)
+        field_domain, cell_set, grid, info = _generate_field_cell_set(
+            ps, domain, project, height=height, band_cells=band_cells,
+            cover=cover, periodic=bool(settings.get("periodic", False)))
+        state.update({
+            "domain": field_domain,
+            "cellSet": cell_set,
+            "grid": grid,
+            "currentGrid": grid,
+            "info": info,
+            "settings": dict(settings),
+            "substrateDepth": substrate,
+            "bandCells": band_cells,
+            "coverMaterial": cover_name,
+            "coverMaterialId": int(cover),
+            "materialMap": _field_material_map(domain),
+            "gridStepId": str(step.get("id")),
+            "remaps": [],
+            "surfaceDirty": False,
+        })
+        setup = _field_setup_record(step, state, info, regenerated=False)
+        return field_domain, cell_set, setup
+    if state.get("surfaceDirty"):
+        remap_field_cell_set(ps, domain, project, state, step)
+    setup = _field_setup_record(step, state, state["info"], regenerated=True)
+    return state["domain"], state["cellSet"], setup
+
+
+def build_implant_profile(ps: Any, profile: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
+    """Build the native profile model and return an exact-readback record."""
+    def moments(row: dict[str, Any]) -> Any:
+        params = ps.PearsonIVParameters()
+        params.mu = float(row["mu"])
+        params.sigma = float(row["sigma"])
+        params.beta = float(row["beta"])
+        params.gamma = float(row["gamma"])
+        return params, {"mu": params.mu, "sigma": params.sigma,
+                        "beta": params.beta, "gamma": params.gamma}
+
+    head, head_readback = moments(profile["head"])
+    kind = str(profile["kind"])
+    record: dict[str, Any] = {
+        "source": "manual",
+        "kind": kind,
+        "momentUnit": INJECTION_MOMENT_UNIT,
+        "head": head_readback,
+        "lateralMu": float(profile.get("lateralMu", 0.0)),
+        "lateralSigma": float(profile["lateralSigma"]),
+    }
+    if kind == "pearsonIV":
+        model = ps.ImplantPearsonIV(head, record["lateralMu"], record["lateralSigma"])
+        record["nativeConstructor"] = "viennaps.ImplantPearsonIV"
+    elif kind == "dualPearsonIV":
+        tail, tail_readback = moments(profile["tail"])
+        record.update({
+            "tail": tail_readback,
+            "headFraction": float(profile["headFraction"]),
+            "tailLateralMu": float(profile["tailLateralMu"]),
+            "tailLateralSigma": float(profile["tailLateralSigma"]),
+        })
+        model = ps.ImplantDualPearsonIV(
+            head, tail, record["headFraction"], record["lateralMu"], record["lateralSigma"],
+            record["tailLateralMu"], record["tailLateralSigma"])
+        record["nativeConstructor"] = "viennaps.ImplantDualPearsonIV"
+    else:
+        record.update({
+            "tailFraction": float(profile["tailFraction"]),
+            "tailStartDepth": float(profile["tailStartDepth"]),
+            "tailDecayLength": float(profile["tailDecayLength"]),
+            "tailBlendWidth": float(profile.get("tailBlendWidth", 0.0)),
+        })
+        model = ps.ImplantPearsonIVChanneling(
+            head, record["lateralMu"], record["lateralSigma"], record["tailFraction"],
+            record["tailStartDepth"], record["tailDecayLength"], record["tailBlendWidth"])
+        record["nativeConstructor"] = "viennaps.ImplantPearsonIVChanneling"
+    return model, record
+
+
+def apply_implant_step(ps: Any, domain: Any, project: dict[str, Any],
+                       step: dict[str, Any], *, run_dir: Path, run_id: str,
+                       state: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Run native ``IonImplantation`` on the field cell set (duration 0)."""
+    from backend.implant_models import LENGTH_UNIT_CM
+    field_domain, cell_set, cell_set_record = ensure_field_cell_set(ps, domain, project, step, state)
+    profile_model, profile_record = build_implant_profile(ps, step["profile"])
+    implant = ps.IonImplantation()
+    implant.setImplantModel(profile_model)
+    damage_record = None
+    damage = step.get("damage")
+    if damage is not None:
+        damage_model = ps.ImplantDamageHobler(
+            float(damage["projectedRange"]), float(damage["verticalSigma"]),
+            float(damage["lambdaValue"]), float(damage["defectsPerIon"]),
+            float(damage["lateralSigma"]), float(damage["lateralDeltaSigma"]))
+        implant.setDamageModel(damage_model)
+        damage_record = {
+            "nativeConstructor": "viennaps.ImplantDamageHobler",
+            "kind": damage["kind"],
+            "projectedRange": float(damage["projectedRange"]),
+            "verticalSigma": float(damage["verticalSigma"]),
+            "lambdaValue": float(damage["lambdaValue"]),
+            "defectsPerIon": float(damage["defectsPerIon"]),
+            "lateralSigma": float(damage["lateralSigma"]),
+            "lateralDeltaSigma": float(damage["lateralDeltaSigma"]),
+        }
+    implant.setDose(float(step["doseCm2"]))
+    implant.setTiltAngle(float(step["tiltDeg"]))
+    # The workbench declares ``units.length = um``; the native implant model
+    # needs the same unit in centimetres (1 um = 1e-4 cm) so the tabulated /
+    # analytical profile and the deposited concentration are dimensionally
+    # consistent with the cell grid.
+    implant.setLengthUnit(LENGTH_UNIT_CM)
+    implant.setDoseControl(getattr(ps.ImplantDoseControl, str(step["doseControl"])))
+    mask_names = list(step.get("maskMaterials") or [])
+    screen_names = list(step.get("screenMaterials") or [])
+    implant.setMaskMaterials([material_handle(ps, name) for name in mask_names])
+    implant.setScreenMaterials([material_handle(ps, name) for name in screen_names])
+    labels = step["labels"]
+    implant.setConcentrationLabel(str(labels["concentration"]))
+    if labels.get("damage"):
+        implant.setDamageLabel(str(labels["damage"]))
+    if labels.get("lastDamage"):
+        implant.setLastDamageLabel(str(labels["lastDamage"]))
+    if float(step.get("damageFactor", 1.0)) != 1.0:
+        implant.setDamageFactor(float(step["damageFactor"]))
+
+    process = ps.Process(field_domain, implant, 0.0)
+    # The native model does not consume a ray flux engine; pin CPU_DISK so the
+    # Process default never attempts CUDA initialization.
+    process.setFluxEngineType(ps.FluxEngineType.CPU_DISK)
+    started = time.perf_counter()
+    process.apply()
+    elapsed = time.perf_counter() - started
+
+    known = set(str(label) for label in cell_set.getScalarDataLabels())
+    expected = [str(labels["concentration"])] + [
+        str(labels[key]) for key in ("damage", "lastDamage") if labels.get(key)]
+    missing = [label for label in expected if label not in known]
+    if missing:
+        raise RuntimeError("native IonImplantation did not write cell-set field(s): " + ", ".join(missing))
+
+    record: dict[str, Any] = {
+        "nativeModel": "viennaps.IonImplantation",
+        "nativeProcess": "ps.Process(domain, model, 0.0); the level sets are not advanced",
+        "requested": {
+            "species": step["species"], "material": step["material"],
+            "energyKeV": float(step["energyKeV"]), "doseCm2": float(step["doseCm2"]),
+            "tiltDeg": float(step["tiltDeg"]), "rotationDeg": float(step["rotationDeg"]),
+            "doseControl": step["doseControl"],
+            "maskMaterials": mask_names, "screenMaterials": screen_names,
+        },
+        "effective": {
+            "doseCm2": float(step["doseCm2"]), "tiltDeg": float(step["tiltDeg"]),
+            "lengthUnitCm": LENGTH_UNIT_CM,
+            "doseControl": step["doseControl"],
+            "maskMaterialIds": [MATERIAL_IDS.get(name) for name in mask_names],
+            "screenMaterialIds": [MATERIAL_IDS.get(name) for name in screen_names],
+            "damageFactor": float(step.get("damageFactor", 1.0)),
+            "concentrationLabel": str(labels["concentration"]),
+            "damageLabel": labels.get("damage"),
+            "lastDamageLabel": labels.get("lastDamage"),
+        },
+        # The manual Pearson IV path has no native energy/rotation argument;
+        # both are recorded as request metadata, never as native inputs.
+        "energyKeVNativeEffect": False,
+        "rotationDegNativeEffect": False,
+        "nativeDoseControl": f"viennaps.ImplantDoseControl.{step['doseControl']}",
+        "profile": profile_record,
+        "damage": damage_record,
+        "cellSet": cell_set_record,
+        "processSeconds": elapsed,
+    }
+    record["fields"] = _selected_field_rows(cell_set, project, step)
+    record["fieldDigests"] = _selected_field_digests(cell_set, project, step)
+    outputs = write_cell_set_field_outputs(
+        ps, field_domain, cell_set, project, step, {"implant": record}, cell_set_record,
+        run_dir=run_dir, run_id=run_id, field_rows=record["fields"],
+        digests=record["fieldDigests"])
+    return record, outputs
+
+
+def apply_anneal_step(ps: Any, domain: Any, project: dict[str, Any],
+                      step: dict[str, Any], *, run_dir: Path, run_id: str,
+                      state: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Run native ``Anneal`` (or its zero-time activation) on the cell set."""
+    field_domain, cell_set, cell_set_record = ensure_field_cell_set(ps, domain, project, step, state)
+    species_label = str(step["speciesLabel"])
+    known = set(str(label) for label in cell_set.getScalarDataLabels())
+    if species_label not in known:
+        raise RuntimeError(
+            f"anneal speciesLabel {species_label!r} is not present in the native cell set; "
+            "an earlier implant step must produce it")
+    anneal = ps.Anneal()
+    schedule = step["schedule"]
+    if schedule["kind"] == "isothermal":
+        anneal.setTemperature(float(schedule["temperatureK"]))
+        anneal.setDuration(float(schedule["durationSeconds"]))
+        schedule_record = {"kind": "isothermal",
+                           "temperatureK": float(schedule["temperatureK"]),
+                           "durationSeconds": float(schedule["durationSeconds"]),
+                           "nativeCall": "setTemperature + setDuration"}
+    else:
+        durations = [float(value) for value in schedule["durations"]]
+        temperatures = [float(value) for value in schedule["temperatures"]]
+        anneal.setTemperatureSchedule(durations, temperatures)
+        schedule_record = {"kind": "schedule", "durations": durations,
+                           "temperatures": temperatures,
+                           "nativeCall": "setTemperatureSchedule"}
+    diffusivity = step["diffusivity"]
+    if diffusivity["kind"] == "arrhenius":
+        anneal.setArrheniusParameters(float(diffusivity["D0"]), float(diffusivity["Ea_eV"]))
+        diffusivity_record = {"kind": "arrhenius", "D0": float(diffusivity["D0"]),
+                              "Ea_eV": float(diffusivity["Ea_eV"]),
+                              "nativeCall": "setArrheniusParameters"}
+    else:
+        anneal.setDiffusionCoefficient(float(diffusivity["value"]))
+        diffusivity_record = {"kind": "constant", "value": float(diffusivity["value"]),
+                              "nativeCall": "setDiffusionCoefficient"}
+    mode = str(step["mode"])
+    anneal.setMode(getattr(ps.AnnealMode, mode))
+    solver_record: dict[str, Any] = {"mode": mode, "nativeCall": f"setMode(viennaps.AnnealMode.{mode})"}
+    if step.get("implicitSolver") is not None:
+        options = step["implicitSolver"]
+        anneal.setImplicitSolverOptions(int(options["maxIterations"]),
+                                        float(options["relativeTolerance"]),
+                                        float(options["relaxation"]))
+        solver_record["implicitSolver"] = {
+            "maxIterations": int(options["maxIterations"]),
+            "relativeTolerance": float(options["relativeTolerance"]),
+            "relaxation": float(options["relaxation"]),
+        }
+    if step.get("timeStep") is not None:
+        anneal.setTimeStep(float(step["timeStep"]))
+        solver_record["timeStep"] = float(step["timeStep"])
+    if step.get("stabilityFactor") is not None:
+        anneal.setStabilityFactor(float(step["stabilityFactor"]))
+        solver_record["stabilityFactor"] = float(step["stabilityFactor"])
+    diffusion_names = list(step.get("diffusionMaterials") or [])
+    blocking_names = list(step.get("blockingMaterials") or [])
+    anneal.setDiffusionMaterials([material_handle(ps, name) for name in diffusion_names])
+    anneal.setBlockingMaterials([material_handle(ps, name) for name in blocking_names])
+    anneal.setSpeciesLabel(species_label)
+    active_label = str(step["activeLabel"])
+    anneal.setActiveLabel(active_label)
+    activation = step["solidActivation"]
+    anneal.enableSolidActivation(True)
+    anneal.setSolidSolubilityArrhenius(float(activation["solubilityC0"]),
+                                       float(activation["solubilityEa_eV"]))
+    activation_only = bool(step.get("activationOnly", False))
+    started = time.perf_counter()
+    if activation_only:
+        anneal.applyActivation(field_domain)
+        elapsed = time.perf_counter() - started
+        native_call = "Anneal.applyActivation(domain)"
+    else:
+        process = ps.Process(field_domain, anneal, 0.0)
+        process.setFluxEngineType(ps.FluxEngineType.CPU_DISK)
+        process.apply()
+        elapsed = time.perf_counter() - started
+        native_call = "ps.Process(domain, model, 0.0)"
+    known = set(str(label) for label in cell_set.getScalarDataLabels())
+    if active_label not in known:
+        raise RuntimeError(
+            f"native Anneal did not write the active-concentration field {active_label!r}")
+    record: dict[str, Any] = {
+        "nativeModel": "viennaps.Anneal",
+        "nativeProcess": native_call,
+        "activationOnly": activation_only,
+        "requested": {
+            "mode": mode, "speciesLabel": species_label, "activeLabel": active_label,
+            "diffusionMaterials": diffusion_names, "blockingMaterials": blocking_names,
+        },
+        "effective": {
+            "diffusionMaterialIds": [MATERIAL_IDS.get(name) for name in diffusion_names],
+            "blockingMaterialIds": [MATERIAL_IDS.get(name) for name in blocking_names],
+            "solidActivation": {"solubilityC0": float(activation["solubilityC0"]),
+                                "solubilityEa_eV": float(activation["solubilityEa_eV"]),
+                                "nativeCall": "enableSolidActivation + setSolidSolubilityArrhenius"},
+        },
+        "schedule": schedule_record,
+        "diffusivity": diffusivity_record,
+        "solver": solver_record,
+        "cellSet": cell_set_record,
+        "processSeconds": elapsed,
+    }
+    record["fields"] = _selected_field_rows(cell_set, project, step)
+    record["fieldDigests"] = _selected_field_digests(cell_set, project, step)
+    species_values = [float(value) for value in cell_set.getScalarData(species_label)]
+    active_values = [float(value) for value in cell_set.getScalarData(active_label)]
+    total = sum(species_values)
+    record["activation"] = {
+        "speciesLabel": species_label,
+        "activeLabel": active_label,
+        "totalConcentrationSum": total,
+        "activeConcentrationSum": sum(active_values),
+        "activeFractionOfTotal": (sum(active_values) / total) if total > 0.0 else None,
+        "note": "sums are over every native cell; activeFraction is a global ratio, not a local activation model",
+    }
+    outputs = write_cell_set_field_outputs(
+        ps, field_domain, cell_set, project, step, {"anneal": record}, cell_set_record,
+        run_dir=run_dir, run_id=run_id, field_rows=record["fields"],
+        digests=record["fieldDigests"])
+    return record, outputs
+
+
+def apply_analysis_step(ps: Any, domain: Any, project: dict[str, Any],
+                        step: dict[str, Any], *, run_dir: Path, run_id: str,
+                        state: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Run native ``NetDoping`` and ``SheetResistance`` on the current cell set."""
+    from backend.implant_models import LENGTH_UNIT_CM
+    field_domain, cell_set, cell_set_record = ensure_field_cell_set(ps, domain, project, step, state)
+    known = set(str(label) for label in cell_set.getScalarDataLabels())
+    record: dict[str, Any] = {"nativeModel": "viennaps.NetDoping" if step.get("netDoping") else None,
+                              "cellSet": cell_set_record}
+    net = step.get("netDoping")
+    if net is not None:
+        inputs = [*(net.get("donorLabels") or []), *(net.get("acceptorLabels") or [])]
+        missing = [label for label in inputs if label not in known]
+        if missing:
+            raise RuntimeError("native NetDoping input field(s) are missing: " + ", ".join(missing))
+        net_doping = ps.NetDoping()
+        net_doping.setCellSet(cell_set)
+        for label in net.get("donorLabels") or []:
+            net_doping.addDonorLabel(str(label))
+        for label in net.get("acceptorLabels") or []:
+            net_doping.addAcceptorLabel(str(label))
+        net_doping.setOutputLabel(str(net["outputLabel"]))
+        surface_position = net.get("surfacePosition")
+        if surface_position is not None:
+            net_doping.setSurfacePosition(float(surface_position))
+        net_doping.apply()
+        output_label = str(net["outputLabel"])
+        if output_label not in set(str(label) for label in cell_set.getScalarDataLabels()):
+            raise RuntimeError(f"native NetDoping did not write {output_label!r}")
+        values = [float(value) for value in cell_set.getScalarData(output_label)]
+        scan = step.get("scanDepth")
+        lateral = None
+        if scan is not None:
+            lateral = _finite_or_none(net_doping.lateralJunctionPosition(float(scan)))
+        record["netDoping"] = {
+            "donorLabels": list(net.get("donorLabels") or []),
+            "acceptorLabels": list(net.get("acceptorLabels") or []),
+            "outputLabel": output_label,
+            "surfacePosition": float(surface_position) if surface_position is not None else 0.0,
+            "surfacePositionSource": "request" if surface_position is not None else "native-default-0",
+            "junctionDepth": _finite_or_none(net_doping.junctionDepth()),
+            "junctionDepths": [_finite_or_none(value) for value in net_doping.junctionDepths()],
+            "junctionCount": int(net_doping.junctionCount()),
+            "scanDepth": float(scan) if scan is not None else None,
+            "lateralJunctionPosition": lateral,
+            "outputField": {"count": len(values), "min": min(values), "max": max(values),
+                            "sum": sum(values),
+                            "integralNative": _field_integral(values, grid_delta=float(domain.getGridDelta()),
+                                                              dimension=int(project["dimension"]))},
+            "junctionDepthNote": "depth in the project length unit (um); inf means no sign change",
+        }
+        record["nativeModel"] = "viennaps.NetDoping"
+    sheet_rows: list[dict[str, Any]] = []
+    for entry in step.get("sheetResistance") or []:
+        label = str(entry["concentrationLabel"])
+        if label not in known:
+            raise RuntimeError(f"native SheetResistance input field {label!r} is missing")
+        resistance = ps.SheetResistance()
+        resistance.setCellSet(cell_set)
+        resistance.setLengthUnit(LENGTH_UNIT_CM)
+        resistance.setConcentrationLabel(label)
+        surface_position = entry.get("surfacePosition")
+        if surface_position is not None:
+            resistance.setSurfacePosition(float(surface_position))
+        value = (resistance.computeElectron() if entry["carrier"] == "electron"
+                 else resistance.computeHole())
+        sheet_rows.append({
+            "concentrationLabel": label,
+            "carrier": entry["carrier"],
+            "nativeMethod": ("viennaps.SheetResistance.computeElectron" if entry["carrier"] == "electron"
+                             else "viennaps.SheetResistance.computeHole"),
+            "lengthUnitCm": LENGTH_UNIT_CM,
+            "concentrationUnitCm3": 1e12,
+            "surfacePosition": float(surface_position) if surface_position is not None else 0.0,
+            "surfacePositionSource": "request" if surface_position is not None else "native-default-0",
+            "sheetResistanceOhmPerSquare": _finite_or_none(value),
+        })
+    if sheet_rows:
+        record["sheetResistance"] = sheet_rows
+        if record["nativeModel"] is None:
+            record["nativeModel"] = "viennaps.SheetResistance"
+    record["fields"] = _selected_field_rows(cell_set, project, step)
+    record["fieldDigests"] = _selected_field_digests(cell_set, project, step)
+    outputs = write_cell_set_field_outputs(
+        ps, field_domain, cell_set, project, step, {"analysis": record}, cell_set_record,
+        run_dir=run_dir, run_id=run_id, field_rows=record["fields"],
+        digests=record["fieldDigests"])
+    return record, outputs
+
+
+def _selected_labels(cell_set: Any, step: dict[str, Any]) -> list[str]:
+    labels = [str(label) for label in cell_set.getScalarDataLabels()]
+    settings = step.get("cellSet") or {}
+    selected = settings.get("scalarLabels")
+    if selected is None:
+        return labels
+    missing = sorted(set(selected) - set(labels))
+    if missing:
+        raise RuntimeError("native cell set is missing requested scalar label(s): " + ", ".join(missing))
+    return [str(label) for label in selected]
+
+
+def _selected_field_rows(cell_set: Any, project: dict[str, Any], step: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    # GAS (3) and Air (2) are native enum values that the curated workbench
+    # material catalog does not list; the cover cells carry one of them.
+    material_names = {**MATERIAL_NAMES, 2: "Air", 3: "GAS"}
+    material_values = [float(value) for value in cell_set.getScalarData("Material")]
+    rows: dict[str, dict[str, Any]] = {}
+    for label in _selected_labels(cell_set, step):
+        if label == "Material":
+            rows[label] = _cell_set_field_row(label, material_values, material_names)
+            continue
+        if label == "FillingFraction":
+            values = [float(value) for value in cell_set.getFillingFractions()]
+        else:
+            values = [float(value) for value in cell_set.getScalarData(label)]
+        row = _cell_set_field_row(label, values, material_names)
+        if len(values) > 200_000:
+            # ``_cell_set_field_row`` builds a Python set of every value for
+            # distinctCount; above this size the memory/time cost outweighs the
+            # information, so the compact summary omits it.
+            row.pop("distinctCount", None)
+        row["integralNative"] = _field_integral(
+            values, grid_delta=float(cell_set.getGridDelta()), dimension=int(project["dimension"]))
+        if label not in ("FillingFraction",):
+            row["byMaterial"] = _material_field_rows(values, material_values, material_names)
+        rows[label] = row
+    return rows
+
+
+def _selected_field_digests(cell_set: Any, project: dict[str, Any], step: dict[str, Any]) -> dict[str, str]:
+    digests: dict[str, str] = {}
+    for label in _selected_labels(cell_set, step):
+        if label == "FillingFraction":
+            values = [float(value) for value in cell_set.getFillingFractions()]
+        else:
+            values = [float(value) for value in cell_set.getScalarData(label)]
+        digests[label] = _scalar_digest(values)
+    return digests
+
+
+def write_cell_set_field_outputs(ps: Any, domain: Any, cell_set: Any, project: dict[str, Any],
+                                 step: dict[str, Any], record: dict[str, Any],
+                                 cell_set_record: dict[str, Any], *, run_dir: Path,
+                                 run_id: str, field_rows: dict[str, dict[str, Any]],
+                                 digests: dict[str, str]) -> list[dict[str, Any]]:
+    """Write the native field cell set as a VTU and a compact JSON summary.
+
+    Both artifacts are budgeted before the VTU is written, so an oversized grid
+    is refused instead of being silently truncated or written past the cap.
+    """
+    settings = step.get("cellSet") or {}
+    format_ = str(settings.get("format") or "both")
+    if format_ not in {"vtu", "json", "both"}:
+        raise RuntimeError(f"unsupported cellSet.format {format_!r}")
+    dimension = int(project["dimension"])
+    delta = float(domain.getGridDelta())
+    cells = int(cell_set.getNumberOfCells())
+    step_id = str(step["id"])
+    if cells <= 0:
+        raise RuntimeError("native cell set has no cells")
+    artifact_dir = run_dir / "artifacts"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    target_paths: list[Path] = []
+    if format_ in {"vtu", "both"}:
+        target_paths.append(artifact_dir / f"{step_id}-cell-set-fields.vtu")
+    if format_ in {"json", "both"}:
+        target_paths.append(artifact_dir / f"{step_id}-cell-set-fields.json")
+    estimate = 0
+    if format_ in {"vtu", "both"}:
+        estimate += cells * CELL_SET_VTU_BYTES_PER_CELL + 8192
+    if format_ in {"json", "both"}:
+        # The summary carries per-label statistics plus a per-material breakdown
+        # and a 64-byte digest per selected label; 64 KiB is the generic cell-set
+        # JSON bound and is conservative for these compact rows.
+        estimate += CELL_SET_JSON_BYTES
+    replaced = sum(path.stat().st_size for path in target_paths if path.is_file())
+    cap = artifact_limit_bytes()
+    used = artifact_bytes_used(run_dir) - replaced
+    if used + estimate > cap:
+        raise RuntimeError(
+            f"cell-set field output would need about {estimate / (1024 * 1024):.1f} MiB but only "
+            f"{(cap - used) / (1024 * 1024):.1f} MiB remain under the {artifact_limit_label()} cap; "
+            "reduce cellSet.height, use format=json, or coarsen gridDelta")
+
+    labels = _selected_labels(cell_set, step)
+    bounds = json.loads(json.dumps(cell_set.getBoundingBox(), default=float))
+    association = ("native Domain cell set shared by every implant/anneal/analysis step; "
+                   "separate from the returned surface mesh")
+    rows: list[dict[str, Any]] = []
+    if format_ in {"vtu", "both"}:
+        path = artifact_dir / f"{step_id}-cell-set-fields.vtu"
+        cell_set.writeVTU(str(path))
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise RuntimeError("native DenseCellSet.writeVTU did not produce a nonempty VTU file")
+        rows.append(output_artifact(
+            path, run_dir, run_id, step_id, "cellSetFields", "VTU",
+            association=association, dimension=dimension, gridDelta=delta,
+            numberOfCells=cells, coverMaterial=settings.get("coverMaterial", "GAS"),
+            heightAboveSurface=float(settings["height"]), periodic=bool(settings.get("periodic", False)),
+            scalarLabels=labels))
+    if format_ in {"json", "both"}:
+        payload = {
+            "schemaVersion": 1,
+            "source": "viennaps.Domain.getCellSet() after the native process",
+            "nativeType": "DenseCellSet",
+            "dimension": dimension,
+            "association": association,
+            "stepId": step_id,
+            "nativeModel": (next(iter(record.values())) or {}).get("nativeModel") if record else None,
+            "setup": {
+                "heightAboveSurface": float(settings["height"]),
+                "coverMaterial": settings.get("coverMaterial", "GAS"),
+                "periodic": bool(settings.get("periodic", False)),
+                "scalarLabels": labels,
+                "nativeScalarLabels": [str(label) for label in cell_set.getScalarDataLabels()],
+            },
+            "numberOfCells": cells,
+            "numberOfNodes": len(cell_set.getNodes()),
+            "grid": {
+                "gridDelta": delta,
+                "nodes": len(cell_set.getNodes()),
+                "elements": len(cell_set.getElements()),
+                "elementNodes": len(cell_set.getElement(0)),
+                "nativeElementType": "tetra" if dimension == 2 else "hexahedron",
+                "logicalCellShape": "quad" if dimension == 2 else "hexahedron",
+                "bounds": bounds,
+            },
+            "fields": field_rows,
+            "fieldDigests": digests,
+            "cellSetSetup": cell_set_record,
+            # The native implant writes a volumetric concentration in both
+            # dimensions (SheetResistance converts it with 1e12 cm^-3), so the
+            # unit is 1/um^3 in 2D as well. ``integralNative`` is sum*delta^D:
+            # with C in 1/um^3 the 2D value has unit 1/um, while the 3D value is
+            # dimensionless and is omitted instead of being labelled.
+            "concentrationUnit": f"1/{LENGTH_UNIT_NAME}^3",
+            "concentrationUnitCm3": 1e12,
+            **({"integralUnit": f"1/{LENGTH_UNIT_NAME}"} if dimension == 2 else {}),
+            "process": record,
+        }
+        path = artifact_dir / f"{step_id}-cell-set-fields.json"
+        atomic_json(path, payload)
+        rows.append(output_artifact(
+            path, run_dir, run_id, step_id, "cellSetFieldsSummary", "JSON",
+            association=association, dimension=dimension, gridDelta=delta,
+            numberOfCells=cells, coverMaterial=settings.get("coverMaterial", "GAS"),
+            heightAboveSurface=float(settings["height"]), periodic=bool(settings.get("periodic", False)),
+            scalarLabels=labels))
+    return rows
+
+
 def execute(input_path: Path, run_dir: Path) -> None:
     input_path = input_path.resolve()
     run_dir = run_dir.resolve()
@@ -2624,9 +4390,46 @@ def execute(input_path: Path, run_dir: Path) -> None:
     run_seed = int(config["runSeed"]) if config.get("runSeed") is not None else None
     engine_preference = project["solver"]["enginePreference"]
     actual_steps = [step for step in project["steps"] if step["enabled"]] if kind == "simulate" else []
-    step_engines = config.get("stepEngines", {})
-    if kind == "flux" and config.get("analysisStepId"):
-        step_engines = {**step_engines, config["analysisStepId"]: step_engines.get(config["analysisStepId"])}
+    step_engines = dict(config.get("stepEngines", {}))
+    if kind == "simulate" and any(step.get("model") in CELL_SET_PROCESS_MODELS for step in actual_steps):
+        # The native cell grid is captured once and reused by every later field
+        # step. A hand-edited input.json never passes through the API validator,
+        # so the shared-grid and pre-allocation rules run here, before any
+        # native call.
+        from backend.implant_models import field_geometry_issues, field_sequence_issues
+        domain = project.get("domain") or {}
+        domain_periodic = bool(domain.get("boundaryXY") == "periodic" if project["dimension"] == 3
+                               else domain.get("xBoundary") == "periodic")
+        preflight_messages = [
+            message for _index, _path, message in field_sequence_issues(
+                actual_steps, grid_delta=float(domain["gridDelta"]),
+                domain_periodic=domain_periodic)
+        ]
+        preflight_messages.extend(
+            message for _index, _path, message in field_geometry_issues(
+                actual_steps, geometry=project.get("geometry"),
+                dimension=int(project["dimension"]), grid_delta=float(domain["gridDelta"]),
+                x_extent=float(domain["xExtent"]),
+                y_extent=float(domain.get("yExtent", 0.0)),
+                from_domain_state=project.get("continuationState") is not None)
+        )
+        if preflight_messages:
+            raise RuntimeError("; ".join(preflight_messages))
+    # Resolve every particle step before CUDA setup. This makes an omitted
+    # stepEngines entry inherit an explicit solver.gpuEngine instead of
+    # silently selecting GPU_DISK, and gates GPU_TRIANGLE exactly like the API.
+    if kind == "simulate":
+        engine_steps = [step for step in actual_steps if uses_flux(step)]
+    elif kind == "flux":
+        flux_id = config.get("analysisStepId")
+        candidate = next((step for step in project["steps"] if step.get("id") == flux_id), None)
+        engine_steps = [candidate] if candidate is not None and candidate.get("enabled") and uses_flux(candidate) else []
+    else:
+        engine_steps = []
+    for step in engine_steps:
+        resolved = requested_engine_for_step(project, step, step_engines)
+        verify_worker_engine_evidence(project, step, resolved)
+        step_engines[step["id"]] = resolved
     uses_cuda_engine = any(isinstance(engine, str) and engine.startswith("GPU_") for engine in step_engines.values())
     selected_gpu_device = None
     cuda_readback = None
@@ -2682,6 +4485,12 @@ def execute(input_path: Path, run_dir: Path) -> None:
     ls_version = version("viennals")
     if ps_version != config["expectedVersions"]["viennaps"] or ls_version != config["expectedVersions"]["viennals"]:
         raise RuntimeError(f"installed package version changed: ViennaPS {ps_version}, ViennaLS {ls_version}")
+    if (ps_version != "4.7.0"
+            and any(step.get("model") in CELL_SET_PROCESS_MODELS
+                    for step in project["steps"] if step.get("enabled"))):
+        raise RuntimeError(
+            f"ViennaPS {ps_version} does not provide the native IonImplantation / Anneal / NetDoping / "
+            "SheetResistance classes; cell-set field steps require the ViennaPS 4.7.0 runtime")
     configure_native_materials(ps, config.get("customMaterials", []))
     if project.get("schemaVersion") == 7 and project.get("outputSettings", {}).get("nativeMetadata"):
         metadata_level = ps.MetaDataLevel.FULL
@@ -2719,7 +4528,11 @@ def execute(input_path: Path, run_dir: Path) -> None:
         readback_delta=float(domain.getGridDelta())
     else:
         boundary = ps.BoundaryType.REFLECTIVE_BOUNDARY if project["domain"]["xBoundary"] == "reflective" else ps.BoundaryType.PERIODIC_BOUNDARY
-        domain = ps.Domain(float(project["domain"]["gridDelta"]), float(project["domain"]["xExtent"]), boundary)
+        # Keyword form is required: viennaps 4.7.0 binds the three positional
+        # arguments to the (gridDelta, xExtent, yExtent) overload, silently
+        # dropping the boundary (4.6.2 bound the (gridDelta, xExtent, boundary)
+        # overload). Both versions accept the keyword form.
+        domain = ps.Domain(float(project["domain"]["gridDelta"]), float(project["domain"]["xExtent"]), boundary=boundary)
         if initial_state_path is not None:
             ps.Reader(domain, str(initial_state_path)).apply()
         else:
@@ -2780,6 +4593,9 @@ def execute(input_path: Path, run_dir: Path) -> None:
         initial["nativeState"] = save_native_state(ps, domain, run_dir, project=project, run_id=run_id,
                                                    step_id="initial", viennaps_version=ps_version, viennals_version=ls_version)
     snapshots = [initial]
+    # The native field cell set lives on a widened deep copy of the Domain and
+    # is shared by every implant/anneal/analysis step of this run.
+    field_state: dict[str, Any] = {}
     actual_execution: list[dict[str, Any]] = []
     intermediate_outputs: list[dict[str, Any]] = []
     event(run_dir, {"type": "snapshot", **initial})
@@ -2787,26 +4603,78 @@ def execute(input_path: Path, run_dir: Path) -> None:
     slice_result = None
     if kind == "slice":
         slice_request = config.get("sliceRequest")
-        if project["dimension"] != 3 or not isinstance(slice_request, dict) or slice_request.get("axis") != 1:
-            raise RuntimeError("native Slice requires a 3D source and the verified y-normal axis")
+        if project["dimension"] != 3 or not isinstance(slice_request, dict):
+            raise RuntimeError("native Slice requires a 3D source domain")
+        try:
+            axis_bounds = slice_axis_bounds(project, slice_request)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(str(exc)) from exc
+        axis_label = axis_bounds["axisName"]
+        slice_axis = axis_bounds["axis"]
+        output_extent = axis_bounds["outputExtent"]
+        lateral_axis, vertical_axis = axis_bounds["lateralAxis"], axis_bounds["verticalAxis"]
+        normal = axis_bounds["normal"]
+        reflect_x = bool(slice_request.get("reflectX", False))
         slice_position = float(slice_request["position"])
-        if not math.isfinite(slice_position) or abs(slice_position) > float(project["domain"]["yExtent"]) / 2:
-            raise RuntimeError("native Slice position must lie inside the 3D y domain")
+        if not math.isfinite(slice_position):
+            raise RuntimeError("native Slice position must be finite")
+        delta = float(project["domain"]["gridDelta"])
+        # Native ViennaLS maps the two remaining coordinates into the output
+        # x/h plane in ascending source-axis order:
+        #   x-normal -> (y, z), y-normal -> (x, z), z-normal -> (x, y).
+        # The slice position moves along the normal axis, so x/y are bounded
+        # by that axis' (possibly halved) domain extent.
+        if axis_bounds["min"] is not None:
+            if not (axis_bounds["min"] - 1e-12 <= slice_position <= axis_bounds["max"] + 1e-12):
+                note = f" ({axis_bounds['restriction']} limit)" if axis_bounds.get("restriction") else ""
+                raise RuntimeError(
+                    f"native Slice {axis_label} position {slice_position:g} lies outside the source "
+                    f"{axis_label} range [{axis_bounds['min']:g}, {axis_bounds['max']:g}]{note}")
+        else:
+            # The z computational boundary is infinite; use the measured
+            # source surface range instead of a lateral extent.
+            bounds = initial.get("surfaceBounds") or []
+            if len(bounds) == 2:
+                axis_min, axis_max = float(bounds[0][2]), float(bounds[1][2])
+                if slice_position < axis_min - delta or slice_position > axis_max + delta:
+                    raise RuntimeError(
+                        f"native Slice z position {slice_position:g} lies outside the source surface "
+                        f"z range [{axis_min:g}, {axis_max:g}]")
+        # Native ViennaLS uses std::round(): half away from zero. Python's
+        # round() is ties-to-even and floor(q + 0.5) loses precision at
+        # 0.49999999999999994, which would record a different position than
+        # the plane native Slice actually selects.
+        native_position = native_slice_position(slice_position, delta)
         ps.setDimension(2)
         slice_boundary = ps.BoundaryType.REFLECTIVE_BOUNDARY if project["domain"]["boundaryXY"] == "reflective" else ps.BoundaryType.PERIODIC_BOUNDARY
-        sliced_domain = ps.d2.Domain(float(project["domain"]["gridDelta"]), float(project["domain"]["xExtent"]), slice_boundary)
-        ps.Slice(domain, sliced_domain, 1, slice_position).apply()
+        sliced_domain = ps.d2.Domain(delta, output_extent, slice_boundary)
+        slice_operation = ps.Slice(domain, sliced_domain, slice_axis, slice_position)
+        if reflect_x:
+            slice_operation.setReflectX(True)
+        slice_operation.apply()
         if int(sliced_domain.getNumberOfLevelSets()) <= 0:
-            raise RuntimeError("ViennaPS Slice returned no level sets at the requested y position")
+            raise RuntimeError(
+                f"ViennaPS Slice returned no level sets at {axis_label}={slice_position:g}")
         slice_project = json.loads(json.dumps(project, ensure_ascii=False))
         slice_project["dimension"] = 2
-        slice_project["domain"] = {"gridDelta":float(project["domain"]["gridDelta"]),
-                                    "xExtent":float(project["domain"]["xExtent"]),
+        slice_project["domain"] = {"gridDelta":delta,
+                                    "xExtent":output_extent,
                                     "xBoundary":project["domain"]["boundaryXY"]}
         slice_project.pop("view3D", None)
-        slice_readback = {"nativeOperation":"viennaps.Slice", "axis":1,
-                          "axisLabel":"y-normal; output plane uses x/z coordinates mapped to x/h",
-                          "position":slice_position, "sourceDimension":3, "outputDimension":2,
+        mapped = f"{lateral_axis}/{vertical_axis} mapped to x/h"
+        slice_readback = {"nativeOperation":"viennaps.Slice", "axis":slice_axis,
+                          "axisLabel":f"{axis_label}-normal",
+                          "axisName":axis_label,
+                          "planeNormal":normal,
+                          "outputCoordinateMapping":mapped,
+                          "reflectX":reflect_x,
+                          "requestedPosition":slice_position,
+                          "position":native_position,
+                          "positionAdjustedToGrid":native_position != slice_position,
+                          "sourceDimension":3, "outputDimension":2,
+                          "outputLateralExtent":output_extent,
+                          "sourceAxisRange":[axis_bounds["min"], axis_bounds["max"]]
+                          if axis_bounds["min"] is not None else "infinite",
                           "viewerClipping":False, "levelSetCount":int(sliced_domain.getNumberOfLevelSets()),
                           "materialIdsByLevelSetIndex":material_map(sliced_domain)}
         slice_result = save_snapshot(ps, sliced_domain, run_dir, run_id=run_id, step_id="true-slice",
@@ -2816,9 +4684,10 @@ def execute(input_path: Path, run_dir: Path) -> None:
         event(run_dir, {"type":"snapshot", **slice_result})
         ps.setDimension(3)
     if flux_step is not None:
-        selected_engine = config.get("stepEngines", {}).get(flux_step["id"])
+        selected_engine = step_engines.get(flux_step["id"])
         if selected_engine is None:
-            raise RuntimeError("single flux calculation has no selected concrete engine")
+            selected_engine = requested_engine_for_step(project, flux_step, step_engines)
+        verify_worker_engine_evidence(project, flux_step, selected_engine)
         if run_seed is None:
             raise RuntimeError("single flux calculation requires a recorded fixed random seed")
         flux_multi_ion = (flux_step.get("model") == "multiParticle"
@@ -2884,7 +4753,45 @@ def execute(input_path: Path, run_dir: Path) -> None:
         event(run_dir, {"type": "step-started", "stepId": step["id"], "index": index, "total": len(actual_steps), "name": step["name"]})
         geometry_step = is_geometry_step(step)
         no_op = not geometry_step and not has_motion(step)
-        if geometry_step:
+        if step.get("model") in CELL_SET_PROCESS_MODELS:
+            # Native 4.7.0 cell-set field steps. They never advance the level
+            # sets; the surface snapshot is the unchanged Domain and the real
+            # output is the native DenseCellSet plus its compact summary.
+            from backend.implant_models import numeric_guard_messages
+            guard_messages = numeric_guard_messages(
+                step, dimension=project["dimension"],
+                grid_delta=float(domain.getGridDelta()))
+            if guard_messages:
+                # Defense in depth: a hand-edited input.json bypasses the API
+                # validator, but must never reach a native constructor with a
+                # value the schema would reject.
+                raise RuntimeError(" ".join(guard_messages))
+            cell_set_applied = {
+                "implant": apply_implant_step,
+                "anneal": apply_anneal_step,
+                "analysis": apply_analysis_step,
+            }[step["model"]]
+            record, cell_set_outputs = cell_set_applied(
+                ps, domain, project, step, run_dir=run_dir, run_id=run_id,
+                state=field_state)
+            event(run_dir, {"type": "step-configured", "stepId": step["id"],
+                            "operation": "native", "model": step["model"], "noOp": False,
+                            "actualEngine": "not-applicable",
+                            "engineSelectionReason": "native cell-set field model; no ray flux engine or surface advection",
+                            "requestedEnginePreference": engine_preference,
+                            "actualSeed": None, "actualRate": None,
+                            "duration": 0.0, "actualParameters": record})
+            previous_tops = snapshots[-1].get("materialTops")
+            metadata = save_snapshot(ps, domain, run_dir, run_id=run_id, step_id=step["id"],
+                                     step_name=step["name"], step_index=index, requested=project,
+                                     step=step, previous_tops=previous_tops,
+                                     extra={"cellSetProcess": record},
+                                     extra_outputs=cell_set_outputs,
+                                     defer_payload=LAZY_SNAPSHOTS)
+            metadata["nativeState"] = save_native_state(ps, domain, run_dir, project=project, run_id=run_id,
+                                                        step_id=step["id"], viennaps_version=ps_version, viennals_version=ls_version)
+            actual_execution.append({"stepId": step["id"], "engine": "not-applicable", "seed": None})
+        elif geometry_step:
             previous_tops = snapshots[-1].get("materialTops")
             actual_parameters = apply_geometry_operation(ps, domain, project, step,
                                                          previous_tops=previous_tops,
@@ -3069,13 +4976,22 @@ def execute(input_path: Path, run_dir: Path) -> None:
             elif step.get("model") != "multiParticle" and not specialized and not csv_process:
                 rate, signed_material_rates = signed_rates(step)
             particle = uses_flux(step)
-            configured_engine = config.get("stepEngines", {}).get(step["id"])
+            configured_engine = step_engines.get(step["id"]) if particle else None
             if configured_engine is None and particle:
-                configured_engine = "GPU_DISK" if engine_preference == "gpu" else "CPU_DISK"
+                configured_engine = requested_engine_for_step(project, step, step_engines)
+                verify_worker_engine_evidence(project, step, configured_engine)
             gpu_multi_ion = (project["schemaVersion"] == 7 and step.get("model") == "multiParticle"
                              and configured_engine == "GPU_DISK"
                              and sum(row.get("kind") == "ion" for row in step.get("species", [])) > 1)
             multi_strategy = config.get("stepExecutionStrategies", {}).get(step["id"])
+            if (project["schemaVersion"] == 7 and step.get("model") == "multiParticle"
+                    and str(configured_engine or "").startswith("GPU_")
+                    and sum(row.get("kind") == "ion" for row in step.get("species", [])) > 1):
+                # Defense in depth: a hand-edited worker input must not reach a
+                # GPU engine that silently drops the extra ion species.
+                policy = multi_ion_gpu_error()
+                if policy is not None:
+                    raise RuntimeError(policy)
             if gpu_multi_ion and multi_strategy not in {GPU_MULTIPARTICLE_SPLIT_STRATEGY, GPU_MULTIPARTICLE_NATIVE_STRATEGY}:
                 raise RuntimeError("GPU MultiParticle input did not pin its multi-ion execution strategy")
             if multi_strategy == GPU_MULTIPARTICLE_NATIVE_STRATEGY and not native_engine_fingerprint:
@@ -3085,7 +5001,8 @@ def execute(input_path: Path, run_dir: Path) -> None:
                 pass
             elif specialized:
                 model, special_process_parameters, specialized_actual, process_duration = build_specialized_model(
-                    ps, domain, project, step, lambda name: material_handle(ps, name), MATERIAL_IDS)
+                    ps, domain, project, step, lambda name: material_handle(ps, name), MATERIAL_IDS,
+                    flux_engine=configured_engine)
             elif csv_process:
                 model, csv_process_actual = build_csv_process(
                     ps, project, step, config=config, run_dir=run_dir,
@@ -3126,9 +5043,10 @@ def execute(input_path: Path, run_dir: Path) -> None:
                                 "native model does not use a stochastic ray flux engine" if specialized and not particle else
                                 "isotropic model does not use a ray flux engine")
             if particle:
-                engine = config.get("stepEngines",{}).get(step["id"])
+                engine = step_engines.get(step["id"])
                 if engine is None:
-                    engine = "GPU_DISK" if engine_preference == "gpu" else "CPU_DISK"
+                    engine = requested_engine_for_step(project, step, step_engines)
+                verify_worker_engine_evidence(project, step, engine)
                 if engine not in {"CPU_DISK","GPU_DISK","CPU_TRIANGLE","GPU_TRIANGLE"}:
                     raise RuntimeError("no verified concrete flux engine for step")
                 if process is not None:
@@ -3236,7 +5154,7 @@ def execute(input_path: Path, run_dir: Path) -> None:
                     os.chdir(previous_cwd)
             next_gpu_step_pending = any(
                 uses_flux(future)
-                and str(config.get("stepEngines", {}).get(
+                and str(step_engines.get(
                     future["id"], "GPU_DISK" if engine_preference == "gpu" else "CPU_DISK")).startswith("GPU_")
                 for future in actual_steps[index:]
             )
@@ -3353,11 +5271,26 @@ def execute(input_path: Path, run_dir: Path) -> None:
             elif gpu_multi_ion:
                 execution_record["executionStrategy"] = GPU_MULTIPARTICLE_NATIVE_STRATEGY
             actual_execution.append(execution_record)
+        # A surface-moving step invalidates the native field cell set. When a
+        # later field step still needs it, regenerate the grid now and remap the
+        # scalar fields, so the record names the exact step that moved the
+        # surface (a lazy remap would collapse several moves into one entry).
+        if (field_state.get("grid") is not None
+                and step.get("model") not in CELL_SET_PROCESS_MODELS
+                and (geometry_step or not no_op)):
+            # Defensive: even when no field step follows, remember that the
+            # captured grid no longer matches the level sets.
+            field_state["surfaceDirty"] = True
+            if any(future.get("model") in CELL_SET_PROCESS_MODELS
+                   for future in actual_steps[index:]):
+                remap_record = remap_field_cell_set(ps, domain, project, field_state, step)
+                event(run_dir, {"type": "cell-set-remap", "afterStepId": step["id"],
+                                **remap_record})
         snapshots.append(metadata)
         event(run_dir, {"type": "snapshot", **metadata})
         future_gpu_process = any(
             uses_flux(future)
-            and str(config.get("stepEngines", {}).get(
+            and str(step_engines.get(
                 future["id"], "GPU_DISK" if engine_preference == "gpu" else "CPU_DISK")).startswith("GPU_")
             for future in actual_steps[index:]
         )

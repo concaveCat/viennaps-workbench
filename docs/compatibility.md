@@ -4,8 +4,9 @@ Date: 2026-10-26
 
 ## Environment
 
-- Python 3.12.14; installed ViennaPS 4.6.2 and ViennaLS 5.8.5. Metadata was read without importing ViennaPS.
-- `/root/ViennaPS` source tree is 4.7.0 and was used only to compare documented call shape; installed-package probes were performed against 4.6.2.
+- Python 3.12.14; the default runtime is the isolated venv `requirements-v470.lock` (ViennaPS 4.7.0 / ViennaLS 5.10.0). The 4.6.2 / 5.8.5 system environment is retained for replay, legacy runs and the two capabilities 4.7.0 lacks. Metadata was read without importing ViennaPS.
+- Supported runtimes: **4.7.0 / 5.10.0 (default)** and **4.6.2 / 5.8.5 (retained legacy/replay)**. Both runtimes go through the same backend; 4.7.0 adds version gates for ALD `surfaceDiffusion`, the advanced oxidation controls, the 2D Faraday cage etch and multi-ion GPU; see [`migration-viennaps-4.7.0.md`](migration-viennaps-4.7.0.md).
+- `/root/ViennaPS` is a development snapshot (HEAD `7a8b17f`, 2026-09-18) whose CMake version already says 4.7.0. It was used only to compare documented call shape; the official 4.7.0 release is the PyPI wheel / tag `f65c1dc`.
 - The project `.venv` was created with `--system-site-packages`. Before P0 probes, `scripts/bounded_child.py` was implemented and exercised with a success child, a one-second timeout, a 1 MiB RSS threshold, and a 1 KiB log cap. Every engine probe then ran through that guard in a new session and process group.
 - RSS supervision measures `/proc` resident pages for the owned process group every 200 ms. It is not a hard memory cap. No usable `memory.max` cgroup file was available in this sandbox; RLIMIT_AS is not used.
 - The workbench filesystem had about 985 GB free at P0. The app still enforces its own 10 GiB accumulation cap and 20 GiB minimum-free reserve.
@@ -31,7 +32,7 @@ Date: 2026-10-26
 
 - The bounded sandbox probe of `gpuAvailable()` raised `RuntimeError: Failed to load CUDA symbol via cuGetProcAddress: cuInit`. This establishes only that GPU access is blocked in the current sandbox.
 - After the user authorized an out-of-sandbox check, the bounded host probe returned `gpuAvailable() = true` and found one `NVIDIA GeForce RTX 3060 Laptop GPU`. ViennaPS 4.6.2 `GPU_DISK` completed 2D single-particle etch and deposition probes at `gridDelta=0.2`, `xExtent=4`, 64 rays, one thread, and a fixed seed. Guard records show normal exit and an empty owned group; see `var/probes/gpu-engine-host.record.json` and `var/probe-tests/gpu-engine-results.json`.
-- A second bounded test ran the actual API supervisor/worker path with explicit GPU preference, then exported and replayed its `GPU_DISK` replay project. GPU runs succeeded and the replay matched material IDs and geometry within `2*gridDelta`; see `var/probes/gpu-api-integration.log` and the associated run manifests. `AUTO` deliberately remains CPU_DISK. GPU_TRIANGLE and GPU_LINE were not tested and remain unavailable.
+- A second bounded test ran the actual API supervisor/worker path with explicit GPU preference, then exported and replayed its `GPU_DISK` replay project. GPU runs succeeded and the replay matched material IDs and geometry within `2*gridDelta`; see `var/probes/gpu-api-integration.log` and the associated run manifests. `AUTO` deliberately remains CPU_DISK. Schema-7 `solver.gpuEngine=GPU_TRIANGLE` is exposed only for the archived 2D/3D specialized sf6o2 etch/reflective stack pair; unproven combinations return 422 and never fall back. `GPU_LINE` remains untested and unavailable.
 - The read-only host self-check returned a non-zero status: patch bytes and static checks passed, while host identity, license runtime and port checks were skipped because the shell is sandboxed. This is not evidence of a host-environment failure. No system service, license, network interface, route, MAC, hostname, or loopback device was changed.
 
 ## Implementation and dependency status

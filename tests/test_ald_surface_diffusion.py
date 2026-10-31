@@ -31,6 +31,7 @@ import copy
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests" / "fixtures"))
@@ -44,6 +45,7 @@ from backend.models import SurfaceDiffusionV7  # noqa: E402
 from backend.validation import ProjectInputError, validate_project  # noqa: E402
 from stage8_direct_reference import make_domain, make_model  # noqa: E402
 from stage8_project_factory import make_project  # noqa: E402
+from backend.engine import ald_surface_diffusion_supported
 from tests.test_api_integration import asgi_request, json_body  # noqa: E402
 from worker.simulate import MATERIAL_IDS, configure_advection, configure_rays, material_handle  # noqa: E402
 from worker.specialized import build_specialized_model  # noqa: E402
@@ -178,12 +180,16 @@ class SurfaceDiffusionSchema(unittest.TestCase):
     def test_adding_the_object_changes_the_request_hash(self):
         plain = ald_project(2)
         with_diffusion = ald_project(2, surface_diffusion={"radius": 0.1})
-        self.assertNotEqual(requested_input_hash(validate_project(plain)[0]),
-                            requested_input_hash(validate_project(with_diffusion)[0]))
+        # Hashes are runtime-independent; validate against the 4.6.2 acceptance
+        # path so this test also runs on the 4.7.0 evaluation runtime.
+        with patch("backend.validation.engine_version", return_value="4.6.2"):
+            self.assertNotEqual(requested_input_hash(validate_project(plain)[0]),
+                                requested_input_hash(validate_project(with_diffusion)[0]))
 
     def test_placement_is_ald_only_and_enabled_requires_positive_coefficient(self):
         good = ald_project(2, surface_diffusion={"radius": 0.1})
-        validate_project(good)
+        with patch("backend.validation.engine_version", return_value="4.6.2"):
+            validate_project(good)
 
         zero_coefficient = ald_project(2, coefficient=0.0, surface_diffusion={"radius": 0.1})
         with self.assertRaises(ProjectInputError) as context:
@@ -213,6 +219,30 @@ class SurfaceDiffusionSchema(unittest.TestCase):
         with self.assertRaises(ProjectInputError) as context:
             validate_project(disabled_override)
         self.assertIn("omit the object", str(context.exception))
+
+    def test_v470_runtime_rejects_enabled_block_before_the_worker(self):
+        project = ald_project(2, surface_diffusion={"radius": 0.1})
+        with patch("backend.validation.engine_version", return_value="4.7.0"):
+            with self.assertRaises(ProjectInputError) as context:
+                validate_project(project)
+        message = str(context.exception)
+        self.assertIn("steps[0].surfaceDiffusion", message)
+        self.assertIn("4.7.0", message)
+        self.assertIn("SurfaceDiffusionParameters", message)
+        self.assertIn("hang", message)
+
+    def test_v462_runtime_accepts_the_enabled_block(self):
+        project = ald_project(2, surface_diffusion={"radius": 0.1})
+        with patch("backend.validation.engine_version", return_value="4.6.2"):
+            parsed, _warnings = validate_project(project)
+        self.assertTrue(parsed.steps[0].surfaceDiffusion.enabled)
+
+    def test_v470_runtime_accepts_an_explicitly_disabled_token(self):
+        project = ald_project(2, coefficient=0.0,
+                              surface_diffusion={"enabled": False})
+        with patch("backend.validation.engine_version", return_value="4.7.0"):
+            parsed, _warnings = validate_project(project)
+        self.assertFalse(parsed.steps[0].surfaceDiffusion.enabled)
 
     def test_unknown_keys_and_bad_values_are_rejected(self):
         for mutation in (
@@ -250,6 +280,8 @@ class SurfaceDiffusionNative(unittest.TestCase):
         parameters.normalizeByLocalScale = self.PARAMS["normalizeByLocalScale"]
         parameters.normalCutoff = self.PARAMS["normalCutoff"]
 
+    @unittest.skipUnless(ald_surface_diffusion_supported(),
+                         "4.7.0 has a confirmed native ALD surface-diffusion hang")
     def test_golden_2d_and_3d_equal_the_native_reference_and_are_deterministic(self):
         for dimension in (2, 3):
             with self.subTest(dimension=dimension):
@@ -272,6 +304,8 @@ class SurfaceDiffusionNative(unittest.TestCase):
                 self.assertEqual(first["heights"], repeat["heights"])
                 self.assertEqual(first["materials"], repeat["materials"])
 
+    @unittest.skipUnless(ald_surface_diffusion_supported(),
+                         "4.7.0 has a confirmed native ALD surface-diffusion hang")
     def test_the_knob_changes_the_surface_and_preserves_materials(self):
         for dimension in (2, 3):
             with self.subTest(dimension=dimension):
@@ -290,8 +324,13 @@ class SurfaceDiffusionNative(unittest.TestCase):
         for dimension in (2, 3):
             with self.subTest(dimension=dimension):
                 omitted = run_worker(normalized(ald_project(dimension)))
-                explicit = run_worker(normalized(
-                    ald_project(dimension, surface_diffusion=dict(NATIVE_DEFAULTS))))
+                # Native default parameters do not trigger the 4.7.0 hang, so
+                # exercise the worker path directly (bypassing the request
+                # gate) to prove the explicit object is still a no-op there.
+                with patch("backend.validation.engine_version", return_value="4.6.2"), \
+                        patch("backend.engine.engine_version", return_value="4.6.2"):
+                    explicit = run_worker(normalized(
+                        ald_project(dimension, surface_diffusion=dict(NATIVE_DEFAULTS))))
                 self.assertEqual(omitted["heights"], explicit["heights"])
                 self.assertEqual(omitted["materials"], explicit["materials"])
                 self.assertIn("surfaceDiffusion", explicit["record"])
@@ -317,13 +356,43 @@ class SurfaceDiffusionNative(unittest.TestCase):
             build_specialized_model(ps, domain, project, step,
                                     lambda name: material_handle(ps, name), MATERIAL_IDS)
 
+    def test_worker_gate_rejects_the_hanging_config_on_v470(self):
+        # Bypass API validation (as a hand-edited worker input would) and prove
+        # the builder itself fails before constructing the native object.
+        with patch("backend.validation.engine_version", return_value="4.6.2"):
+            project = normalized(ald_project(2, surface_diffusion=self.PARAMS))
+        step = project["steps"][0]
+        domain = make_domain(project)
+        with patch("backend.engine.engine_version", return_value="4.7.0"):
+            with self.assertRaises(RuntimeError) as context:
+                build_specialized_model(ps, domain, project, step,
+                                        lambda name: material_handle(ps, name), MATERIAL_IDS)
+        message = str(context.exception)
+        self.assertIn("4.7.0", message)
+        self.assertIn("SurfaceDiffusionParameters", message)
+        self.assertIn("never return", message)
+
+    def test_worker_accepts_the_config_when_runtime_is_462(self):
+        with patch("backend.validation.engine_version", return_value="4.6.2"):
+            project = normalized(ald_project(2, surface_diffusion=self.PARAMS))
+        step = project["steps"][0]
+        domain = make_domain(project)
+        with patch("backend.engine.engine_version", return_value="4.6.2"):
+            _model, extra, _resolved, _duration = build_specialized_model(
+                ps, domain, project, step,
+                lambda name: material_handle(ps, name), MATERIAL_IDS)
+        self.assertIn("SurfaceDiffusionParameters",
+                      [type(item).__name__ for item in extra])
+
     def test_worker_rejects_a_domain_wide_radius(self):
-        project = normalized(ald_project(2, surface_diffusion={"radius": 0.1}))
+        with patch("backend.validation.engine_version", return_value="4.6.2"):
+            project = normalized(ald_project(2, surface_diffusion={"radius": 0.1}))
         project["steps"][0]["surfaceDiffusion"]["radius"] = 1.7
         domain = make_domain(project)
-        with self.assertRaises(RuntimeError) as context:
-            build_specialized_model(ps, domain, project, project["steps"][0],
-                                    lambda name: material_handle(ps, name), MATERIAL_IDS)
+        with patch("backend.engine.engine_version", return_value="4.6.2"):
+            with self.assertRaises(RuntimeError) as context:
+                build_specialized_model(ps, domain, project, project["steps"][0],
+                                        lambda name: material_handle(ps, name), MATERIAL_IDS)
         self.assertIn("8 grid intervals", str(context.exception))
 
 
@@ -349,6 +418,11 @@ class SurfaceDiffusionPersistenceAndReplay(unittest.IsolatedAsyncioTestCase):
     def test_project_saves_and_reopens_with_surface_diffusion(self):
         storage.initialize()
         project = ald_project(2, surface_diffusion=self.PARAMS)
+        if not ald_surface_diffusion_supported():
+            with self.assertRaises(ProjectInputError) as raised:
+                validate_project(project)
+            self.assertIn("surfaceDiffusion", str(raised.exception))
+            return
         parsed, _warnings = validate_project(project)
         normalized_project = parsed.model_dump(mode="json", exclude_none=True)
         run_hash = requested_input_hash(parsed)
@@ -366,6 +440,13 @@ class SurfaceDiffusionPersistenceAndReplay(unittest.IsolatedAsyncioTestCase):
         project["solver"]["enginePreference"] = "cpu"
         response = await asgi_request("/api/runs", method="POST",
                                       payload={"kind": "simulate", "project": project})
+        if not ald_surface_diffusion_supported():
+            self.assertEqual(response[0], 422, response[2])
+            detail = json_body(response)["detail"]
+            issues = detail if isinstance(detail, list) else detail.get("issues", [detail])
+            self.assertTrue(any("surfaceDiffusion" in str(item) and "hang" in str(item)
+                                for item in issues), detail)
+            return
         self.assertEqual(response[0], 202, response[2])
         run_id = json_body(response)["runId"]
         await self.wait(run_id)

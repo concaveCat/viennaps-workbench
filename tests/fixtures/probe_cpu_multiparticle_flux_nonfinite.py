@@ -48,7 +48,7 @@ def main(project_path: Path, state_path: Path, output_path: Path) -> None:
     boundary = (ps.BoundaryType.REFLECTIVE_BOUNDARY if boundary_name == "reflective"
                 else ps.BoundaryType.PERIODIC_BOUNDARY)
     if project["dimension"] == 2:
-        domain = ps.Domain(float(domain_settings["gridDelta"]), float(domain_settings["xExtent"]), boundary)
+        domain = ps.Domain(float(domain_settings["gridDelta"]), float(domain_settings["xExtent"]), boundary=boundary)
     else:
         domain = ps.Domain(float(domain_settings["gridDelta"]), float(domain_settings["xExtent"]),
                            float(domain_settings["yExtent"]), boundary)

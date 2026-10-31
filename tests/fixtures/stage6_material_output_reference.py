@@ -55,7 +55,7 @@ def emit_outputs(domain,dimension,step_id,outdir):
 def main(project_path,custom_path,outpath):
     project=json.loads(Path(project_path).read_text());custom=json.loads(Path(custom_path).read_text());dim=project['dimension'];ps.setDimension(dim);ps.setNumThreads(project['solver']['cpuThreads']);registry=register(custom)
     boundary=ps.BoundaryType.REFLECTIVE_BOUNDARY if project['domain'].get('xBoundary',project['domain'].get('boundaryXY'))=='reflective' else ps.BoundaryType.PERIODIC_BOUNDARY
-    d=project['domain'];domain=ps.Domain(d['gridDelta'],d['xExtent'],d['yExtent'],boundary) if dim==3 else ps.Domain(d['gridDelta'],d['xExtent'],boundary)
+    d=project['domain'];domain=ps.Domain(d['gridDelta'],d['xExtent'],d['yExtent'],boundary) if dim==3 else ps.Domain(d['gridDelta'], d['xExtent'], boundary=boundary)
     g=project['geometry'];ps.MakePlane(domain,height=g['height'],material=registry.getMaterial(g['substrateMaterial']),addToExisting=False).apply()
     if project.get('outputSettings',{}).get('nativeMetadata'):domain.enableMetaData(ps.MetaDataLevel.FULL)
     root=Path(outpath);root.mkdir(parents=True,exist_ok=True);result={'versions':{'viennaps':importlib.metadata.version('viennaps'),'viennals':importlib.metadata.version('viennals')},'snapshots':{}}

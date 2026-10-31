@@ -10,22 +10,50 @@ from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationError, field_validator, model_validator
 from .materials import MaterialDefinition
+from .implant_models import reserved_label_error
 from .runtime_limits import MAX_CELL_SET_CELLS, available_cpu_threads
 
 
-def _finite_number(value: object) -> float:
+def _strict_message(path: str | None, message: str) -> str:
+    return f"{path}: {message}" if path else message
+
+
+def strict_finite_number(value: object, path: str | None = None) -> float:
+    """Reject bool/string/NaN/Inf before any native numeric conversion.
+
+    Shared by the Pydantic request models and the direct worker path so a
+    hand-written worker config cannot reach a native constructor with values
+    the API would reject.
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError("must be a JSON number")
-    result = float(value)
+        raise ValueError(_strict_message(path, "must be a JSON number"))
+    try:
+        result = float(value)
+    except (OverflowError, TypeError, ValueError):
+        raise ValueError(_strict_message(path, "must be finite")) from None
     if not math.isfinite(result):
-        raise ValueError("must be finite")
+        raise ValueError(_strict_message(path, "must be finite"))
     return result
 
 
-def _integer(value: object) -> int:
+def strict_integer(value: object, path: str | None = None) -> int:
     if isinstance(value, bool) or type(value) is not int:
-        raise ValueError("must be a JSON integer")
+        raise ValueError(_strict_message(path, "must be a JSON integer"))
     return value
+
+
+def strict_boolean(value: object, path: str | None = None) -> bool:
+    if type(value) is not bool:
+        raise ValueError(_strict_message(path, "must be a JSON boolean"))
+    return value
+
+
+def _finite_number(value: object) -> float:
+    return strict_finite_number(value)
+
+
+def _integer(value: object) -> int:
+    return strict_integer(value)
 
 
 Number = Annotated[float, BeforeValidator(_finite_number)]
@@ -170,6 +198,17 @@ class SolverV7(Solver):
     # Stable physical NVIDIA device UUID. Missing means host-preferred CUDA
     # device; older schema-1—6 projects remain unchanged and hash-compatible.
     gpuDeviceId: Annotated[str, Field(pattern=r"^GPU-[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$")] | None = None
+    # Concrete native flux engine for an explicit GPU request. Omitted keeps
+    # the historical GPU_DISK route byte-for-byte (hash-compatible). The
+    # installed GPU_TRIANGLE backend is only admitted for evidence-backed
+    # combinations; an unproven request is rejected instead of falling back.
+    gpuEngine: Literal["GPU_DISK", "GPU_TRIANGLE"] | None = None
+
+    @model_validator(mode="after")
+    def gpu_engine_requires_gpu_preference(self) -> "SolverV7":
+        if self.gpuEngine is not None and self.enginePreference != "gpu":
+            raise ValueError("gpuEngine requires solver.enginePreference=gpu; select the GPU engine explicitly or omit gpuEngine")
+        return self
     advection: AdvectionSettingsV7 = Field(default_factory=AdvectionSettingsV7)
     rayTracing: RayTracingSettingsV7 = Field(default_factory=RayTracingSettingsV7)
 
@@ -361,6 +400,8 @@ class ProjectV3(StrictModel):
         # V3 geometry and step unions are validated by the explicit strict
         # validators below; dict fields preserve the v1/v2 model byte shape.
         normalized_geometry, normalized_steps = validate_v3_project_parts(self.geometry, self.steps, self.dimension)
+        validate_geometry_native_flags(normalized_geometry, self.dimension,
+                                       _project_boundary_name(self.domain))
         # Normalize validated numbers/defaults once, without triggering the
         # validate_assignment hook recursively. Legacy contracts are untouched.
         object.__setattr__(self, "geometry", normalized_geometry)
@@ -378,6 +419,43 @@ def validate_v3_project_parts(geometry, steps, dimension):
     return parsed_geometry.model_dump(mode="json", exclude_none=True), [item.model_dump(mode="json", exclude_none=True) for item in parsed]
 
 
+def _project_boundary_name(domain: object) -> str:
+    value = getattr(domain, "boundaryXY", None)
+    if value is None:
+        value = getattr(domain, "xBoundary", "reflective")
+    return str(value)
+
+
+def validate_geometry_native_flags(geometry: dict, dimension: int, boundary: str) -> None:
+    """Reject native half-shape requests that the installed bindings ignore.
+
+    ViennaPS 4.6.2 logs a warning and widens HALF/QUARTER holes (and ignores
+    halfFin/halfTrench) when the domain has periodic boundaries. The Workbench
+    never turns a requested half structure into a full one silently, so the
+    combination fails here before the worker starts.
+    """
+    kind = geometry.get("kind")
+    if kind == "hole":
+        shape = geometry.get("holeShape")
+        if shape in ("HALF", "QUARTER"):
+            if dimension != 3:
+                raise ValueError(f"holeShape {shape} is only applicable to 3D hole geometry")
+            if boundary == "periodic":
+                raise ValueError(
+                    f"holeShape {shape} is not supported with periodic boundaries; "
+                    "the installed ViennaPS binding silently widens it to FULL")
+    elif kind == "trench" and geometry.get("halfTrench"):
+        if boundary == "periodic":
+            raise ValueError(
+                "halfTrench is not supported with periodic boundaries; "
+                "the installed ViennaPS binding silently ignores it")
+    elif kind == "fin" and geometry.get("halfFin"):
+        if boundary == "periodic":
+            raise ValueError(
+                "halfFin is not supported with periodic boundaries; "
+                "the installed ViennaPS binding silently ignores it")
+
+
 class PlaneV3(StrictModel):
     kind: Literal["plane"]
     height: Number
@@ -392,6 +470,9 @@ class TrenchV3(StrictModel):
     maskTaperAngle: Annotated[Number, Field(ge=-45, le=45)]
     substrateMaterial: str
     maskMaterial: str = "Mask"
+    # Installed MakeTrench(..., halfTrench=True) halves the x domain so only
+    # the x>=0 half is built. Omitted preserves the historical full trench.
+    halfTrench: bool | None = None
 
 class HoleV3(StrictModel):
     kind: Literal["hole"]
@@ -402,6 +483,10 @@ class HoleV3(StrictModel):
     maskTaperAngle: Annotated[Number, Field(ge=-45, le=45)]
     substrateMaterial: str
     maskMaterial: str = "Mask"
+    # Installed native ps.HoleShape. Omitted is FULL. HALF keeps x>=0 and
+    # QUARTER keeps x>=0,y>=0; both are 3D-only and reject periodic
+    # boundaries because the native constructor silently widens them to FULL.
+    holeShape: Literal["FULL", "HALF", "QUARTER"] | None = None
 
 class StackLayer(StrictModel):
     id: Annotated[str, Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")]
@@ -411,22 +496,74 @@ class StackLayer(StrictModel):
     role: Literal["film", "mask"]
     source: Literal["gds-mask"] | None = None
 
+class StackPatternLayer(StrictModel):
+    """One cutout in the installed native ``MakeTrench(MaterialLayer[])`` list.
+
+    The entry is matched to one stack layer by zero-based ``layerIndex`` or by
+    ``layerId``. Exactly one reference form is allowed. ``isMask`` is the
+    native ``MaterialLayer.isMask`` flag: true cuts an opening through this
+    layer, false leaves the layer intact. It is therefore a per-layer geometry
+    flag, not the stack layer's etch-protection ``role``.
+    """
+
+    layerIndex: Annotated[Integer, Field(ge=0, le=15)] | None = None
+    layerId: Annotated[str, Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")] | None = None
+    width: Annotated[Number, Field(gt=0)]
+    taperAngle: Annotated[Number, Field(ge=-45, le=45)]
+    isMask: bool
+
+    @model_validator(mode="after")
+    def one_layer_reference(self):
+        if (self.layerIndex is None) == (self.layerId is None):
+            raise ValueError(
+                "each per-layer cutout must reference exactly one stack layer "
+                "with layerIndex or layerId")
+        # The worker shares these helpers for direct (non-API) input.
+        strict_finite_number(self.width, "width")
+        strict_finite_number(self.taperAngle, "taperAngle")
+        if self.layerIndex is not None:
+            strict_integer(self.layerIndex, "layerIndex")
+        strict_boolean(self.isMask, "isMask")
+        return self
+
 class StackPattern(StrictModel):
     kind: Literal["none", "trench", "hole"]
     width: Annotated[Number, Field(gt=0)] | None = None
     radius: Annotated[Number, Field(gt=0)] | None = None
     taperAngle: Annotated[Number, Field(ge=-45, le=45)] | None = None
+    # Omitted keeps the historical top-layer stencil and its request hash.
+    layers: Annotated[list[StackPatternLayer], Field(min_length=1, max_length=16)] | None = None
 
     @model_validator(mode="after")
     def pattern_shape(self):
-        expected={"kind"} if self.kind in {"none", "gds"} else {"kind","width","taperAngle"} if self.kind=="trench" else {"kind","radius","taperAngle"}
-        if self.model_fields_set!=expected:
-            if self.kind in {"none", "gds"}: raise ValueError(f"{self.kind} pattern has no dimensions")
-            if self.kind == "trench": raise ValueError("trench pattern requires exactly width and taperAngle")
+        fields = set(self.model_fields_set)
+        if self.kind in {"none", "gds"}:
+            if fields != {"kind"}:
+                raise ValueError(f"{self.kind} pattern has no dimensions")
+            return self
+        if self.kind == "trench":
+            if "layers" in fields:
+                allowed = {"kind", "layers", "width", "taperAngle"}
+                if not {"kind", "layers"} <= fields or not fields <= allowed:
+                    raise ValueError(
+                        "per-layer trench patterns accept only kind, layers and "
+                        "the optional legacy width/taperAngle pair")
+                if ("width" in fields) != ("taperAngle" in fields):
+                    raise ValueError(
+                        "legacy width and taperAngle must be supplied together "
+                        "or omitted when per-layer cutouts are used")
+            elif fields != {"kind", "width", "taperAngle"}:
+                raise ValueError("trench pattern requires exactly width and taperAngle")
+            if self.layers is None and (self.width is None or self.taperAngle is None):
+                raise ValueError("trench pattern requires width and taperAngle")
+            return self
+        if "layers" in fields:
+            raise ValueError(
+                "per-layer holes are not supported: installed MakeHole has no "
+                "MaterialLayer[] overload")
+        if fields != {"kind", "radius", "taperAngle"}:
             raise ValueError("hole pattern requires exactly radius and taperAngle")
-        if self.kind == "trench" and (self.width is None or self.taperAngle is None):
-            raise ValueError("trench pattern requires width and taperAngle")
-        if self.kind == "hole" and (self.radius is None or self.taperAngle is None):
+        if self.radius is None or self.taperAngle is None:
             raise ValueError("hole pattern requires radius and taperAngle")
         return self
 
@@ -452,7 +589,60 @@ class StackV3(StrictModel):
             raise ValueError("a GDS mask must be the unique top layer with top pattern gds")
         if self.pattern.kind == "gds" and not gds_layers:
             raise ValueError("top pattern gds requires a GDS mask layer")
+        self._check_per_layer_pattern()
         return self
+
+    def _check_per_layer_pattern(self) -> None:
+        pattern = self.pattern
+        if pattern.layers is None:
+            return
+        if pattern.kind != "trench":
+            raise ValueError("per-layer cutouts are supported only for trench patterns")
+        base_height = strict_finite_number(self.baseHeight, "baseHeight")
+        if base_height < 0:
+            raise ValueError("per-layer trench requires a non-negative baseHeight")
+        by_id = {layer.id: index for index, layer in enumerate(self.layers)}
+        resolved: dict[int, StackPatternLayer] = {}
+        previous = -1
+        for position, entry in enumerate(pattern.layers):
+            if entry.layerIndex is not None:
+                index = int(entry.layerIndex)
+                if index >= len(self.layers):
+                    raise ValueError(
+                        f"pattern.layers[{position}].layerIndex {index} is outside "
+                        f"the {len(self.layers)}-layer stack")
+            else:
+                assert entry.layerId is not None
+                if entry.layerId not in by_id:
+                    raise ValueError(
+                        f"pattern.layers[{position}].layerId {entry.layerId!r} is "
+                        "not present in the stack")
+                index = by_id[entry.layerId]
+            if index in resolved:
+                raise ValueError("per-layer cutouts must reference each stack layer at most once")
+            if index <= previous:
+                raise ValueError("per-layer cutouts must be ordered from bottom to top")
+            previous = index
+            resolved[index] = entry
+            if self.layers[index].source == "gds-mask":
+                raise ValueError("a GDS mask layer cannot carry a per-layer native cutout")
+        if set(resolved) != set(range(len(self.layers))) or len(resolved) != len(self.layers):
+            raise ValueError(
+                "per-layer trench must reference every stack layer exactly once "
+                "from bottom to top; omit no layer, including the bottom film")
+        top = len(self.layers) - 1
+        if not resolved[top].isMask:
+            raise ValueError("per-layer trench requires isMask=true on the top stack layer")
+        if pattern.width is not None:
+            if not math.isclose(float(pattern.width), float(resolved[top].width),
+                                rel_tol=0.0, abs_tol=1e-12):
+                raise ValueError(
+                    "legacy pattern.width must match the top per-layer cutout width")
+            assert pattern.taperAngle is not None
+            if not math.isclose(float(pattern.taperAngle), float(resolved[top].taperAngle),
+                                rel_tol=0.0, abs_tol=1e-12):
+                raise ValueError(
+                    "legacy pattern.taperAngle must match the top per-layer cutout taperAngle")
 
 GeometryV3 = Annotated[Union[PlaneV3,TrenchV3,HoleV3,StackV3], Field(discriminator="kind")]
 
@@ -479,6 +669,9 @@ class FinGeometryV7(StrictModel):
     maskMaterial: str = "Mask"
     construction: Literal["native", "boolean"] = "native"
     extrusion: FinExtrusionV7 | None = None
+    # Installed MakeFin(..., halfFin=True) halves the x domain (x>=0 only).
+    # Omitted preserves the historical full fin.
+    halfFin: bool | None = None
 
 
 class GDSLayerV7(StrictModel):
@@ -510,6 +703,55 @@ class StackV7(StackV3):
     pattern: StackPatternV7
     gdsMask: GDSMaskPatternV7 | None = None
 
+    @model_validator(mode="after")
+    def per_layer_excludes_gds_mask(self):
+        # The native per-layer constructor clears and rebuilds the whole
+        # domain, while the GDS overlay is inserted afterwards from a layout.
+        # Combining them would silently discard one of the two geometries.
+        if self.pattern.layers is not None and self.gdsMask is not None:
+            raise ValueError("per-layer trench cannot be combined with a GDS mask overlay")
+        return self
+
+
+class GDSBlurV7(StrictModel):
+    """Optional native GDS proximity blur (``GDSGeometry.addBlur``).
+
+    This is the installed layout proximity blur: Gaussian sigmas on an exposure
+    grid, a normalized weighted sum and one threshold contour. It is **not** a
+    resist model, OPC or three-dimensional lithography simulation. ``sigmas``
+    use the native unit (grid intervals, i.e. ``sigma * gridDelta`` um), exactly
+    like the shipped ``examples/GDSReader/GDSReader.py``. ``delta`` is the
+    exposure grid spacing and defaults to the project gridDelta.
+    """
+
+    enabled: bool = True
+    sigmas: Annotated[list[Annotated[Number, Field(gt=0)]],
+                      Field(min_length=1, max_length=4)] = Field(default_factory=list)
+    weights: Annotated[list[Annotated[Number, Field(ge=0)]],
+                       Field(min_length=1, max_length=4)] = Field(default_factory=list)
+    threshold: Annotated[Number, Field(gt=0, lt=1)] = 0.5
+    delta: Annotated[Number, Field(gt=0)] | None = None
+    gridRefine: Annotated[Integer, Field(ge=1, le=8)] = 4
+
+    @model_validator(mode="after")
+    def checked_sampling(self):
+        if not self.enabled:
+            return self
+        if not self.sigmas or not self.weights:
+            raise ValueError("GDS blur requires nonempty sigmas and weights")
+        if len(self.sigmas) != len(self.weights):
+            raise ValueError("GDS blur sigmas and weights must have the same length")
+        total = 0.0
+        for weight in self.weights:
+            if not math.isfinite(weight):
+                raise ValueError("GDS blur weights must be finite")
+            total += weight
+            if not math.isfinite(total):
+                raise ValueError("GDS blur weights sum exceeds the finite range")
+        if total <= 0:
+            raise ValueError("GDS blur weights must have a positive sum")
+        return self
+
 
 class GDSGeometryV7(StrictModel):
     kind: Literal["gds"]
@@ -519,6 +761,7 @@ class GDSGeometryV7(StrictModel):
     unitScale: Annotated[Number, Field(gt=0, le=1000000)] = 1
     position: Vector3 = [0, 0, 0]
     layers: Annotated[list[GDSLayerV7], Field(min_length=1, max_length=64)]
+    blur: GDSBlurV7 | None = None
 
     @model_validator(mode="after")
     def unique_layers(self):
@@ -631,7 +874,10 @@ class ProjectV4(StrictModel):
             raise ValueError("3D schemaVersion 4 requires 3D domain and view3D only")
         from pydantic import TypeAdapter
         geometry=TypeAdapter(GeometryV3).validate_python(self.geometry)
-        object.__setattr__(self,"geometry",geometry.model_dump(mode="json",exclude_none=True))
+        normalized_geometry=geometry.model_dump(mode="json",exclude_none=True)
+        validate_geometry_native_flags(normalized_geometry, self.dimension,
+                                       _project_boundary_name(self.domain))
+        object.__setattr__(self,"geometry",normalized_geometry)
         ids=[step.id for step in self.steps]
         if len(ids)!=len(set(ids)): raise ValueError("step IDs must be unique")
         return self
@@ -1063,7 +1309,463 @@ class CsvProcessStepV7(StrictModel):
         return self
 
 
-StepV7 = Annotated[Union[StepV5, MultiParticleStepV7, SpecializedStepV7, GdsBooleanStepV7, CsvProcessStepV7], Field(discriminator="model")]
+ShapeAxis = Annotated[Number, Field(gt=0, le=2)]
+
+
+class ParticleShapeStepV7(StrictModel):
+    """Native ``BoxDistribution`` / ``SphereDistribution`` geometry offset.
+
+    These are ViennaLS geometric-advection distributions, not velocity models:
+    ``ps.Process(domain, model, duration)`` ignores the duration and moves the
+    exposed surface by exactly one radius / half-axis set. A masked *etch*
+    through ``addMaskMaterial`` is the officially supported native combination
+    and uses the project's geometry mask materials; a masked *deposition*
+    SIGSEGVs in 2D and 3D on 4.6.2 and 4.7.0, so depositions stay maskless and
+    the run record lists the omitted mask materials. ``operation`` only selects
+    the sign (deposit grows, etch erodes); individual half-axes are positive
+    magnitudes.
+    """
+
+    id: Annotated[str, Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")]
+    name: Annotated[str, Field(min_length=1, max_length=80)]
+    enabled: bool
+    operation: Literal["etch", "deposit"]
+    model: Literal["particleShape"]
+    shape: Literal["box", "sphere"]
+    radius: ShapeAxis | None = None
+    halfAxes: Annotated[list[ShapeAxis], Field(min_length=2, max_length=3)] | None = None
+
+    @model_validator(mode="after")
+    def check_shape_parameters(self) -> "ParticleShapeStepV7":
+        if self.shape == "sphere":
+            if self.radius is None:
+                raise ValueError("sphere particleShape requires radius")
+            if self.halfAxes is not None:
+                raise ValueError("halfAxes applies only to shape=box")
+        else:
+            if self.halfAxes is None:
+                raise ValueError("box particleShape requires halfAxes")
+            if self.radius is not None:
+                raise ValueError("radius applies only to shape=sphere")
+        return self
+
+
+class StepCellSetV7(StrictModel):
+    """The native ``DenseCellSet`` a cell-set field step runs on.
+
+    ``viennaps.Domain.generateCellSet(position, coverMaterial, isAboveSurface)``
+    is the only native constructor available (verified on 4.7.0). ``height`` is
+    passed as the native ``position`` argument; measured on 4.7.0 that argument
+    is the **absolute** top coordinate of the grid (a plane at ``z = 0.05`` with
+    ``position = 0.5`` produced a grid topping out at ``0.50``). For the default
+    plane at ``z = 0`` it therefore equals the height above the surface. The
+    grid is captured at the first cell-set step and every later
+    implant/anneal/analysis step reuses the same absolute grid (a surface-moving
+    step in between regenerates the native cell set and conservatively remaps
+    the scalar fields).
+    """
+
+    height: Annotated[Number, Field(gt=0, le=1000)]
+    #: Depth of the finite substrate below the deepest surface point. A
+    #: ViennaLS level set only stores a narrow band around the surface, so the
+    #: native DenseCellSet would contain one substrate row without this. The
+    #: worker widens the band on a deep copy of the Domain (the simulated
+    #: surface itself is unchanged) before the native grid is generated.
+    substrateDepth: Annotated[Number, Field(gt=0, le=1000)] | None = None
+    coverMaterial: Annotated[str, Field(min_length=1, max_length=64)] = "GAS"
+    periodic: bool = False
+    format: Literal["vtu", "json", "both"] = "both"
+    scalarLabels: list[str] | None = None
+
+    @model_validator(mode="after")
+    def check_scalar_labels(self) -> "StepCellSetV7":
+        if self.scalarLabels is not None:
+            if not self.scalarLabels:
+                raise ValueError("scalarLabels must be omitted or a non-empty list")
+            if len(set(self.scalarLabels)) != len(self.scalarLabels):
+                raise ValueError("scalarLabels must not contain duplicates")
+            for label in self.scalarLabels:
+                if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,47}", label):
+                    raise ValueError(f"scalarLabels entry {label!r} is not a valid cell-set label")
+        if self.coverMaterial != "GAS":
+            # The native generator treats the cover material as the phase above
+            # the surface. A cover equal to the implanted substrate voids the
+            # target (measured: Si cover on Si gives P_total max = 0 in 2D/3D),
+            # and no non-GAS cover has been proven to keep the target visible.
+            raise ValueError(
+                f"cellSet.coverMaterial {self.coverMaterial!r} is not supported for "
+                "implant/anneal/analysis: the native DenseCellSet generator treats the cover "
+                "material as the phase above the surface and skips cells of that material, so a "
+                "cover equal to the implanted substrate voids the target and returns an all-zero "
+                "field; use \"GAS\"")
+        return self
+
+
+class PearsonIVParametersV7(StrictModel):
+    """The installed ``viennaps.PearsonIVParameters`` fields, in length units.
+
+    ``mu``/``sigma`` use the project length unit (um); the native constructor
+    stores exactly these values. ``beta`` and ``gamma`` are the fourth and third
+    standardized moments the native ``PearsonIV`` function expects.
+    """
+
+    mu: Annotated[Number, Field(ge=0, le=10000)]
+    sigma: Annotated[Number, Field(gt=0, le=10000)]
+    beta: Annotated[Number, Field(gt=0, le=1000)]
+    gamma: Annotated[Number, Field(ge=-1000, le=1000)]
+
+
+class ManualImplantProfileV7(StrictModel):
+    """A manually specified analytical profile.
+
+    ViennaPS 4.7.0 ships no model database in the wheel, so the only proven
+    profile source is an explicit moment set. ``kind`` selects the native
+    constructor: ``ImplantPearsonIV``, ``ImplantDualPearsonIV`` or
+    ``ImplantPearsonIVChanneling``. Moments are substrate-depth moments in the
+    project length unit (um) and are *not* corrected for a screen oxide.
+    """
+
+    source: Literal["manual"]
+    kind: Literal["pearsonIV", "dualPearsonIV", "pearsonIVChanneling"]
+    head: PearsonIVParametersV7
+    lateralMu: Number = 0
+    lateralSigma: Annotated[Number, Field(gt=0, le=10000)] = 5
+    tail: PearsonIVParametersV7 | None = None
+    headFraction: Annotated[Number, Field(ge=0, le=1)] | None = None
+    tailLateralMu: Number | None = None
+    tailLateralSigma: Annotated[Number, Field(gt=0, le=10000)] | None = None
+    tailFraction: Annotated[Number, Field(ge=0, le=1)] | None = None
+    tailStartDepth: Annotated[Number, Field(ge=0, le=10000)] | None = None
+    tailDecayLength: Annotated[Number, Field(gt=0, le=10000)] | None = None
+    tailBlendWidth: Annotated[Number, Field(ge=0, le=10000)] = 0
+
+    @model_validator(mode="after")
+    def check_kind_fields(self) -> "ManualImplantProfileV7":
+        dual_values = (self.tail, self.headFraction, self.tailLateralMu, self.tailLateralSigma)
+        channeling_values = (self.tailFraction, self.tailStartDepth, self.tailDecayLength)
+        # Validate values, not ``model_fields_set``: a project is re-parsed from
+        # its own ``model_dump`` (which materialises defaults) before the worker
+        # starts, so a harmless default such as tailBlendWidth=0 must stay valid.
+        if self.kind == "pearsonIV":
+            if any(value is not None for value in dual_values + channeling_values):
+                raise ValueError("pearsonIV does not accept tail/channeling parameters; "
+                                 "use kind=dualPearsonIV or pearsonIVChanneling")
+            if float(self.tailBlendWidth) != 0.0:
+                raise ValueError("tailBlendWidth applies only to pearsonIVChanneling")
+        elif self.kind == "dualPearsonIV":
+            missing = [name for name, value in zip(("tail", "headFraction", "tailLateralMu",
+                                                    "tailLateralSigma"), dual_values) if value is None]
+            if missing:
+                raise ValueError("dualPearsonIV requires " + ", ".join(missing))
+            if any(value is not None for value in channeling_values) or float(self.tailBlendWidth) != 0.0:
+                raise ValueError("dualPearsonIV does not accept channeling parameters")
+        else:
+            missing = [name for name, value in zip(("tailFraction", "tailStartDepth",
+                                                    "tailDecayLength"), channeling_values) if value is None]
+            if missing:
+                raise ValueError("pearsonIVChanneling requires " + ", ".join(missing))
+            if any(value is not None for value in dual_values):
+                raise ValueError("pearsonIVChanneling does not accept dual-Pearson parameters")
+        return self
+
+
+class ImplantDamageV7(StrictModel):
+    """The installed ``viennaps.ImplantDamageHobler`` constructor arguments."""
+
+    kind: Literal["hobler"]
+    projectedRange: Annotated[Number, Field(gt=0, le=10000)]
+    verticalSigma: Annotated[Number, Field(gt=0, le=10000)]
+    lambdaValue: Annotated[Number, Field(gt=0, le=100000)]
+    defectsPerIon: Annotated[Number, Field(ge=0, le=100000)]
+    lateralSigma: Annotated[Number, Field(gt=0, le=10000)]
+    lateralDeltaSigma: Annotated[Number, Field(ge=-10000, le=10000)] = 0
+
+
+class ImplantLabelsV7(StrictModel):
+    concentration: str | None = None
+    damage: str | None = None
+    lastDamage: str | None = None
+
+    @model_validator(mode="after")
+    def check_labels(self) -> "ImplantLabelsV7":
+        for name in ("concentration", "damage", "lastDamage"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,47}", value):
+                raise ValueError(f"{name} must be a valid cell-set label")
+            error = reserved_label_error(value, f"labels.{name}")
+            if error is not None:
+                raise ValueError(error)
+        return self
+
+
+class ImplantStepV7(StrictModel):
+    """Native ``viennaps.IonImplantation`` applied to the domain cell set.
+
+    The model never moves the level sets; ``ps.Process(domain, implant, 0.0)``
+    only stamps the concentration (and optional damage) fields into the cell
+    set. ``energyKeV``/``rotationDeg`` are recorded request metadata: the
+    manual Pearson IV path has no native energy or rotation parameter (only
+    ``ImplantTableModel`` consumes them), so a nonzero rotation is refused
+    instead of being silently dropped.
+    """
+
+    id: Annotated[str, Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")]
+    name: Annotated[str, Field(min_length=1, max_length=80)]
+    enabled: bool
+    model: Literal["implant"]
+    species: Annotated[str, Field(min_length=1, max_length=24, pattern=r"^[A-Za-z][A-Za-z0-9_-]*$")]
+    material: Annotated[str, Field(min_length=1, max_length=64)]
+    energyKeV: Annotated[Number, Field(gt=0, le=100000)]
+    doseCm2: Annotated[Number, Field(gt=0, le=1e19)]
+    tiltDeg: Annotated[Number, Field(ge=0, le=90)]
+    rotationDeg: Annotated[Number, Field(ge=0, le=360)] = 0
+    doseControl: Literal["Off", "WaferDose", "BeamDose"] = "WaferDose"
+    profile: ManualImplantProfileV7
+    damage: ImplantDamageV7 | None = None
+    maskMaterials: list[Annotated[str, Field(min_length=1, max_length=64)]] = Field(default_factory=list)
+    screenMaterials: list[Annotated[str, Field(min_length=1, max_length=64)]] = Field(default_factory=list)
+    labels: ImplantLabelsV7 | None = None
+    damageFactor: Annotated[Number, Field(gt=0, le=1000000)] = 1
+    cellSet: StepCellSetV7
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_unproven_sources(cls, data):
+        if isinstance(data, dict):
+            profile = data.get("profile")
+            if isinstance(profile, dict) and profile.get("source") == "table":
+                raise ValueError(
+                    "implant profile.source=table is not exposed: the installed ViennaPS 4.7.0 wheel "
+                    "ships no model database (viennaps.getModelDbRoot() is empty) and the workbench does "
+                    "not bundle one, so a table lookup would fail at the native layer; use "
+                    "profile.source=manual with explicit Pearson IV moments")
+        return data
+
+    @model_validator(mode="after")
+    def check_implant_fields(self) -> "ImplantStepV7":
+        if float(self.rotationDeg) != 0.0:
+            raise ValueError(
+                "rotationDeg is only consumed by the native ImplantTableModel; the manual Pearson IV "
+                "path has no rotation parameter, so only rotationDeg=0 is accepted")
+        for name in ("maskMaterials", "screenMaterials"):
+            values = getattr(self, name)
+            if len(set(values)) != len(values):
+                raise ValueError(f"{name} must not contain duplicates")
+        if set(self.maskMaterials) & set(self.screenMaterials):
+            raise ValueError("maskMaterials and screenMaterials must be disjoint")
+        if self.material in set(self.maskMaterials) | set(self.screenMaterials):
+            raise ValueError("material must not also be a mask or screen material")
+        resolved = self.labels or ImplantLabelsV7()
+        stem = re.sub(r"[^A-Za-z0-9_]", "_", self.species)
+        if not re.match(r"^[A-Za-z]", stem):
+            stem = "dopant_" + stem
+        concentration = resolved.concentration or f"{stem}_total"
+        damage = resolved.damage
+        last_damage = resolved.lastDamage
+        if self.damage is None:
+            if damage is not None or last_damage is not None:
+                raise ValueError("labels.damage/lastDamage require a damage model")
+        else:
+            damage = damage or f"{stem}_damage"
+            last_damage = last_damage or f"{damage}_last"
+        if len({concentration, damage, last_damage} - {None}) != len(
+                [value for value in (concentration, damage, last_damage) if value is not None]):
+            raise ValueError("implant labels must be distinct")
+        object.__setattr__(self, "labels", ImplantLabelsV7(
+            concentration=concentration, damage=damage, lastDamage=last_damage))
+        return self
+
+
+class IsothermalScheduleV7(StrictModel):
+    kind: Literal["isothermal"]
+    temperatureK: Annotated[Number, Field(gt=0, le=5000)]
+    durationSeconds: Annotated[Number, Field(ge=0, le=1000000)]
+
+
+class StepScheduleV7(StrictModel):
+    """``Anneal.setTemperatureSchedule(durations, temperatures)``.
+
+    Native accepts N durations with N isothermal temperatures or N+1 ramp
+    endpoint temperatures (the 4.7.0 example uses three ramp/soak steps).
+    """
+
+    kind: Literal["schedule"]
+    durations: Annotated[list[Annotated[Number, Field(ge=0, le=1000000)]], Field(min_length=1, max_length=32)]
+    temperatures: Annotated[list[Annotated[Number, Field(gt=0, le=5000)]], Field(min_length=1, max_length=33)]
+
+    @model_validator(mode="after")
+    def check_lengths(self) -> "StepScheduleV7":
+        if len(self.temperatures) not in (len(self.durations), len(self.durations) + 1):
+            raise ValueError(
+                "schedule.temperatures must contain N isothermal values or N+1 ramp endpoints "
+                f"for {len(self.durations)} duration(s)")
+        return self
+
+
+AnnealScheduleV7 = Annotated[Union[IsothermalScheduleV7, StepScheduleV7], Field(discriminator="kind")]
+
+
+class ArrheniusDiffusivityV7(StrictModel):
+    kind: Literal["arrhenius"]
+    D0: Annotated[Number, Field(gt=0, le=1e40)]
+    Ea_eV: Annotated[Number, Field(ge=0, le=100)]
+
+
+class ConstantDiffusivityV7(StrictModel):
+    kind: Literal["constant"]
+    value: Annotated[Number, Field(ge=0, le=1e40)]
+
+
+AnnealDiffusivityV7 = Annotated[Union[ArrheniusDiffusivityV7, ConstantDiffusivityV7], Field(discriminator="kind")]
+
+
+class ImplicitSolverOptionsV7(StrictModel):
+    maxIterations: Annotated[Integer, Field(ge=1, le=100000)] = 400
+    relativeTolerance: Annotated[Number, Field(gt=0, le=1)] = 1e-6
+    relaxation: Annotated[Number, Field(gt=0, le=2)] = 1.0
+
+
+class SolidActivationV7(StrictModel):
+    """``enableSolidActivation(True)`` + ``setSolidSolubilityArrhenius``.
+
+    The native activation model writes ``C_active = C_SS·C/(C_SS+C)`` with
+    ``C_SS = C0·exp(-Ea/kT)``. Without this block the anneal would diffuse the
+    dopant but never produce an electrically active field.
+    """
+
+    solubilityC0: Annotated[Number, Field(gt=0, le=1e40)]
+    solubilityEa_eV: Annotated[Number, Field(ge=0, le=100)]
+
+
+class AnnealStepV7(StrictModel):
+    """Native ``viennaps.Anneal`` on the cell set produced by an implant.
+
+    Only the parameters proven to run on the installed 4.7.0 runtime are
+    exposed. Defect coupling, TED/Fermi enhancement, trapping/segregation,
+    clustering and source-field injection are intentionally absent: they are
+    separate calibrated models whose parameter provenance the workbench cannot
+    validate.
+    """
+
+    id: Annotated[str, Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")]
+    name: Annotated[str, Field(min_length=1, max_length=80)]
+    enabled: bool
+    model: Literal["anneal"]
+    mode: Literal["GaussSeidel", "Explicit"] = "GaussSeidel"
+    schedule: AnnealScheduleV7
+    diffusivity: AnnealDiffusivityV7
+    timeStep: Annotated[Number, Field(gt=0, le=1000000)] | None = None
+    stabilityFactor: Annotated[Number, Field(ge=0.01, le=1)] | None = None
+    implicitSolver: ImplicitSolverOptionsV7 | None = None
+    diffusionMaterials: list[Annotated[str, Field(min_length=1, max_length=64)]] = Field(default_factory=list)
+    blockingMaterials: list[Annotated[str, Field(min_length=1, max_length=64)]] = Field(default_factory=list)
+    speciesLabel: Annotated[str, Field(min_length=1, max_length=48)]
+    activeLabel: Annotated[str, Field(min_length=1, max_length=48)]
+    solidActivation: SolidActivationV7
+    activationOnly: bool = False
+    cellSet: StepCellSetV7
+
+    @model_validator(mode="after")
+    def check_anneal_fields(self) -> "AnnealStepV7":
+        for name in ("speciesLabel", "activeLabel"):
+            value = getattr(self, name)
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,47}", value):
+                raise ValueError(f"{name} must be a valid cell-set label")
+            error = reserved_label_error(value, name)
+            if error is not None:
+                raise ValueError(error)
+        if self.speciesLabel == self.activeLabel:
+            raise ValueError("speciesLabel and activeLabel must be different cell-set fields")
+        if set(self.diffusionMaterials) & set(self.blockingMaterials):
+            raise ValueError("diffusionMaterials and blockingMaterials must be disjoint")
+        if len(set(self.diffusionMaterials)) != len(self.diffusionMaterials):
+            raise ValueError("diffusionMaterials must not contain duplicates")
+        if len(set(self.blockingMaterials)) != len(self.blockingMaterials):
+            raise ValueError("blockingMaterials must not contain duplicates")
+        if self.mode == "Explicit" and self.implicitSolver is not None:
+            raise ValueError("implicitSolver applies only to mode=GaussSeidel")
+        return self
+
+
+class NetDopingV7(StrictModel):
+    """Native ``viennaps.NetDoping`` on the current cell set."""
+
+    donorLabels: Annotated[list[Annotated[str, Field(min_length=1, max_length=48)]], Field(max_length=8)] = Field(default_factory=list)
+    acceptorLabels: Annotated[list[Annotated[str, Field(min_length=1, max_length=48)]], Field(max_length=8)] = Field(default_factory=list)
+    outputLabel: Annotated[str, Field(min_length=1, max_length=48)] = "net_doping"
+    surfacePosition: Number | None = None
+
+    @model_validator(mode="after")
+    def check_net_doping(self) -> "NetDopingV7":
+        if not self.donorLabels and not self.acceptorLabels:
+            raise ValueError("netDoping requires at least one donor or acceptor label")
+        for name in ("outputLabel", *self.donorLabels, *self.acceptorLabels):
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,47}", name):
+                raise ValueError(f"{name!r} is not a valid cell-set label")
+            error = reserved_label_error(name, "netDoping label")
+            if error is not None:
+                raise ValueError(error)
+        labels = [*self.donorLabels, *self.acceptorLabels]
+        if len(set(labels)) != len(labels):
+            raise ValueError("netDoping labels must be unique across donors and acceptors")
+        if self.outputLabel in labels:
+            raise ValueError("netDoping.outputLabel must not overwrite an input field")
+        return self
+
+
+class SheetResistanceEntryV7(StrictModel):
+    """One native ``viennaps.SheetResistance`` evaluation.
+
+    ``computeElectron`` uses the Masetti-Severi n-type mobility (donors) and
+    ``computeHole`` the p-type mobility (acceptors). The native length unit is
+    fixed at 1e-4 cm (the workbench's um), which also sets the matching
+    concentration unit 1e12 cm^-3.
+    """
+
+    concentrationLabel: Annotated[str, Field(min_length=1, max_length=48)]
+    carrier: Literal["electron", "hole"]
+    surfacePosition: Number | None = None
+
+    @model_validator(mode="after")
+    def check_label(self) -> "SheetResistanceEntryV7":
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,47}", self.concentrationLabel):
+            raise ValueError("concentrationLabel is not a valid cell-set label")
+        error = reserved_label_error(self.concentrationLabel, "concentrationLabel")
+        if error is not None:
+            raise ValueError(error)
+        return self
+
+
+class AnalysisStepV7(StrictModel):
+    """Native ``NetDoping`` / ``SheetResistance`` analysis of the cell set.
+
+    This step never changes geometry. ``netDoping`` writes its output field into
+    the cell set; ``sheetResistance`` only reports the native scalar.
+    """
+
+    id: Annotated[str, Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")]
+    name: Annotated[str, Field(min_length=1, max_length=80)]
+    enabled: bool
+    model: Literal["analysis"]
+    netDoping: NetDopingV7 | None = None
+    sheetResistance: Annotated[list[SheetResistanceEntryV7], Field(max_length=8)] = Field(default_factory=list)
+    scanDepth: Annotated[Number, Field(ge=0, le=10000)] | None = None
+    cellSet: StepCellSetV7
+
+    @model_validator(mode="after")
+    def check_analysis_fields(self) -> "AnalysisStepV7":
+        if self.netDoping is None and not self.sheetResistance:
+            raise ValueError("analysis requires netDoping or at least one sheetResistance entry")
+        if self.scanDepth is not None and self.netDoping is None:
+            raise ValueError("scanDepth is the NetDoping lateral scan and requires netDoping")
+        return self
+
+
+StepV7 = Annotated[Union[StepV5, MultiParticleStepV7, SpecializedStepV7, GdsBooleanStepV7, CsvProcessStepV7,
+                         ParticleShapeStepV7, ImplantStepV7, AnnealStepV7, AnalysisStepV7],
+                   Field(discriminator="model")]
 
 
 class DomainStateRef(StrictModel):
@@ -1130,6 +1832,8 @@ class ProjectV6(StrictModel):
         geometry_adapter = GeometryV7 if self.schemaVersion == 7 else GeometryV3
         geometry = TypeAdapter(geometry_adapter).validate_python(self.geometry)
         normalized_geometry = geometry.model_dump(mode="json", exclude_none=True)
+        validate_geometry_native_flags(normalized_geometry, self.dimension,
+                                       _project_boundary_name(self.domain))
         object.__setattr__(self, "geometry", normalized_geometry)
         ids = [step.id for step in self.steps]
         if len(ids) != len(set(ids)):
@@ -1262,6 +1966,20 @@ class ProjectV7(ProjectV6):
                 if min(abs(start), abs(end)) > self.domain.yExtent / 2 or max(abs(start), abs(end)) > self.domain.yExtent / 2:
                     raise ValueError("fin extrusion extent must fit inside the 3D y domain")
         elif geometry["kind"] == "gds":
+            blur = geometry.get("blur")
+            if blur is not None and blur.get("enabled", True):
+                exposure_delta = (float(blur.get("delta"))
+                                  if blur.get("delta") is not None else float(delta))
+                if not math.isfinite(exposure_delta) or exposure_delta <= 0:
+                    raise ValueError("geometry.blur.delta must be finite and positive")
+                if exposure_delta > float(delta) + 1e-12:
+                    raise ValueError(
+                        "geometry.blur.delta is the exposure grid spacing and cannot be coarser than gridDelta")
+                int(blur.get("gridRefine", 4))
+                # The real exposure-grid budget depends on the GDS layout and
+                # is enforced by backend.validation, which can read the asset.
+                # Do not estimate it from the simulation domain here: a 2D
+                # layout can be much taller than xExtent.
             if self.dimension == 2:
                 if abs(geometry["position"][2]) > 1e-12:
                     raise ValueError("2D GDS position must use [x,h,0]")
@@ -1292,6 +2010,16 @@ class ProjectV7(ProjectV6):
                 raise ValueError("GDS mask height must span at least two grid intervals")
             if abs(mask["baseHeight"] + mask["position"][2]) / delta > 1_000_000:
                 raise ValueError("GDS mask base height exceeds the application coordinate budget")
+        for index, step in enumerate(self.steps):
+            if isinstance(step, ParticleShapeStepV7) and step.shape == "box":
+                # The native BoxDistribution binding always takes three axes;
+                # 2D only consumes the first two. The project surface therefore
+                # carries exactly the axes the dimension uses, so a 2D file can
+                # never silently contain an unused third half-axis.
+                if len(step.halfAxes) != self.dimension:
+                    raise ValueError(
+                        f"steps[{index}].halfAxes must contain {self.dimension} values "
+                        f"({'[x, h]' if self.dimension == 2 else '[x, y, z]'}) for a {self.dimension}D project")
         for index, step in enumerate(self.steps):
             if not isinstance(step, GdsBooleanStepV7):
                 continue
@@ -1341,6 +2069,48 @@ class ProjectV7(ProjectV6):
                 raise ValueError(
                     f"cellSet.height would create at least {estimate:,} cells, above the "
                     f"{MAX_CELL_SET_CELLS:,}-cell limit; reduce cellSet.height or coarsen gridDelta")
+        delta = float(self.domain.gridDelta)
+        domain_periodic = (self.domain.boundaryXY == "periodic" if self.dimension == 3
+                           else self.domain.xBoundary == "periodic")
+        nx = max(1, math.ceil(float(self.domain.xExtent) / delta))
+        ny = (max(1, math.ceil(float(self.domain.yExtent) / delta))
+              if self.dimension == 3 else 1)
+        lateral = (nx + 2) * (ny + 2)
+        for index, step in enumerate(self.steps):
+            settings = getattr(step, "cellSet", None)
+            if settings is None:
+                continue
+            height = float(settings.height)
+            if height + 1e-12 < delta:
+                raise ValueError(
+                    f"steps[{index}].cellSet.height must span at least one grid interval "
+                    f"({delta:g} um); the installed DenseCellSet generator crashes on a thinner band")
+            if height / delta > 1_000_000:
+                raise ValueError(f"steps[{index}].cellSet.height exceeds the application coordinate budget")
+            if bool(settings.periodic) != domain_periodic:
+                raise ValueError(
+                    f"steps[{index}].cellSet.periodic must match the domain lateral boundary; the "
+                    "cell set is generated from the domain's level sets and only the native "
+                    "neighbor topology can be marked periodic")
+            rows = math.ceil(height / delta) + 4
+            estimate = lateral * max(rows, 2)
+            if estimate > MAX_CELL_SET_CELLS:
+                raise ValueError(
+                    f"steps[{index}].cellSet.height would create at least {estimate:,} cells, above "
+                    f"the {MAX_CELL_SET_CELLS:,}-cell limit; reduce the height or coarsen gridDelta")
+            substrate_depth = settings.substrateDepth
+            if substrate_depth is not None:
+                if float(substrate_depth) + 1e-12 < 2 * delta:
+                    raise ValueError(
+                        f"steps[{index}].cellSet.substrateDepth must span at least two grid intervals "
+                        f"({2 * delta:g} um) so the substrate has interior cells")
+                rows = math.ceil((height + float(substrate_depth)) / delta) + 4
+                estimate = lateral * max(rows, 2)
+                if estimate > MAX_CELL_SET_CELLS:
+                    raise ValueError(
+                        f"steps[{index}].cellSet.height + substrateDepth would create at least "
+                        f"{estimate:,} cells, above the {MAX_CELL_SET_CELLS:,}-cell limit; reduce the "
+                        "depth or coarsen gridDelta")
         return self
 
 
@@ -1370,7 +2140,10 @@ class ProjectV5(StrictModel):
             raise ValueError("3D schemaVersion 5 requires 3D domain and view3D only")
         from pydantic import TypeAdapter
         geometry = TypeAdapter(GeometryV3).validate_python(self.geometry)
-        object.__setattr__(self, "geometry", geometry.model_dump(mode="json", exclude_none=True))
+        normalized_geometry = geometry.model_dump(mode="json", exclude_none=True)
+        validate_geometry_native_flags(normalized_geometry, self.dimension,
+                                       _project_boundary_name(self.domain))
+        object.__setattr__(self, "geometry", normalized_geometry)
         ids = [step.id for step in self.steps]
         if len(ids) != len(set(ids)):
             raise ValueError("step IDs must be unique")
@@ -1457,8 +2230,15 @@ class ReplayRequirements(StrictModel):
 
 
 class SliceRequestV7(StrictModel):
+    # ``axis`` is the historical y-normal integer and is kept for byte-level
+    # compatibility with saved requests/replays. New requests select the native
+    # Slice.setSliceDimension index through ``sliceAxis`` (x=0, y=1, z=2).
     axis: Literal[1] = 1
     position: Number
+    sliceAxis: Literal["x", "y", "z"] | None = None
+    # Native Slice.setReflectX negates the first remaining coordinate. Omitted
+    # means False so old request hashes stay unchanged.
+    reflectX: bool | None = None
 
 
 class ReplayProjectV1(StrictModel):

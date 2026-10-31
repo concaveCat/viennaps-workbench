@@ -4,7 +4,13 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from backend.specialized_models import advanced_spec, model_spec, oxidation_advanced_spec
+from backend.specialized_models import (IBE_ENERGY_MODELS, PLASMA_COVERAGE_MODELS, advanced_spec,
+                                       coverage_tolerance_issues, faraday_cage_2d_engine_error,
+                                       geometric_trench_issues, ibe_energy_issues,
+                                       model_spec, nv_factors_issues,
+                                       oxidation_advanced_spec)
+from backend.engine import (ald_surface_diffusion_error, engine_version,
+                           oxidation_advanced_supported)
 
 
 def _set_native_path(target: Any, path: str, value: Any) -> None:
@@ -153,18 +159,84 @@ def _build_plasma_model(ps: Any, model_id: str, spec: dict[str, Any], parameters
     return model, metadata
 
 
+def _coverage_parameters(ps: Any, parameters: dict[str, Any]) -> tuple[Any, dict[str, Any] | None]:
+    """Build the native plasma ``CoverageParameters`` for one step.
+
+    The worker has always pinned tolerance=1e-3 while the native struct default
+    is 0.0. Omitting ``coverageTolerance`` must keep that historical value and
+    add no new metadata; only an explicit request records the readback.
+    """
+    coverage = ps.CoverageParameters()
+    if "coverageTolerance" not in parameters:
+        coverage.tolerance = 1e-3
+        return coverage, None
+    if messages := coverage_tolerance_issues(parameters["coverageTolerance"]):
+        raise RuntimeError(f"CoverageParameters.tolerance {'; '.join(messages)}")
+    coverage.tolerance = float(parameters["coverageTolerance"])
+    native_readback = {str(key): [float(value) for value in values]
+                       for key, values in coverage.toMetaData().items()}
+    return coverage, {
+        "nativeClass": "CoverageParameters",
+        "nativeMember": "tolerance",
+        "requested": float(parameters["coverageTolerance"]),
+        "effective": float(coverage.tolerance),
+        "nativeDefault": 0.0,
+        "workbenchHistoricalDefault": 1e-3,
+        "source": "explicit",
+        "nativeReadback": native_readback,
+        "coverageInitIterations": (
+            "the native CoverageParameters.maxIterations is left at its default; when tolerance==0 the "
+            "installed FluxProcessStrategy replaces it with 10 initialization iterations, while a positive "
+            "tolerance iterates until every coverage delta metric is <= tolerance"),
+    }
+
+
 def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step: dict[str, Any],
-                            material_handle: Any, material_ids: dict[str, int]) -> tuple[Any, list[Any], dict[str, Any], float]:
+                            material_handle: Any, material_ids: dict[str, int],
+                            *, flux_engine: str | None = None) -> tuple[Any, list[Any], dict[str, Any], float]:
     """Build an installed native model and its native process parameters.
 
     The model ID is an application allowlist key; submitted JSON never selects
     an arbitrary Python attribute or constructor.
+
+    ``flux_engine`` is the engine the caller is about to pin on ``ps.Process``.
+    It is required for 2D ``faradayCage``: the shared CPU_DISK gate rejects an
+    omitted or non-CPU engine before any native object is constructed, because
+    the AUTO/GPU 2D kernel hangs for part of the cageAngle/tiltAngle matrix.
     """
     model_id = step["nativeModel"]
     spec = model_spec(model_id)
     if spec is None:
         raise RuntimeError(f"unavailable ViennaPS 4.6.2 model {model_id!r}")
     p = step["nativeParameters"]
+    # Worker-side preflight: replay/direct worker inputs reach this function
+    # without backend.validation. Keep the same safety rules here so an
+    # invalid optional value can never reach a native setter/constructor.
+    if model_id == "faradayCage" and int(project["dimension"]) == 2:
+        gate_message = faraday_cage_2d_engine_error(flux_engine)
+        if gate_message is not None:
+            raise RuntimeError(f"FaradayCageEtching rejected before the native call: {gate_message}")
+    if model_id in IBE_ENERGY_MODELS:
+        # Same rule as backend.validation: thresholdEnergy >= meanEnergy makes
+        # the native IBE yield change sign, so reject before IBEParameters is
+        # constructed (a hand-edited/replayed worker input reaches this point
+        # without validation).
+        for suffix, message in ibe_energy_issues(p):
+            raise RuntimeError(f"{spec['nativeClass']} rejected before the native call: {suffix}: {message}")
+    if "coverageTolerance" in p:
+        if model_id not in PLASMA_COVERAGE_MODELS:
+            raise RuntimeError(f"{model_id} does not accept nativeParameters.coverageTolerance")
+        if messages := coverage_tolerance_issues(p["coverageTolerance"]):
+            raise RuntimeError(f"{model_id} coverageTolerance {'; '.join(messages)}")
+    if "nvFactors" in p:
+        if model_id != "selectiveEpitaxy":
+            raise RuntimeError(f"{model_id} does not accept nativeParameters.nvFactors")
+        if messages := nv_factors_issues(p["nvFactors"]):
+            raise RuntimeError(f"selectiveEpitaxy nvFactors {'; '.join(messages)}")
+    if model_id == "geometricTrenchDeposition":
+        if problems := geometric_trench_issues(project, step):
+            detail = "; ".join(f"{path}: {message}" for path, message in problems)
+            raise RuntimeError(f"GeometricTrenchDeposition rejected before the native call: {detail}")
     extra: list[Any] = []
     duration = float(step["duration"]) if step.get("duration") is not None else float(p["timeHours"]) * 3600.0
     resolved: dict[str, Any] = {"nativeClass": spec["nativeClass"], "nativeModel": model_id,
@@ -180,8 +252,9 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
             material_handle, material_ids)
         if advanced_metadata is not None:
             resolved["nativeAdvancedParameters"] = advanced_metadata
-        coverage = ps.CoverageParameters()
-        coverage.tolerance = 1e-3
+        coverage, coverage_metadata = _coverage_parameters(ps, p)
+        if coverage_metadata is not None:
+            resolved["nativeCoverageParameters"] = coverage_metadata
         extra.append(coverage)
     elif model_id == "cf4o2":
         model, advanced_metadata = _build_plasma_model(
@@ -191,8 +264,9 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
             material_handle, material_ids)
         if advanced_metadata is not None:
             resolved["nativeAdvancedParameters"] = advanced_metadata
-        coverage = ps.CoverageParameters()
-        coverage.tolerance = 1e-3
+        coverage, coverage_metadata = _coverage_parameters(ps, p)
+        if coverage_metadata is not None:
+            resolved["nativeCoverageParameters"] = coverage_metadata
         extra.append(coverage)
     elif model_id == "hbro2":
         model, advanced_metadata = _build_plasma_model(
@@ -202,8 +276,9 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
             material_handle, material_ids)
         if advanced_metadata is not None:
             resolved["nativeAdvancedParameters"] = advanced_metadata
-        coverage = ps.CoverageParameters()
-        coverage.tolerance = 1e-3
+        coverage, coverage_metadata = _coverage_parameters(ps, p)
+        if coverage_metadata is not None:
+            resolved["nativeCoverageParameters"] = coverage_metadata
         extra.append(coverage)
     elif model_id == "sf6c4f8":
         model, advanced_metadata = _build_plasma_model(
@@ -212,8 +287,9 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
             material_handle, material_ids)
         if advanced_metadata is not None:
             resolved["nativeAdvancedParameters"] = advanced_metadata
-        coverage = ps.CoverageParameters()
-        coverage.tolerance = 1e-3
+        coverage, coverage_metadata = _coverage_parameters(ps, p)
+        if coverage_metadata is not None:
+            resolved["nativeCoverageParameters"] = coverage_metadata
         extra.append(coverage)
     elif model_id == "fluorocarbon":
         parameters = ps.FluorocarbonParameters()
@@ -262,6 +338,10 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
         resolved["nativeParameterContainer"] = {
             "nativeClass": "FaradayCageParameters",
             "ibeParametersClass": "IBEParameters",
+            "dimension": int(project["dimension"]),
+            "fluxEngine": flux_engine,
+            "fluxEngineGate": ("CPU_DISK only in 2D" if int(project["dimension"]) == 2
+                               else "not restricted; 3D behaviour is unchanged"),
             "cageAngle": float(parameters.cageAngle),
             "ibeParameters": {key: float(getattr(parameters.ibeParams, key)) for key in (
                 "meanEnergy", "sigmaEnergy", "thresholdEnergy", "thetaRMin", "thetaRMax", "minAngle",
@@ -303,6 +383,12 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
         extra.append(atomic)
         surface_diffusion = step.get("surfaceDiffusion")
         if surface_diffusion is not None and surface_diffusion.get("enabled", True):
+            # Same rule as API validation: a hand-edited worker input must not
+            # reach the known hanging 4.7.0 native stencil. Fail before any
+            # SurfaceDiffusionParameters setter is constructed.
+            gate_message = ald_surface_diffusion_error()
+            if gate_message is not None:
+                raise RuntimeError(gate_message)
             coefficient = float(p["coverageDiffusionCoefficient"])
             if not math.isfinite(coefficient) or coefficient <= 0.0:
                 # ViennaPS 4.6.2 sets the ALP surface-diffusion flag only from
@@ -349,7 +435,13 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
             resolved["surfaceDiffusion"] = recorded
     elif model_id == "oxidation":
         model = ps.Oxidation()
-        model.setOxidant(getattr(ps.OxidantType, p["oxidant"]))
+        # viennals 5.8.5 spelled these enum members ``Dry``/``Wet``; 5.10.0
+        # renamed them to ``DRY``/``WET``. Accept both so the worker keeps
+        # working on either installed runtime.
+        oxidant = getattr(ps.OxidantType, p["oxidant"], None)
+        if oxidant is None:
+            oxidant = getattr(ps.OxidantType, str(p["oxidant"]).upper())
+        model.setOxidant(oxidant)
         model.setOrientation(getattr(ps.SiliconOrientation, p["orientation"]))
         model.setTemperature(float(p["temperatureC"]))
         model.setPressure(float(p["pressureAtm"]))
@@ -393,10 +485,23 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
             if effective["couplingTolerance"] < effective["mechanicsTolerance"]:
                 raise RuntimeError(
                     "advancedOxidation.couplingTolerance must be at least mechanicsTolerance")
+            for restricted in ("simplePressureRelaxation", "mechanicsTolerance",
+                               "couplingTolerance"):
+                if (effective[restricted] != fields[restricted]["default"]
+                        and not oxidation_advanced_supported(restricted)):
+                    raise RuntimeError(
+                        f"ViennaPS {engine_version()} does not honour "
+                        f"advancedOxidation.{restricted}; use the ViennaPS 4.6.2 runtime "
+                        f"or omit this override")
             model.setCFLFactor(effective["cflFactor"])
             model.setMechanicsTolerance(effective["mechanicsTolerance"])
             model.setCouplingTolerance(effective["couplingTolerance"])
-            model.setSimplePressureRelaxation(effective["simplePressureRelaxation"])
+            # 4.7.0 removed setSimplePressureRelaxation (pressure/stokes
+            # controls moved into OxidationParameters). Keep sending it when
+            # the binding has it; otherwise record that the knob is inert.
+            pressure_relaxation_applied = hasattr(model, "setSimplePressureRelaxation")
+            if pressure_relaxation_applied:
+                model.setSimplePressureRelaxation(effective["simplePressureRelaxation"])
             # ``Oxidation`` has no getters for these solver controls. The only
             # native readback available on the installed binding is the
             # Deal-Grove planar estimate, which also re-reads the orientation.
@@ -404,8 +509,10 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
                 "orientation": str(p["orientation"]),
                 "planarOxideThicknessUm": float(model.estimatePlanarOxideThickness(
                     float(p["initialOxideThicknessUm"]))),
-                "solverControls": "no native getters in viennaps 4.6.2; requested == effective after schema validation",
+                "solverControls": "no native getters in the installed viennaps; requested == effective after schema validation",
                 "nativeGetters": "not exposed",
+                "pressureRelaxationSetter": ("applied" if pressure_relaxation_applied
+                                             else "removed by the installed viennaps (4.7.0)"),
             }
             resolved["advancedOxidation"] = {
                 "schemaVersion": 1,
@@ -422,6 +529,7 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
                 "nativeSetters": {key: field["nativeSetter"] for key, field in fields.items()},
                 "nativeReadback": readback,
                 "defaultsSource": spec["defaultsSource"],
+                "runtimeGate": spec.get("runtimeGate", {}),
             }
     elif model_id == "oxideRegrowth":
         surface = domain.getSurfaceMesh(addInterfaces=True, sharpCorners=False, minNodeDistanceFactor=0.01)
@@ -446,7 +554,35 @@ def build_specialized_model(ps: Any, domain: Any, project: dict[str, Any], step:
         # ViennaPS 4.6.2 requires the native epitaxy enum identity in this
         # overload; registry handles do not satisfy its top-material check.
         rates = [(getattr(ps.Material, name), float(value)) for name, value in sorted(p["materialRates"].items())]
-        model = ps.SelectiveEpitaxy(rates, float(p["rate111"]), float(p["rate100"]))
+        requested_nv = p.get("nvFactors")
+        if requested_nv is None:
+            model = ps.SelectiveEpitaxy(rates, float(p["rate111"]), float(p["rate100"]))
+        else:
+            # The nvFactors overload is a separate native constructor: it leaves
+            # materialRates_ empty, so every epitaxy rate must be applied through
+            # setMaterialRate (the velocity field holds that map by reference).
+            # Do not replace this with the materialRates overload: that would
+            # silently drop the requested factors.
+            factors = [float(value) for value in requested_nv]
+            model = ps.SelectiveEpitaxy(factors, float(p["rate111"]), float(p["rate100"]))
+            for material, value in rates:
+                model.setMaterialRate(material, value)
+            resolved["nativeNvFactors"] = {
+                "nativeClass": "SelectiveEpitaxy",
+                "nativeModule": f"viennaps.d{int(project['dimension'])}",
+                "constructorOverload": ("viennaps.d%d.SelectiveEpitaxy(nvFactors, rate111, rate100)"
+                                        % int(project["dimension"])),
+                "requested": factors,
+                "effective": factors,
+                "nativeDefaultByDimension": {"2": [0.5, 1.0, 0.0], "3": [0.5, 0.0, 1.0]},
+                "materialRatesAppliedAfterConstruction": {
+                    name: float(value) for name, value in sorted(p["materialRates"].items())},
+                "velocityFormula": ("max_i(|nvFactors[i]*normal[i]|) mapped from [1/sqrt(D), 1] "
+                                    "to [rate111, rate100]; the result is clamped to <= 0 by the native model"),
+                "nativeReadback": None,
+                "nativeReadbackReason": ("the installed binding exposes no nvFactors getter; getVelocityField() "
+                                         "returns an unregistered EpitaxyVelocityField that cannot be converted to Python"),
+            }
     elif model_id == "geometricTrenchDeposition":
         # GeometricTrenchDeposition is a ViennaLS geometric-advection
         # distribution. It has no material table and no native mask; the worker

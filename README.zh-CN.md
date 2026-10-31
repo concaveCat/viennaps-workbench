@@ -5,7 +5,8 @@
 在三维查看器中检查快照与粒子通量，并导出可精确重放的运行记录。
 
 按单用户、仅回环地址设计：服务只绑定 `127.0.0.1`，数据全部保存在本机，不访问外部
-接口。已在 **ViennaPS 4.6.2 / ViennaLS 5.8.5** 上验证，运行平台为 Linux。
+接口。已在 **ViennaPS 4.7.0 / ViennaLS 5.10.0** 上验证，运行平台为 Linux；ViennaPS 4.6.2 /
+ViennaLS 5.8.5 环境保留用于回放、历史运行以及 4.7.0 绑定缺失的能力（见下文运行时说明）。
 
 [English](README.md)
 
@@ -43,11 +44,17 @@
 - 各向同性刻蚀与沉积。
 - 射线追踪单粒子刻蚀/沉积（`singleParticle`），支持 CPU 与 GPU 通量引擎。
 - 原生专用模型：SF6/O2、CF4/O2、HBr/O2、SF6/C4F8、含氟碳、离子束刻蚀、
-  法拉第笼离子束刻蚀（实验，仅 3D）、几何沟槽沉积（实验，仅 2D）、
+  法拉第笼离子束刻蚀（实验，2D/3D，2D 仅限 CPU 通量引擎）、几何沟槽沉积（实验，2D/3D）、
   湿法刻蚀、TEOS 沉积、TEOS PECVD、ALD、氧化、氧化层再生长、选择性外延、
   中性粒子输运、多粒子。两个实验模型有真实原生构造与 CPU 冒烟测试，但还没有归档的
-  Stage 8/9 直接参考验收行，因此运行时会附带验证警告。安装版绑定受维度限制：
-  2D 法拉第笼路径不返回，3D 几何沟槽沉积路径会 SIGSEGV，因此这两个维度会被验证拒绝。
+  Stage 8/9 直接参考验收行，因此运行时会附带验证警告。原始审计看到的 2D 法拉第笼
+  不返回属于未固定引擎的 AUTO/GPU 内核；固定 CPU_DISK 后全部 cage/tilt 组合都能完成，
+  因此 2D 只在 `solver.enginePreference` 为 `cpu` 时放行（AUTO/GPU 请求在启动 worker
+  之前返回 422）。IBE 模型还要求 `thresholdEnergy < meanEnergy`；阈值等于或高于平均
+  能量时原生产额符号反转，刻蚀步骤会变成生长。几何沟槽沉积在平面、沟槽、孔、鳍与叠层
+  几何上支持 2D/3D，GDS 输入因缺少可界定的垂直范围仍被拒绝。
+- 可选原生控制：选择性外延的 `nvFactors`、四个等离子体模型的
+  `coverageTolerance`，以及 `advanced` 等离子体参数对象。
 - 定向速率模型与选择性对照。
 - 步骤可启用/禁用、重排，并逐项设置原生参数。
 
@@ -101,7 +108,7 @@ Web 进程只读取包元数据和静态资源；ViennaPS/CUDA 原生库只在 w
 | --- | --- |
 | 操作系统 | Linux（依赖 `/proc` 做进程监督与 CPU 亲和性读取） |
 | Python | 3.12 |
-| ViennaPS | 4.6.2，安装在本机系统环境；GPU 运行需要 CUDA 构建 |
+| ViennaPS | 默认 4.7.0（`requirements-v470.lock`）；4.6.2 保留用于回放/历史运行。GPU 运行需要 CUDA 构建 |
 | ViennaLS | 5.8.5 |
 | Node.js | 20.19+ 或 22.12+（Vite 8） |
 | GPU | 可选，NVIDIA GPU + CUDA，用于 `GPU_DISK` |
@@ -130,7 +137,7 @@ cd ..
 
 ```bash
 .venv/bin/python -c "import viennaps, viennals; print(viennaps.__version__, viennals.__version__)"
-# 预期输出：4.6.2 5.8.5
+# 预期输出：4.7.0 5.10.0（保留的 4.6.2 旧环境输出 4.6.2 5.8.5）
 ```
 
 如果导入失败，请先安装 ViennaPS/ViennaLS（含 Python 绑定），再用
@@ -285,7 +292,7 @@ cd frontend && npm run typecheck && npm run build
 | 启动时报 `frontend build is missing` | 在 `frontend/` 下执行 `npm ci && npm run build`。 |
 | `cannot bind configured loopback port` | 端口被其他进程占用。设置 `WORKBENCH_PORT` 或删除 `var/listen-port.json`；工作台不会杀掉未知监听进程。 |
 | `ModuleNotFoundError: viennaps` | `.venv` 未使用 `--system-site-packages`，或该 Python 未安装 ViennaPS。 |
-| GPU 运行被拒绝或 `gpuAvailable()` 为 false | 检查 `nvidia-smi`、ViennaPS 的 CUDA 构建，以及 `GET /api/gpu-devices`。仅开放 `docs/stage9-evidence/gpu-capability-matrix.json` 中记录过的 `GPU_DISK` 组合。 |
+| GPU 运行被拒绝或 `gpuAvailable()` 为 false | 检查 `nvidia-smi`、ViennaPS 的 CUDA 构建，以及 `GET /api/gpu-devices`。仅开放 `docs/stage9-evidence/gpu-capability-matrix.json` 中记录过的 `GPU_DISK` 组合；schema-7 的 `solver.gpuEngine=GPU_TRIANGLE` 只开放两条已归档 sf6o2 行，且不会回退。 |
 | `request Host must be the active loopback address` | 使用 `127.0.0.1:<端口>` 或 `localhost:<端口>`；反向代理与自定义域名会被有意拒绝。 |
 | 运行因 `run artifact size exceeded` 停止 | 单步产物超过有效上限（默认 4 GiB，可用 `WORKBENCH_MAX_ARTIFACT_MIB` 调整）；降低网格分辨率、射线数或输出频率。 |
 
@@ -314,10 +321,18 @@ var/            运行时数据（git 忽略）
 
 ## 已知限制
 
-- 仅在 ViennaPS 4.6.2 / ViennaLS 5.8.5 上验证，其他版本会被拒绝而不是猜测兼容。
-- GPU 仅开放覆盖组合的 `GPU_DISK`；`GPU_TRIANGLE` 与 `GPU_LINE` 不开放。
-- 安装版 4.6.2 的 MultiParticle GPU 路径只处理单一离子种类；多离子 GPU 请求会
-  明确报告为原生限制，不做静默近似。多离子 CPU 路径与单次通量策略仍可用。
+- 已在 ViennaPS 4.7.0 / ViennaLS 5.10.0（默认）与 ViennaPS 4.6.2 / ViennaLS 5.8.5（保留）
+  上验证，其他版本会被拒绝而不是猜测兼容。归档的能力矩阵仍固定为产出它们的 4.6.2 运行。
+- GPU 仅开放覆盖组合的 `GPU_DISK`；schema-7 的 `solver.gpuEngine=GPU_TRIANGLE`
+  只开放两条已归档的 2D/3D sf6o2 刻蚀/reflective stack 行，其余组合一律拒绝；
+  `GPU_LINE` 不开放。
+- 两个运行时的 GPU MultiParticle 绑定都只转换一种离子：4.6.2 原版与 4.7.0 原版都只输出
+  一个 `ion<label><0>` 通量场，速率回调只收到长度为 1 的通量向量。多离子 GPU 运行因此
+  必须使用打过补丁的 ViennaPS 4.6.2 运行时；在 4.7.0 上会直接拒绝并指明运行时，而不是
+  产出静默错误的几何。多离子 `CPU_DISK` 在 4.7.0 上可用。
+- ViennaPS 4.7.0 封禁三个 4.6.2 没有的原生回归：ALD `surfaceDiffusion` 卡死、高级氧化
+  控制项失效、2D `FaradayCageEtching` 零刻蚀。每项都会连带字段、运行时与实测原因一起
+  拒绝；4.6.2 运行时仍可执行。
 - 宿主能力证据来自一张 NVIDIA RTX 3060 Laptop GPU；多 GPU 选择已实现并有单元测试，
   但未在两张物理卡上验证。
 - 界面是单用户本机工具：没有认证、没有 TLS、不提供远程访问。

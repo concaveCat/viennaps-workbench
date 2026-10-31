@@ -29,7 +29,7 @@ def build_domain(project):
     boundary_name = project["domain"].get("boundaryXY", project["domain"].get("xBoundary"))
     boundary = ps.BoundaryType.REFLECTIVE_BOUNDARY if boundary_name == "reflective" else ps.BoundaryType.PERIODIC_BOUNDARY
     if project["dimension"] == 2:
-        domain = ps.Domain(delta, float(project["domain"]["xExtent"]), boundary)
+        domain = ps.Domain(delta, float(project["domain"]["xExtent"]), boundary=boundary)
     else:
         domain = ps.Domain(delta, float(project["domain"]["xExtent"]), float(project["domain"]["yExtent"]), boundary)
     geometry = project["geometry"]

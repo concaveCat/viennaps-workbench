@@ -118,7 +118,7 @@ SNAPSHOT_GEOMETRY_FACTOR = {
     "hole": 1.2,
     "plane": 1.0,
 }
-GEOMETRY_ONLY_MODELS = {"removeMaterial", "planarize", "boolean"}
+GEOMETRY_ONLY_MODELS = {"removeMaterial", "planarize", "boolean", "particleShape"}
 MODEL_WEIGHTS = {
     "isotropic": 0.9,
     "singleParticle": 1.0,
@@ -308,6 +308,53 @@ def _cell_set_estimate(project: dict[str, Any], *, step_count: int) -> tuple[int
     return per_step * max(1, step_count), cells
 
 
+def _step_cell_set_estimate(project: dict[str, Any]) -> tuple[int, int]:
+    """Return ``(bytes, cells_upper_bound)`` for cell-set field steps.
+
+    ``implant``/``anneal``/``analysis`` write the native ``Domain`` cell set,
+    which is a different artifact from ``outputSettings.cellSet``: one VTU plus
+    one summary per step. The vertical extent comes from the same conservative
+    structure span used for the generic cell set, because the native generator
+    walks the stored level-set band up to ``height`` above the surface.
+    """
+    total = 0
+    largest = 0
+    domain = project.get("domain") or {}
+    try:
+        delta = float(domain.get("gridDelta") or 0.0)
+    except (TypeError, ValueError):
+        return 0, 0
+    if delta <= 0.0:
+        return 0, 0
+    nx, ny = _lateral_grid(project)
+    lateral = math.ceil(nx) + 2
+    if int(project.get("dimension") or 2) == 3:
+        lateral *= math.ceil(ny) + 2
+    for step in _enabled_steps(project):
+        if step.get("model") not in {"implant", "anneal", "analysis"}:
+            continue
+        settings = step.get("cellSet")
+        if not isinstance(settings, dict):
+            continue
+        try:
+            height = max(0.0, float(settings.get("height") or 0.0))
+        except (TypeError, ValueError):
+            continue
+        try:
+            substrate = max(0.0, float(settings.get("substrateDepth") or 0.0))
+        except (TypeError, ValueError):
+            substrate = 0.0
+        rows = math.ceil((height + substrate + _structure_vertical_extent(project)) / delta) + 4
+        cells = lateral * max(rows, 2)
+        largest = max(largest, cells)
+        fmt = str(settings.get("format") or "both")
+        if fmt in {"vtu", "both"}:
+            total += cells * CELL_SET_VTU_BYTES_PER_CELL + 8192
+        if fmt in {"json", "both"}:
+            total += CELL_SET_JSON_BYTES
+    return total, largest
+
+
 def _optional_outputs(project: dict[str, Any], *, cells: float, step_count: int,
                       all_snapshot_bytes: int) -> tuple[int, list[str], int, int]:
     settings = project.get("outputSettings") or {}
@@ -337,6 +384,11 @@ def _optional_outputs(project: dict[str, Any], *, cells: float, step_count: int,
     if cell_set_bytes:
         total += cell_set_bytes
         contributors.append(f"cellSet（至多 {cell_set_cells:,} 个单元/步）")
+    step_cell_set_bytes, step_cell_set_cells = _step_cell_set_estimate(project)
+    if step_cell_set_bytes:
+        total += step_cell_set_bytes
+        contributors.append(f"implant/anneal/analysis cellSet（至多 {step_cell_set_cells:,} 个单元/步）")
+        cell_set_cells = max(cell_set_cells, step_cell_set_cells)
     return int(round(total)), contributors, cell_set_bytes, cell_set_cells
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio, hashlib, json, math, subprocess, unittest, zipfile, io
 from pathlib import Path
 from urllib.parse import quote
+from backend.engine import engine_version
 from backend import storage
 from backend.main import app
 from tests.test_api_integration import asgi_request, json_body
@@ -49,7 +50,7 @@ class Stage6MaterialsAndOutputs(unittest.IsolatedAsyncioTestCase):
         return json.loads((output/'reference.json').read_text()),output
     async def test_custom_registry_materials_replay_and_native_output_roundtrip(self):
         catalog=json_body(await asgi_request('/api/materials'))
-        self.assertEqual(catalog['engineVersion'],'4.6.2')
+        self.assertEqual(catalog['engineVersion'],engine_version())
         first=await asgi_request('/api/materials',method='POST',payload={'name':'WB_Custom_Oxide','color':'#123456','densityGcm3':2.1,'conductive':False,'description':'Stage 6 reference material'})
         self.assertEqual(first[0],201,first[2]);first=json_body(first)
         second=await asgi_request('/api/materials',method='POST',payload={'name':'WB_Custom_Film','color':'#8b5cf6','densityGcm3':1.6,'conductive':True,'description':'second ordered native ID'})

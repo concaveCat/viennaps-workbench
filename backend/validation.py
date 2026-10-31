@@ -14,8 +14,14 @@ from pydantic import ValidationError
 from .models import Domain3D, Project, ProjectV3, ProjectV4, ProjectV5, ProjectV6, ProjectV7, parse_project
 from .materials import attach_and_reconcile_project_materials, geometry_mask_material_names
 from .rates import has_motion, is_geometry_step, uses_flux, value as step_value
-from .specialized_models import FLUOROCARBON_MATERIAL_DEFAULTS, model_spec
+from .specialized_models import (FLUOROCARBON_MATERIAL_DEFAULTS, IBE_ENERGY_MODELS,
+                                 faraday_cage_2d_engine_error, geometric_trench_issues,
+                                 ibe_energy_issues, nv_factors_issues, model_spec,
+                                 oxidation_advanced_spec)
 from .runtime_limits import available_cpu_threads
+from .engine import (EVIDENCE_ENGINE_VERSION, OXIDATION_ADVANCED_RESTRICTED,
+                     ald_surface_diffusion_error, ald_surface_diffusion_supported,
+                     engine_version, multi_ion_gpu_error, oxidation_advanced_supported)
 
 
 # These ViennaPS 4.6.2 combinations either SIGSEGV or produce different final
@@ -178,7 +184,8 @@ def validate_project(payload: Any, *, kind: str = "project") -> tuple[Project, l
     delta = project.domain.gridDelta
     extent = project.domain.xExtent
     if project.schemaVersion in (3,4,5,6,7):
-        issues.extend(_validate_materials(project))
+        issues.extend(_validate_materials(
+            project, enforce_gds_domain=kind in ("simulate", "preview", "flux")))
         warnings.extend(_planarize_warnings(project))
         warnings.extend(_gds_boolean_warnings(project))
         warnings.extend(_directional_rate_set_warnings(project))
@@ -189,6 +196,9 @@ def validate_project(payload: Any, *, kind: str = "project") -> tuple[Project, l
             csv_issues, csv_warnings = _validate_csv_process_steps(project)
             issues.extend(csv_issues)
             warnings.extend(csv_warnings)
+            issues.extend(_validate_particle_shape_steps(project))
+            warnings.extend(_particle_shape_warnings(project))
+            issues.extend(_validate_implant_steps(project))
         if project.dimension == 3:
             issues.extend(_validate_v3_3d_geometry(project))
         else:
@@ -220,6 +230,16 @@ def validate_project(payload: Any, *, kind: str = "project") -> tuple[Project, l
                         (not native_engine.startswith("GPU_") and not capability_verified(
                             project.dimension, model_key, step_value(step, "operation"), boundary,
                             native_engine, schema_version=project.schemaVersion, **signature))):
+                    if (project.solver.enginePreference == "gpu"
+                            and normalized["solver"].get("gpuEngine") == "GPU_TRIANGLE"):
+                        issues.append(FieldIssue(
+                            f"steps[{i}].nativeModel",
+                            f"GPU_TRIANGLE has no direct-reference acceptance row for model "
+                            f"{model_key}, operation {step_value(step,'operation')}, boundary {boundary} "
+                            f"in {project.dimension}D; the request is rejected instead of falling back to "
+                            "GPU_DISK or CPU_DISK. Use solver.gpuEngine=GPU_DISK with a covered "
+                            "combination, or select CPU."))
+                        continue
                     if installed_model and installed_model.get("experimental") and not native_engine.startswith("GPU_"):
                         # Experimental models have native smoke tests but no
                         # archived direct-reference row yet. Only CPU_DISK (or
@@ -230,10 +250,29 @@ def validate_project(payload: Any, *, kind: str = "project") -> tuple[Project, l
                 continue
             if step_value(step,"enabled") and (uses_flux(step) if project.schemaVersion in (4,5,6,7) else step_value(step,"model")=="singleParticle" and step_value(step,"rateMagnitude")>0):
                 engine=select_engine(normalized,step_dict)
+                if (step_value(step, "model") == "multiParticle" and engine.startswith("GPU_")
+                        and sum(1 for row in (step_dict.get("species") or []) if row.get("kind") == "ion") > 1):
+                    # Stock 4.7.0 drops every ion after the first without an
+                    # error, so a multi-ion GPU step must be rejected here
+                    # instead of silently producing a wrong geometry.
+                    policy = multi_ion_gpu_error()
+                    if policy is not None:
+                        issues.append(FieldIssue(f"steps[{i}].species", policy))
+                        continue
                 signature = gpu_project_signature(normalized, step_dict)
                 if engine=="unavailable" or (not engine.startswith("GPU_") and not capability_verified(
                         project.dimension,step_value(step,"model"),step_value(step,"operation"),boundary,engine,
                         schema_version=project.schemaVersion, **signature)):
+                    if (project.solver.enginePreference == "gpu"
+                            and normalized["solver"].get("gpuEngine") == "GPU_TRIANGLE"):
+                        issues.append(FieldIssue(
+                            f"steps[{i}].model",
+                            f"GPU_TRIANGLE has no direct-reference acceptance row for model "
+                            f"{step_value(step,'model')}, operation {step_value(step,'operation')}, boundary "
+                            f"{boundary} in {project.dimension}D; the request is rejected instead of falling "
+                            "back to GPU_DISK or CPU_DISK. Use solver.gpuEngine=GPU_DISK with a covered "
+                            "combination, or select CPU."))
+                        continue
                     limitation = known_engine_limitation(project.dimension, step_value(step, "model"),
                                                          "GPU_DISK", step_dict)
                     if limitation and project.solver.enginePreference == "gpu":
@@ -288,7 +327,7 @@ def validate_project(payload: Any, *, kind: str = "project") -> tuple[Project, l
 def _planarize_warnings(project: Any) -> list[str]:
     """Explain what a material-aware planarize can and cannot do.
 
-    The installed ViennaPS 4.6.2 Planarize accepts a height only. A
+    The installed ViennaPS Planarize accepts a height only. A
     ``stopMaterial`` step therefore derives one global cutoff from the
     area-weighted 90th percentile of that material's up-facing surface; it is
     not a CMP selectivity model. Surface the limitation in the same place the
@@ -303,7 +342,7 @@ def _planarize_warnings(project: Any) -> list[str]:
             continue
         warnings.append(
             f"steps[{index}]: material-aware CMP derives one global cutoff from the area-weighted 90th "
-            f"percentile of {stop_material}'s up-facing surface, minus overPolish. ViennaPS 4.6.2 Planarize "
+            f"percentile of {stop_material}'s up-facing surface, minus overPolish. ViennaPS {engine_version()} Planarize "
             f"still cuts every material above that height and models no lateral selectivity, so a stop material "
             f"whose upper plateau covers 10% of its exposed area or less, or that is genuinely multi-level "
             f"without one dominant upper plateau, can be over- or under-cut. The measured stop height, the "
@@ -336,23 +375,40 @@ def _specialized_model_warnings(project: Any) -> list[str]:
             boundary = getattr(domain, "boundaryXY", None) or getattr(domain, "xBoundary", None)
             if boundary != "periodic":
                 warnings.append(
-                    f"steps[{index}].nativeModel: ViennaPS 4.6.2 FaradayCageEtching builds a periodic cage source "
+                    f"steps[{index}].nativeModel: ViennaPS {engine_version()} FaradayCageEtching builds a periodic cage source "
                     f"and requires periodic lateral boundaries; this project uses {boundary!r}. The native run "
                     f"still executes but does not represent a periodic Faraday cage.")
+            if project.dimension == 2:
+                # 2D is newly exposed. A negative tiltAngle is accepted and is
+                # NOT a no-op for small values: cage 45 / tilt -0.2 still
+                # lowered the surface (0.8 -> 0.782019 um in the probe). The
+                # etch depth falls toward zero as the tilt becomes more
+                # negative (tilt -30 produced no measurable etch at the same
+                # settings), so warn about the asymmetry without claiming an
+                # unchanged surface. 3D keeps its existing response.
+                tilt = step_value(step_value(step, "nativeParameters", {}), "tiltAngle", None)
+                if isinstance(tilt, (int, float)) and float(tilt) < 0.0:
+                    warnings.append(
+                        f"steps[{index}].nativeParameters.tiltAngle: the installed native FaradayCageEtching "
+                        f"accepts a negative tiltAngle, but the cage source is not symmetric between positive "
+                        f"and negative tilt. A small negative tilt can still etch (tiltAngle -0.2 deg with "
+                        f"cageAngle 45 deg lowered the 2D surface), and the etch depth falls toward zero as the "
+                        f"tilt becomes more negative. Do not assume the surface stays flat.")
         if model_id == "geometricTrenchDeposition":
             warnings.append(
                 f"steps[{index}].nativeModel: GeometricTrenchDeposition is a ViennaLS geometric-advection "
                 f"distribution, not a flux or velocity-field deposition. It grows the step's depositMaterial "
-                f"top level set without a native mask; 4.6.2 ignores trenchWidth, the process duration does not "
+                f"top level set without a native mask; {engine_version()} ignores trenchWidth, the process duration does not "
                 f"scale the thickness, and the local radius a*(1-|z|/trenchDepth)^n+b is evaluated from absolute "
                 f"z with the trench top assumed at z=0.")
         surface_diffusion = step_value(step, "surfaceDiffusion")
         if (model_id == "ald" and surface_diffusion is not None
-                and step_value(surface_diffusion, "enabled", True)):
+                and step_value(surface_diffusion, "enabled", True)
+                and ald_surface_diffusion_supported()):
             warnings.append(
-                f"steps[{index}].surfaceDiffusion: ViennaPS 4.6.2 builds this Laplacian stencil only inside "
-                f"the ALP strategy and only while coverageDiffusionCoefficient > 0. It smooths the native "
-                f"Coverage scalar that drives the ALD growth rate; it does not smooth the level-set surface.")
+                f"steps[{index}].surfaceDiffusion: ViennaPS {engine_version()} builds this Laplacian stencil "
+                f"only inside the ALP strategy and only while coverageDiffusionCoefficient > 0. It smooths the "
+                f"native Coverage scalar that drives the ALD growth rate; it does not smooth the level-set surface.")
     return warnings
 
 
@@ -384,6 +440,79 @@ def _directional_rate_set_warnings(project: Any) -> list[str]:
     return warnings
 
 
+def _validate_particle_shape_steps(project: Any) -> list[FieldIssue]:
+    """Reject the native particle-shape configurations that are not safe.
+
+    ``BoxDistribution`` / ``SphereDistribution`` are ViennaLS geometric
+    advection distributions. Measured 4.6.2/4.7.0 behaviour (one bounded
+    subprocess per case, see docs/particle-shape-distribution-contract.md):
+
+    * an active half-axis or radius of exactly 0 SIGSEGVs;
+    * an active magnitude below one grid interval logs "smaller than the grid
+      Delta" and can break the distribution;
+    * a masked etch through ``addMaskMaterial`` is the officially supported
+      combination and is used for ``operation=etch``;
+    * any masked deposition SIGSEGVs in 2D and 3D, so a deposition never gets a
+      mask (the project's mask materials are reported as omitted in the run);
+    * mixed-sign half-axes can delete the surface or SIGSEGV, so the sign comes
+      from ``operation`` and every native axis is positive.
+    """
+    issues: list[FieldIssue] = []
+    delta = float(project.domain.gridDelta)
+    boundary = getattr(project.domain, "boundaryXY", None) or getattr(project.domain, "xBoundary", None)
+    for index, step in enumerate(project.steps):
+        if step_value(step, "model") != "particleShape":
+            continue
+        if boundary != "reflective":
+            issues.append(FieldIssue(
+                f"steps[{index}].model",
+                "particleShape uses ViennaLS GeometricAdvect, whose periodic-boundary support is "
+                "still a native TODO; use reflective lateral boundaries for this step"))
+        if step_value(step, "shape") == "box":
+            values = step_value(step, "halfAxes") or []
+            path = f"steps[{index}].halfAxes"
+        else:
+            values = [step_value(step, "radius")]
+            path = f"steps[{index}].radius"
+        for axis_index, value in enumerate(values):
+            axis_path = f"{path}[{axis_index}]" if step_value(step, "shape") == "box" else path
+            if float(value) < delta - 1e-12:
+                issues.append(FieldIssue(
+                    axis_path,
+                    f"must be at least one grid interval ({delta:g} um); a half-axis or radius below "
+                    "gridDelta triggers the native 'smaller than the grid Delta' warning and is not "
+                    "resolved by the level set"))
+    return issues
+
+
+def _particle_shape_warnings(project: Any) -> list[str]:
+    """State what a particleShape step is and is not in native 4.6.2.
+
+    The native object is a geometric advection distribution: it offsets the
+    exposed surface by exactly one radius / half-axis set and ignores the
+    process duration. Etches protect the project's native mask materials
+    through ``addMaskMaterial``; depositions cannot, because the native positive
+    masked path SIGSEGVs, so their mask materials are omitted and recorded.
+    """
+    warnings: list[str] = []
+    for index, step in enumerate(project.steps):
+        if step_value(step, "model") != "particleShape":
+            continue
+        shape = "BoxDistribution" if step_value(step, "shape") == "box" else "SphereDistribution"
+        if step_value(step, "operation") == "etch":
+            mask_note = ("刻蚀会把项目几何的原生掩膜材料通过 addMaskMaterial 传给几何推进，"
+                         "被保护的材料不动；掩膜覆盖整个暴露表面时原生会静默不动，工作台会因此报错。")
+        else:
+            mask_note = ("原生 4.6.2/4.7.0 的正向几何推进在有掩膜时 2D/3D 都会 SIGSEGV，"
+                         "因此沉积步骤始终使用无掩膜重载：项目里的掩膜材料也会一起长大。")
+        warnings.append(
+            f"steps[{index}]: particleShape 使用原生 viennaps.{shape}（ViennaLS 几何推进），"
+            "对当前整个暴露表面做一次形态学膨胀/收缩，位移等于半径/半轴，原生 Process 忽略持续时间。"
+            f"它不是通量或速度刻蚀/沉积模型；{mask_note}"
+            "（详见 docs/particle-shape-distribution-contract.md）。")
+    return warnings
+
+
 def _gds_boolean_warnings(project: Any) -> list[str]:
     """State what a GDS boolean does not model.
 
@@ -405,7 +534,8 @@ def _gds_boolean_warnings(project: Any) -> list[str]:
     return warnings
 
 
-def _validate_materials(project: ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 | ProjectV7) -> list[FieldIssue]:
+def _validate_materials(project: ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 | ProjectV7, *,
+                        enforce_gds_domain: bool = False) -> list[FieldIssue]:
     try:
         from .materials import material_catalog
         catalog=material_catalog()
@@ -450,6 +580,89 @@ def _validate_materials(project: ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 |
             # path would extrude to an empty body and fail at run time.
             available_pairs = set(library.effective_layer_datatypes(g["structure"]))
             mask_pairs = set(library.effective_mask_layer_datatypes(g["structure"]))
+            # A GDS layer body is inserted on its layout grid. If the layout is
+            # wider than the simulation domain, ViennaPS 4.6.2 does not clip it:
+            # insertNextLevelSetAsMaterial crashes the worker with SIGSEGV. The
+            # bounds below are pure Python and only cover direct elements; any
+            # SREF/AREF layout returns None and keeps the native worker guard.
+            blur = g.get("blur")
+            blur_enabled = isinstance(blur, dict) and blur.get("enabled", True)
+            padding_margin = 2.0 * float(project.domain.gridDelta) if blur_enabled else 0.0
+            layout_bounds = (library.selected_layout_bounds_um(
+                g["structure"], unit_scale=float(g["unitScale"]),
+                position_um=g["position"][:2])
+                if (enforce_gds_domain or blur_enabled) else None)
+            if blur_enabled:
+                # The installed blur allocates a fine exposure grid over the
+                # *padded native layout*, not over the simulation domain. A 2D
+                # layout can be thousands of micrometres tall while xExtent is
+                # small, so budget both actual GDS axes.
+                from .gds import MAX_GDS_BLUR_CELLS, blur_exposure_cell_count
+                if layout_bounds is None:
+                    issues.append(FieldIssue(
+                        "geometry.blur",
+                        "GDS blur cannot size its native exposure grid because the selected "
+                        "structure has no provable XY layout bounds (SREF/AREF references or "
+                        "invalid placement); flatten the layout or disable blur"))
+                else:
+                    grid_delta = float(project.domain.gridDelta)
+                    exposure_delta = (float(blur.get("delta"))
+                                      if blur.get("delta") is not None else grid_delta)
+                    bounds_with_padding = (layout_bounds[0] - padding_margin,
+                                           layout_bounds[1] - padding_margin,
+                                           layout_bounds[2] + padding_margin,
+                                           layout_bounds[3] + padding_margin)
+                    cells = blur_exposure_cell_count(
+                        bounds_with_padding, grid_delta=grid_delta,
+                        exposure_delta=exposure_delta,
+                        grid_refine=int(blur.get("gridRefine", 4)),
+                        sigma_count=len(blur.get("sigmas") or []))
+                    if cells > MAX_GDS_BLUR_CELLS:
+                        width_x = bounds_with_padding[2] - bounds_with_padding[0]
+                        width_y = bounds_with_padding[3] - bounds_with_padding[1]
+                        issues.append(FieldIssue(
+                            "geometry.blur",
+                            "GDS blur exposure grid would allocate "
+                            f"{cells:,} cells on the padded layout "
+                            f"({width_x:g} x {width_y:g} um); the limit is "
+                            f"{MAX_GDS_BLUR_CELLS:,} cells. Increase delta, reduce "
+                            "gridRefine/sigmas, or shrink the layout"))
+            if layout_bounds is not None and enforce_gds_domain:
+                bounds = layout_bounds
+                tolerance = max(1e-7, float(project.domain.gridDelta) * 1e-6)
+                x_extent = float(project.domain.xExtent)
+                if project.dimension == 3:
+                    half_x = x_extent / 2.0 - padding_margin
+                    half_y = float(project.domain.yExtent) / 2.0 - padding_margin
+                    outside = (bounds[0] < -half_x - tolerance
+                               or bounds[2] > half_x + tolerance
+                               or bounds[1] < -half_y - tolerance
+                               or bounds[3] > half_y + tolerance)
+                else:
+                    # ViennaPS builds the 2D Domain centered, but Stage 5 GDS
+                    # layouts are authored in the absolute [0, xExtent] frame.
+                    # Accept a layout that fits either frame entirely; blur
+                    # padding shrinks both frames because the Python bounds are
+                    # unpadded while the native read adds it.
+                    absolute = (bounds[0] >= padding_margin - tolerance
+                                and bounds[2] <= x_extent - padding_margin + tolerance)
+                    centered = (bounds[0] >= -x_extent / 2.0 + padding_margin - tolerance
+                                and bounds[2] <= x_extent / 2.0 - padding_margin + tolerance)
+                    outside = not (absolute or centered)
+                if outside:
+                    margin_text = (f" and leave {padding_margin:g} um of native blur padding"
+                                   if padding_margin else "")
+                    issues.append(FieldIssue(
+                        "geometry.assetId",
+                        "GDS layout bounds "
+                        f"[{bounds[0]:g}, {bounds[2]:g}]"
+                        + (f" x [{bounds[1]:g}, {bounds[3]:g}]" if project.dimension == 3 else "")
+                        + f" exceed the simulation domain (xExtent={x_extent:g}"
+                        + ("; 2D accepts the absolute [0, xExtent] frame or the native "
+                           "centered [-xExtent/2, xExtent/2] frame"
+                           if project.dimension == 2 else "")
+                        + (f", yExtent={float(project.domain.yExtent):g}" if project.dimension == 3 else "")
+                        + f"); enlarge the domain or move the layout so it fits inside{margin_text}"))
             for step_index, step in enumerate(project.steps):
                 if not is_geometry_step(step) or step_value(step, "model") != "gdsBoolean":
                     continue
@@ -540,7 +753,7 @@ def _validate_materials(project: ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 |
                     for name in sticking:
                         if name not in names:
                             issues.append(FieldIssue(f"steps[{i}].species[{species_index}].stickingProbabilityByMaterial.{name}",f"unknown or unavailable material {name!r}"))
-        if step_value(step,"operation")=="deposit":
+        if not is_geometry_step(step) and step_value(step,"operation")=="deposit":
             name=step_value(step,"depositMaterial")
             if name not in names: issues.append(FieldIssue(f"steps[{i}].depositMaterial", f"unknown or unavailable material {name!r}"))
             if step_value(step,"enabled") and has_motion(step):
@@ -684,33 +897,6 @@ def gpu_project_signature(project: dict[str, Any], step: dict[str, Any]) -> dict
 
 
 
-def _initial_vertical_extent(project: Any) -> float:
-    """Conservative max |z| of the initial geometry.
-
-    GeometricTrenchDeposition evaluates ``a*(1-|z|/trenchDepth)**n+b`` from
-    absolute z. If the initial structure reaches beyond ``trenchDepth``, the
-    base is negative or >1 and a large integer exponent can overflow. Require
-    the native depth to cover the initial vertical span.
-    """
-    geometry = getattr(project, "geometry", {}) or {}
-    if not isinstance(geometry, dict):
-        return 0.0
-    kind = geometry.get("kind")
-    if kind == "plane":
-        return abs(float(geometry.get("height", 0.0)))
-    if kind in {"trench", "hole"}:
-        return max(abs(float(geometry.get("depth", 0.0))),
-                   abs(float(geometry.get("maskHeight", 0.0))))
-    if kind == "fin":
-        return max(abs(float(geometry.get("height", 0.0))),
-                   abs(float(geometry.get("maskHeight", 0.0))))
-    if kind == "stack":
-        base = float(geometry.get("baseHeight", 0.0))
-        return max(abs(base), abs(base) + sum(abs(float(row.get("thickness", 0.0)))
-                                                for row in geometry.get("layers", [])))
-    return 0.0
-
-
 def _advanced_number_issue(path: str, field: dict[str, Any], value: Any) -> FieldIssue | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return FieldIssue(path, "must be a finite JSON number")
@@ -807,6 +993,21 @@ def _validate_advanced_parameters(prefix: str, spec: dict[str, Any], advanced: A
     return issues
 
 
+def _specialized_flux_engine(project: Any) -> str:
+    """Resolve the schema-7 engine the supervisor will pin for a specialized step.
+
+    Mirrors ``select_engine`` for schema 7: ``cpu`` pins CPU_DISK, ``gpu`` pins
+    the requested GPU engine (or GPU_DISK), and ``auto`` keeps the historical
+    GPU_DISK-first policy for flux models.
+    """
+    preference = project.solver.enginePreference
+    if preference == "cpu":
+        return "CPU_DISK"
+    if preference == "gpu":
+        return str(project.solver.gpuEngine or "GPU_DISK")
+    return "GPU_DISK"
+
+
 def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
     issues: list[FieldIssue] = []
     material_names = {row["name"] for row in _catalog_names()}
@@ -824,6 +1025,29 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
         spec = model_spec(step.nativeModel)
         if spec is None:
             continue
+        engine = engine_version()
+        surface_diffusion = step.surfaceDiffusion
+        if (step.enabled and step.nativeModel == "ald" and surface_diffusion is not None
+                and surface_diffusion.enabled):
+            gate_message = ald_surface_diffusion_error(engine)
+            if gate_message is not None:
+                issues.append(FieldIssue(f"steps[{index}].surfaceDiffusion", gate_message))
+        advanced = step.advancedOxidation
+        if step.enabled and step.nativeModel == "oxidation" and advanced is not None:
+            fields = {field["key"]: field for field in oxidation_advanced_spec()["fields"]}
+            for key, reason in OXIDATION_ADVANCED_RESTRICTED.items():
+                if oxidation_advanced_supported(key, engine):
+                    continue
+                default = fields[key]["default"]
+                if getattr(advanced, key) == default:
+                    # Materialised defaults are behaviour no-ops and must stay
+                    # replayable. Only an attempt to change the control is
+                    # rejected; the worker never sends the removed setter.
+                    continue
+                issues.append(FieldIssue(
+                    f"steps[{index}].advancedOxidation.{key}",
+                    f"ViennaPS {engine}: {reason}. The worker would silently ignore "
+                    f"{key}={getattr(advanced, key)!r}; use the ViennaPS 4.6.2 runtime or omit this override."))
         allowed_dimensions = spec.get("dimensions")
         if allowed_dimensions and project.dimension not in allowed_dimensions:
             available = ", ".join(f"{value}D" for value in allowed_dimensions)
@@ -831,6 +1055,12 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
                 f"steps[{index}].nativeModel",
                 f"{step.nativeModel} is only available in {available}; this project is {project.dimension}D"))
             continue
+        if step.enabled and step.nativeModel == "faradayCage" and project.dimension == 2:
+            # Shared with the worker (build_specialized_model) so a direct
+            # worker input cannot reach the hanging AUTO/GPU path either.
+            gate_message = faraday_cage_2d_engine_error(_specialized_flux_engine(project))
+            if gate_message is not None:
+                issues.append(FieldIssue("solver.enginePreference", gate_message))
         # Material tables describe the stack the process sees: the initial
         # geometry plus everything earlier enabled deposition steps added.
         # A disabled draft step is checked against the same chain with disabled
@@ -840,60 +1070,23 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
         prefix = f"steps[{index}].nativeParameters"
         params = step.nativeParameters
         if step.nativeModel == "geometricTrenchDeposition":
-            # The native radius formula needs a trustworthy vertical bound.
-            # GDS geometry has no project-level z description we can bound
-            # without parsing the asset, and a continuation state loads a
-            # saved Domain whose actual coordinates are not in the project.
-            if project.geometry.get("kind") == "gds":
-                issues.append(FieldIssue(
-                    f"steps[{index}].nativeModel",
-                    "GeometricTrenchDeposition is not supported with GDS geometry; its native radius formula "
-                    "needs a bounded vertical span from a parametric 2D structure"))
-            if getattr(project, "continuationState", None) is not None:
-                issues.append(FieldIssue(
-                    f"steps[{index}].nativeModel",
-                    "GeometricTrenchDeposition is not supported with a continuation state; the saved Domain's "
-                    "vertical span cannot be validated from the project description"))
-            # The native closed form uses absolute z and the initial-structure
-            # bound below is only valid when this is the first enabled step.
-            # A later step can raise/lower the surface and move it outside the
-            # validated span; reject instead of guessing an operation chain.
-            if any(step_value(previous, "enabled") for previous in project.steps[:index]):
-                issues.append(FieldIssue(
-                    f"steps[{index}].nativeModel",
-                    "GeometricTrenchDeposition must be the first enabled step; its native radius formula is "
-                    "evaluated from absolute z and the validated vertical span cannot account for earlier operations"))
-            # The native closed form is a*(1-|z|/depth)^n+b. A fractional n on
-            # a negative base is NaN; the installed binding does not guard it.
-            n_value = params.get("n")
-            try:
-                n_number = float(n_value)
-            except (TypeError, ValueError):
-                n_number = float("nan")
-            if not n_number.is_integer() or n_number < 1:
-                issues.append(FieldIssue(f"{prefix}.n", "must be an integer >= 1; fractional n can produce a non-finite native radius"))
-            for key in ("trenchWidth", "depositionRate"):
-                try:
-                    value = float(params.get(key, 0))
-                except (TypeError, ValueError):
-                    value = 0.0
-                if value <= 0.0:
-                    issues.append(FieldIssue(f"{prefix}.{key}", "must be positive"))
-            try:
-                depth = float(params.get("trenchDepth", 0))
-            except (TypeError, ValueError):
-                depth = 0.0
-            max_z = _initial_vertical_extent(project)
-            if depth < max_z:
-                issues.append(FieldIssue(
-                    f"{prefix}.trenchDepth",
-                    f"must be at least the initial structure's maximum |z| ({max_z:g} um); "
-                    "a shallower depth puts the native radius formula outside its valid range and can overflow"))
+            # Shared with the worker: a direct worker input cannot bypass the
+            # dimension/geometry/depth/reach checks.
+            for suffix, message in geometric_trench_issues(project, step):
+                issues.append(FieldIssue(f"steps[{index}].{suffix}", message))
+        if step.nativeModel in IBE_ENERGY_MODELS:
+            # Shared with the worker: thresholdEnergy >= meanEnergy reverses
+            # the native IBE flux and turns an etch step into growth.
+            for suffix, message in ibe_energy_issues(params):
+                issues.append(FieldIssue(f"steps[{index}].{suffix}", message))
         for field in spec["fields"]:
             key = field["key"]
             path = f"{prefix}.{key}"
             value = params.get(key)
             kind = field["kind"]
+            if step.nativeModel == "geometricTrenchDeposition":
+                # geometric_trench_issues() validated every numeric argument.
+                continue
             if kind == "number":
                 if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
                     issues.append(FieldIssue(path, "must be a finite JSON number"))
@@ -940,6 +1133,20 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
                             if isinstance(subvalue, bool) or not isinstance(subvalue, (int, float)) or not math.isfinite(float(subvalue)) or not field["minimum"] <= float(subvalue) <= field["maximum"]:
                                 issues.append(FieldIssue(f"{path}.{name}.{subkey}", "must be a finite number within the displayed range"))
 
+        optional_fields = {field["key"]: field for field in spec.get("optionalFields", [])}
+        for key, field in optional_fields.items():
+            if key not in params:
+                continue
+            value = params[key]
+            path = f"{prefix}.{key}"
+            kind = field["kind"]
+            if kind == "nvFactors":
+                for message in nv_factors_issues(value):
+                    issues.append(FieldIssue(path, message))
+            elif kind == "number":
+                if issue := _advanced_number_issue(path, field, value):
+                    issues.append(issue)
+
         if "advanced" in params:
             spec_advanced = spec.get("advanced")
             if spec_advanced is None:
@@ -974,7 +1181,10 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
             issues.append(FieldIssue(f"steps[{index}].nativeModel", "OxideRegrowth requires native SiO2 and Si3N4 materials in the geometry"))
         if step.nativeModel == "oxideRegrowth" and (project.geometry.get("kind") != "stack" or
                 project.geometry.get("pattern", {}).get("kind") != "none"):
-            issues.append(FieldIssue(f"steps[{index}].nativeModel", "installed OxideRegrowth is verified only on a flat stack with top-layer pattern set to none; patterned or non-stack domains can crash ViennaPS 4.6.2"))
+            issues.append(FieldIssue(
+                f"steps[{index}].nativeModel",
+                f"installed OxideRegrowth is verified only on a flat stack with top-layer pattern set to none; "
+                f"patterned or non-stack domains can crash ViennaPS {engine_version()}"))
         if step.nativeModel == "selectiveEpitaxy" and custom_names & geometry_names:
             issues.append(FieldIssue(f"steps[{index}].nativeModel", "SelectiveEpitaxy has only been verified with installed native epitaxy materials"))
         surface_diffusion = getattr(step, "surfaceDiffusion", None)
@@ -990,6 +1200,130 @@ def _validate_specialized_steps(project: ProjectV7) -> list[FieldIssue]:
                     f"steps[{index}].surfaceDiffusion.radius",
                     f"must not exceed 8 grid intervals ({limit:g} um for gridDelta="
                     f"{float(project.domain.gridDelta):g}); use radius=0 with kNeighbors for a bounded stencil"))
+    return issues
+
+
+def _validate_implant_steps(project: ProjectV7) -> list[FieldIssue]:
+    """Validate the 4.7.0 cell-set implant / anneal / analysis capability.
+
+    Everything here is a pure-Python check: a rejected request never reaches a
+    native constructor, so an unsupported runtime, a missing material or a
+    label that no earlier step produces cannot turn into a worker crash.
+    """
+    from .implant_models import (
+        CELL_SET_STEP_MODELS, cell_set_output_conflict,
+        field_geometry_issues, field_sequence_issues, label_provenance_issues,
+        numeric_guard_messages, produced_labels, step_cell_set, step_value,
+    )
+
+    issues: list[FieldIssue] = []
+    steps = [step if isinstance(step, dict) else step.model_dump(mode="json", exclude_none=True)
+             for step in project.steps]
+    cell_set_steps = [(index, step) for index, step in enumerate(steps)
+                      if step_value(step, "model") in CELL_SET_STEP_MODELS]
+    if not cell_set_steps:
+        return issues
+
+    runtime = engine_version()
+    if runtime != "4.7.0":
+        for index, _step in cell_set_steps:
+            issues.append(FieldIssue(
+                f"steps[{index}].model",
+                f"ViennaPS {runtime} does not provide the native IonImplantation / Anneal / "
+                "NetDoping / SheetResistance classes; this step requires the ViennaPS 4.7.0 "
+                "runtime. The request is rejected before a worker starts instead of failing "
+                "inside the native layer"))
+        return issues
+
+    conflict = cell_set_output_conflict(project)
+    if conflict is not None:
+        issues.append(FieldIssue("outputSettings.cellSet", conflict))
+
+    try:
+        from .materials import material_catalog
+        names = {row["name"] for row in material_catalog()["materials"]}
+    except (OSError, ValueError, KeyError, TypeError):
+        names = set()
+
+    available: set[str] = {"Material", "FillingFraction"}
+    for index, path, message in field_sequence_issues(
+            steps, grid_delta=float(project.domain.gridDelta),
+            domain_periodic=(project.domain.boundaryXY == "periodic" if project.dimension == 3
+                             else project.domain.xBoundary == "periodic")):
+        issues.append(FieldIssue(f"steps[{index}].{path}" if path else f"steps[{index}]", message))
+    for index, path, message in field_geometry_issues(
+            steps, geometry=project.geometry, dimension=int(project.dimension),
+            grid_delta=float(project.domain.gridDelta),
+            x_extent=float(project.domain.xExtent),
+            y_extent=float(getattr(project.domain, "yExtent", 0.0)),
+            from_domain_state=project.continuationState is not None):
+        issues.append(FieldIssue(f"steps[{index}].{path}" if path else f"steps[{index}]", message))
+    for index, step in enumerate(steps):
+        if step_value(step, "model") not in CELL_SET_STEP_MODELS:
+            continue
+        enabled = bool(step_value(step, "enabled"))
+        for message in numeric_guard_messages(step, dimension=project.dimension,
+                                              grid_delta=float(project.domain.gridDelta)):
+            issues.append(FieldIssue(f"steps[{index}]", message))
+        settings = step_cell_set(step) or {}
+        cover = str(settings.get("coverMaterial") or "GAS")
+        if cover != "GAS" and names and cover not in names:
+            issues.append(FieldIssue(
+                f"steps[{index}].cellSet.coverMaterial",
+                f"unknown or unavailable material {cover!r}; choose GAS or a material from /api/materials"))
+        requested_labels = settings.get("scalarLabels")
+        if isinstance(requested_labels, list):
+            unknown = sorted(set(requested_labels) - (available | produced_labels(step)))
+            if unknown:
+                issues.append(FieldIssue(
+                    f"steps[{index}].cellSet.scalarLabels",
+                    "label(s) not present in this step's native cell set: " + ", ".join(unknown)))
+        model = step_value(step, "model")
+        if model == "implant":
+            if names:
+                for field_name, values in (
+                        ("material", [step_value(step, "material")]),
+                        ("maskMaterials", list(step_value(step, "maskMaterials") or [])),
+                        ("screenMaterials", list(step_value(step, "screenMaterials") or []))):
+                    for material in values:
+                        if material not in names:
+                            issues.append(FieldIssue(
+                                f"steps[{index}].{field_name}",
+                                f"unknown or unavailable material {material!r}; choose a material from /api/materials"))
+        elif model == "anneal":
+            if names:
+                for field_name in ("diffusionMaterials", "blockingMaterials"):
+                    for material in step_value(step, field_name) or []:
+                        if material not in names:
+                            issues.append(FieldIssue(
+                                f"steps[{index}].{field_name}",
+                                f"unknown or unavailable material {material!r}; choose a material from /api/materials"))
+            species = step_value(step, "speciesLabel")
+            if enabled and species not in available:
+                issues.append(FieldIssue(
+                    f"steps[{index}].speciesLabel",
+                    f"{species!r} is not produced by an earlier implant step"))
+        elif model == "analysis":
+            net = step_value(step, "netDoping")
+            if isinstance(net, dict):
+                for name in [*(net.get("donorLabels") or []), *(net.get("acceptorLabels") or [])]:
+                    if enabled and name not in available:
+                        issues.append(FieldIssue(
+                            f"steps[{index}].netDoping",
+                            f"{name!r} is not produced by an earlier implant/anneal step"))
+            for entry_index, entry in enumerate(step_value(step, "sheetResistance") or []):
+                label = entry.get("concentrationLabel") if isinstance(entry, dict) else None
+                if enabled and label not in available:
+                    issues.append(FieldIssue(
+                        f"steps[{index}].sheetResistance[{entry_index}]",
+                        f"{label!r} is not produced by an earlier implant/anneal step"))
+        if enabled:
+            # A disabled step produces nothing, so it must not satisfy a later
+            # step's label provenance check.
+            available |= produced_labels(step)
+
+    for index, message in label_provenance_issues(steps):
+        issues.append(FieldIssue(f"steps[{index}]", message))
     return issues
 
 
@@ -1109,6 +1443,34 @@ def _validate_v3_geometry(project: ProjectV3) -> list[FieldIssue]:
         if pattern["kind"] in ("none", "gds"): return out
         if pattern["kind"]=="hole" and project.dimension==2:
             return out+[FieldIssue("geometry.pattern.kind","2D stacks do not support hole patterns")]
+        if pattern.get("layers") is not None:
+            if pattern["kind"] != "trench":
+                return out+[FieldIssue("geometry.pattern.layers",
+                    "per-layer cutouts are supported only for trench patterns")]
+            by_id={layer["id"]:index for index,layer in enumerate(g["layers"])}
+            for position, entry in enumerate(pattern["layers"]):
+                index = entry.get("layerIndex")
+                if index is None:
+                    index = by_id.get(entry.get("layerId"))
+                if index is None or not 0 <= int(index) < len(g["layers"]):
+                    out.append(FieldIssue(
+                        f"geometry.pattern.layers[{position}]",
+                        "references an unknown stack layer"))
+                    continue
+                path=f"geometry.pattern.layers[{position}]"
+                thickness=float(g["layers"][int(index)]["thickness"])
+                # In the native per-layer constructor the cutout is anchored at
+                # the layer bottom, so width is the top width and a positive
+                # angle widens the bottom by 2*height*tan(angle).
+                change=2.0*thickness*math.tan(math.radians(float(entry["taperAngle"])))
+                narrow=float(entry["width"])+min(0.0,change)
+                wide=float(entry["width"])+max(0.0,change)
+                feature(float(entry["width"]),f"{path}.width")
+                feature(narrow,f"{path}.taperAngle")
+                if wide >= d.xExtent:
+                    out.append(FieldIssue(path,
+                        "per-layer cutout and tapered opening must fit inside the lateral domain"))
+            return out
         size=pattern["width"] if pattern["kind"]=="trench" else 2*pattern["radius"]
         change=2*g["layers"][-1]["thickness"]*math.tan(math.radians(pattern["taperAngle"]))
         feature(min(size,size-change),"geometry.pattern")
@@ -1147,7 +1509,7 @@ def _gpu_material_scope_matches(scope: dict[str, Any], materials: list[str] | No
                                geometry_kind: str | None, operation: str,
                                boundary: str) -> bool:
     if (scope.get("kind") != "viennaps-native-material-registry-v1"
-            or scope.get("engineVersion") != "4.6.2"
+            or scope.get("engineVersion") != EVIDENCE_ENGINE_VERSION
             or boundary not in scope.get("boundaries", [])):
         return False
     if materials is None or material_roles is None or material_bindings is None or geometry_kind is None:
@@ -1345,7 +1707,7 @@ def _gpu_combination_verified(dimension: int, model: str, operation: str, bounda
                 if geometry_kind == "gds":
                     scope = row.get("gdsScope", {})
                     if (scope.get("kind") != "viennaps-gds-process-v1"
-                            or scope.get("engineVersion") != "4.6.2"
+                            or scope.get("engineVersion") != EVIDENCE_ENGINE_VERSION
                             or dimension not in scope.get("dimensions", [])
                             or gds_mapping_count is None
                             or gds_mapping_count < 1
@@ -1459,6 +1821,74 @@ def capability_verified(dimension: int, model: str, operation: str, boundary: st
         return False
 
 
+def slice_axis_bounds(project: dict[str, Any], slice_request: dict[str, Any]) -> dict[str, Any]:
+    """Return the native Slice axis, output extent and source-axis bound.
+
+    The slice position moves along the normal axis, so it is bounded by that
+    axis' domain extent. Half-domain geometries (HALF/QUARTER holes and
+    halfFin/halfTrench) only occupy the positive half of the halved axes.
+    z has no finite computational boundary; its bound is the measured source
+    surface range and is checked by the worker after the initial snapshot.
+    """
+    axis_label = str(slice_request.get("sliceAxis") or "y")
+    if axis_label not in {"x", "y", "z"}:
+        raise ValueError(f"native Slice axis must be x, y or z, not {axis_label!r}")
+    axis = {"x": 0, "y": 1, "z": 2}[axis_label]
+    domain = project["domain"]
+    geometry = project.get("geometry") or {}
+    hole_shape = str(geometry.get("holeShape") or "FULL")
+    half_x = (hole_shape in ("HALF", "QUARTER")
+              or bool(geometry.get("halfTrench")) or bool(geometry.get("halfFin")))
+    half_y = hole_shape == "QUARTER"
+    x_extent = float(domain["xExtent"])
+    y_extent = float(domain["yExtent"])
+    if axis == 0:
+        return {"axis": axis, "axisName": "x", "outputExtent": y_extent,
+                "min": 0.0 if half_x else -x_extent / 2,
+                "max": x_extent / 2, "halfDomain": half_x,
+                "restriction": "half-domain" if half_x else None,
+                "lateralAxis": "y", "verticalAxis": "z", "normal": [1.0, 0.0, 0.0]}
+    if axis == 1:
+        if geometry.get("kind") == "fin" and geometry.get("extrusion") is not None:
+            # An extruded 3D fin occupies only the requested y extrusion
+            # range, regardless of whether the worker uses the d2-Extrude
+            # route or the direct 3D box-stencil route.
+            y_min, y_max = (float(value) for value in geometry["extrusion"]["extent"])
+            restriction = "extrusion"
+        elif half_y:
+            y_min, y_max = 0.0, y_extent / 2
+            restriction = "half-domain"
+        else:
+            y_min, y_max = -y_extent / 2, y_extent / 2
+            restriction = None
+        return {"axis": axis, "axisName": "y", "outputExtent": x_extent,
+                "min": y_min, "max": y_max,
+                "halfDomain": half_y,
+                "restriction": restriction,
+                "lateralAxis": "x", "verticalAxis": "z", "normal": [0.0, 1.0, 0.0]}
+    return {"axis": axis, "axisName": "z", "outputExtent": x_extent,
+            "min": None, "max": None, "halfDomain": False, "restriction": None,
+            "lateralAxis": "x", "verticalAxis": "y", "normal": [0.0, 0.0, 1.0]}
+
+
+def slice_position_issue(project: dict[str, Any], slice_request: dict[str, Any]) -> str | None:
+    """Return a 422-ready reason when the Slice position misses its axis."""
+    try:
+        position = float(slice_request["position"])
+    except (KeyError, TypeError, ValueError):
+        return "native Slice requires a finite position"
+    if not math.isfinite(position):
+        return "native Slice requires a finite position"
+    bounds = slice_axis_bounds(project, slice_request)
+    if bounds["min"] is None:
+        return None
+    if bounds["min"] - 1e-12 <= position <= bounds["max"] + 1e-12:
+        return None
+    half_note = f" ({bounds['restriction']} limit)" if bounds.get("restriction") else ""
+    return (f"native Slice {bounds['axisName']} position {position:g} lies outside the source "
+            f"{bounds['axisName']} range [{bounds['min']:g}, {bounds['max']:g}]{half_note}")
+
+
 def select_engine(project: dict, step: dict, *, analysis_mode: str = "process") -> str:
     if not (uses_flux(step) if project.get("schemaVersion") in (4,5,6,7) else step["model"] == "singleParticle" and step["rateMagnitude"] > 0):
         return "not-applicable"
@@ -1467,9 +1897,15 @@ def select_engine(project: dict, step: dict, *, analysis_mode: str = "process") 
     if model == "specialized":
         model = f"specialized:{step.get('nativeModel', '')}"
     if project.get("schemaVersion") in (3,4,5,6,7):
+        requested_gpu_engine = project.get("solver", {}).get("gpuEngine")
         if preference == "gpu":
-            candidates = ["GPU_DISK"]
+            # An explicit GPU engine request never falls back to another GPU
+            # backend. GPU_TRIANGLE is admitted only when its evidence row
+            # matches; otherwise the step resolves to "unavailable".
+            candidates = [requested_gpu_engine or "GPU_DISK"]
         elif preference == "auto" and project.get("schemaVersion") == 7:
+            # AUTO keeps its historical GPU_DISK/CPU_DISK policy; it never
+            # selects GPU_TRIANGLE on its own.
             candidates = ["GPU_DISK", "CPU_DISK"]
         else:
             candidates = ["CPU_DISK"]

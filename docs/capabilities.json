@@ -172,7 +172,7 @@
         "result": "var/evidence/gpu-host/2d-product-probe/gpu-engine-results.json"
       },
       "gpuAvailableResultInSandbox": "RuntimeError: Failed to load CUDA symbol via cuGetProcAddress: cuInit",
-      "otherFluxEngines": "GPU_TRIANGLE and GPU_LINE were not probed and are not exposed."
+      "otherFluxEngines": "GPU_TRIANGLE is exposed as an opt-in schema-7 solver.gpuEngine for the measured 2D/3D specialized sf6o2 etch on a reflective stack only; GPU_LINE remains unprobed and unexposed."
     }
   },
   "mesh": {

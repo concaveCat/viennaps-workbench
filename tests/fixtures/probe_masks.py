@@ -10,7 +10,7 @@ for dim in [2,3]:
     kw={'rate':-.1,keyword:[r.getMaterial('Si3N4'),r.getMaterial('PMMA')]}
     if cls==ps.SingleParticleProcess:kw.update(stickingProbability=.5,sourceExponent=1.)
     model=cls(**kw)
-    d=ps.Domain(.2,4.,4.,ps.BoundaryType.REFLECTIVE_BOUNDARY) if dim==3 else ps.Domain(.2,4.,ps.BoundaryType.REFLECTIVE_BOUNDARY)
+    d=ps.Domain(.2,4.,4.,ps.BoundaryType.REFLECTIVE_BOUNDARY) if dim==3 else ps.Domain(.2, 4., boundary=ps.BoundaryType.REFLECTIVE_BOUNDARY)
     ps.MakePlane(d,height=0.,material=r.getMaterial('Si3N4'),addToExisting=False).apply()
     p=ps.Process(d,model,.1);p.setFluxEngineType(ps.FluxEngineType.CPU_DISK)
     if cls==ps.SingleParticleProcess:

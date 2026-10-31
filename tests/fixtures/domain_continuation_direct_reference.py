@@ -26,7 +26,7 @@ def make_domain(project):
     settings = project["domain"]
     boundary = ps.BoundaryType.REFLECTIVE_BOUNDARY if settings.get("xBoundary", settings.get("boundaryXY")) == "reflective" else ps.BoundaryType.PERIODIC_BOUNDARY
     if project["dimension"] == 2:
-        domain = ps.Domain(float(settings["gridDelta"]), float(settings["xExtent"]), boundary)
+        domain = ps.Domain(float(settings["gridDelta"]), float(settings["xExtent"]), boundary=boundary)
     else:
         domain = ps.Domain(float(settings["gridDelta"]), float(settings["xExtent"]), float(settings["yExtent"]), boundary)
     geometry = project["geometry"]
