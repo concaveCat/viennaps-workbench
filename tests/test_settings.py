@@ -12,8 +12,11 @@ from unittest.mock import patch
 
 os.environ.setdefault("WORKBENCH_PORT", "8767")
 
+from pydantic import ValidationError
+
 from backend import runtime_limits, settings  # noqa: E402
 from backend import main as backend_main  # noqa: E402
+from backend.models import ProjectV7  # noqa: E402
 from tests.test_api_integration import asgi_request, json_body  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -61,6 +64,7 @@ class Defaults(SettingsTestBase):
             "minFreeGiB": (20, 0, "GiB", "最小空闲磁盘"),
         }
         self.assertEqual(set(body["limits"]), set(expected))
+        self.assertEqual(body["defaults"], {"solverTimeoutSeconds": 600})
         for key, (value, minimum, unit, label) in expected.items():
             item = body["limits"][key]
             self.assertEqual(item["value"], value)
@@ -99,13 +103,44 @@ class Persistence(SettingsTestBase):
         self.assertTrue(path.is_file())
         raw = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(raw, {"schemaVersion": 1,
-                               "limits": {"maxDataGiB": 20, "artifactLimitMiB": 2048}})
+                               "limits": {"maxDataGiB": 20, "artifactLimitMiB": 2048},
+                               "defaults": {}})
         self.assertFalse(list(self.data_dir.glob(".settings.json.*.tmp")))
 
         status, fetched = await self.get_settings()
         self.assertEqual(status, 200)
         self.assertEqual(fetched["limits"]["maxDataGiB"]["value"], 20)
         self.assertEqual(fetched["limits"]["artifactLimitMiB"]["value"], 2048)
+
+    async def test_legacy_file_without_defaults_still_loads(self) -> None:
+        self.settings_file().write_text(
+            json.dumps({"schemaVersion": 1, "limits": {"maxLogMiB": 8}}),
+            encoding="utf-8",
+        )
+        status, body = await self.get_settings()
+        self.assertEqual(status, 200)
+        self.assertEqual(body["limits"]["maxLogMiB"]["value"], 8)
+        self.assertEqual(body["defaults"], {"solverTimeoutSeconds": 600})
+
+    async def test_solver_timeout_default_persists_and_round_trips(self) -> None:
+        status, body = await self.put_settings({"defaults": {"solverTimeoutSeconds": 1200}})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["defaults"], {"solverTimeoutSeconds": 1200})
+
+        raw = json.loads(self.settings_file().read_text(encoding="utf-8"))
+        self.assertEqual(raw["defaults"], {"solverTimeoutSeconds": 1200})
+
+        status, fetched = await self.get_settings()
+        self.assertEqual(status, 200)
+        self.assertEqual(fetched["defaults"], {"solverTimeoutSeconds": 1200})
+
+        # A partial PUT that only touches limits keeps the stored default.
+        status, body = await self.put_settings({"limits": {"maxLogMiB": 8}})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["defaults"], {"solverTimeoutSeconds": 1200})
+        status, fetched = await self.get_settings()
+        self.assertEqual(status, 200)
+        self.assertEqual(fetched["defaults"], {"solverTimeoutSeconds": 1200})
 
     async def test_null_removes_only_that_override(self) -> None:
         await self.put_settings({"limits": {"maxDataGiB": 25, "minFreeGiB": 30}})
@@ -175,6 +210,45 @@ class Validation(SettingsTestBase):
         status, body = await self.put_settings({"limits": {"maxLogMiB": "4"}})
         self.assertEqual(status, 422)
         self.assertEqual(body["detail"][0]["path"], "limits.maxLogMiB")
+
+    async def test_solver_timeout_default_out_of_range_is_rejected(self) -> None:
+        for value in (4, 86401):
+            with self.subTest(value=value):
+                status, body = await self.put_settings(
+                    {"defaults": {"solverTimeoutSeconds": value}})
+                self.assertEqual(status, 422)
+                self.assertEqual(body["detail"][0]["path"],
+                                 "defaults.solverTimeoutSeconds")
+                self.assertFalse(self.settings_file().exists())
+
+    async def test_solver_timeout_default_null_is_rejected(self) -> None:
+        status, body = await self.put_settings(
+            {"defaults": {"solverTimeoutSeconds": None}})
+        self.assertEqual(status, 422)
+        self.assertEqual(body["detail"][0]["path"], "defaults.solverTimeoutSeconds")
+        self.assertFalse(self.settings_file().exists())
+
+    async def test_unknown_defaults_key_is_rejected(self) -> None:
+        status, body = await self.put_settings({"defaults": {"notADefault": 1}})
+        self.assertEqual(status, 422)
+        self.assertEqual(body["detail"][0]["path"], "defaults.notADefault")
+        self.assertFalse(self.settings_file().exists())
+
+
+class SolverTimeoutModel(unittest.TestCase):
+    def project(self) -> dict:
+        fixture = ROOT / "tests" / "fixtures" / "finfet22_project.json"
+        return json.loads(fixture.read_text(encoding="utf-8"))
+
+    def test_project_accepts_solver_timeout_above_the_old_cap(self) -> None:
+        project = self.project()
+        project["solver"]["timeoutSeconds"] = 1200
+        validated = ProjectV7.model_validate(project)
+        self.assertEqual(validated.solver.timeoutSeconds, 1200)
+
+        project["solver"]["timeoutSeconds"] = 86401
+        with self.assertRaises(ValidationError):
+            ProjectV7.model_validate(project)
 
 
 class DynamicLimits(SettingsTestBase):

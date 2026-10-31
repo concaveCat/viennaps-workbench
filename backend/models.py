@@ -155,7 +155,7 @@ class Solver(StrictModel):
     cpuThreads: Annotated[Integer, Field(ge=1)]
     random: RandomSettings
     enginePreference: Literal["auto", "cpu", "gpu"]
-    timeoutSeconds: Annotated[Integer, Field(ge=0, le=600)] = 0
+    timeoutSeconds: Annotated[Integer, Field(ge=0, le=86400)] = 0
 
     @field_validator("cpuThreads")
     @classmethod

@@ -41,6 +41,20 @@ LIMIT_ORDER = (
     "minFreeGiB",
 )
 
+#: Defaults for newly created projects. Unlike the limits above these are not
+#: environment-capped; they only seed a new project's solver settings.
+DEFAULT_ORDER = ("solverTimeoutSeconds",)
+
+DEFAULT_SPECS: dict[str, dict[str, Any]] = {
+    "solverTimeoutSeconds": {
+        "default": 600,
+        "minimum": 5,
+        "maximum": 86400,
+        "unit": "s",
+        "label": "新项目求解超时默认值",
+    },
+}
+
 #: ``kind`` is ``upper`` for size caps (env is a hard maximum) and ``floor`` for
 #: the free-disk minimum (env is a hard minimum).
 LIMIT_SPECS: dict[str, dict[str, Any]] = {
@@ -182,34 +196,49 @@ def _signature(path: Path) -> tuple[int, int, int] | None:
     return info.st_mtime_ns, info.st_size, info.st_ino
 
 
-def load_stored_limits() -> dict[str, Any]:
-    """Return the raw ``limits`` object from settings.json (cached by mtime)."""
+def load_stored_settings() -> dict[str, dict[str, Any]]:
+    """Return ``{"limits": {...}, "defaults": {...}}`` from settings.json.
+
+    The parsed file is cached by path and file signature. Files written before
+    ``defaults`` existed load with an empty defaults object.
+    """
     path = settings_path()
     key = str(path)
     signature = _signature(path)
     cached = _RAW_CACHE.get(key)
     if cached is not None and cached[0] == signature:
-        return dict(cached[1])
+        return {"limits": dict(cached[1]["limits"]), "defaults": dict(cached[1]["defaults"])}
     if signature is None:
         if key not in _WARNED_MISSING:
             _WARNED_MISSING.add(key)
             LOGGER.warning("settings file %s is missing; using environment/default limits", path)
-        _RAW_CACHE[key] = (None, {})
-        return {}
+        _RAW_CACHE[key] = (None, {"limits": {}, "defaults": {}})
+        return {"limits": {}, "defaults": {}}
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        limits = payload.get("limits") if isinstance(payload, dict) else None
+        if not isinstance(payload, dict):
+            raise ValueError("expected a JSON object")
+        limits = payload.get("limits")
         if not isinstance(limits, dict):
             raise ValueError("expected an object with a 'limits' object")
+        defaults = payload.get("defaults", {})
+        if not isinstance(defaults, dict):
+            raise ValueError("expected 'defaults' to be an object")
     except (OSError, ValueError, TypeError) as exc:
         marker = (key, str(signature), str(exc))
         if marker not in _WARNED_SETTINGS:
             _WARNED_SETTINGS.add(marker)
             LOGGER.warning("settings file %s is invalid (%s); using environment/default limits", path, exc)
-        _RAW_CACHE[key] = (signature, {})
-        return {}
-    _RAW_CACHE[key] = (signature, dict(limits))
-    return dict(limits)
+        _RAW_CACHE[key] = (signature, {"limits": {}, "defaults": {}})
+        return {"limits": {}, "defaults": {}}
+    stored = {"limits": dict(limits), "defaults": dict(defaults)}
+    _RAW_CACHE[key] = (signature, stored)
+    return {"limits": dict(stored["limits"]), "defaults": dict(stored["defaults"])}
+
+
+def load_stored_limits() -> dict[str, Any]:
+    """Return the raw ``limits`` object from settings.json (cached by mtime)."""
+    return load_stored_settings()["limits"]
 
 
 def applicable_limits() -> dict[str, int]:
@@ -271,6 +300,52 @@ def effective_value(key: str) -> int:
     return int(effective_limit(key)["value"])
 
 
+def applicable_defaults() -> dict[str, int]:
+    """Return stored defaults that are valid, warning about ignored values."""
+    stored = load_stored_settings()["defaults"]
+    applicable: dict[str, int] = {}
+    for key, value in stored.items():
+        spec = DEFAULT_SPECS.get(key)
+        if spec is None:
+            continue
+        reason = None
+        if isinstance(value, bool) or not isinstance(value, int):
+            reason = "not an integer"
+        elif value < spec["minimum"]:
+            reason = f"below the minimum {spec['minimum']}"
+        elif value > spec["maximum"]:
+            reason = f"above the maximum {spec['maximum']}"
+        if reason is not None:
+            marker = (str(settings_path()), repr(value), reason)
+            if marker not in _WARNED_SETTINGS:
+                _WARNED_SETTINGS.add(marker)
+                LOGGER.warning("ignoring settings default %s=%r (%s)", key, value, reason)
+            continue
+        applicable[key] = value
+    return applicable
+
+
+def effective_default(key: str) -> dict[str, Any]:
+    """Return the effective value and metadata for one new-project default."""
+    spec = DEFAULT_SPECS[key]
+    stored = applicable_defaults()
+    value = stored.get(key, spec["default"])
+    return {
+        "value": value,
+        "source": "settings" if key in stored else "default",
+        "default": spec["default"],
+        "minimum": spec["minimum"],
+        "maximum": spec["maximum"],
+        "unit": spec["unit"],
+        "label": spec["label"],
+    }
+
+
+def defaults_response() -> dict[str, int]:
+    """Return the flat ``defaults`` object exposed by GET/PUT."""
+    return {key: int(effective_default(key)["value"]) for key in DEFAULT_ORDER}
+
+
 def _atomic_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -290,12 +365,23 @@ def _atomic_json(path: Path, payload: Any) -> None:
             pass
 
 
-def write_stored_limits(limits: dict[str, int]) -> None:
-    """Atomically persist the provided overrides in canonical order."""
-    ordered = {key: limits[key] for key in LIMIT_ORDER if key in limits}
+def write_stored_settings(limits: dict[str, int], defaults: dict[str, int]) -> None:
+    """Atomically persist limits and defaults in canonical order."""
+    ordered_limits = {key: limits[key] for key in LIMIT_ORDER if key in limits}
+    ordered_defaults = {key: defaults[key] for key in DEFAULT_ORDER if key in defaults}
     path = settings_path()
-    _atomic_json(path, {"schemaVersion": SCHEMA_VERSION, "limits": ordered})
+    _atomic_json(path, {
+        "schemaVersion": SCHEMA_VERSION,
+        "limits": ordered_limits,
+        "defaults": ordered_defaults,
+    })
     _RAW_CACHE.pop(str(path), None)
+
+
+def write_stored_limits(limits: dict[str, int]) -> None:
+    """Atomically persist only the provided limit overrides."""
+    stored = load_stored_settings()["defaults"]
+    write_stored_settings(limits, stored)
 
 
 def _validate_value(key: str, value: Any, issues: list[dict[str, str]]) -> None:
@@ -322,15 +408,28 @@ def _validate_value(key: str, value: Any, issues: list[dict[str, str]]) -> None:
         })
 
 
-def validate_update(payload: Any) -> dict[str, int | None]:
-    """Validate a PUT body and return ``{limit: int or None}`` updates."""
+def _validate_default(key: str, value: Any, issues: list[dict[str, str]]) -> None:
+    spec = DEFAULT_SPECS[key]
+    path = f"defaults.{key}"
+    if isinstance(value, bool) or not isinstance(value, int):
+        issues.append({"path": path, "message": "must be an integer"})
+        return
+    if value < spec["minimum"]:
+        issues.append({"path": path, "message": f"must be >= {spec['minimum']} {spec['unit']}"})
+        return
+    if value > spec["maximum"]:
+        issues.append({"path": path, "message": f"must be <= {spec['maximum']} {spec['unit']}"})
+
+
+def validate_update(payload: Any) -> dict[str, dict[str, int | None]]:
+    """Validate a PUT body and return ``{"limits": ..., "defaults": ...}``."""
     if not isinstance(payload, dict):
         raise SettingsValidationError([
             {"path": "$", "message": "request body must be a JSON object"},
         ])
     issues: list[dict[str, str]] = []
     for key in payload:
-        if key not in {"limits", "schemaVersion"}:
+        if key not in {"limits", "defaults", "schemaVersion"}:
             issues.append({"path": str(key), "message": "unknown field"})
     if "schemaVersion" in payload and payload["schemaVersion"] != SCHEMA_VERSION:
         issues.append({"path": "schemaVersion", "message": f"must be {SCHEMA_VERSION}"})
@@ -341,34 +440,57 @@ def validate_update(payload: Any) -> dict[str, int | None]:
     if not isinstance(limits, dict):
         issues.append({"path": "limits", "message": "must be a JSON object"})
         limits = {}
-    updates: dict[str, int | None] = {}
+    limit_updates: dict[str, int | None] = {}
     for key, value in limits.items():
         if key not in LIMIT_SPECS:
             issues.append({"path": f"limits.{key}", "message": "unknown limit"})
             continue
         if value is None:
-            updates[key] = None
+            limit_updates[key] = None
             continue
         before = len(issues)
         _validate_value(key, value, issues)
         if len(issues) == before:
-            updates[key] = value
+            limit_updates[key] = value
+    if "defaults" not in payload:
+        defaults: Any = {}
+    else:
+        defaults = payload["defaults"]
+    if not isinstance(defaults, dict):
+        issues.append({"path": "defaults", "message": "must be a JSON object"})
+        defaults = {}
+    default_updates: dict[str, int] = {}
+    for key, value in defaults.items():
+        if key not in DEFAULT_SPECS:
+            issues.append({"path": f"defaults.{key}", "message": "unknown default"})
+            continue
+        before = len(issues)
+        _validate_default(key, value, issues)
+        if len(issues) == before:
+            default_updates[key] = value
     if issues:
         raise SettingsValidationError(issues)
-    return updates
+    return {"limits": limit_updates, "defaults": default_updates}
 
 
 def apply_update(payload: Any) -> dict[str, Any]:
     """Validate, merge, persist, and return the full settings response."""
     updates = validate_update(payload)
-    merged = dict(load_stored_limits())
-    for key, value in updates.items():
+    stored = load_stored_settings()
+    merged_limits = dict(stored["limits"])
+    for key, value in updates["limits"].items():
         if value is None:
-            merged.pop(key, None)
+            merged_limits.pop(key, None)
         else:
-            merged[key] = value
-    write_stored_limits({key: value for key, value in merged.items()
-                         if key in LIMIT_SPECS and isinstance(value, int)})
+            merged_limits[key] = value
+    merged_defaults = dict(stored["defaults"])
+    merged_defaults.update(updates["defaults"])
+    write_stored_settings(
+        {key: value for key, value in merged_limits.items()
+         if key in LIMIT_SPECS and isinstance(value, int)},
+        {key: value for key, value in merged_defaults.items()
+         if key in DEFAULT_SPECS and isinstance(value, int)},
+    )
     return settings_response()
 
 
@@ -445,6 +567,7 @@ def settings_response() -> dict[str, Any]:
     return {
         "schemaVersion": SCHEMA_VERSION,
         "limits": {key: effective_limit(key) for key in LIMIT_ORDER},
+        "defaults": defaults_response(),
         "storage": storage_summary(),
         "versions": {
             "viennaps": _installed_version("viennaps"),

@@ -9947,7 +9947,7 @@
           "timeoutSeconds": {
             "default": 0,
             "ge": 0,
-            "le": 600,
+            "le": 86400,
             "title": "Timeoutseconds",
             "type": "integer"
           }
