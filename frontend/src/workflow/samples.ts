@@ -10,7 +10,7 @@ export type ExampleSample = {
   sample: Record<string, unknown>;
 };
 
-/** Eight ViennaPS example starters plus a GDS-import card in the gallery. */
+/** Nine bundled starters, including the accepted 22 nm FinFET bare-wafer demo. */
 export const SAMPLE_EXAMPLES = exampleSamples as ExampleSample[];
 
 export const SAMPLE_2D_PLANE: Record<string, unknown> = {
