@@ -3359,13 +3359,14 @@ def _finite_or_none(value: Any) -> float | None:
 
 
 def _field_integral(values: list[float], *, grid_delta: float, dimension: int) -> float:
-    """Native concentration integral over the cell grid.
+    """Native concentration integral over the cell grid (``sum · delta^D``).
 
-    Native 3D cells are cubes with volume ``delta^3`` and native 2D cells are
-    quads with area ``delta^2`` (nominal unit thickness). The integral is in
-    ``length^(D-1)`` normalised concentration units; it is reported with an
-    explicit unit and never converted to an areal cm^-2 dose, because a 2D
-    native grid has no physical depth.
+    The native implant concentration is volumetric in both dimensions
+    (``1/um^3``; the native cm^-3 conversion is 1e12). ``sum · delta^2`` is
+    therefore reported as the 2D areal integral ``1/um^2``, and the 3D value
+    ``sum · delta^3`` is dimensionless and is not given a length unit. It is
+    never converted to an areal cm^-2 dose, because a 2D native grid has no
+    physical depth.
     """
     return sum(values) * (float(grid_delta) ** int(dimension))
 
@@ -3972,8 +3973,14 @@ def write_cell_set_field_outputs(ps: Any, domain: Any, cell_set: Any, project: d
             "fields": field_rows,
             "fieldDigests": digests,
             "cellSetSetup": cell_set_record,
-            "concentrationUnit": f"1/{LENGTH_UNIT_NAME}^{dimension}",
-            "integralUnit": f"1/{LENGTH_UNIT_NAME}^{dimension - 1}",
+            # The native implant writes a volumetric concentration in both
+            # dimensions (SheetResistance converts it with 1e12 cm^-3), so the
+            # unit is 1/um^3 in 2D as well. ``integralNative`` is sum*delta^D:
+            # an areal 1/um^2 integral in 2D and dimensionless in 3D (where it
+            # is omitted instead of being labelled with a wrong unit).
+            "concentrationUnit": f"1/{LENGTH_UNIT_NAME}^3",
+            "concentrationUnitCm3": 1e12,
+            **({"integralUnit": f"1/{LENGTH_UNIT_NAME}^2"} if dimension == 2 else {}),
             "process": record,
         }
         path = artifact_dir / f"{step_id}-cell-set-fields.json"
@@ -4000,6 +4007,23 @@ def execute(input_path: Path, run_dir: Path) -> None:
     engine_preference = project["solver"]["enginePreference"]
     actual_steps = [step for step in project["steps"] if step["enabled"]] if kind == "simulate" else []
     step_engines = dict(config.get("stepEngines", {}))
+    if kind == "simulate" and any(step.get("model") in CELL_SET_PROCESS_MODELS for step in actual_steps):
+        # The native cell grid is generated once and reused by every later
+        # field step. A hand-edited input.json never passes through the API
+        # validator, so the shared-grid and ordering rules run here, before the
+        # first native call, instead of silently reusing a stale grid.
+        from backend.implant_models import field_sequence_issues, ordering_issues
+        domain = project.get("domain") or {}
+        domain_periodic = bool(domain.get("boundaryXY") == "periodic" if project["dimension"] == 3
+                               else domain.get("xBoundary") == "periodic")
+        preflight_messages = [
+            message for _index, _path, message in field_sequence_issues(
+                actual_steps, grid_delta=float(domain["gridDelta"]),
+                domain_periodic=domain_periodic)
+        ]
+        preflight_messages.extend(message for _index, message in ordering_issues(actual_steps))
+        if preflight_messages:
+            raise RuntimeError("; ".join(preflight_messages))
     # Resolve every particle step before CUDA setup. This makes an omitted
     # stepEngines entry inherit an explicit solver.gpuEngine instead of
     # silently selecting GPU_DISK, and gates GPU_TRIANGLE exactly like the API.

@@ -31,6 +31,12 @@ LENGTH_UNIT_NAME = "um"
 #: DenseCellSet field names the installed runtime always writes.
 NATIVE_CELL_SET_LABELS = ("Material", "FillingFraction")
 
+#: A user-supplied step label may never shadow a native system scalar. The
+#: native implant writes its concentration into the scalar with the requested
+#: name; ``Material`` therefore overwrote the per-cell material ID (measured:
+#: 1500 cells got IDs around 5.6e8) and every later step read a corrupt cell set.
+RESERVED_CELL_SET_LABELS = frozenset(NATIVE_CELL_SET_LABELS)
+
 #: Upper bound for one step's native cell set. The generic cell-set output uses
 #: the same hard construction limit; an implant grid above it is refused before
 #: the native grid is allocated.
@@ -55,6 +61,22 @@ def step_cell_set(step: Any) -> dict[str, Any] | None:
 
 def valid_label(name: Any) -> bool:
     return isinstance(name, str) and bool(LABEL_PATTERN.fullmatch(name))
+
+
+def reserved_label_error(name: Any, field: str) -> str | None:
+    """Return why ``name`` may not be used as a step-owned cell-set label.
+
+    ``Material`` and ``FillingFraction`` are written by the native cell set
+    itself. A concentration/damage/active/net-doping/sheet label with one of
+    those names makes the native model overwrite the system scalar: the
+    measured ``labels.concentration="Material"`` case replaced the material ID
+    of 1500 cells with concentration values (~5.6e8).
+    """
+    if isinstance(name, str) and name in RESERVED_CELL_SET_LABELS:
+        return (f"{field} {name!r} is reserved by the native DenseCellSet "
+                f"(system labels: {', '.join(NATIVE_CELL_SET_LABELS)}) and cannot be used as a "
+                "step-owned cell-set label; the native model would overwrite the system scalar")
+    return None
 
 
 def produced_labels(step: Any) -> set[str]:
@@ -135,6 +157,18 @@ def numeric_guard_messages(step: Any, *, dimension: int, grid_delta: float) -> l
             "the installed DenseCellSet generator would crash")
     if dimension not in (2, 3):
         messages.append("cell-set steps require a 2D or 3D project")
+    cover = str(settings.get("coverMaterial") or "GAS")
+    if cover != "GAS":
+        # Measured on 4.7.0: ``generateCellSet(height, Si, True)`` on a Si
+        # substrate makes every cell a cover cell, so the substrate is skipped
+        # and the implant writes an all-zero field (P_total max = 0 in 2D/3D).
+        # No non-GAS cover has been proven to keep the target visible, so the
+        # field steps require GAS instead of silently voiding the substrate.
+        messages.append(
+            f"cellSet.coverMaterial {cover!r} is not supported for implant/anneal/analysis: the native "
+            "DenseCellSet generator treats the cover material as the phase above the surface and skips "
+            "cells of that material, so a cover equal to the implanted substrate voids the target and "
+            "returns an all-zero field (measured: Si cover on a Si substrate). Use \"GAS\"")
     if settings.get("periodic") and dimension == 3:
         # The native periodic cell-set boundary is flag-per-axis and the 3D
         # Domain boundary is applied to x and y; z stays non-periodic.
@@ -194,6 +228,12 @@ def _implant_guard_messages(step: Any) -> list[str]:
     tilt = step_value(step, "tiltDeg")
     if not _finite(tilt) or not 0.0 <= float(tilt) <= 90.0:
         messages.append("tiltDeg must be within [0, 90]")
+    labels = step_value(step, "labels")
+    if isinstance(labels, dict):
+        for key in ("concentration", "damage", "lastDamage"):
+            error = reserved_label_error(labels.get(key), f"labels.{key}")
+            if error is not None:
+                messages.append(error)
     return messages
 
 
@@ -247,6 +287,10 @@ def _anneal_guard_messages(step: Any) -> list[str]:
             messages.append("solidActivation.solubilityC0 must be positive")
         if not _finite(activation.get("solubilityEa_eV")) or float(activation["solubilityEa_eV"]) < 0.0:
             messages.append("solidActivation.solubilityEa_eV must be non-negative")
+    for key in ("speciesLabel", "activeLabel"):
+        error = reserved_label_error(step_value(step, key), key)
+        if error is not None:
+            messages.append(error)
     return messages
 
 
@@ -260,6 +304,15 @@ def _analysis_guard_messages(step: Any) -> list[str]:
         output = net.get("outputLabel")
         if not valid_label(output):
             messages.append("netDoping.outputLabel must be a valid cell-set label")
+        else:
+            error = reserved_label_error(output, "netDoping.outputLabel")
+            if error is not None:
+                messages.append(error)
+        for key in ("donorLabels", "acceptorLabels"):
+            for index, name in enumerate(net.get(key) or []):
+                error = reserved_label_error(name, f"netDoping.{key}[{index}]")
+                if error is not None:
+                    messages.append(error)
         if not (net.get("donorLabels") or net.get("acceptorLabels")):
             messages.append("netDoping requires at least one donor or acceptor label")
     for index, row in enumerate(sheet):
@@ -268,9 +321,103 @@ def _analysis_guard_messages(step: Any) -> list[str]:
             continue
         if not valid_label(row.get("concentrationLabel")):
             messages.append(f"sheetResistance[{index}].concentrationLabel must be a valid cell-set label")
+        else:
+            error = reserved_label_error(row.get("concentrationLabel"),
+                                         f"sheetResistance[{index}].concentrationLabel")
+            if error is not None:
+                messages.append(error)
         if row.get("carrier") not in {"electron", "hole"}:
             messages.append(f"sheetResistance[{index}].carrier must be electron or hole")
     return messages
+
+
+def field_grid_signature(step: Any) -> dict[str, Any]:
+    """Return the settings that define the one shared native cell grid."""
+    settings = step_cell_set(step) or {}
+    substrate = settings.get("substrateDepth")
+    return {
+        "height": float(settings.get("height") or 0.0),
+        "substrateDepth": None if substrate is None else float(substrate),
+        "coverMaterial": str(settings.get("coverMaterial") or "GAS"),
+        "periodic": bool(settings.get("periodic", False)),
+    }
+
+
+def field_sequence_issues(steps: Iterable[Any], *, grid_delta: float,
+                          domain_periodic: bool | None = None) -> list[tuple[int, str, str]]:
+    """Return ``(step_index, field_path, message)`` for grid-sequence violations.
+
+    The native ``DenseCellSet`` is generated once, at the first enabled field
+    step, and every later implant/anneal/analysis step reuses it. This function
+    is the single shared implementation for the API validator and the worker
+    preflight, so a hand-edited ``input.json`` cannot silently reuse a stale
+    grid: it rejects
+
+    * a later field step asking for a different ``height``/``substrateDepth``/
+      ``coverMaterial``/``periodic``;
+    * the first enabled field step omitting ``substrateDepth``;
+    * a grid-defining step below one grid interval / a substrate depth below
+      two grid intervals;
+    * a cell-set step that follows a surface change after the grid was built.
+
+    ``field_path`` is ``""`` for a whole-step issue, otherwise a dotted path
+    below the step (``cellSet.height``). The complementary rule (a
+    surface-moving step after a field step) is in :func:`ordering_issues`.
+    """
+    issues: list[tuple[int, str, str]] = []
+    first: dict[str, Any] | None = None
+    grid_generated = False
+    surface_changed_since_grid = False
+    for index, step in enumerate(steps):
+        if not step_value(step, "enabled"):
+            continue
+        model = step_value(step, "model")
+        if model not in CELL_SET_STEP_MODELS:
+            if grid_generated:
+                surface_changed_since_grid = True
+            continue
+        if surface_changed_since_grid:
+            issues.append((index, "",
+                           "a cell-set step cannot follow a surface change: the native DenseCellSet "
+                           "was generated from the level sets of the first field step and every later "
+                           "cell-set step reuses that stale grid; move the surface-changing step before "
+                           "the first cell-set step"))
+            surface_changed_since_grid = False
+        signature = field_grid_signature(step)
+        height = signature["height"]
+        if height + 1e-12 < float(grid_delta):
+            issues.append((index, "cellSet.height",
+                           f"cellSet.height {height:g} um is below one grid interval ({float(grid_delta):g} um); "
+                           "the installed DenseCellSet generator would crash"))
+        substrate = signature["substrateDepth"]
+        if substrate is not None and substrate + 1e-12 < 2.0 * float(grid_delta):
+            issues.append((index, "cellSet.substrateDepth",
+                           f"cellSet.substrateDepth must span at least two grid intervals ({2.0 * float(grid_delta):g} um)"))
+        if domain_periodic is not None and signature["periodic"] != bool(domain_periodic):
+            issues.append((index, "cellSet.periodic",
+                           "cellSet.periodic must match the domain lateral boundary; the cell set is "
+                           "generated from the domain's level sets and only the native neighbor topology "
+                           "can be marked periodic"))
+        if first is None:
+            first = signature
+            if substrate is None:
+                issues.append((index, "cellSet.substrateDepth",
+                               "the first enabled cell-set field step must declare substrateDepth: a native "
+                               "ViennaLS level set stores only a narrow band, so without it the DenseCellSet "
+                               "would contain a single substrate row and the dopant profile would have no depth"))
+        else:
+            for key in ("height", "coverMaterial", "periodic"):
+                if signature[key] != first[key]:
+                    issues.append((index, f"cellSet.{key}",
+                                   "every cell-set step shares the grid generated by the first field step; "
+                                   f"{key} must match that step ({first[key]!r})"))
+            if substrate is not None and first["substrateDepth"] is not None \
+                    and abs(substrate - float(first["substrateDepth"])) > 1e-12:
+                issues.append((index, "cellSet.substrateDepth",
+                               "every cell-set step shares the grid generated by the first field step; "
+                               "substrateDepth must match that step or be omitted"))
+        grid_generated = True
+    return issues
 
 
 def ordering_issues(steps: Iterable[Any]) -> list[tuple[int, str]]:

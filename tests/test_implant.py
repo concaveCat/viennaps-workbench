@@ -22,7 +22,11 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import shutil
+import subprocess
+import tempfile
 import unittest
+from importlib.metadata import version
 from pathlib import Path
 from unittest.mock import patch
 
@@ -144,6 +148,54 @@ class ImplantSchema(unittest.TestCase):
         without_damage = implant_step(damage=None)
         parsed = normalized(project(2, steps=[without_damage]))
         self.assertEqual(set(parsed["steps"][0]["labels"]), {"concentration"})
+
+    def test_reserved_native_labels_are_rejected(self) -> None:
+        # ``Material`` / ``FillingFraction`` belong to the native DenseCellSet.
+        # Writing a dopant field into one of them overwrote the material scalar
+        # (measured: 1500 cells got invalid material IDs ~5.6e8).
+        cases = [
+            ("implant concentration", [implant_step(labels={"concentration": "Material"}),
+                                       anneal_step(), analysis_step()]),
+            ("implant damage", [implant_step(labels={"concentration": "P_total",
+                                                     "damage": "FillingFraction"}),
+                                anneal_step(), analysis_step()]),
+            ("implant lastDamage", [implant_step(labels={"concentration": "P_total",
+                                                         "lastDamage": "Material"}),
+                                    anneal_step(), analysis_step()]),
+            ("anneal active", [implant_step(), anneal_step(activeLabel="Material"),
+                               analysis_step()]),
+            ("anneal species", [implant_step(), anneal_step(speciesLabel="FillingFraction"),
+                                analysis_step()]),
+            ("net doping output", [implant_step(), anneal_step(), analysis_step(
+                netDoping={"donorLabels": ["P_active"], "acceptorLabels": [],
+                           "outputLabel": "Material"})]),
+            ("net doping input", [implant_step(), anneal_step(), analysis_step(
+                netDoping={"donorLabels": ["FillingFraction"], "acceptorLabels": []})]),
+            ("sheet resistance", [implant_step(), anneal_step(), analysis_step(
+                sheetResistance=[{"concentrationLabel": "Material", "carrier": "hole"}])]),
+        ]
+        for label, steps in cases:
+            with self.subTest(label=label), self.assertRaises(ProjectInputError) as context:
+                validate_project(project(2, steps=steps))
+            self.assertIn("reserved", str(context.exception))
+        # A non-reserved custom label is still accepted and recorded.
+        accepted = normalized(project(2, steps=[implant_step(
+            labels={"concentration": "As_total"})]))
+        self.assertEqual(accepted["steps"][0]["labels"]["concentration"], "As_total")
+
+    def test_cover_material_must_be_gas_for_field_steps(self) -> None:
+        # A cover equal to (or any material of) the target is skipped by the
+        # native generator: Si cover on a Si substrate returned P_total max 0
+        # in 2D and 3D, while GAS kept the substrate visible.
+        for dimension in (2, 3):
+            for cover in ("Si", "SiO2"):
+                steps = [implant_step(cellSet=cell_set(coverMaterial=cover)),
+                         anneal_step(cellSet=cell_set(coverMaterial=cover)),
+                         analysis_step(cellSet=cell_set(coverMaterial=cover))]
+                with self.subTest(dimension=dimension, cover=cover), \
+                        self.assertRaises(ProjectInputError) as context:
+                    validate_project(project(dimension, steps=steps))
+                self.assertIn("GAS", str(context.exception))
 
     def test_unknown_keys_and_invalid_values_are_rejected(self) -> None:
         cases = [
@@ -380,6 +432,15 @@ class ImplantWorkflow(unittest.IsolatedAsyncioTestCase):
                          "viennaps.SheetResistance.computeElectron")
         self.assertGreater(sheet["sheetResistanceOhmPerSquare"], 0.0)
 
+        # Exported units: the native implant concentration is volumetric in 2D
+        # as well (1e12 cm^-3 conversion), while the 2D areal integral is 1/um^2.
+        summary = storage.read_json(storage.run_path(run_id) / "artifacts" /
+                                    "analysis_step_01-cell-set-fields.json")
+        self.assertEqual(summary["concentrationUnit"], "1/um^3")
+        self.assertEqual(summary["concentrationUnitCm3"], 1e12)
+        self.assertEqual(summary["integralUnit"], "1/um^2")
+        self.assertIn("net_doping", summary["fields"])
+
         # The surface itself must be untouched: the same project without the
         # cell-set steps produces an identical surface payload.
         baseline_id, _baseline = await self.run_project(project(
@@ -420,6 +481,11 @@ class ImplantWorkflow(unittest.IsolatedAsyncioTestCase):
                                     "analysis_step_01-cell-set-fields.json")
         self.assertEqual(summary["dimension"], 3)
         self.assertEqual(summary["grid"]["nativeElementType"], "hexahedron")
+        # 3D concentration is still volumetric; sum*delta^3 is dimensionless and
+        # is therefore not labelled with a length unit.
+        self.assertEqual(summary["concentrationUnit"], "1/um^3")
+        self.assertEqual(summary["concentrationUnitCm3"], 1e12)
+        self.assertNotIn("integralUnit", summary)
         self.assertTrue(summary["process"]["analysis"]["fieldDigests"])
         self.assertGreater(len(summary["grid"]["bounds"]), 0)
 
@@ -472,6 +538,124 @@ class ImplantWorkerGuards(unittest.TestCase):
         }
         messages = numeric_guard_messages(broken, dimension=2, grid_delta=0.01)
         self.assertTrue(any("doseCm2" in message for message in messages))
+
+    def test_shared_guard_rejects_reserved_labels(self) -> None:
+        from backend.implant_models import numeric_guard_messages
+        parsed = normalized(project(2))
+        cases = [
+            (0, lambda step: step["labels"].__setitem__("concentration", "Material")),
+            (0, lambda step: step["labels"].__setitem__("damage", "FillingFraction")),
+            (0, lambda step: step["labels"].__setitem__("lastDamage", "Material")),
+            (1, lambda step: step.__setitem__("activeLabel", "Material")),
+            (1, lambda step: step.__setitem__("speciesLabel", "FillingFraction")),
+            (2, lambda step: step["netDoping"].__setitem__("outputLabel", "Material")),
+            (2, lambda step: step["netDoping"]["donorLabels"].append("FillingFraction")),
+            (2, lambda step: step["sheetResistance"][0].__setitem__(
+                "concentrationLabel", "Material")),
+        ]
+        for index, mutate in cases:
+            step = copy.deepcopy(parsed["steps"][index])
+            mutate(step)
+            with self.subTest(index=index):
+                messages = numeric_guard_messages(step, dimension=2, grid_delta=0.01)
+                self.assertTrue(any("reserved" in message for message in messages), messages)
+
+    def test_shared_guard_requires_gas_cover(self) -> None:
+        from backend.implant_models import numeric_guard_messages
+        parsed = normalized(project(2))
+        for dimension in (2, 3):
+            step = copy.deepcopy(parsed["steps"][0])
+            step["cellSet"]["coverMaterial"] = "Si"
+            with self.subTest(dimension=dimension):
+                messages = numeric_guard_messages(step, dimension=dimension, grid_delta=0.01)
+                self.assertTrue(any("coverMaterial" in message for message in messages), messages)
+
+
+class ImplantDirectWorkerGuards(unittest.TestCase):
+    """The exact worker path a hand-edited ``input.json`` reaches.
+
+    These bypass ``validate_project`` entirely (like the recorded defects) and
+    prove the worker itself refuses the request instead of reporting
+    ``WORKER_COMPLETE`` with a corrupt field or a stale grid.
+    """
+
+    def run_worker(self, project: dict, timeout: int = 240) -> tuple[int, str, dict]:
+        workdir = Path(tempfile.mkdtemp(prefix="implant-direct-", dir=str(ROOT / "var")))
+        self.addCleanup(shutil.rmtree, workdir, ignore_errors=True)
+        config = {
+            "kind": "simulate", "runId": "implant-direct", "project": project,
+            "runSeed": 271828,
+            "expectedVersions": {"viennaps": version("viennaps"),
+                                 "viennals": version("viennals")},
+        }
+        input_path = workdir / "input.json"
+        input_path.write_text(json.dumps(config), encoding="utf-8")
+        run_dir = workdir / "run"
+        run_dir.mkdir()
+        completed = subprocess.run(
+            [str(ROOT / ".venv/bin/python"), str(ROOT / "worker/simulate.py"),
+             str(input_path), str(run_dir)],
+            cwd=ROOT, capture_output=True, text=True, timeout=timeout)
+        result_path = run_dir / "worker-result.json"
+        result = json.loads(result_path.read_text()) if result_path.is_file() else {}
+        return completed.returncode, completed.stdout + completed.stderr, result
+
+    def assert_worker_refused(self, project: dict, *fragments: str) -> None:
+        code, output, result = self.run_worker(project)
+        self.assertNotEqual(code, 0, output)
+        self.assertNotIn("WORKER_COMPLETE", output)
+        self.assertEqual(result, {})
+        for fragment in fragments:
+            self.assertIn(fragment, output)
+
+    def test_direct_worker_rejects_reserved_labels(self) -> None:
+        value = normalized(project(2))
+        value["steps"][0]["labels"]["concentration"] = "Material"
+        self.assert_worker_refused(value, "reserved", "Material")
+
+        value = normalized(project(2))
+        value["steps"][1]["activeLabel"] = "FillingFraction"
+        self.assert_worker_refused(value, "reserved", "FillingFraction")
+
+        value = normalized(project(2))
+        value["steps"][2]["sheetResistance"][0]["concentrationLabel"] = "Material"
+        self.assert_worker_refused(value, "reserved", "concentrationLabel")
+
+    def test_direct_worker_rejects_target_cover_material_in_2d_and_3d(self) -> None:
+        for dimension in (2, 3):
+            value = normalized(project(dimension))
+            for step in value["steps"]:
+                step["cellSet"]["coverMaterial"] = "Si"
+            with self.subTest(dimension=dimension):
+                self.assert_worker_refused(value, "coverMaterial", "GAS")
+
+    def test_direct_worker_rejects_a_later_cell_step_with_a_different_grid(self) -> None:
+        value = normalized(project(2))
+        value["steps"][1]["cellSet"]["height"] = 0.3
+        self.assert_worker_refused(value, "height must match")
+
+        value = normalized(project(2))
+        value["steps"][2]["cellSet"]["substrateDepth"] = 0.2
+        self.assert_worker_refused(value, "substrateDepth must match")
+
+    def test_direct_worker_rejects_surface_motion_after_a_field_step(self) -> None:
+        value = normalized(project(2))
+        value["steps"].insert(1, {
+            "id": "etch_step_0001", "name": "etch", "enabled": True,
+            "operation": "etch", "model": "isotropic", "rateMagnitude": 0.1,
+            "duration": 0.1, "rateMode": "uniform",
+        })
+        # The etch itself is refused, and the later anneal is refused again
+        # because it would reuse the field grid built before the surface moved.
+        self.assert_worker_refused(value, "surface-moving", "stale")
+
+    def test_direct_worker_accepts_the_shared_grid(self) -> None:
+        code, output, result = self.run_worker(normalized(project(2)))
+        self.assertEqual(code, 0, output)
+        self.assertIn("WORKER_COMPLETE", output)
+        self.assertEqual([row["stepId"] for row in result["actualSteps"]],
+                         ["implant_step_01", "anneal_step_01", "analysis_step_01"])
+
 
 
 if __name__ == "__main__":

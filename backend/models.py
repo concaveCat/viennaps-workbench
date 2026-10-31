@@ -10,6 +10,7 @@ from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationError, field_validator, model_validator
 from .materials import MaterialDefinition
+from .implant_models import reserved_label_error
 from .runtime_limits import MAX_CELL_SET_CELLS, available_cpu_threads
 
 
@@ -1382,6 +1383,17 @@ class StepCellSetV7(StrictModel):
             for label in self.scalarLabels:
                 if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,47}", label):
                     raise ValueError(f"scalarLabels entry {label!r} is not a valid cell-set label")
+        if self.coverMaterial != "GAS":
+            # The native generator treats the cover material as the phase above
+            # the surface. A cover equal to the implanted substrate voids the
+            # target (measured: Si cover on Si gives P_total max = 0 in 2D/3D),
+            # and no non-GAS cover has been proven to keep the target visible.
+            raise ValueError(
+                f"cellSet.coverMaterial {self.coverMaterial!r} is not supported for "
+                "implant/anneal/analysis: the native DenseCellSet generator treats the cover "
+                "material as the phase above the surface and skips cells of that material, so a "
+                "cover equal to the implanted substrate voids the target and returns an all-zero "
+                "field; use \"GAS\"")
         return self
 
 
@@ -1474,8 +1486,13 @@ class ImplantLabelsV7(StrictModel):
     def check_labels(self) -> "ImplantLabelsV7":
         for name in ("concentration", "damage", "lastDamage"):
             value = getattr(self, name)
-            if value is not None and not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,47}", value):
+            if value is None:
+                continue
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,47}", value):
                 raise ValueError(f"{name} must be a valid cell-set label")
+            error = reserved_label_error(value, f"labels.{name}")
+            if error is not None:
+                raise ValueError(error)
         return self
 
 
@@ -1649,8 +1666,12 @@ class AnnealStepV7(StrictModel):
     @model_validator(mode="after")
     def check_anneal_fields(self) -> "AnnealStepV7":
         for name in ("speciesLabel", "activeLabel"):
-            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,47}", getattr(self, name)):
+            value = getattr(self, name)
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,47}", value):
                 raise ValueError(f"{name} must be a valid cell-set label")
+            error = reserved_label_error(value, name)
+            if error is not None:
+                raise ValueError(error)
         if self.speciesLabel == self.activeLabel:
             raise ValueError("speciesLabel and activeLabel must be different cell-set fields")
         if set(self.diffusionMaterials) & set(self.blockingMaterials):
@@ -1679,6 +1700,9 @@ class NetDopingV7(StrictModel):
         for name in ("outputLabel", *self.donorLabels, *self.acceptorLabels):
             if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,47}", name):
                 raise ValueError(f"{name!r} is not a valid cell-set label")
+            error = reserved_label_error(name, "netDoping label")
+            if error is not None:
+                raise ValueError(error)
         labels = [*self.donorLabels, *self.acceptorLabels]
         if len(set(labels)) != len(labels):
             raise ValueError("netDoping labels must be unique across donors and acceptors")
@@ -1704,6 +1728,9 @@ class SheetResistanceEntryV7(StrictModel):
     def check_label(self) -> "SheetResistanceEntryV7":
         if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,47}", self.concentrationLabel):
             raise ValueError("concentrationLabel is not a valid cell-set label")
+        error = reserved_label_error(self.concentrationLabel, "concentrationLabel")
+        if error is not None:
+            raise ValueError(error)
         return self
 
 
