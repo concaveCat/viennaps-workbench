@@ -1,3 +1,5 @@
+> Superseded by the accepted bare-wafer demo: [`docs/finfet22-bare-wafer/README.md`](finfet22-bare-wafer/README.md).
+
 # 22 nm FinFET geometry-only flow (wafer to M0)
 
 This run is a backend/API-only geometry flow built on the engine-complete archive.
