@@ -22,6 +22,7 @@ BASE_HASH = {
     2: "29784db671c11b7d74cc1604b49ab2ae48d43641f452f9d76c763a27d51efaf0",
     3: "31fe30193cbc6d480edc2edd6b7acde1f38ee81325ff9570740a8380be08ca44",
 }
+TINY_LEGACY_HASH = "f6763f3546b6b9191203587acf0091a74ea59ec0320e09321ca92dd250ace43f"
 
 
 def project_value(dimension: int, pattern: dict, *, grid_delta: float = 0.2) -> dict:
@@ -67,6 +68,19 @@ def per_layer_pattern(*, film_mask: bool = True) -> dict:
         {"layerIndex": 0, "width": 1.6, "taperAngle": 0.0, "isMask": film_mask},
         {"layerIndex": 1, "width": 0.8, "taperAngle": 0.0, "isMask": True},
     ]}
+
+
+def tiny_project(pattern: dict) -> dict:
+    """Exact reviewer repro: native 1e-4 axe is larger than either layer."""
+    value = project_value(2, pattern, grid_delta=0.00005)
+    value["domain"]["xExtent"] = 1.0
+    value["geometry"]["layers"] = [
+        {"id": "oxide_layer", "name": "oxide", "material": "SiO2",
+         "thickness": 0.0001, "role": "film"},
+        {"id": "nitride_layer", "name": "mask", "material": "Si3N4",
+         "thickness": 0.0001, "role": "mask"},
+    ]
+    return value
 
 
 def new_domain(dimension: int, grid_delta: float = 0.2):
@@ -293,11 +307,46 @@ class LegacyStackStability(unittest.TestCase):
                 expected = capture(reference_domain, dimension)
                 self.assertEqual(actual, expected)
 
+    def test_tiny_legacy_omitted_block_still_preserves_the_oxide(self):
+        project = tiny_project({"kind": "trench", "width": 0.4,
+                                "taperAngle": 0.0})
+        normalized, _ = validate_project(project)
+        self.assertEqual(requested_input_hash(normalized), TINY_LEGACY_HASH)
+        value = normalized.model_dump(mode="json", exclude_none=True)
+        domain = new_domain(2, 0.00005)
+        make_v3_geometry(ps, domain, value)
+        result = capture(domain, 2)
+        self.assertIn(30, result["materialMap"])
+        self.assertTrue(any(abs(point[0]) < 0.001 and point[1] > 0.00005
+                            for point in result["points"]))
+
 
 class PerLayerTrenchValidation(unittest.TestCase):
     def assert_invalid(self, project: dict):
         with self.assertRaises(ProjectInputError):
             validate_project(project)
+
+    def test_reviewer_partial_list_is_rejected_before_native(self):
+        # Exact repro: only the top 1e-4 mask is referenced while the 1e-4
+        # oxide below it is not. Native MakeTrench cuts 1e-4 below the mask,
+        # which would silently erase the whole unreferenced oxide.
+        project = tiny_project({"kind": "trench", "layers": [
+            {"layerIndex": 1, "width": 0.4, "taperAngle": 0.0, "isMask": True}]})
+        with self.assertRaises(ProjectInputError) as raised:
+            validate_project(project)
+        self.assertIn("every stack layer", str(raised.exception))
+
+        # The worker has the same guard for direct (non-API) input, before any
+        # numeric conversion or native constructor is reached.
+        full = tiny_project({"kind": "trench", "layers": [
+            {"layerIndex": 0, "width": 0.4, "taperAngle": 0.0, "isMask": False},
+            {"layerIndex": 1, "width": 0.4, "taperAngle": 0.0, "isMask": True}]})
+        normalized, _ = validate_project(full)
+        value = normalized.model_dump(mode="json", exclude_none=True)
+        value["geometry"]["pattern"]["layers"] = value["geometry"]["pattern"]["layers"][1:]
+        domain = new_domain(2, 0.00005)
+        with self.assertRaisesRegex(RuntimeError, "every stack layer"):
+            make_v3_geometry(ps, domain, value)
 
     def test_negative_cases(self):
         cases = {}
@@ -393,6 +442,50 @@ class PerLayerTrenchValidation(unittest.TestCase):
         }
         with self.assertRaises(ValidationError):
             StackV7.model_validate(value["geometry"])
+
+
+class DirectWorkerNumericGuard(unittest.TestCase):
+    def raw_value(self, dimension: int) -> dict:
+        normalized, _ = validate_project(
+            project_value(dimension, per_layer_pattern()))
+        return normalized.model_dump(mode="json", exclude_none=True)
+
+    def assert_worker_rejected(self, dimension: int, mutate):
+        value = self.raw_value(dimension)
+        mutate(value)
+        with self.assertRaises((RuntimeError, ValueError)):
+            make_v3_geometry(ps, new_domain(dimension), value)
+
+    def test_nan_inf_bool_and_huge_int_are_rejected_before_native(self):
+        entry = lambda value: value["geometry"]["pattern"]["layers"][0]
+        cases = {
+            "width string nan": lambda v: entry(v).update(width="nan"),
+            "width string inf": lambda v: entry(v).update(width="inf"),
+            "width float nan": lambda v: entry(v).update(width=float("nan")),
+            "width float inf": lambda v: entry(v).update(width=float("inf")),
+            "width bool": lambda v: entry(v).update(width=True),
+            "width huge finite int": lambda v: entry(v).update(width=10 ** 100),
+            "width huge overflow int": lambda v: entry(v).update(width=10 ** 400),
+            "taper string nan": lambda v: entry(v).update(taperAngle="nan"),
+            "taper float inf": lambda v: entry(v).update(taperAngle=float("inf")),
+            "taper bool": lambda v: entry(v).update(taperAngle=True),
+            "taper huge int": lambda v: entry(v).update(taperAngle=10 ** 100),
+            "index string": lambda v: entry(v).update(layerIndex="0"),
+            "index bool": lambda v: entry(v).update(layerIndex=True),
+            "index huge int": lambda v: entry(v).update(layerIndex=10 ** 100),
+            "isMask int": lambda v: entry(v).update(isMask=1),
+            "isMask string": lambda v: entry(v).update(isMask="true"),
+            "isMask huge int": lambda v: entry(v).update(isMask=10 ** 100),
+            "baseHeight string nan": lambda v: v["geometry"].update(baseHeight="nan"),
+            "baseHeight float inf": lambda v: v["geometry"].update(baseHeight=float("inf")),
+            "baseHeight bool": lambda v: v["geometry"].update(baseHeight=True),
+            "baseHeight huge int": lambda v: v["geometry"].update(baseHeight=10 ** 100),
+            "thickness string nan": lambda v: v["geometry"]["layers"][0].update(thickness="nan"),
+        }
+        for dimension in (2, 3):
+            for name, mutate in cases.items():
+                with self.subTest(dimension=dimension, case=name):
+                    self.assert_worker_rejected(dimension, mutate)
 
 
 if __name__ == "__main__":

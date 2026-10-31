@@ -1664,7 +1664,7 @@
         "geometry:stack/pattern=trench",
         "geometry:stack/pattern=trench + pattern.layers[]"
       ],
-      "notes": "halfTrench (mirror symmetry) is fixed false. pattern.layers[] calls the native MaterialLayer[] overload directly; omitted keeps the legacy top-layer stencil.",
+      "notes": "halfTrench (mirror symmetry) is fixed false. pattern.layers[] calls the native MaterialLayer[] overload directly and must list every stack layer once, bottom to top; omitted keeps the legacy top-layer stencil.",
       "members": {
         "exposed": [
           "trenchWidth",

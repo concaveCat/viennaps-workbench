@@ -28,7 +28,9 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from backend.rates import has_motion, is_geometry_step, uses_flux, signed_rates, signed_directional_rates, signed_directional_rate_sets
-from backend.models import normalized_geometry_v3, parse_project, project_structure_hash
+from backend.models import (normalized_geometry_v3, parse_project,
+                            project_structure_hash, strict_boolean,
+                            strict_finite_number, strict_integer)
 from backend.runtime_limits import MAX_CELL_SET_CELLS, artifact_limit_bytes, artifact_limit_label
 from backend.preflight import CELL_SET_JSON_BYTES, CELL_SET_VTU_BYTES_PER_CELL
 from backend.validation import (capability_verified, fin_construction_decision,
@@ -1627,36 +1629,79 @@ def _per_layer_stack_geometry(ps: Any, domain: Any,
             "per-layer cutouts require a trench pattern; installed MakeHole has "
             "no MaterialLayer[] overload")
     entries = pattern.get("layers")
-    if not entries:
-        raise RuntimeError("per-layer trench requires at least one cutout entry")
-    if float(g.get("baseHeight", 0.0)) < 0:
+    if not isinstance(entries, list) or not entries:
+        raise RuntimeError("per-layer trench requires a non-empty layers array")
+    if len(entries) != len(stack):
+        raise RuntimeError(
+            "per-layer trench must reference every stack layer exactly once "
+            "from bottom to top; omit no layer, including the bottom film")
+    domain_config = project.get("domain") or {}
+    grid_delta = strict_finite_number(domain_config.get("gridDelta"),
+                                      "domain.gridDelta")
+    x_extent = strict_finite_number(domain_config.get("xExtent"), "domain.xExtent")
+    if grid_delta <= 0 or x_extent <= 0:
+        raise RuntimeError("per-layer trench requires positive gridDelta and xExtent")
+    base_height = strict_finite_number(g.get("baseHeight", 0.0),
+                                       "geometry.baseHeight")
+    if base_height < 0:
         raise RuntimeError("per-layer trench requires a non-negative baseHeight")
+    if base_height / grid_delta > 1_000_000:
+        raise RuntimeError("per-layer baseHeight exceeds the coordinate budget")
+
     by_id = {layer.get("id"): index for index, layer in enumerate(stack)}
     cutouts: dict[int, dict[str, Any]] = {}
-    previous = -1
-    for position, entry in enumerate(entries):
+    thicknesses: list[float] = []
+    for position, (entry, layer) in enumerate(zip(entries, stack)):
+        if not isinstance(entry, dict):
+            raise RuntimeError(f"per-layer cutout {position} must be a JSON object")
         index = entry.get("layerIndex")
         layer_id = entry.get("layerId")
         if (index is None) == (layer_id is None):
             raise RuntimeError(
                 f"per-layer cutout {position} must reference exactly one stack layer")
-        if index is None:
-            if layer_id not in by_id:
+        if index is not None:
+            index = strict_integer(index, f"pattern.layers[{position}].layerIndex")
+        else:
+            if not isinstance(layer_id, str) or layer_id not in by_id:
                 raise RuntimeError(
-                    f"per-layer cutout {position} references unknown stack layer {layer_id!r}")
+                    f"per-layer cutout {position} references unknown stack layer "
+                    f"{layer_id!r}")
             index = by_id[layer_id]
-        if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(stack):
-            raise RuntimeError(f"per-layer cutout {position} has an invalid stack layer index")
-        if index in cutouts:
-            raise RuntimeError("per-layer cutouts must reference each stack layer at most once")
-        if index <= previous:
-            raise RuntimeError("per-layer cutouts must be ordered from bottom to top")
-        previous = index
-        cutouts[index] = entry
-    top = len(stack) - 1
-    if top not in cutouts or not cutouts[top].get("isMask"):
+        if index != position:
+            raise RuntimeError(
+                "per-layer cutouts must be ordered from bottom to top and "
+                "reference every stack layer exactly once")
+        path = f"pattern.layers[{position}]"
+        width = strict_finite_number(entry.get("width"), f"{path}.width")
+        taper_angle = strict_finite_number(entry.get("taperAngle"),
+                                           f"{path}.taperAngle")
+        is_mask = strict_boolean(entry.get("isMask"), f"{path}.isMask")
+        thickness = strict_finite_number(layer.get("thickness"),
+                                         f"geometry.layers[{position}].thickness")
+        if width <= 0:
+            raise RuntimeError(f"{path}.width must be positive")
+        if not -45.0 <= taper_angle <= 45.0:
+            raise RuntimeError(f"{path}.taperAngle must be between -45 and 45 degrees")
+        if thickness <= 0:
+            raise RuntimeError(
+                f"geometry.layers[{position}].thickness must be positive")
+        change = 2.0 * thickness * math.tan(math.radians(taper_angle))
+        narrow = width + min(0.0, change)
+        wide = width + max(0.0, change)
+        if narrow < 2.0 * grid_delta - 1e-12:
+            raise RuntimeError(
+                f"{path}.taperAngle closes the opening below two grid intervals")
+        if wide >= x_extent:
+            raise RuntimeError(
+                f"{path} cutout and tapered opening must fit inside the lateral domain")
+        if layer.get("source") == "gds-mask":
+            raise RuntimeError("a GDS mask layer cannot carry a per-layer native cutout")
+        thicknesses.append(thickness)
+        cutouts[position] = {"width": width, "taperAngle": taper_angle,
+                             "isMask": is_mask}
+    if not cutouts[len(stack) - 1]["isMask"]:
         raise RuntimeError(
-            "per-layer trench must include the top stack layer with isMask=true")
+            "per-layer trench requires isMask=true on the top stack layer")
 
     epsilon = 1e-4
     records: list[dict[str, Any]] = []
@@ -1674,18 +1719,13 @@ def _per_layer_stack_geometry(ps: Any, domain: Any,
                         "height": float(height), "width": float(width),
                         "taperAngle": float(taper_angle), "isMask": bool(is_mask)})
 
-    base_height = float(g.get("baseHeight", 0.0))
     append_layer(None, None, "substrate", g["substrateMaterial"],
                  base_height + epsilon, 0.0, 0.0, False)
     for index, layer in enumerate(stack):
-        if layer.get("source") == "gds-mask":
-            raise RuntimeError("a GDS mask layer cannot carry a per-layer native cutout")
-        entry = cutouts.get(index)
+        entry = cutouts[index]
         append_layer(index, layer.get("id"), str(layer.get("name", layer.get("id", ""))),
-                     layer["material"], float(layer["thickness"]),
-                     float(entry["width"]) if entry else 0.0,
-                     float(entry["taperAngle"]) if entry else 0.0,
-                     bool(entry["isMask"]) if entry else False)
+                     layer["material"], thicknesses[index],
+                     entry["width"], entry["taperAngle"], entry["isMask"])
 
     ps.MakeTrench(domain=domain, materialLayers=native_layers,
                   halfTrench=False).apply()

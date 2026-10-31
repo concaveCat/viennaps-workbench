@@ -13,19 +13,46 @@ from .materials import MaterialDefinition
 from .runtime_limits import MAX_CELL_SET_CELLS, available_cpu_threads
 
 
-def _finite_number(value: object) -> float:
+def _strict_message(path: str | None, message: str) -> str:
+    return f"{path}: {message}" if path else message
+
+
+def strict_finite_number(value: object, path: str | None = None) -> float:
+    """Reject bool/string/NaN/Inf before any native numeric conversion.
+
+    Shared by the Pydantic request models and the direct worker path so a
+    hand-written worker config cannot reach a native constructor with values
+    the API would reject.
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError("must be a JSON number")
-    result = float(value)
+        raise ValueError(_strict_message(path, "must be a JSON number"))
+    try:
+        result = float(value)
+    except (OverflowError, TypeError, ValueError):
+        raise ValueError(_strict_message(path, "must be finite")) from None
     if not math.isfinite(result):
-        raise ValueError("must be finite")
+        raise ValueError(_strict_message(path, "must be finite"))
     return result
 
 
-def _integer(value: object) -> int:
+def strict_integer(value: object, path: str | None = None) -> int:
     if isinstance(value, bool) or type(value) is not int:
-        raise ValueError("must be a JSON integer")
+        raise ValueError(_strict_message(path, "must be a JSON integer"))
     return value
+
+
+def strict_boolean(value: object, path: str | None = None) -> bool:
+    if type(value) is not bool:
+        raise ValueError(_strict_message(path, "must be a JSON boolean"))
+    return value
+
+
+def _finite_number(value: object) -> float:
+    return strict_finite_number(value)
+
+
+def _integer(value: object) -> int:
+    return strict_integer(value)
 
 
 Number = Annotated[float, BeforeValidator(_finite_number)]
@@ -490,6 +517,12 @@ class StackPatternLayer(StrictModel):
             raise ValueError(
                 "each per-layer cutout must reference exactly one stack layer "
                 "with layerIndex or layerId")
+        # The worker shares these helpers for direct (non-API) input.
+        strict_finite_number(self.width, "width")
+        strict_finite_number(self.taperAngle, "taperAngle")
+        if self.layerIndex is not None:
+            strict_integer(self.layerIndex, "layerIndex")
+        strict_boolean(self.isMask, "isMask")
         return self
 
 class StackPattern(StrictModel):
@@ -564,7 +597,8 @@ class StackV3(StrictModel):
             return
         if pattern.kind != "trench":
             raise ValueError("per-layer cutouts are supported only for trench patterns")
-        if float(self.baseHeight) < 0:
+        base_height = strict_finite_number(self.baseHeight, "baseHeight")
+        if base_height < 0:
             raise ValueError("per-layer trench requires a non-negative baseHeight")
         by_id = {layer.id: index for index, layer in enumerate(self.layers)}
         resolved: dict[int, StackPatternLayer] = {}
@@ -591,9 +625,11 @@ class StackV3(StrictModel):
             resolved[index] = entry
             if self.layers[index].source == "gds-mask":
                 raise ValueError("a GDS mask layer cannot carry a per-layer native cutout")
+        if set(resolved) != set(range(len(self.layers))) or len(resolved) != len(self.layers):
+            raise ValueError(
+                "per-layer trench must reference every stack layer exactly once "
+                "from bottom to top; omit no layer, including the bottom film")
         top = len(self.layers) - 1
-        if top not in resolved:
-            raise ValueError("per-layer trench must include the top stack layer")
         if not resolved[top].isMask:
             raise ValueError("per-layer trench requires isMask=true on the top stack layer")
         if pattern.width is not None:

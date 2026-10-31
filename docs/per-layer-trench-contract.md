@@ -57,8 +57,10 @@ of being emulated with a top-only stencil or a different geometry.
 
 - Each entry references exactly one stack layer by zero-based `layerIndex` or
   by `layerId`; supplying both or neither is rejected.
-- Entries must be unique and ordered bottom to top.
-- The top stack layer must be present with `isMask=true`.
+- The list must cover **every** stack layer exactly once, ordered bottom to
+  top. Partial lists are rejected with a 422 even when they only name the top
+  layer, because the native top cutout extends below its own layer.
+- The top stack layer must have `isMask=true`.
 - `width` must be positive, `taperAngle` must be in `[-45, 45]`, and both must
   be finite JSON numbers.
 - `isMask` may open film or mask layers. `role` remains the process
@@ -75,10 +77,17 @@ Omitting `layers` keeps the historical `MakePlane` + top-layer
 
 The Workbench substrate is the half-space below `baseHeight`. The native
 constructor starts at `-1e-4`, so the worker prepends a native substrate layer
-with `height = baseHeight + 1e-4`, then one native layer per stack layer with
-its declared thickness. Unreferenced layers get `width=0`, `taperAngle=0`,
-`isMask=false`; the native constructor ignores width/taper for non-cut layers.
-`baseHeight` must be non-negative in this mode.
+with `height = baseHeight + 1e-4`, then one explicit native layer per stack
+layer with its declared thickness. The first native layer is the non-mask
+substrate; the top entry must be a mask. `baseHeight` must be non-negative in
+this mode.
+
+The installed constructor anchors every cutout at `currentBase - 1e-4` and
+extends it into the layer below. For layers thinner than about `1e-4` that
+bleed can remove the entire lower layer even when its `isMask=false`. The
+schema now makes every layer explicit and rejects partial lists, but it does
+not hide this native fixed-epsilon behavior. The legacy omitted-block path
+keeps its own `gridDelta * 1e-3` stencil and is unchanged.
 
 The initial snapshot's `geometryReadback.perLayerPattern` records the native
 constructor, the actual native layer sequence, all heights, widths, tapers,
@@ -92,6 +101,8 @@ materials and `isMask` flags.
 - a GDS mask overlay (`geometry.gdsMask`) or a `source="gds-mask"` stack layer
 - negative `baseHeight`
 - unknown, duplicate, out-of-order or ambiguous layer references
+- a partial list that omits any stack layer, including an unreferenced lower
+  film below the top cutout
 - a missing top layer or `isMask=false` on the top layer
 - cutouts that close under taper or exceed the lateral domain
 - unknown keys, non-finite numbers, zero/negative widths and out-of-range angles
@@ -105,6 +116,9 @@ materials and `isMask` flags.
 - replay determinism
 - hard-coded pre-feature request hashes and artifact equality for omitted
   blocks
+- the exact reviewer partial-list repro rejected before native
+- direct-worker `"nan"`, `"inf"`, bool and huge-int values rejected before any
+  numeric conversion or native constructor
 - negative schema and incompatible-geometry cases
 
 The repository-wide suite in a worktree without the untracked `docs/*-evidence`
