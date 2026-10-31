@@ -52,6 +52,10 @@ from worker.artifacts import (artifact_bytes_used, atomic_json, check_artifact_b
 from worker.engine_policy import (multi_ion_gpu_step, native_slice_position,
                                   requested_engine_for_step, require_multi_ion_flux_fields,
                                   require_multi_ion_gpu_policy, verify_worker_engine_evidence)
+from worker.steps.cellset import run_cell_set_step
+from worker.steps.context import RunContext
+from worker.steps.geometry import run_geometry_step
+from worker.steps.noop import run_no_op_step
 MATERIAL_CATALOG = json.loads((ROOT / "docs" / "materials-catalog.json").read_text(encoding="utf-8"))
 MATERIAL_ROWS = MATERIAL_CATALOG["materials"]
 MATERIAL_NAMES = {int(row["id"]): row["name"] for row in MATERIAL_ROWS}
@@ -4830,175 +4834,38 @@ def execute(input_path: Path, run_dir: Path) -> None:
                             "cudaDeviceReadback": flux_result["cudaDeviceReadback"]})
         event(run_dir, {"type": "flux-result", **flux_result})
 
+    ctx = RunContext(
+        project=project,
+        ps=ps,
+        domain=domain,
+        run_dir=run_dir,
+        run_id=run_id,
+        config=config,
+        actual_steps=actual_steps,
+        step_engines=step_engines,
+        engine_preference=engine_preference,
+        run_seed=run_seed,
+        selected_gpu_device=selected_gpu_device,
+        cuda_readback=cuda_readback,
+        gpu_sample=gpu_sample,
+        native_engine_fingerprint=native_engine_fingerprint,
+        ps_version=ps_version,
+        ls_version=ls_version,
+        snapshots=snapshots,
+        field_state=field_state,
+        actual_execution=actual_execution,
+        intermediate_outputs=intermediate_outputs,
+    )
     for index, step in enumerate(actual_steps, start=1):
         event(run_dir, {"type": "step-started", "stepId": step["id"], "index": index, "total": len(actual_steps), "name": step["name"]})
         geometry_step = is_geometry_step(step)
         no_op = not geometry_step and not has_motion(step)
         if step.get("model") in CELL_SET_PROCESS_MODELS:
-            # Native 4.7.0 cell-set field steps. They never advance the level
-            # sets; the surface snapshot is the unchanged Domain and the real
-            # output is the native DenseCellSet plus its compact summary.
-            from backend.implant_models import numeric_guard_messages
-            guard_messages = numeric_guard_messages(
-                step, dimension=project["dimension"],
-                grid_delta=float(domain.getGridDelta()))
-            if guard_messages:
-                # Defense in depth: a hand-edited input.json bypasses the API
-                # validator, but must never reach a native constructor with a
-                # value the schema would reject.
-                raise RuntimeError(" ".join(guard_messages))
-            cell_set_applied = {
-                "implant": apply_implant_step,
-                "anneal": apply_anneal_step,
-                "analysis": apply_analysis_step,
-            }[step["model"]]
-            record, cell_set_outputs = cell_set_applied(
-                ps, domain, project, step, run_dir=run_dir, run_id=run_id,
-                state=field_state)
-            event(run_dir, {"type": "step-configured", "stepId": step["id"],
-                            "operation": "native", "model": step["model"], "noOp": False,
-                            "actualEngine": "not-applicable",
-                            "engineSelectionReason": "native cell-set field model; no ray flux engine or surface advection",
-                            "requestedEnginePreference": engine_preference,
-                            "actualSeed": None, "actualRate": None,
-                            "duration": 0.0, "actualParameters": record})
-            previous_tops = snapshots[-1].get("materialTops")
-            metadata = save_snapshot(ps, domain, run_dir, run_id=run_id, step_id=step["id"],
-                                     step_name=step["name"], step_index=index, requested=project,
-                                     step=step, previous_tops=previous_tops,
-                                     extra={"cellSetProcess": record},
-                                     extra_outputs=cell_set_outputs,
-                                     defer_payload=LAZY_SNAPSHOTS)
-            metadata["nativeState"] = save_native_state(ps, domain, run_dir, project=project, run_id=run_id,
-                                                        step_id=step["id"], viennaps_version=ps_version, viennals_version=ls_version)
-            actual_execution.append({"stepId": step["id"], "engine": "not-applicable", "seed": None})
+            metadata = run_cell_set_step(ctx, index, step)
         elif geometry_step:
-            previous_tops = snapshots[-1].get("materialTops")
-            actual_parameters = apply_geometry_operation(ps, domain, project, step,
-                                                         previous_tops=previous_tops,
-                                                         config=config, run_dir=run_dir)
-            event(run_dir, {"type": "step-configured", "stepId": step["id"], "operation": step["model"], "model": step["model"],
-                            "noOp": False, "actualEngine": "not-applicable", "engineSelectionReason": "native geometry operation; no process engine or physical duration",
-                            "actualSeed": None, "actualParameters": actual_parameters})
-            metadata = save_snapshot(ps, domain, run_dir, run_id=run_id, step_id=step["id"], step_name=step["name"], step_index=index, requested=project,
-                                     step=step, previous_tops=previous_tops,
-                                     defer_payload=LAZY_SNAPSHOTS)
-            metadata["nativeState"] = save_native_state(ps, domain, run_dir, project=project, run_id=run_id,
-                                                        step_id=step["id"], viennaps_version=ps_version, viennals_version=ls_version)
-            actual_execution.append({"stepId": step["id"], "engine": "not-applicable", "seed": None})
+            metadata = run_geometry_step(ctx, index, step)
         elif no_op:
-            no_op_parameters: dict[str,Any] = {}
-            if project["schemaVersion"] in (4,5,6,7) and step.get("rateMode") == "material":
-                fallback,no_op_rates=signed_rates(step)
-                no_op_parameters={"rateMode":step["rateMode"],"actualDefaultRate":fallback,
-                                  "actualMaterialRatesByName":no_op_rates,
-                                  "actualMaterialRatesById":{str(MATERIAL_IDS[name]):value for name,value in no_op_rates.items()},
-                                  "nativeRateTable":[{"name":name,"id":MATERIAL_IDS[name],"rate":value} for name,value in sorted(no_op_rates.items())]}
-            if project["schemaVersion"] in (5,6,7) and step.get("model")=="directional":
-                if step.get("rateSets") is not None:
-                    records=directional_rate_set_records(project,step)
-                    for record in records:
-                        record["calculateVisibility"]="not-applicable: no rate is active"
-                    no_op_parameters={"mode":"rateSets","nativeOverload":RATE_SET_OVERLOAD,
-                        "rateSets":records,"rateSetCount":len(records),
-                        "maskMaterials":records[0]["maskMaterials"] if records else [],
-                        "maskMaterialIds":records[0]["maskMaterialIds"] if records else [],
-                        "maskSource":records[0]["maskSource"] if records else None,
-                        "nativeProcess":"viennaps.DirectionalProcess (not called: every rate is zero)"}
-                elif directional_material_mode(step):
-                    material_record=directional_material_rate_records(step)
-                    raw_direction=[float(value) for value in (step.get("direction") or [0.0,0.0,0.0])]
-                    length=math.sqrt(sum(value*value for value in raw_direction))
-                    no_op_parameters={"mode":"materialRates","rateMode":"material",
-                        "nativeClass":"DirectionalProcess","nativeOverload":DIRECTIONAL_MATERIAL_OVERLOAD,
-                        "direction":raw_direction,
-                        "nativeUnitDirection":([value/length for value in raw_direction] if length>1e-12 else None),
-                        "materialRates":material_record["rows"],
-                        "defaultMaterialRate":material_record["requestedDefault"],
-                        "defaultMaterialRateOmitted":material_record["defaultOmitted"],
-                        "nativeDefaultDirectionalRate":material_record["nativeDefault"][0],
-                        "nativeDefaultIsotropicRate":material_record["nativeDefault"][1],
-                        "directionalSign":material_record["directionalSign"],
-                        "isotropicSign":material_record["isotropicSign"],
-                        "calculateVisibility":"not-applicable: no rate is active",
-                        "nativeProcess":"viennaps.DirectionalProcess (not called: every rate is zero)"}
-                else:
-                    native_directional,native_isotropic=signed_directional_rates(step)
-                    raw_direction=[float(value) for value in step["direction"]]
-                    length=math.sqrt(sum(value*value for value in raw_direction))
-                    no_op_parameters={"direction":raw_direction,"nativeUnitDirection":[value/length for value in raw_direction],
-                        "directionalRateMagnitude":float(step["directionalRateMagnitude"]),"isotropicRateMagnitude":float(step["isotropicRateMagnitude"]),
-                        "nativeDirectionalVelocity":native_directional,"nativeIsotropicVelocity":native_isotropic,
-                        "calculateVisibility":"not-applicable: no rate is active"}
-            if step.get("model")=="multiParticle":
-                no_op_parameters={"nativeProcess":"viennaps.MultiParticleProcess (not called: zero coefficient)",
-                    "species":step["species"],"rateCoefficients":step["rateCoefficients"],
-                    "rateFunction":"not-applicable: all configured coefficients are zero"}
-            previous = snapshots[-1]
-            next_vtk_name = f"{step['id']}.vtk"
-            if previous.get("vtk"):
-                shutil.copyfile(run_dir / previous["vtk"], run_dir / next_vtk_name)
-            previous_path = run_dir / previous["snapshot"]
-            copied = None
-            if previous_path.is_file():
-                copied = json.loads(previous_path.read_text(encoding="utf-8"))
-                copied_mesh = dict(copied["mesh"])
-                if previous.get("vtk"):
-                    copied_mesh["vtk"] = next_vtk_name
-                else:
-                    copied_mesh.pop("vtk", None)
-                copied.update({"stepId": step["id"], "stepName": step["name"], "stepIndex": index, "noOp": True,
-                               "mesh": copied_mesh})
-                # The copied surface is the previous step's; its measured
-                # add/remove record belongs to that step, not to this no-op.
-                for key in ("measuredRemoval", "measuredAdded"):
-                    copied.pop(key, None)
-            # A zero-rate step still owns its requested output settings. Build
-            # this step's real cell set from the unchanged Domain. Only the
-            # generic cell-set rows are replaced/relocated to this step; every
-            # unrelated output row (nativeMetadata, level sets, surface mesh,
-            # ...) stays exactly as copied from the predecessor.
-            no_op_cell_set_settings = (project.get("outputSettings") or {}).get("cellSet")
-            no_op_cell_set_enabled = (isinstance(no_op_cell_set_settings, dict)
-                                      and bool(no_op_cell_set_settings.get("enabled")))
-            no_op_outputs: list[dict[str, Any]] = []
-            inherited_outputs = ([row for row in (copied.get("outputs") or [])
-                                  if row.get("kind") not in {"cellSet", "cellSetSummary"}]
-                                 if copied is not None else [])
-            if no_op_cell_set_enabled:
-                no_op_mesh = domain.getSurfaceMesh(addInterfaces=True, sharpCorners=False,
-                                                   minNodeDistanceFactor=0.01)
-                no_op_top, no_op_bottom = _surface_vertical_bounds(
-                    no_op_mesh.getNodes(), is3d=project["dimension"] == 3)
-                no_op_outputs = write_cell_set_outputs(
-                    ps, domain, run_dir, run_id, step["id"], project,
-                    no_op_cell_set_settings, surface_top=no_op_top,
-                    surface_bottom=no_op_bottom, is3d=project["dimension"] == 3)
-                no_op_outputs = no_op_outputs + inherited_outputs
-            if copied is not None:
-                if no_op_cell_set_enabled:
-                    copied["outputs"] = no_op_outputs
-                atomic_json(run_dir / f"{step['id']}.json", copied)
-            check_artifact_budget(run_dir)
-            metadata = {"stepId": step["id"], "name": step["name"], "stepIndex": index, "snapshot": f"{step['id']}.json",
-                        **({"vtk": next_vtk_name} if previous.get("vtk") else {}),
-                        "pointCount": previous["pointCount"], **{k:previous[k] for k in ("lineCount","triangleCount","topology","dimension") if k in previous},
-                        "materialIds": previous["materialIds"], "materialIdsByLevelSetIndex": previous["materialIdsByLevelSetIndex"], "noOp": True,
-                        "measuredGeometry": (copied or previous).get("measuredGeometry"),
-                        "materialTops": previous.get("materialTops")}
-            if no_op_cell_set_enabled:
-                metadata["outputs"] = no_op_outputs
-            if copied is None:
-                # Previous step is deferred: this no-op step shares its native
-                # state and is materialised from state-<step>.vpsd on first read.
-                atomic_json(run_dir / f"{step['id']}.meta.json",
-                            {"schemaVersion": 1, "deferred": True, "metadata": metadata})
-            metadata["nativeState"] = save_native_state(ps, domain, run_dir, project=project, run_id=run_id,
-                                                        step_id=step["id"], viennaps_version=ps_version, viennals_version=ls_version)
-            event(run_dir, {"type": "step-configured", "stepId": step["id"], "operation": step["operation"], "model": step["model"],
-                            "noOp": True, "actualEngine": "not-applicable", "engineSelectionReason": "zero rate; ViennaPS Process was not called",
-                            "actualSeed": None, "actualRate": 0.0, "duration": step["duration"], "actualParameters": no_op_parameters})
-            actual_execution.append({"stepId": step["id"], "engine": "not-applicable", "seed": None})
+            metadata = run_no_op_step(ctx, index, step)
         else:
             deposition = step["operation"] == "deposit"
             directional = project["schemaVersion"] in (5,6,7) and step.get("model")=="directional"
