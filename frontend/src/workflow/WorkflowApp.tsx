@@ -892,6 +892,18 @@ const OPERATION_STEP_MODELS = new Set(['isotropic', 'singleParticle', 'direction
 const RATE_STEP_MODELS = new Set(['isotropic', 'singleParticle', 'directional']);
 const RATE_MODE_STEP_MODELS = new Set(['isotropic', 'singleParticle']);
 const DEPOSIT_STEP_MODELS = new Set(['isotropic', 'singleParticle', 'directional', 'multiParticle', 'specialized']);
+// Only these step models declare a `duration` in backend/models.py. In
+// particular gdsBoolean/planarize/removeMaterial/boolean are pure geometry
+// operations, and particleShape/implant/anneal/analysis carry their own time
+// fields — a stray `duration` makes the strict model reject the project.
+const DURATION_STEP_MODELS = new Set(['isotropic', 'singleParticle', 'directional', 'multiParticle', 'specialized', 'csvProcess']);
+const GEOMETRY_ONLY_STEP_MODELS = new Set(['gdsBoolean', 'planarize', 'removeMaterial', 'boolean']);
+// Backend ProjectV7 domain floors. Domain.xExtent uses the historical 1 um
+// floor; Domain3D.x/yExtent use MIN_DOMAIN_EXTENT_3D (0.1) plus a two-cell
+// minimum. The form mirrors them so a backend-valid project can always save.
+const MIN_DOMAIN_EXTENT_2D = 1;
+const MIN_DOMAIN_EXTENT_3D = 0.1;
+const MAX_DOMAIN_EXTENT = 40;
 
 /**
  * Hard masks and resists are pattern materials, not deposition sources. The
@@ -919,10 +931,38 @@ function sanitizeProjectStep(step: ProjectStep, materialNames: string[]): Projec
   const next: ProjectStep = { ...step };
   const model = String(next.model ?? 'isotropic');
   const operation = String(next.operation ?? 'etch');
+  const geometryOnly = GEOMETRY_ONLY_STEP_MODELS.has(model);
+  // Directional `rateSets` is a mutually exclusive alternative to the scalar
+  // direction/rate triple. Keeping both (or injecting the scalar placeholder)
+  // makes the strict DirectionalStepV5 reject an otherwise valid project.
+  const hasRateSets = model === 'directional'
+    && Array.isArray(next.rateSets) && next.rateSets.length > 0;
   if (OPERATION_STEP_MODELS.has(model)) {
     if (operation !== 'deposit' && operation !== 'etch') next.operation = 'etch';
   } else if (model !== 'specialized') {
     delete next.operation;
+  }
+  if (geometryOnly) {
+    // Geometry-only models accept only id/name/enabled/model plus their own
+    // mask/cutoff/material fields. A model switch must not carry any shared
+    // process scalar into them: the strict backend rejects every extra key.
+    delete next.operation;
+    delete next.duration;
+    delete next.rateMagnitude;
+    delete next.directionalRateMagnitude;
+    delete next.isotropicRateMagnitude;
+    delete next.rateMode;
+    delete next.materialRates;
+    delete next.rateSets;
+    delete next.depositMaterial;
+    delete next.stickingProbability;
+    delete next.sourceExponent;
+    delete next.direction;
+    delete next.calculateVisibility;
+  } else if (!DURATION_STEP_MODELS.has(model)) {
+    // Models whose time lives in their own fields (particleShape/implant/
+    // anneal/analysis) do not declare `duration`.
+    delete next.duration;
   }
   if (operation !== 'deposit' || !DEPOSIT_STEP_MODELS.has(model)) {
     delete next.depositMaterial;
@@ -951,12 +991,27 @@ function sanitizeProjectStep(step: ProjectStep, materialNames: string[]): Projec
   if (!RATE_STEP_MODELS.has(model)) {
     delete next.rateMagnitude;
     delete next.directionalRateMagnitude;
+    delete next.isotropicRateMagnitude;
+  } else if (model === 'directional' && hasRateSets) {
+    // Scalar-only fields must be absent, including `direction`.
+    delete next.direction;
+    delete next.rateMagnitude;
+    delete next.directionalRateMagnitude;
+    delete next.isotropicRateMagnitude;
   } else if (model === 'directional') {
     delete next.rateMagnitude;
     if (typeof next.directionalRateMagnitude !== 'number') next.directionalRateMagnitude = 0.02;
   } else {
     delete next.directionalRateMagnitude;
+    delete next.isotropicRateMagnitude;
   }
+  // rateSets belongs to directional only; an empty array is not a mode, so it
+  // falls back to the scalar path instead of sending `rateSets: []`.
+  if (model !== 'directional' || !hasRateSets) delete next.rateSets;
+  // Model-specific payloads (specialized.nativeParameters, gdsBoolean.gdsMask,
+  // planarize.cutoffHeight/stopMaterial/overPolish, removeMaterial.material)
+  // are intentionally left untouched: only the shared scalar fields above are
+  // normalized.
   return next;
 }
 
@@ -980,7 +1035,63 @@ const STEP_LABELS: Record<string, string> = {
   planarize: '平坦化',
   removeMaterial: '移除材料',
   boolean: '布尔几何',
+  gdsBoolean: 'GDS 布尔',
+  csvProcess: 'CSV 速率表',
+  particleShape: '粒子形状',
+  implant: '注入',
+  anneal: '退火',
+  analysis: '分析',
 };
+
+const BOOLEAN_OPERATION_LABELS: Record<string, string> = {
+  union: '并集',
+  intersection: '交集',
+  difference: '差集',
+};
+
+/**
+ * Short, capability-aware description of a geometry-only step for the 02 step
+ * table: the parameters the backend actually reads, not just the model name.
+ */
+function geometryStepSummary(step: ProjectStep): string {
+  const model = String(step.model ?? '');
+  const format = (value: unknown) => (typeof value === 'number' ? String(value) : String(value ?? ''));
+  switch (model) {
+    case 'gdsBoolean': {
+      const mask = (step.gdsMask ?? {}) as Record<string, unknown>;
+      const layer = mask.layer ?? '?';
+      const datatype = mask.datatype ?? 0;
+      const operation = BOOLEAN_OPERATION_LABELS[String(step.booleanOperation ?? '')] ?? String(step.booleanOperation ?? '—');
+      const retained = mask.retainedRegion === 'outside' ? ' · 保留外侧' : '';
+      return `${operation} · L${layer}/${datatype}${retained}`;
+    }
+    case 'planarize': {
+      if (step.stopMaterial) {
+        const overPolish = typeof step.overPolish === 'number' ? ` · 过抛 ${format(step.overPolish)} µm` : '';
+        return `停在 ${String(step.stopMaterial)}${overPolish}`;
+      }
+      return step.cutoffHeight === undefined || step.cutoffHeight === null
+        ? '未设置切削高度'
+        : `切削 ${format(step.cutoffHeight)} µm`;
+    }
+    case 'removeMaterial':
+      return step.material ? `移除 ${String(step.material)}` : '未选择材料';
+    case 'specialized':
+      return String(step.nativeModel ?? '未选择原生模型');
+    case 'boolean': {
+      const operation = BOOLEAN_OPERATION_LABELS[String(step.booleanOperation ?? '')] ?? String(step.booleanOperation ?? '—');
+      return `${operation} · ${String(step.position ?? '')}`.trim();
+    }
+    case 'csvProcess':
+      return [step.fileName, step.interpolationMode].filter(Boolean).map(String).join(' · ') || 'CSV 速率表';
+    case 'particleShape':
+      return step.shape === 'sphere'
+        ? `球 · r=${format(step.radius)} µm`
+        : `盒 · ${Array.isArray(step.halfAxes) ? (step.halfAxes as unknown[]).map(format).join(' × ') : '?'} µm`;
+    default:
+      return '';
+  }
+}
 
 function errorText(payload: unknown): string {
   let text = '请求失败';
@@ -1934,11 +2045,14 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     const solver = (project.solver ?? {}) as Record<string, unknown>;
     const gridDelta = Number(domain.gridDelta);
     const xExtent = Number(domain.xExtent);
+    const is3D = project.dimension === 3;
+    // Same floors as backend Domain (2D) / Domain3D (3D).
+    const minExtent = is3D ? MIN_DOMAIN_EXTENT_3D : MIN_DOMAIN_EXTENT_2D;
     if (!Number.isFinite(gridDelta) || gridDelta <= 0 || gridDelta > 0.5) errors['domain.gridDelta'] = 'gridDelta 必须 > 0 且 ≤ 0.5 µm';
-    if (!Number.isFinite(xExtent) || xExtent < 1 || xExtent > 40) errors['domain.xExtent'] = 'xExtent 必须在 1–40 µm';
-    if (project.dimension === 3) {
+    if (!Number.isFinite(xExtent) || xExtent < minExtent || xExtent > MAX_DOMAIN_EXTENT) errors['domain.xExtent'] = `xExtent 必须在 ${minExtent}–${MAX_DOMAIN_EXTENT} µm`;
+    if (is3D) {
       const yExtent = Number(domain.yExtent);
-      if (!Number.isFinite(yExtent) || yExtent < 1 || yExtent > 40) errors['domain.yExtent'] = 'yExtent 必须在 1–40 µm';
+      if (!Number.isFinite(yExtent) || yExtent < minExtent || yExtent > MAX_DOMAIN_EXTENT) errors['domain.yExtent'] = `yExtent 必须在 ${minExtent}–${MAX_DOMAIN_EXTENT} µm`;
       if (Number.isFinite(gridDelta) && gridDelta > 0) {
         const minimum = 2 * gridDelta;
         if (xExtent < minimum) errors['domain.xExtent'] = `3D xExtent 至少为 2×gridDelta（${minimum} µm）`;
@@ -2885,6 +2999,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const selectedStepOperation = String(selectedFlowStep?.operation ?? 'etch');
   const stepModelOptions = Array.from(new Set([selectedStepModel, ...EDITABLE_STEP_MODELS].filter(Boolean)));
   const stepSupportsOperation = OPERATION_STEP_MODELS.has(selectedStepModel);
+  const stepSupportsDuration = DURATION_STEP_MODELS.has(selectedStepModel);
   const stepSupportsRate = RATE_STEP_MODELS.has(selectedStepModel);
   const stepSupportsRateMode = RATE_MODE_STEP_MODELS.has(selectedStepModel);
   const stepSupportsDepositMaterial = selectedStepOperation === 'deposit'
@@ -3334,20 +3449,51 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setDraft(previous => ({ ...previous, [key]: value }));
   };
 
-  const loadSample = (sample: Record<string, unknown>, label: string) => {
+  /**
+   * Gallery starter. A GDS sample (e.g. finfet22-bare-wafer) must reopen its
+   * layout binding exactly like an imported project: the sample cannot upload
+   * anything, so the registered Clip/Layout is resolved by asset/file name.
+   * A missing asset is announced instead of silently flipping to parametric,
+   * which would drop the demo's 3D mask stack.
+   */
+  const loadSample = async (sample: Record<string, unknown>, label: string) => {
     setProject(sample as ProjectDoc);
     setProjectId('');
     setSavedProjectJson('');
     setProjectSavedAt('');
     setProjectNotice('');
     resetProjectScopedState();
-    setProjectGeometrySource({ kind: 'parametric' });
+    const geometry = (sample.geometry ?? {}) as Record<string, unknown>;
+    const isGds = geometry.kind === 'gds';
+    if (isGds) {
+      // A GDS uploaded for the previous project must not rename this asset.
+      setGds(null);
+      parametricGeometryRef.current = null;
+      setProjectGeometrySource({
+        kind: 'layout',
+        clipName: typeof geometry.fileName === 'string' ? geometry.fileName : 'GDS Clip',
+      });
+    } else {
+      parametricGeometryRef.current = geometry;
+      setProjectGeometrySource({ kind: 'parametric' });
+    }
     setProjectState(emptyWorkflowState());
     lastStateJson.current = '';
     setRestoreNotice('');
     setStateNotice('');
-    parametricGeometryRef.current = (sample.geometry ?? null) as Record<string, unknown> | null;
     setSetupMode('project');
+    if (isGds) {
+      try {
+        const binding = await resolveClipBinding(sample as ProjectDoc);
+        await activateClipBinding(binding);
+        if (!binding?.clipId && !binding?.layoutId) {
+          const fileName = typeof geometry.fileName === 'string' ? geometry.fileName : 'GDS';
+          setRestoreNotice(`示例「${label}」引用的 GDS 资源 ${fileName} 尚未在本机注册；请在 01 上传同名 GDS 或重新选择 Clip 后再编译。`);
+        }
+      } catch (exc) {
+        setRestoreNotice(`示例「${label}」的 GDS 资源无法解析：${exc instanceof Error ? exc.message : String(exc)}`);
+      }
+    }
     setActivityLog(previous => [...previous.slice(-79), `${clockTime()}  已载入示例: ${label}`]);
   };
 
@@ -3550,11 +3696,13 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     }
     if (route && !rebuild) { navigateZone('run'); return; }
     const enabledSteps = compile.compile.project.steps.filter(step => step.enabled);
-    const splitAfterStepId = enabledSteps.length > 1 ? enabledSteps[enabledSteps.length - 2].id : undefined;
+    // One Segment for the whole compiled flow. A split at the second-to-last
+    // step was a historical default, not a native requirement: it forced a
+    // checkpoint/restart in the middle of a 23-step demo. The API still accepts
+    // splitAfterStepId for callers that explicitly want a checkpoint.
     const result = await postJson<{ plan: RoutePlan }>('/api/v1/workflow/routes/from-compile', {
       compileId: compile.compileId,
       name: `${compile.projectName} · Route`,
-      splitAfterStepId,
     });
     // Never replace a working Route with one that silently dropped an enabled
     // compiled step: the old Route stays intact and the banner explains why.
@@ -5999,9 +6147,14 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
           : `已保存${projectSavedAt ? ` · ${formatDateTime(projectSavedAt)}` : ''}`;
   const renderDomainField = (label: string, key: 'gridDelta' | 'xExtent' | 'yExtent', step = '0.01', title?: string) => {
     const error = projectFormErrors[`domain.${key}`];
+    // gridDelta has no backend floor beyond > 0; extents use the dimension's
+    // real floor so the spinner/validation cannot re-impose the old 1 µm rule.
+    const min = key === 'gridDelta'
+      ? 0
+      : project?.dimension === 3 ? MIN_DOMAIN_EXTENT_3D : MIN_DOMAIN_EXTENT_2D;
     return <label className={`spx-field${error ? ' invalid' : ''}`} key={key}>
       <span title={title ?? key}>{label}</span>
-      <input aria-label={`工程 ${key}`} type="number" step={step} value={String(projectDomain[key] ?? '')}
+      <input aria-label={`工程 ${key}`} type="number" min={min} max={key === 'gridDelta' ? 0.5 : MAX_DOMAIN_EXTENT} step={step} value={String(projectDomain[key] ?? '')}
         aria-invalid={!!error}
         onChange={event => updateProjectDomain({ [key]: Number(event.target.value) })} />
       {error && <em className="spx-field-error">{error}</em>}
@@ -6333,7 +6486,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             <div className="spx-samples">
               {SAMPLE_EXAMPLES.map(item => <button type="button" className="spx-sample" key={item.id}
                 data-example-id={item.id} title={`${item.source}\n${item.note}`}
-                onClick={() => loadSample(item.sample, item.label)}>
+                onClick={() => { void loadSample(item.sample, item.label); }}>
                 <strong>{item.label}</strong>
                 <span>{item.meta}</span>
                 <em>载入示例</em>
@@ -6558,9 +6711,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                     <button type="button" className={project.dimension === 3 ? 'active' : ''} onClick={() => changeProjectDimension(3)}>3D</button>
                   </div>
                 </div>
-                {renderDomainField('网格步长 (µm)', 'gridDelta', '0.01', 'gridDelta')}
-                {renderDomainField('X 范围 (µm)', 'xExtent', '0.01', 'xExtent')}
-                {project.dimension === 3 && renderDomainField('Y 范围 (µm)', 'yExtent', '0.01', 'yExtent')}
+                {renderDomainField('网格步长 (µm)', 'gridDelta', '0.001', 'gridDelta')}
+                {renderDomainField('X 范围 (µm)', 'xExtent', '0.1', 'xExtent')}
+                {project.dimension === 3 && renderDomainField('Y 范围 (µm)', 'yExtent', '0.1', 'yExtent')}
                 <label className="spx-field"><span>{project.dimension === 3 ? '边界 XY' : '边界 X'}</span>
                   <select aria-label="工程边界类型"
                     value={String((project.dimension === 3 ? projectDomain.boundaryXY : projectDomain.xBoundary) ?? 'reflective')}
@@ -6787,6 +6940,12 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                           ? Number(step.directionalRateMagnitude ?? 0)
                           : Number(step.rateMagnitude ?? 0);
                         const rateText = RATE_STEP_MODELS.has(step.model) ? `${rate} µm/s` : '—';
+                        const modelLabel = STEP_LABELS[step.model] ?? step.model;
+                        const operationLabel = step.operation === 'deposit' ? '沉积' : step.operation === 'etch' ? '刻蚀' : (step.operation ?? '');
+                        // Geometry steps carry their capability in model fields
+                        // (mask layer, cutoff, material, native model), not in a
+                        // rate/duration, so the model cell names them.
+                        const capability = geometryStepSummary(step);
                         return <tr key={step.id}
                           draggable
                           className={`${selectedFlowStepId === step.id ? 'selected' : ''}${materialTarget && step.depositMaterial === materialTarget.material ? ' material-match' : ''}`}
@@ -6810,8 +6969,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                         >
                           <td>{String(index + 1).padStart(2, '0')}</td>
                           <td className="wf-step-name" title={step.name}>{step.name}</td>
-                          <td>{step.operation === 'deposit' ? '沉积' : step.operation === 'etch' ? '刻蚀' : (step.operation ?? '—')} · {STEP_LABELS[step.model] ?? step.model}</td>
-                          <td>{`${Number(step.duration ?? 0)} s · ${rateText}`}</td>
+                          <td>{[operationLabel, modelLabel, capability].filter(Boolean).join(' · ')}</td>
+                          <td>{DURATION_STEP_MODELS.has(step.model) ? `${Number(step.duration ?? 0)} s · ${rateText}` : '—'}</td>
                           <td>{step.enabled ? '启用' : '跳过'}</td>
                           <td className="wf-step-order">
                             <button type="button" className="wf-step-move" aria-label={`上移 ${step.name}`} disabled={index === 0}
@@ -6841,7 +7000,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                       {stepModelOptions.map(model => <option key={model} value={model}>{STEP_LABELS[model] ?? model}</option>)}
                     </select>
                   </label>
-                  <label className="spx-field" data-field="duration"><span title="duration">时长（s）</span><input aria-label="步骤时长" type="number" step="0.01" value={Number(selectedFlowStep.duration ?? 0)} onChange={event => updateSelectedStep({ duration: Number(event.target.value) })} /></label>
+                  {stepSupportsDuration && <label className="spx-field" data-field="duration"><span title="duration">时长（s）</span><input aria-label="步骤时长" type="number" step="0.01" value={Number(selectedFlowStep.duration ?? 0)} onChange={event => updateSelectedStep({ duration: Number(event.target.value) })} /></label>}
                   {stepSupportsRate && <label className="spx-field" data-field="rate"><span title={selectedRateField}>速率（µm/s）</span><input aria-label="步骤速率" type="number" step="0.01" value={selectedRateValue} onChange={event => updateSelectedStep({ [selectedRateField]: Number(event.target.value) })} /></label>}
                   {stepSupportsRateMode && <label className="spx-field" data-field="rateMode"><span title="rateMode">速率模式</span>
                     <select aria-label="步骤速率模式" value={String(selectedFlowStep.rateMode ?? 'uniform')} disabled={selectedStepOperation !== 'etch'} onChange={event => updateSelectedStep({ rateMode: event.target.value })}>
