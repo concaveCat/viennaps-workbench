@@ -1571,14 +1571,19 @@ function structureChains(edges: Array<[number, number]>): number[][] {
   return chains;
 }
 
-type StructureFill = { materialId: number; coords: Array<[number, number]>; closed: boolean };
+type StructureFill = { materialId: number; path: string };
 
 /**
- * Fill the material below every interface line down to the bottom of the view,
- * one polygon per material chain. Overlaps between materials stack their
- * translucency (the outlines are drawn afterwards and stay crisp).
+ * Fill the material below every interface line down to the bottom of the view.
+ *
+ * A material can own more than one chain: a conformal film that pinches off
+ * leaves a closed loop around a void next to the open top surface. Filling each
+ * chain as its own polygon paints that void as material (and overlaps the top
+ * fill). One compound path per material with ``fill-rule: evenodd`` keeps the
+ * closed loop as a hole instead. Overlaps between different materials still
+ * stack their translucency; the outlines are drawn afterwards and stay crisp.
  */
-function structureFillPolygons(view: CandidateView, points: Array<[number, number]>): StructureFill[] {
+function structureFillPolygons(view: CandidateView, points: Array<[number, number]>, fillBottom: number): StructureFill[] {
   if (view.dimension !== 2 || !view.lines.length) return [];
   const byMaterial = new Map<number, Array<[number, number]>>();
   view.lines.forEach((line, index) => {
@@ -1594,15 +1599,18 @@ function structureFillPolygons(view: CandidateView, points: Array<[number, numbe
   });
   const fills: StructureFill[] = [];
   for (const [materialId, edges] of byMaterial) {
+    const subpaths: string[] = [];
     for (const chain of structureChains(edges)) {
       const closed = chain.length > 2 && chain[0] === chain[chain.length - 1];
       const coords = chain.map(index => points[index]);
       if (!closed) {
         const xs = coords.map(([x]) => x);
         if (Math.max(...xs) - Math.min(...xs) < 1e-12) continue;
+        coords.push([coords[coords.length - 1][0], fillBottom], [coords[0][0], fillBottom]);
       }
-      fills.push({ materialId, coords, closed });
+      subpaths.push(`${coords.map(([x, y], index) => `${index === 0 ? 'M' : 'L'}${x},${-y}`).join(' ')} Z`);
     }
+    if (subpaths.length) fills.push({ materialId, path: subpaths.join(' ') });
   }
   return fills;
 }
@@ -1793,8 +1801,6 @@ function StructureCanvas({ view, frame, axis = 'xy', marker = null, note = null,
     const entry = materialId === undefined ? undefined : view.materials?.[String(materialId)];
     return isHexColor(entry?.color ?? '') ? String(entry?.color) : '#9aa3ab';
   };
-  const points = view.points.map(point => structurePoint(point, axes));
-  const fills = structureFillPolygons(view, points);
   // Zoom keeps the plot center fixed; the pan offset is expressed in screen
   // pixels and converted to world units with the *current* rendered scale.
   const centerU = (frame.minU + frame.maxU) / 2;
@@ -1810,15 +1816,17 @@ function StructureCanvas({ view, frame, axis = 'xy', marker = null, note = null,
     unit: frame.unit,
     flatV: frame.flatV,
   };
+  const points = view.points.map(point => structurePoint(point, axes));
+  const fills = structureFillPolygons(view, points, viewFrame.minV);
   const uTicks = showAxes ? axisTicks(viewFrame.minU, viewFrame.maxU) : [];
   const vTicks = showAxes ? axisTicks(viewFrame.minV, viewFrame.maxV) : [];
-  // Plot area in SVG coordinates (y grows downwards). `fillBottom` stays in data
-  // coordinates because the fills are mapped with `-y`.
+  // Plot area in SVG coordinates (y grows downwards). The fills close on
+  // `viewFrame.minV`, which is in data coordinates because they are mapped with
+  // `-y`, so a panned/zoomed viewport still fills to its own bottom.
   const plotLeft = viewFrame.minU;
   const plotRight = viewFrame.maxU;
   const plotTop = -viewFrame.maxV;
   const plotBottom = -viewFrame.minV;
-  const fillBottom = viewFrame.minV;
   // Margins live outside the plot so the axis titles, the tick labels, the
   // scale bar and the depth/surface note never sit on the structure or on each
   // other (N7).
@@ -1866,15 +1874,12 @@ function StructureCanvas({ view, frame, axis = 'xy', marker = null, note = null,
       x1={tick} y1={plotBottom} x2={tick} y2={plotTop} stroke="#e6eaee" strokeWidth={strokeWidth} />)}
     {showAxes && vTicks.map(tick => <line key={`vg-${tick}`} className="wf-axes wf-axes-grid"
       x1={plotLeft} y1={-tick} x2={plotRight} y2={-tick} stroke="#e6eaee" strokeWidth={strokeWidth} />)}
-    {fills.map((fill, index) => {
-      const coords = fill.closed
-        ? fill.coords
-        : [...fill.coords, [fill.coords[fill.coords.length - 1][0], fillBottom], [fill.coords[0][0], fillBottom]];
-      return <polygon key={`f-${index}`} className="wf-fill" data-material={fill.materialId}
+    {fills.map((fill, index) => (
+      <path key={`f-${index}`} className="wf-fill" data-material={fill.materialId}
         clipPath={`url(#${clipId})`}
-        points={coords.map(([x, y]) => `${x},${-y}`).join(' ')}
-        fill={colorOf(fill.materialId)} fillOpacity={0.3} stroke="none" />;
-    })}
+        d={fill.path} fillRule="evenodd"
+        fill={colorOf(fill.materialId)} fillOpacity={0.3} stroke="none" />
+    ))}
     {view.dimension === 2
       ? (view.lines.length
         ? view.lines.map((line, index) => {
