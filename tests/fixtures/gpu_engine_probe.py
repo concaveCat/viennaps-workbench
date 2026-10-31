@@ -25,7 +25,7 @@ def run_operation(operation: str, output_dir: Path) -> dict[str, object]:
     duration = 0.2
     magnitude = 0.2
 
-    domain = ps.Domain(delta, extent, ps.BoundaryType.REFLECTIVE_BOUNDARY)
+    domain = ps.Domain(delta, extent, boundary=ps.BoundaryType.REFLECTIVE_BOUNDARY)
     ps.MakePlane(domain, height=0.0, material=ps.Material.Si, addToExisting=False).apply()
     depositing = operation == "deposit"
     if depositing:

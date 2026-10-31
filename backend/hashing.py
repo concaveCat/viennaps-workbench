@@ -38,6 +38,10 @@ def _applicable_solver(project: Project | ProjectV3 | ProjectV4 | ProjectV5 | Pr
         data["advection"] = project.solver.advection.model_dump(mode="json")
         if project.solver.gpuDeviceId is not None:
             data["gpuDeviceId"] = project.solver.gpuDeviceId
+        if project.solver.gpuEngine is not None:
+            # Engine identity is part of the requested simulation input: a
+            # GPU_TRIANGLE request must never hash the same as GPU_DISK.
+            data["gpuEngine"] = project.solver.gpuEngine
     if any((uses_flux(step) if project.schemaVersion in (4, 5, 6, 7) else _step_value(step,"model")=="singleParticle" and _step_value(step,"rateMagnitude")>0) for step in project.steps if _step_value(step,"enabled")):
         data.update(
             raysPerPoint=project.solver.raysPerPoint,
@@ -52,6 +56,16 @@ def _applicable_solver(project: Project | ProjectV3 | ProjectV4 | ProjectV5 | Pr
 def requested_input(project: Project | ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 | ProjectV7) -> dict[str, Any]:
     geometry = json.loads(json.dumps(project.geometry)) if isinstance(project.geometry,dict) else project.geometry.model_dump(mode="json", exclude_none=True)
     if project.schemaVersion in (3,4,5,6,7) and geometry.get("kind") == "stack":
+        pattern = geometry.get("pattern") or {}
+        if pattern.get("layers"):
+            # Layer IDs are deliberately hash-neutral. Resolve ID references to
+            # positions before the IDs are removed so a pure rename keeps the
+            # request hash stable for per-layer stacks too.
+            by_id = {layer["id"]: index for index, layer in enumerate(geometry["layers"])}
+            for entry in pattern["layers"]:
+                if entry.get("layerId") is not None:
+                    entry["layerIndex"] = by_id[entry["layerId"]]
+                    entry.pop("layerId", None)
         for layer in geometry["layers"]:
             layer.pop("id", None)
             layer.pop("name", None)
@@ -67,7 +81,21 @@ def requested_input(project: Project | ProjectV3 | ProjectV4 | ProjectV5 | Proje
         if project.schemaVersion in (4,5,6,7):
             item.pop("selectivityReference",None)
         if project.schemaVersion in (5,6,7) and item.get("model") == "directional":
-            if float(item.get("directionalRateMagnitude", 0.0)) == 0.0:
+            if item.get("rateSets") is not None:
+                # The multi-set surface is additive: each set normalizes its own
+                # direction, and a set without a directional magnitude cannot
+                # consume its direction or visibility natively. Mirroring the
+                # scalar rule keeps hashes equal for physically equal inputs.
+                for rate_set in item["rateSets"]:
+                    if float(rate_set.get("directionalVelocity", 0.0)) == 0.0:
+                        rate_set.pop("direction", None)
+                        rate_set.pop("calculateVisibility", None)
+                    else:
+                        direction = rate_set.get("direction", [0.0, 0.0, 0.0])
+                        norm = math.sqrt(sum(float(value) ** 2 for value in direction))
+                        if norm > 0.0:
+                            rate_set["direction"] = [float(value) / norm for value in direction]
+            elif float(item.get("directionalRateMagnitude", 0.0)) == 0.0:
                 item.pop("direction", None)
                 item.pop("calculateVisibility", None)
             else:
@@ -95,7 +123,9 @@ def requested_input(project: Project | ProjectV3 | ProjectV4 | ProjectV5 | Proje
         # the content hash and compatibility metadata define simulation input.
         result["continuationState"] = project.continuationState.model_dump(mode="json", exclude_none=True, exclude={"sourceRunId", "sourceStepId"})
     if project.schemaVersion == 7 and project.outputSettings is not None:
-        result["outputSettings"] = project.outputSettings.model_dump(mode="json")
+        # ``cellSet`` is a new optional block. Excluding None keeps every
+        # historical schema-7 hash stable when the block is omitted.
+        result["outputSettings"] = project.outputSettings.model_dump(mode="json", exclude_none=True)
     definitions = getattr(project, "materialDefinitions", None) or []
     if definitions:
         from .materials import referenced_material_names

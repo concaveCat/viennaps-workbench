@@ -23,9 +23,10 @@ from . import storage
 from . import materials as material_registry
 from .validation import (GPU_MULTIPARTICLE_FLUX_STRATEGY, GPU_MULTIPARTICLE_SPLIT_STRATEGY,
                          GPU_MULTIPARTICLE_NATIVE_STRATEGY, GPU_MULTIPARTICLE_NATIVE_FLUX_STRATEGY,
-                         select_engine, capability_verified,
-                         gpu_project_signature)
+                         select_engine, capability_verified, experimental_cpu_replay_allowed,
+                         gpu_project_signature, slice_position_issue)
 from .native_build import configured_runtime
+from .engine import multi_ion_gpu_error
 from .rates import uses_flux
 from .runtime_limits import max_log_bytes, max_log_mib, rss_limit_mib
 from .gpu_devices import cuda_devices, resolve_gpu_device
@@ -192,8 +193,15 @@ class Supervisor:
             if kind == "slice":
                 if project.get("schemaVersion") != 7 or project.get("dimension") != 3 or project.get("steps"):
                     raise ReplayMismatch("native Slice requires a schema-7 3D geometry project without process steps")
-                if not isinstance(slice_request, dict) or slice_request.get("axis") != 1 or not isinstance(slice_request.get("position"), (int, float)):
-                    raise ReplayMismatch("native Slice requires its verified y-normal axis and finite position")
+                from .models import SliceRequestV7
+                try:
+                    normalized_slice = SliceRequestV7.model_validate(slice_request).model_dump(
+                        mode="json", exclude_none=True)
+                except ValueError as exc:
+                    raise ReplayMismatch(f"native Slice request is invalid: {exc}") from exc
+                slice_request = normalized_slice
+                if issue := slice_position_issue(project, slice_request):
+                    raise ReplayMismatch(issue)
                 request_hash = hashlib.sha256((request_hash + json.dumps(slice_request, sort_keys=True, separators=(",", ":"), allow_nan=False)).encode("utf-8")).hexdigest()
             if kind == "simulate":
                 enabled_steps = [step for step in project["steps"] if step["enabled"]]
@@ -222,10 +230,16 @@ class Supervisor:
             state_path: Path | None = None
             if state_ref is not None:
                 if state_ref.get("viennapsVersion") != ps_version or state_ref.get("viennalsVersion") != ls_version:
-                    raise ReplayMismatch("native Domain state requires a different ViennaPS/ViennaLS version")
+                    raise ReplayMismatch(
+                    f"native Domain state requires ViennaPS {state_ref['viennapsVersion']} / "
+                    f"ViennaLS {state_ref['viennalsVersion']}; installed is {ps_version} / {ls_version}. "
+                    f"Saved state is never reinterpreted under a different runtime.")
                 state_path = storage.resolve_domain_state(state_ref)
             if replay and (replay["viennapsVersion"] != ps_version or replay["viennalsVersion"] != ls_version):
-                raise ReplayMismatch(f"replay requires ViennaPS {replay['viennapsVersion']} / ViennaLS {replay['viennalsVersion']}; installed is {ps_version} / {ls_version}")
+                raise ReplayMismatch(
+                    f"replay requires ViennaPS {replay['viennapsVersion']} / "
+                    f"ViennaLS {replay['viennalsVersion']}; installed is {ps_version} / {ls_version}. "
+                    f"Old runs are never reinterpreted under a different runtime; start the matching runtime.")
             actual_steps = []
             analysis_mode = "flux" if kind == "flux" else "process"
             for step in enabled_steps:
@@ -265,10 +279,25 @@ class Supervisor:
                     capability_model=f"specialized:{step['nativeModel']}" if step.get("model")=="specialized" else step["model"]
                     boundary=project["domain"].get("boundaryXY",project["domain"].get("xBoundary"))
                     signature=gpu_project_signature(project,step)
-                    if not engine.startswith("GPU_") and not capability_verified(project["dimension"],capability_model,step["operation"],boundary,engine,
-                                               schema_version=project["schemaVersion"],
-                                               execution_strategy=execution_strategy,
-                                               flux_strategy=flux_strategy, **signature):
+                    requested_gpu_engine = project.get("solver", {}).get("gpuEngine")
+                    if requested_gpu_engine is not None and engine != requested_gpu_engine:
+                        raise ReplayMismatch(
+                            f"replay engine {engine} differs from the saved solver.gpuEngine {requested_gpu_engine}")
+                    if engine == "GPU_TRIANGLE" and not capability_verified(
+                            project["dimension"], capability_model, step["operation"], boundary, engine,
+                            schema_version=project["schemaVersion"],
+                            execution_strategy=execution_strategy,
+                            flux_strategy=flux_strategy, **signature):
+                        raise ReplayMismatch(
+                            f"GPU_TRIANGLE has no direct-reference acceptance row for {capability_model} "
+                            f"{step['operation']} on {boundary} in {project['dimension']}D; replay is refused "
+                            "instead of falling back to GPU_DISK or CPU_DISK")
+                    if (not engine.startswith("GPU_")
+                            and not capability_verified(project["dimension"],capability_model,step["operation"],boundary,engine,
+                                                        schema_version=project["schemaVersion"],
+                                                        execution_strategy=execution_strategy,
+                                                        flux_strategy=flux_strategy, **signature)
+                            and not experimental_cpu_replay_allowed(step, engine)):
                         raise ReplayMismatch("unverified replay engine, geometry or material combination")
                     if requirement["engine"] != engine or requirement["seed"] != run_seed:
                         raise ReplayMismatch(f"replay engine or seed does not match step {step['id']}")
@@ -306,7 +335,7 @@ class Supervisor:
                 if not any(item["engine"].startswith("GPU_") for item in actual_steps):
                     selected_gpu_device = None
                 elif selected_gpu_device is None:
-                    raise ReplayMismatch("GPU_DISK requires a concrete CUDA device; no implicit fallback is allowed")
+                    raise ReplayMismatch("GPU execution requires a concrete CUDA device; no implicit fallback is allowed")
                 else:
                     for item in actual_steps:
                         if item["engine"].startswith("GPU_"):
@@ -337,6 +366,21 @@ class Supervisor:
                 item["stepId"] in gpu_multi_steps and item["engine"] == "GPU_DISK"
                 and _requires_patched_multi_particle(gpu_multi_steps[item["stepId"]])
                 for item in actual_steps)
+            # Shared policy for every multi-ion GPU step, new run or replay,
+            # process or single-pass flux, and independently of the recorded
+            # strategy: a per-species flux replay needs no patched-runtime
+            # fingerprint, so keying the gate off ``needs_native_patch`` left it
+            # accepted as pending on 4.7.0 while the worker could only truncate
+            # or guess. API validation, the worker and this supervisor agree.
+            multi_ion_gpu_steps = [
+                item["stepId"] for item in actual_steps
+                if str(item["engine"]).startswith("GPU_")
+                and item["stepId"] in gpu_multi_steps
+                and _requires_patched_multi_particle(gpu_multi_steps[item["stepId"]])]
+            if multi_ion_gpu_steps:
+                policy = multi_ion_gpu_error()
+                if policy is not None:
+                    raise ReplayMismatch(policy)
             # Old replays without a fingerprint must retain their original
             # runtime and execution identity. New runs only inject the patched
             # build for the multi-particle shapes that actually need it.
@@ -367,6 +411,19 @@ class Supervisor:
                 shutil.copyfile(source_gds, gds_asset_path)
                 if storage.file_sha256(gds_asset_path) != gds_asset["assetId"]:
                     raise OSError("copied GDS asset does not match its SHA-256 reference")
+            csv_asset_paths: dict[str, Path] = {}
+            for step in enabled_steps:
+                if step.get("model") != "csvProcess":
+                    continue
+                csv_asset_id = step.get("assetId")
+                if not isinstance(csv_asset_id, str) or csv_asset_id in csv_asset_paths:
+                    continue
+                source_csv = storage.resolve_csv_asset(csv_asset_id)
+                copied_csv = run_dir / f"csv-source-{csv_asset_id}.csv"
+                shutil.copyfile(source_csv, copied_csv)
+                if storage.file_sha256(copied_csv) != csv_asset_id:
+                    raise OSError("copied CSV rate asset does not match its SHA-256 reference")
+                csv_asset_paths[csv_asset_id] = copied_csv
             initial_state_path = None
             if state_path is not None:
                 initial_state_path = run_dir / "domain-state.vpsd"
@@ -391,6 +448,8 @@ class Supervisor:
             input_config["customMaterials"] = custom_materials
             if gds_asset_path is not None:
                 input_config["gdsAssetPath"] = str(gds_asset_path)
+            if csv_asset_paths:
+                input_config["csvAssets"] = {asset_id: str(path) for asset_id, path in csv_asset_paths.items()}
             if kind == "flux":
                 input_config["analysisStepId"] = analysis_step_id
             if kind == "slice":
@@ -424,6 +483,7 @@ class Supervisor:
                 "executionHash": None,
                 "normalizedProject": project,
                 "gdsAssetId": gds_asset.get("assetId") if isinstance(gds_asset, dict) else None,
+                "csvAssetIds": sorted(csv_asset_paths) or None,
                 "sliceRequest": slice_request if kind == "slice" else None,
                 "requestedSolver": project["solver"],
                 "selectedGpuDevice": selected_gpu_device,
@@ -449,23 +509,65 @@ class Supervisor:
             replay_actual_seed = run_seed
             if replay_actual_seed is None:
                 random_config = project["solver"]["random"]
-                replay_actual_seed = int(random_config.get("seed", 0))
+                seed_value = random_config.get("seed")
+                replay_actual_seed = int(seed_value) if seed_value is not None else 0
             replay_project["solver"]["random"] = {"mode": "fixed", "seed": replay_actual_seed}
-            replay_engine = next((item["engine"] for item in actual_steps if item["engine"] in {"CPU_DISK", "GPU_DISK", "CPU_TRIANGLE", "GPU_TRIANGLE"}), "CPU_DISK")
-            replay_project["solver"]["enginePreference"] = "gpu" if replay_engine.startswith("GPU_") else "cpu"
+            # A preview does not execute its enabled steps, but its replay
+            # document must still describe what would run. Resolve the same
+            # concrete engine/strategy the simulate path would use.
+            preview_requirements: list[dict[str, Any]] = []
+            preview_native_strategy = False
+            if kind == "preview":
+                for step in project["steps"]:
+                    if not step.get("enabled") or not uses_flux(step):
+                        continue
+                    engine = select_engine(project, step)
+                    if engine not in {"CPU_DISK", "GPU_DISK", "CPU_TRIANGLE", "GPU_TRIANGLE"}:
+                        raise ReplayMismatch(
+                            f"preview replay cannot pin an engine for step {step['id']}: {engine}")
+                    execution_strategy = None
+                    if (project.get("schemaVersion") == 7 and step.get("model") == "multiParticle"
+                            and sum(row.get("kind") == "ion" for row in step.get("species", [])) > 1
+                            and engine == "GPU_DISK"):
+                        execution_strategy = GPU_MULTIPARTICLE_NATIVE_STRATEGY
+                        preview_native_strategy = True
+                    preview_requirements.append({
+                        "stepId": step["id"], "engine": engine, "seed": replay_actual_seed,
+                        **({"executionStrategy": execution_strategy} if execution_strategy else {}),
+                    })
+            replay_items = actual_steps if actual_steps else preview_requirements
+            replay_engine = next((item["engine"] for item in replay_items
+                                  if item["engine"] in {"CPU_DISK", "GPU_DISK", "CPU_TRIANGLE", "GPU_TRIANGLE"}), None)
+            if replay_engine is not None:
+                replay_project["solver"]["enginePreference"] = "gpu" if replay_engine.startswith("GPU_") else "cpu"
+            elif replay_project["solver"].get("gpuEngine") is not None:
+                # A preview has no executed particle step, so there is no
+                # actual engine to pin. Keep the requested gpu/gpuEngine pair
+                # intact; forcing "cpu" here would leave an invalid
+                # combination that the replay schema rejects.
+                replay_project["solver"]["enginePreference"] = "gpu"
+            else:
+                replay_project["solver"]["enginePreference"] = "cpu"
             if selected_gpu_device is not None and project["schemaVersion"] == 7:
                 replay_project["solver"]["gpuDeviceId"] = selected_gpu_device["uuid"]
             replay_requirements = [
                 {"stepId": item["stepId"], "engine": item["engine"], "seed": replay_actual_seed,
                  **({"executionStrategy": item["executionStrategy"]} if item.get("executionStrategy") else {}),
                  **({"fluxStrategy": item["fluxStrategy"]} if item.get("fluxStrategy") else {})}
-                for item in actual_steps if item["engine"] in {"CPU_DISK", "GPU_DISK", "CPU_TRIANGLE", "GPU_TRIANGLE"}
+                for item in replay_items if item["engine"] in {"CPU_DISK", "GPU_DISK", "CPU_TRIANGLE", "GPU_TRIANGLE"}
             ]
+            preview_native_fingerprint = None
+            if preview_native_strategy:
+                try:
+                    _, preview_native_fingerprint = configured_runtime(None)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    raise ReplayMismatch(str(exc)) from exc
+            replay_native_fingerprint = native_engine_fingerprint or preview_native_fingerprint
             replay_document = {
                 "format": "viennaps-replay", "schemaVersion": project["schemaVersion"], "normalizedProject": replay_project,
                 "executionRequirements": {"viennapsVersion": ps_version, "viennalsVersion": ls_version,
                                           "cpuThreads": project["solver"]["cpuThreads"], "steps": replay_requirements,
-                                          **({"nativeEngineFingerprint": native_engine_fingerprint} if native_engine_fingerprint else {})},
+                                          **({"nativeEngineFingerprint": replay_native_fingerprint} if replay_native_fingerprint else {})},
             }
             if project["schemaVersion"] == 6:
                 replay_document["replayMode"] = "from-domain-state" if state_ref is not None else "from-initial"
@@ -576,7 +678,7 @@ class Supervisor:
                 manifest["currentStepId"] = item.get("stepId")
                 manifest["currentStepName"] = item.get("name")
             elif event_type == "snapshot":
-                entry = {key: item[key] for key in ("stepId", "name", "stepIndex", "snapshot", "vtk", "pointCount", "lineCount", "triangleCount", "topology", "dimension", "materialIds", "materialIdsByLevelSetIndex", "noOp", "measuredGeometry", "geometryReadback", "sliceReadback", "nativeState", "outputs") if key in item}
+                entry = {key: item[key] for key in ("stepId", "name", "stepIndex", "snapshot", "vtk", "pointCount", "lineCount", "triangleCount", "topology", "dimension", "materialIds", "materialIdsByLevelSetIndex", "noOp", "measuredGeometry", "geometryReadback", "sliceReadback", "nativeState", "oxidation", "outputs") if key in item}
                 if not any(existing.get("stepId") == entry.get("stepId") for existing in manifest["snapshots"]):
                     manifest["snapshots"].append(entry)
                 if entry.get("stepId") != "initial" and entry.get("stepId") not in manifest["completedStepIds"]:

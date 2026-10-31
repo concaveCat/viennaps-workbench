@@ -8,12 +8,13 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationError
 
 from . import storage
+from .engine import ENGINE_REGISTRY_VERSION, SUPPORTED_ENGINE_VERSIONS, engine_version
 
 
 BUILTIN_CATALOG = storage.ROOT / "docs" / "materials-catalog.json"
-NATIVE_IDS = storage.ROOT / "docs" / "native-material-ids-4.6.2.json"
+NATIVE_IDS = storage.ROOT / "docs" / "native-material-ids-4.6.2.json"  # historical inventory; IDs re-verified identical on 4.7.0
 CUSTOM_CATALOG = storage.VAR / "custom-materials.json"
-CUSTOM_LEGACY_ID_BASE = 177  # Native 4.6.2 probe: built-ins end at 176; first custom is 177.
+CUSTOM_LEGACY_ID_BASE = 177  # Built-ins end at 176 in both 4.6.2 and 4.7.0; first custom is 177.
 MAX_CUSTOM_MATERIALS = 64
 NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_. -]{0,63}$")
 # The complete viennaps.MaterialCategory enum exposed by ViennaPS 4.6.2.
@@ -60,7 +61,9 @@ class MaterialDefinition(BaseModel):
 def _custom_record(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict) or set(raw) != {"schemaVersion", "engineVersion", "materials"}:
         raise ValueError("custom material registry has an invalid shape")
-    if raw["schemaVersion"] != 1 or raw["engineVersion"] != "4.6.2" or not isinstance(raw["materials"], list):
+    if (raw["schemaVersion"] != 1
+            or raw["engineVersion"] not in SUPPORTED_ENGINE_VERSIONS
+            or not isinstance(raw["materials"], list)):
         raise ValueError("custom material registry header is invalid")
     rows = []
     seen: set[str] = set()
@@ -82,7 +85,7 @@ def _custom_record(raw: Any) -> dict[str, Any]:
         rows.append(row)
     if len(rows) > MAX_CUSTOM_MATERIALS:
         raise ValueError("custom material registry exceeds the installed-ID budget")
-    return {"schemaVersion": 1, "engineVersion": "4.6.2", "materials": rows}
+    return {"schemaVersion": 1, "engineVersion": ENGINE_REGISTRY_VERSION, "materials": rows}
 
 
 def custom_materials() -> list[dict[str, Any]]:
@@ -97,7 +100,7 @@ def custom_materials() -> list[dict[str, Any]]:
 
 def native_builtin_materials() -> list[dict[str, Any]]:
     raw = storage.read_json(NATIVE_IDS)
-    rows = raw.get("materials") if raw.get("engineVersion") == "4.6.2" else None
+    rows = raw.get("materials") if raw.get("engineVersion") in SUPPORTED_ENGINE_VERSIONS else None
     if not isinstance(rows, list) or raw.get("maxBuiltInLegacyId") != max((item.get("legacyId", -1) for item in rows), default=-1):
         raise ValueError("installed native material ID inventory is invalid")
     if CUSTOM_LEGACY_ID_BASE != raw["maxBuiltInLegacyId"] + 1:
@@ -107,7 +110,7 @@ def native_builtin_materials() -> list[dict[str, Any]]:
 
 def material_catalog() -> dict[str, Any]:
     catalog = storage.read_json(BUILTIN_CATALOG)
-    if catalog.get("schemaVersion") != 1 or catalog.get("engineVersion") != "4.6.2":
+    if catalog.get("schemaVersion") != 1 or catalog.get("engineVersion") not in SUPPORTED_ENGINE_VERSIONS:
         raise ValueError("installed native material catalog header is invalid")
     builtins = []
     names: set[str] = set()
@@ -125,7 +128,7 @@ def material_catalog() -> dict[str, Any]:
     if any(item["name"] in native_names or item["name"] in names or item["id"] in ids or item["id"] in native_ids for item in custom):
         raise ValueError("custom material identity collides with the installed built-in catalog")
     visible_custom = [row for row in custom if not row.get("deleted", False)]
-    return {"schemaVersion": 1, "engineVersion": "4.6.2", "materials": [*builtins, *[{**row, "isCustom": True} for row in visible_custom]]}
+    return {"schemaVersion": 1, "engineVersion": engine_version(), "materials": [*builtins, *[{**row, "isCustom": True} for row in visible_custom]]}
 
 
 def create_material(payload: Any) -> dict[str, Any]:
@@ -150,7 +153,7 @@ def create_material(payload: Any) -> dict[str, Any]:
     index = len(current)
     row = {"name": name, "id": CUSTOM_LEGACY_ID_BASE + index, "customId": index,
            **base.model_dump(mode="json", exclude_none=True)}
-    record = {"schemaVersion": 1, "engineVersion": "4.6.2", "materials": [*current, row]}
+    record = {"schemaVersion": 1, "engineVersion": ENGINE_REGISTRY_VERSION, "materials": [*current, row]}
     storage.atomic_json(CUSTOM_CATALOG, record)
     return {**row, "isCustom": True}
 
@@ -173,7 +176,7 @@ def update_material(name: str, payload: Any) -> dict[str, Any]:
         raise ValueError(str(exc)) from exc
     rows[index] = {"name": current["name"], "id": current["id"], "customId": current["customId"],
                    **metadata.model_dump(mode="json", exclude_none=True)}
-    storage.atomic_json(CUSTOM_CATALOG, {"schemaVersion": 1, "engineVersion": "4.6.2", "materials": rows})
+    storage.atomic_json(CUSTOM_CATALOG, {"schemaVersion": 1, "engineVersion": ENGINE_REGISTRY_VERSION, "materials": rows})
     return {**rows[index], "isCustom": True}
 
 
@@ -203,8 +206,38 @@ def delete_material(name: str, current_project: Any = None) -> dict[str, Any]:
         raise ValueError(f"{name!r} is used by the current project, a saved project, or run history and cannot be deleted")
 
     rows[index] = {**rows[index], "deleted": True}
-    storage.atomic_json(CUSTOM_CATALOG, {"schemaVersion": 1, "engineVersion": "4.6.2", "materials": rows})
+    storage.atomic_json(CUSTOM_CATALOG, {"schemaVersion": 1, "engineVersion": ENGINE_REGISTRY_VERSION, "materials": rows})
     return {**rows[index], "isCustom": True}
+
+
+GEO_MASK_MATERIAL_DEFAULT = "Mask"
+
+
+def geometry_mask_material_names(geometry: Any) -> list[str]:
+    """Material names exposed as masks by the project geometry alone.
+
+    This is the single derivation shared by the scalar particle/directional
+    paths, the CSV rate-grid path and the per-rate-set mask default. It covers
+    the built-in trench/hole/fin mask, stack mask layers and the legacy stack
+    ``gdsMask`` overlay (only when it protects etch), plus GDS geometry layers
+    explicitly marked as masks.
+    """
+    if not isinstance(geometry, dict):
+        return []
+    kind = geometry.get("kind")
+    if kind in ("trench", "hole", "fin") and float(geometry.get("maskHeight", 0) or 0) > 0:
+        return [str(geometry.get("maskMaterial", GEO_MASK_MATERIAL_DEFAULT))]
+    if kind == "stack":
+        values = [str(layer["material"]) for layer in geometry.get("layers", []) if layer.get("role") == "mask"]
+        gds_mask = geometry.get("gdsMask") or {}
+        if gds_mask.get("protectsEtch") and gds_mask.get("material"):
+            values.append(str(gds_mask["material"]))
+        return list(dict.fromkeys(values))
+    if kind == "gds":
+        return list(dict.fromkeys(
+            str(layer["material"]) for layer in geometry.get("layers", []) if layer.get("mask", False)
+        ))
+    return []
 
 
 def referenced_material_names(project: Any) -> set[str]:
@@ -217,6 +250,18 @@ def referenced_material_names(project: Any) -> set[str]:
                 if child_key in {"material", "substrateMaterial", "maskMaterial", "depositMaterial"} and isinstance(child, str):
                     if child:
                         found.add(child)
+                elif child_key == "maskMaterials":
+                    # Per-rate-set mask lists are real material references: a
+                    # custom material named only there must stay registered.
+                    if isinstance(child, list):
+                        found.update(str(name) for name in child if isinstance(name, str))
+                    elif isinstance(child, str) and child:
+                        found.add(child)
+                elif child_key == "coverMaterial" and isinstance(child, str) and child and child != "GAS":
+                    # DenseCellSet cover cells can use a registered material or
+                    # the native GAS sentinel. Keep a custom-only reference
+                    # registered, but do not invent a catalog entry for GAS.
+                    found.add(child)
                 elif child_key in {"materialRates", "stickingProbabilityByMaterial", "byMaterial"} and isinstance(child, dict):
                     found.update(str(name) for name in child)
                 else:
@@ -254,7 +299,7 @@ def attach_and_reconcile_project_materials(project: Any) -> None:
                 existing.append(definition.model_dump(mode="json", exclude_none=True))
             else:
                 raise ValueError("project custom material definitions are not a complete registration prefix")
-        storage.atomic_json(CUSTOM_CATALOG, {"schemaVersion": 1, "engineVersion": "4.6.2", "materials": existing})
+        storage.atomic_json(CUSTOM_CATALOG, {"schemaVersion": 1, "engineVersion": ENGINE_REGISTRY_VERSION, "materials": existing})
     names = referenced_material_names(project)
     catalog_names = {row["name"] for row in material_catalog()["materials"]}
     custom_names = {row["name"] for row in custom_materials() if not row.get("deleted", False)}

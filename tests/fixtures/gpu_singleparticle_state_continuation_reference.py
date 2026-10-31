@@ -32,7 +32,7 @@ def main(project_path: str, state_path: str, output_path: str, engine: str = "GP
         ps.Length.setUnit("um")
         ps.Time.setUnit("s")
     if dimension == 2:
-        domain = ps.Domain(float(settings["gridDelta"]), float(settings["xExtent"]), boundary)
+        domain = ps.Domain(float(settings["gridDelta"]), float(settings["xExtent"]), boundary=boundary)
     else:
         domain = ps.Domain(float(settings["gridDelta"]), float(settings["xExtent"]),
                            float(settings["yExtent"]), boundary)

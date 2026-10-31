@@ -7,7 +7,9 @@ in a 3D viewer, and export runs that can be replayed exactly.
 
 Single-user and loopback-only by design: the service binds `127.0.0.1`, keeps all
 data on the local disk, and never calls an external API. Verified against
-**ViennaPS 4.6.2 / ViennaLS 5.8.5** on Linux.
+**ViennaPS 4.7.0 / ViennaLS 5.10.0** on Linux; the ViennaPS 4.6.2 / ViennaLS
+5.8.5 environment is retained for replay, legacy runs and the capabilities the
+4.7.0 binding does not provide (see "Runtime versions" below).
 
 [中文说明](README.zh-CN.md)
 
@@ -48,8 +50,22 @@ data on the local disk, and never calls an external API. Verified against
 - Ray-traced single-particle etch/deposition (`singleParticle`), with CPU or GPU
   flux engines.
 - Native specialized models: SF6/O2, CF4/O2, HBr/O2, SF6/C4F8, fluorocarbon,
-  ion-beam etching, wet etch, TEOS deposition, TEOS PECVD, ALD, oxidation, oxide
-  regrowth, selective epitaxy, neutral transport, and multi-particle.
+  ion-beam etching, Faraday-cage ion-beam etching (experimental, 2D/3D, 2D pinned
+  to the CPU flux engine), geometric trench deposition (experimental, 2D/3D), wet
+  etch, TEOS deposition, TEOS PECVD, ALD, oxidation, oxide regrowth, selective
+  epitaxy, neutral transport, and multi-particle. The two experimental models have
+  real native construction and CPU smoke tests but no archived Stage 8/9
+  direct-reference acceptance row, so their runs are reported with a validation
+  warning. The 2D FaradayCage halt the original audit saw belongs to the unpinned
+  AUTO/GPU kernel; with CPU_DISK every catalog cage/tilt combination completes, so
+  2D is admitted only when `solver.enginePreference` is `cpu` (AUTO/GPU requests
+  are a 422 before the worker starts). The IBE models also require
+  `thresholdEnergy < meanEnergy`; at or above the mean the native yield sign
+  reverses and an etch grows the surface. GeometricTrenchDeposition runs in both
+  dimensions for plane, trench, hole, fin and stack geometry, while GDS inputs
+  are rejected because the native radius needs a bounded vertical span.
+- Optional native controls: `nvFactors` on selective epitaxy, `coverageTolerance`
+  on the four plasma models, and the `advanced` plasma parameter object.
 - Directional rate model and selectivity comparisons.
 - Per-step enable/disable, reordering, and per-step native parameters.
 
@@ -105,8 +121,8 @@ original process.
 | --- | --- |
 | OS | Linux (uses `/proc` for process supervision and CPU affinity) |
 | Python | 3.12 |
-| ViennaPS | 4.6.2, installed system-wide; a CUDA build is required for GPU runs |
-| ViennaLS | 5.8.5 |
+| ViennaPS | 4.7.0 (default, `requirements-v470.lock`); 4.6.2 retained for replay/legacy. A CUDA build is required for GPU runs |
+| ViennaLS | 5.10.0 (default); 5.8.5 for the retained 4.6.2 runtime |
 | Node.js | 20.19+ or 22.12+ (Vite 8) |
 | GPU | Optional. NVIDIA GPU with CUDA for `GPU_DISK` |
 
@@ -136,7 +152,7 @@ Check that the engines are visible to the venv:
 
 ```bash
 .venv/bin/python -c "import viennaps, viennals; print(viennaps.__version__, viennals.__version__)"
-# expected: 4.6.2 5.8.5
+# expected: 4.7.0 5.10.0   (the retained legacy venv prints 4.6.2 5.8.5)
 ```
 
 If the import fails, install ViennaPS/ViennaLS first (including their Python
@@ -300,7 +316,7 @@ references when adapting the suite.
 | `frontend build is missing` on start | Run `npm ci && npm run build` in `frontend/`. |
 | `cannot bind configured loopback port` | Another process holds the port. Set `WORKBENCH_PORT` or remove `var/listen-port.json`; the workbench will not kill the unknown listener. |
 | `ModuleNotFoundError: viennaps` | `.venv` was created without `--system-site-packages`, or ViennaPS is not installed for this Python. |
-| GPU runs rejected or `gpuAvailable()` false | Check `nvidia-smi`, the CUDA build of ViennaPS, and `GET /api/gpu-devices`. GPU support is only exposed for `GPU_DISK` combinations recorded in `docs/stage9-evidence/gpu-capability-matrix.json`. |
+| GPU runs rejected or `gpuAvailable()` false | Check `nvidia-smi`, the CUDA build of ViennaPS, and `GET /api/gpu-devices`. GPU support is only exposed for `GPU_DISK` combinations recorded in `docs/stage9-evidence/gpu-capability-matrix.json`; schema-7 `solver.gpuEngine=GPU_TRIANGLE` is limited to the two archived sf6o2 rows and never falls back. |
 | `request Host must be the active loopback address` | Use `127.0.0.1:<port>` or `localhost:<port>`; reverse proxies and custom hostnames are intentionally rejected. |
 | Run stops with `run artifact size exceeded` | The step produced more than the effective artifact cap (4 GiB by default, `WORKBENCH_MAX_ARTIFACT_MIB`); reduce grid resolution, rays, or output frequency. |
 
@@ -330,14 +346,25 @@ the three capability matrices required at runtime are the exception.
 
 ## Known limitations
 
-- Verified only against ViennaPS 4.6.2 / ViennaLS 5.8.5; other versions are
-  rejected rather than guessed at.
+- Verified against ViennaPS 4.7.0 / ViennaLS 5.10.0 (default) and ViennaPS
+  4.6.2 / ViennaLS 5.8.5 (retained); other versions are rejected rather than
+  guessed at. Archived capability matrices stay pinned to the 4.6.2 run that
+  produced them.
 - GPU support is limited to `GPU_DISK` for covered model/geometry combinations.
-  `GPU_TRIANGLE` and `GPU_LINE` are not exposed.
-- The installed 4.6.2 MultiParticle GPU path handles a single ion species;
-  multi-ion GPU requests are reported as a native limitation, not silently
-  approximated. Multi-ion CPU paths and the single-pass flux strategy remain
-  available.
+  Schema-7 `solver.gpuEngine=GPU_TRIANGLE` is exposed only for the two archived
+  2D/3D sf6o2 etch/reflective stack rows and is rejected for everything else.
+  `GPU_LINE` is not exposed.
+- No GPU MultiParticle binding on either runtime converts more than one ion
+  species per flux field: 4.6.2 stock and 4.7.0 stock both emit a single
+  `ion<label><0>` field and pass a one-element flux vector to the rate
+  callback. Multi-ion GPU runs therefore require the patched ViennaPS 4.6.2
+  runtime; on 4.7.0 the request is rejected with the runtime named instead of
+  running a silently wrong geometry. Multi-ion `CPU_DISK` works on 4.7.0.
+- ViennaPS 4.7.0 gates three native regressions the 4.6.2 wheel does not have:
+  the ALD `surfaceDiffusion` stencil hang, the inert advanced-oxidation
+  controls, and the 2D `FaradayCageEtching` zero-etch kernel. Each is rejected
+  with the field, runtime and measured reason; the 4.6.2 runtime still runs
+  them.
 - Host capability evidence was collected on one NVIDIA RTX 3060 Laptop GPU;
   multi-GPU selection is implemented and unit-tested, but not proven on two
   physical cards.

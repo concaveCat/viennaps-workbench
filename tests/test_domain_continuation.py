@@ -12,6 +12,7 @@ from pathlib import Path
 from starlette.requests import Request
 from fastapi import HTTPException
 
+from backend.engine import engine_version, viennals_version
 from backend import storage
 from backend.hashing import requested_input_hash
 from backend.main import app, continuation_package_export, continuation_package_import
@@ -178,8 +179,8 @@ class DomainContinuationWorkflow(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(source_info["runMode"], "from-initial")
                 saved_row = next(row for row in source_info["snapshots"] if row["stepId"] == "step_first_etch")
                 native_ref = saved_row["nativeState"]
-                self.assertEqual(native_ref["viennapsVersion"], "4.6.2")
-                self.assertEqual(native_ref["viennalsVersion"], "5.8.5")
+                self.assertEqual(native_ref["viennapsVersion"], engine_version())
+                self.assertEqual(native_ref["viennalsVersion"], viennals_version())
                 self.assertEqual(native_ref["boundaryConditions"], ["reflective", "infinite"] if dimension == 2 else ["reflective", "reflective", "infinite"])
                 self.assertEqual(native_ref["materialIdsByLevelSetIndex"], reference["afterRead"]["materialMap"])
                 self.assertEqual(native_ref["levelSetCount"], len(reference["afterRead"]["materialMap"]))

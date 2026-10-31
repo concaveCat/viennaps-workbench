@@ -66,7 +66,7 @@ def make_domain(project: dict[str, Any]):
     ps.Time.setUnit("s")
     d = project["domain"]
     boundary = ps.BoundaryType.REFLECTIVE_BOUNDARY if (d.get("xBoundary", d.get("boundaryXY")) == "reflective") else ps.BoundaryType.PERIODIC_BOUNDARY
-    domain = ps.Domain(float(d["gridDelta"]), float(d["xExtent"]), boundary) if dimension == 2 else ps.Domain(float(d["gridDelta"]), float(d["xExtent"]), float(d["yExtent"]), boundary)
+    domain = ps.Domain(float(d["gridDelta"]), float(d["xExtent"]), boundary=boundary) if dimension == 2 else ps.Domain(float(d["gridDelta"]), float(d["xExtent"]), float(d["yExtent"]), boundary)
     geometry = project["geometry"]
     ps.MakePlane(domain, height=float(geometry["baseHeight"]), material=material(geometry["substrateMaterial"]), addToExisting=False).apply()
     height = float(geometry["baseHeight"])
@@ -150,9 +150,23 @@ def make_model(step: dict[str, Any], domain: Any, project: dict[str, Any]):
         atomic = ps.AtomicLayerProcessParameters()
         for key in ("pulseTime", "purgePulseTime", "coverageTimeStep", "purgeTimeStep"): setattr(atomic, key, float(p[key]))
         atomic.numCycles = int(p["numCycles"]); extra.append(atomic)
+        surface_diffusion = step.get("surfaceDiffusion")
+        if surface_diffusion is not None and surface_diffusion.get("enabled", True):
+            if float(p["coverageDiffusionCoefficient"]) <= 0.0:
+                raise ValueError("surfaceDiffusion requires coverageDiffusionCoefficient > 0")
+            native = ps.SurfaceDiffusionParameters()
+            defaults = {key: getattr(native, key) for key in (
+                "kNeighbors", "normalCutoff", "normalizeByLocalScale", "radius",
+                "sigmaNormal", "stabilityFactor", "symmetrizeWeights")}
+            for key, default in defaults.items():
+                setattr(native, key, type(default)(surface_diffusion.get(key, default)))
+            extra.append(native)
     elif kind == "oxidation":
         model = ps.Oxidation()
-        model.setOxidant(getattr(ps.OxidantType, p["oxidant"])); model.setOrientation(getattr(ps.SiliconOrientation, p["orientation"]))
+        oxidant = getattr(ps.OxidantType, p["oxidant"], None)
+        if oxidant is None:
+            oxidant = getattr(ps.OxidantType, str(p["oxidant"]).upper())
+        model.setOxidant(oxidant); model.setOrientation(getattr(ps.SiliconOrientation, p["orientation"]))
         model.setTemperature(p["temperatureC"]); model.setPressure(p["pressureAtm"]); model.setTime(p["timeHours"]); model.setTimeStep(p["timeStepHours"])
         model.setTransferCoefficient(p["transferCoefficientUmHr"]); model.setInitialOxideThickness(p["initialOxideThicknessUm"])
         model.setReactionActivationVolume(p["reactionActivationVolumeM3"]); model.setDiffusionActivationVolume(p["diffusionActivationVolumeM3"])

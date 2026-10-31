@@ -1,5 +1,6 @@
 # Application-only dependencies. ViennaPS/ViennaLS are supplied by the
-# existing system-site-packages and must never be upgraded by this project.
+# runtime venv (requirements-v470.lock by default; requirements.lock for the
+# retained 4.6.2 environment) and must never be upgraded by this project.
 fastapi>=0.110,<1
 pydantic>=2.7,<3
 uvicorn>=0.27,<1

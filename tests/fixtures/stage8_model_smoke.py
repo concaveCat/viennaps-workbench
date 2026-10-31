@@ -64,7 +64,7 @@ def make_domain(dimension, name):
     ps.Time.setUnit("s")
     delta, extent = 0.2, 4.0
     boundary = ps.BoundaryType.REFLECTIVE_BOUNDARY
-    domain = ps.Domain(delta, extent, boundary) if dimension == 2 else ps.Domain(delta, extent, extent, boundary)
+    domain = ps.Domain(delta, extent, boundary=boundary) if dimension == 2 else ps.Domain(delta, extent, extent, boundary)
     ps.MakePlane(domain, height=0.0, material=ps.Material.Si, addToExisting=False).apply()
     if name == "selectiveEpitaxy":
         return domain
@@ -124,7 +124,10 @@ def make_model(name):
         return model
     if name == "oxidation":
         model = ps.Oxidation()
-        model.setOxidant(ps.OxidantType.Dry)
+        oxidant = getattr(ps.OxidantType, "Dry", None)
+        if oxidant is None:
+            oxidant = getattr(ps.OxidantType, "DRY")
+        model.setOxidant(oxidant)
         model.setOrientation(ps.SiliconOrientation.Si100)
         model.setTemperature(1000.0)
         model.setPressure(1.0)

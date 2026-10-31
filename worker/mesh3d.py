@@ -66,12 +66,34 @@ def measure_initial(report,g,delta,substrate_id=10):
     depth=-min(p[i][2] for i in si)
     if g['kind']=='hole':
         opening=min(math.hypot(v[0],v[1]) for v in top); target=g['radius']; label='openingRadius'
-        quadrants={(v[0]>0,v[1]>0) for v in p if v[2]<-delta and math.hypot(v[0],v[1])<g['radius']+g['depth']+delta}
-        if len(quadrants)!=4:raise RuntimeError('FULL hole does not include all four quadrants')
+        shape=str(g.get('holeShape') or 'FULL')
+        tol=delta*.5
+        quadrants={(v[0]>= -tol,v[1]>= -tol) for v in p if v[2]<-delta and math.hypot(v[0],v[1])<g['radius']+g['depth']+delta}
+        if shape=='FULL':
+            required={(True,True),(True,False),(False,True),(False,False)}
+        elif shape=='HALF':
+            required={(True,True),(True,False)}
+        elif shape=='QUARTER':
+            required={(True,True)}
+        else:
+            raise RuntimeError(f'unknown native HoleShape {shape!r}')
+        if not required.issubset(quadrants):
+            raise RuntimeError(f'{shape} hole is missing its required quadrant(s): got {sorted(quadrants)}')
+        if shape in ('HALF','QUARTER') and any(v[0] < -tol for v in p):
+            raise RuntimeError(f'{shape} hole contains points on the removed x<0 half')
+        if shape=='QUARTER' and any(v[1] < -tol for v in p):
+            raise RuntimeError('QUARTER hole contains points on the removed y<0 half')
     else:
-        neg=[v[0] for v in top if v[0]<0];pos=[v[0] for v in top if v[0]>0]
-        if not pos or not neg:raise RuntimeError('3D trench requires both sidewalls')
-        opening=min(pos)-max(neg);target=g['width'];label='openingWidth'
+        half_trench=bool(g.get('halfTrench'))
+        tol=delta*.5
+        neg=[v[0] for v in top if v[0] < -tol];pos=[v[0] for v in top if v[0] >= -tol]
+        if half_trench:
+            if not pos:raise RuntimeError('half trench requires the retained x>=0 sidewall')
+            opening=min(pos);target=g['width']/2
+        else:
+            if not pos or not neg:raise RuntimeError('3D trench requires both sidewalls')
+            opening=min(pos)-max(neg);target=g['width']
+        label='openingWidth'
     if abs(depth-g['depth'])>2*delta+1e-9 or abs(opening-target)>2*delta+1e-9:raise RuntimeError('rasterized 3D opening/depth differs by more than two grid intervals')
     return {label:opening,'depth':depth,'tolerance':2*delta}
 

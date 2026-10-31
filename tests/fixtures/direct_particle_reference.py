@@ -31,7 +31,7 @@ def main() -> None:
     output = Path(sys.argv[1]).resolve()
     ps.setDimension(2)
     ps.setNumThreads(THREADS)
-    domain = ps.Domain(GRID_DELTA, X_EXTENT, ps.BoundaryType.REFLECTIVE_BOUNDARY)
+    domain = ps.Domain(GRID_DELTA, X_EXTENT, boundary=ps.BoundaryType.REFLECTIVE_BOUNDARY)
     ps.MakePlane(domain, height=0.0, material=ps.Material.Si, addToExisting=False).apply()
 
     model = ps.SingleParticleProcess(
