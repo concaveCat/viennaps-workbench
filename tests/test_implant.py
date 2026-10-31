@@ -247,13 +247,17 @@ class ImplantSchema(unittest.TestCase):
             validate_project(project(2, steps=analysis_first))
         self.assertIn("earlier", str(context.exception))
 
+        # A surface-moving step between two field steps is allowed: the worker
+        # regenerates the native cell set and conservatively remaps the fields.
         moved = [implant_step(), {
             "id": "etch_step_0001", "name": "etch", "enabled": True, "operation": "etch",
             "model": "isotropic", "rateMagnitude": 0.1, "duration": 0.1,
             "rateMode": "uniform"}, anneal_step()]
-        with self.assertRaises(ProjectInputError) as context:
-            validate_project(project(2, steps=moved))
-        self.assertIn("surface-moving", str(context.exception))
+        parsed, warnings = validate_project(project(2, steps=moved))
+        self.assertEqual([step["model"] for step in
+                          parsed.model_dump(mode="json")["steps"]],
+                         ["implant", "isotropic", "anneal"])
+        self.assertEqual(warnings, [])
 
         wrong_label = [implant_step(), anneal_step(activeLabel="B_active"),
                        analysis_step(netDoping={"donorLabels": ["B_active"],
@@ -587,7 +591,7 @@ class ImplantDirectWorkerGuards(unittest.TestCase):
     ``WORKER_COMPLETE`` with a corrupt field or a stale grid.
     """
 
-    def run_worker(self, project: dict, timeout: int = 240) -> tuple[int, str, dict]:
+    def run_worker(self, project: dict, timeout: int = 240) -> tuple[int, str, dict, Path]:
         workdir = Path(tempfile.mkdtemp(prefix="implant-direct-", dir=str(ROOT / "var")))
         self.addCleanup(shutil.rmtree, workdir, ignore_errors=True)
         config = {
@@ -606,10 +610,10 @@ class ImplantDirectWorkerGuards(unittest.TestCase):
             cwd=ROOT, capture_output=True, text=True, timeout=timeout)
         result_path = run_dir / "worker-result.json"
         result = json.loads(result_path.read_text()) if result_path.is_file() else {}
-        return completed.returncode, completed.stdout + completed.stderr, result
+        return completed.returncode, completed.stdout + completed.stderr, result, run_dir
 
     def assert_worker_refused(self, project: dict, *fragments: str) -> None:
-        code, output, result = self.run_worker(project)
+        code, output, result, _run_dir = self.run_worker(project)
         self.assertNotEqual(code, 0, output)
         self.assertNotIn("WORKER_COMPLETE", output)
         self.assertEqual(result, {})
@@ -646,19 +650,33 @@ class ImplantDirectWorkerGuards(unittest.TestCase):
         value["steps"][2]["cellSet"]["substrateDepth"] = 0.2
         self.assert_worker_refused(value, "substrateDepth must match")
 
-    def test_direct_worker_rejects_surface_motion_after_a_field_step(self) -> None:
+    def test_direct_worker_accepts_surface_motion_and_remaps_the_fields(self) -> None:
         value = normalized(project(2))
         value["steps"].insert(1, {
             "id": "etch_step_0001", "name": "etch", "enabled": True,
             "operation": "etch", "model": "isotropic", "rateMagnitude": 0.1,
             "duration": 0.1, "rateMode": "uniform",
         })
-        # The etch itself is refused, and the later anneal is refused again
-        # because it would reuse the field grid built before the surface moved.
-        self.assert_worker_refused(value, "surface-moving", "stale")
+        code, output, result, run_dir = self.run_worker(value)
+        self.assertEqual(code, 0, output)
+        self.assertIn("WORKER_COMPLETE", output)
+        self.assertEqual([row["stepId"] for row in result["actualSteps"]],
+                         ["implant_step_01", "etch_step_0001", "anneal_step_01",
+                          "analysis_step_01"])
+        payload = json.loads((run_dir / "artifacts" /
+                              "analysis_step_01-cell-set-fields.json").read_text())
+        setup = payload["cellSetSetup"]
+        self.assertEqual(setup["remapCount"], 1)
+        record = setup["remaps"][0]
+        self.assertEqual(record["sourceStepId"], "etch_step_0001")
+        self.assertEqual(record["remapOfStepId"], "implant_step_01")
+        self.assertEqual(record["method"], "same-grid-index-copy")
+        self.assertEqual(record["oldCellCount"], record["newCellCount"])
+        self.assertGreater(record["removedCells"], 0)
+        self.assertGreater(record["mass"]["P_total"]["lost"], 0.0)
 
     def test_direct_worker_accepts_the_shared_grid(self) -> None:
-        code, output, result = self.run_worker(normalized(project(2)))
+        code, output, result, _run_dir = self.run_worker(normalized(project(2)))
         self.assertEqual(code, 0, output)
         self.assertIn("WORKER_COMPLETE", output)
         self.assertEqual([row["stepId"] for row in result["actualSteps"]],

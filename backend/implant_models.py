@@ -10,7 +10,8 @@ preflight and the worker must agree on:
 * the fixed workbench length unit (um) expressed in centimetres, which the
   native implant / sheet-resistance models need for their cm-based physics;
 * label provenance (which step produces which cell-set scalar label);
-* the ordering rule that forbids a surface-moving step after a cell-set step;
+* the shared fixed-grid rule for every cell-set step (a surface-moving step in
+  between is allowed: the worker regenerates and remaps the cell set);
 * numeric guard rails that a hand-edited worker input can never bypass.
 
 Nothing here imports ViennaPS, so it is safe in the API process.
@@ -343,46 +344,160 @@ def field_grid_signature(step: Any) -> dict[str, Any]:
     }
 
 
+def initial_geometry_vertical_bounds(geometry: Any,
+                                     dimension: int) -> tuple[float, float] | None:
+    """Return the initial surface ``(top, bottom)`` for a parametric geometry.
+
+    ``Domain.generateCellSet(position, ...)`` takes the *absolute* top of the
+    grid, so a field ``cellSet.height`` below the initial surface top would
+    either clip the surface or (measured on 4.7.0) make the native generator
+    walk the whole surface band down to the requested position and allocate a
+    huge grid. The API can reject such a request statically for every geometry
+    whose vertical extent is fully described by the project.
+
+    ``None`` means the vertical extent is not knowable from the project alone
+    (GDS layout or a saved Domain continuation); the worker still performs the
+    same check against the real surface before allocating.
+    """
+    if not isinstance(geometry, dict):
+        geometry = geometry.model_dump(mode="json", exclude_none=True)
+    kind = geometry.get("kind")
+    if kind == "plane":
+        height = float(geometry.get("height", 0.0))
+        return height, height
+    if kind in {"trench", "hole"}:
+        # MakeTrench/MakeHole: substrate at z=0, opening down to -depth, mask
+        # above z=0 up to maskHeight.
+        return float(geometry.get("maskHeight", 0.0)), -float(geometry.get("depth", 0.0))
+    if kind == "fin":
+        # MakeFin: the fin sits on z=0, the mask on its top.
+        return (float(geometry.get("height", 0.0)) + float(geometry.get("maskHeight", 0.0)),
+                0.0)
+    if kind == "stack":
+        base = float(geometry.get("baseHeight", 0.0))
+        top = base + sum(abs(float(row.get("thickness", 0.0)))
+                         for row in geometry.get("layers") or [])
+        bottom = base
+        mask = geometry.get("gdsMask")
+        if isinstance(mask, dict):
+            position = mask.get("position") or [0.0, 0.0, 0.0]
+            mask_bottom = float(mask.get("baseHeight", 0.0)) + float(position[2])
+            top = max(top, mask_bottom + float(mask.get("height", 0.0)))
+            bottom = min(bottom, mask_bottom)
+        return top, bottom
+    return None
+
+
+def field_geometry_issues(steps: Iterable[Any], *, geometry: Any, dimension: int,
+                          grid_delta: float, x_extent: float, y_extent: float,
+                          from_domain_state: bool = False) -> list[tuple[int, str, str]]:
+    """Return static pre-allocation issues for the first cell-set grid.
+
+    * ``cellSet.height`` is the native **absolute** grid top. A value below the
+      highest initial surface point is rejected instead of letting the native
+      generator build a band from that position up to the surface.
+    * The cell count implied by the surface top/bottom, ``substrateDepth`` and
+      the domain's lateral grid is checked against ``MAX_CELL_SET_CELLS`` before
+      the worker allocates the dense grid.
+
+    The checks only apply when the field step is the first enabled operation:
+    an earlier enabled step (planarize, boolean, process, ...) can move the
+    surface arbitrarily, so the original geometry no longer bounds it and the
+    worker's live pre-allocation check decides. GDS geometry and Domain
+    continuations likewise have no project-level vertical extent.
+    """
+    from .runtime_limits import MAX_CELL_SET_CELLS
+
+    bounds = None if from_domain_state else initial_geometry_vertical_bounds(
+        geometry, dimension)
+    if bounds is None:
+        return []
+    first: tuple[int, Any] | None = None
+    for index, step in enumerate(steps):
+        if step_value(step, "enabled") and step_value(step, "model") in CELL_SET_STEP_MODELS:
+            first = (index, step)
+            break
+    if first is None:
+        return []
+    index, step = first
+    if any(step_value(earlier, "enabled") for earlier in steps[:index]):
+        # A preceding enabled operation (planarize, boolean, a process step,
+        # ...) can move the surface arbitrarily before the grid is built, so the
+        # original geometry bounds no longer describe it. The worker checks the
+        # live surface before it allocates; a static check here would reject
+        # valid sequences such as plane(2) -> planarize(0) -> implant.
+        return []
+    settings = step_cell_set(step) or {}
+    if settings.get("height") is None:
+        return []
+    delta = float(grid_delta)
+    height = float(settings["height"])
+    surface_top, surface_bottom = float(bounds[0]), float(bounds[1])
+    top_node = math.ceil(surface_top / delta - 1e-9) * delta
+    issues: list[tuple[int, str, str]] = []
+    if height + 1e-9 < top_node:
+        issues.append((
+            index, "cellSet.height",
+            f"cellSet.height {height:g} um is below the highest initial surface point "
+            f"{surface_top:g} um; the native generateCellSet position is an absolute coordinate, "
+            "so the field grid would clip the surface (and, below the surface band, the native "
+            "generator allocates the whole band between them). Set cellSet.height above the "
+            "surface or lower the geometry"))
+    substrate = settings.get("substrateDepth")
+    if substrate is None:
+        return issues
+    substrate = float(substrate)
+    nx = max(1, math.ceil(float(x_extent) / delta))
+    ny = (max(1, math.ceil(float(y_extent) / delta)) if int(dimension) == 3 else 1)
+    lateral = (nx + 2) * (ny + 2)
+    bottom_node = math.floor(surface_bottom / delta + 1e-9) * delta
+    band_half = math.ceil(substrate / delta) + 1
+    required_top = max(height, top_node)
+    required_bottom = bottom_node - band_half * delta
+    rows = math.ceil((required_top - required_bottom) / delta) + 4
+    estimate = lateral * max(rows, 2)
+    if estimate > MAX_CELL_SET_CELLS:
+        issues.append((
+            index, "cellSet",
+            f"the field grid would need about {estimate:,} cells between the highest surface "
+            f"point ({surface_top:g} um) and substrateDepth below the deepest point "
+            f"({surface_bottom:g} um), above the {MAX_CELL_SET_CELLS:,}-cell construction limit; "
+            "raise cellSet.height above the surface only as needed, reduce substrateDepth, or "
+            "coarsen gridDelta"))
+    return issues
+
+
+
 def field_sequence_issues(steps: Iterable[Any], *, grid_delta: float,
                           domain_periodic: bool | None = None) -> list[tuple[int, str, str]]:
     """Return ``(step_index, field_path, message)`` for grid-sequence violations.
 
-    The native ``DenseCellSet`` is generated once, at the first enabled field
-    step, and every later implant/anneal/analysis step reuses it. This function
-    is the single shared implementation for the API validator and the worker
-    preflight, so a hand-edited ``input.json`` cannot silently reuse a stale
-    grid: it rejects
+    The native ``DenseCellSet`` grid is captured at the first enabled field
+    step, and every later implant/anneal/analysis step uses the same grid
+    definition. This function is the single shared implementation for the API
+    validator and the worker preflight, so a hand-edited ``input.json`` cannot
+    silently change the grid: it rejects
 
     * a later field step asking for a different ``height``/``substrateDepth``/
       ``coverMaterial``/``periodic``;
     * the first enabled field step omitting ``substrateDepth``;
     * a grid-defining step below one grid interval / a substrate depth below
-      two grid intervals;
-    * a cell-set step that follows a surface change after the grid was built.
+      two grid intervals.
 
     ``field_path`` is ``""`` for a whole-step issue, otherwise a dotted path
-    below the step (``cellSet.height``). The complementary rule (a
-    surface-moving step after a field step) is in :func:`ordering_issues`.
+    below the step (``cellSet.height``). A surface-moving step between two field
+    steps is *not* an issue: the worker regenerates the native cell set and
+    conservatively remaps every scalar field (see
+    ``backend/field_remap.py``).
     """
     issues: list[tuple[int, str, str]] = []
     first: dict[str, Any] | None = None
-    grid_generated = False
-    surface_changed_since_grid = False
     for index, step in enumerate(steps):
         if not step_value(step, "enabled"):
             continue
         model = step_value(step, "model")
         if model not in CELL_SET_STEP_MODELS:
-            if grid_generated:
-                surface_changed_since_grid = True
             continue
-        if surface_changed_since_grid:
-            issues.append((index, "",
-                           "a cell-set step cannot follow a surface change: the native DenseCellSet "
-                           "was generated from the level sets of the first field step and every later "
-                           "cell-set step reuses that stale grid; move the surface-changing step before "
-                           "the first cell-set step"))
-            surface_changed_since_grid = False
         signature = field_grid_signature(step)
         height = signature["height"]
         if height + 1e-12 < float(grid_delta):
@@ -416,34 +531,6 @@ def field_sequence_issues(steps: Iterable[Any], *, grid_delta: float,
                 issues.append((index, "cellSet.substrateDepth",
                                "every cell-set step shares the grid generated by the first field step; "
                                "substrateDepth must match that step or be omitted"))
-        grid_generated = True
-    return issues
-
-
-def ordering_issues(steps: Iterable[Any]) -> list[tuple[int, str]]:
-    """Return ``(step_index, message)`` for illegal step ordering.
-
-    A cell-set field step operates on the cell grid generated from the level
-    sets at that moment. Any later step that moves the surface would leave the
-    grid (and every dopant field) stale, so the request is refused instead of
-    reporting a field that no longer matches the geometry.
-    """
-    issues: list[tuple[int, str]] = []
-    seen_cell_set = False
-    for index, step in enumerate(steps):
-        if not step_value(step, "enabled"):
-            continue
-        model = step_value(step, "model")
-        if model in CELL_SET_STEP_MODELS:
-            seen_cell_set = True
-            continue
-        if seen_cell_set:
-            issues.append((
-                index,
-                "a surface-moving step cannot follow a cell-set field step "
-                "(implant/anneal/analysis); the native DenseCellSet would no longer "
-                "match the moved level sets",
-            ))
     return issues
 
 

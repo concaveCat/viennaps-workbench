@@ -1212,8 +1212,8 @@ def _validate_implant_steps(project: ProjectV7) -> list[FieldIssue]:
     """
     from .implant_models import (
         CELL_SET_STEP_MODELS, cell_set_output_conflict,
-        field_sequence_issues, label_provenance_issues, numeric_guard_messages,
-        ordering_issues, produced_labels, step_cell_set, step_value,
+        field_geometry_issues, field_sequence_issues, label_provenance_issues,
+        numeric_guard_messages, produced_labels, step_cell_set, step_value,
     )
 
     issues: list[FieldIssue] = []
@@ -1250,6 +1250,13 @@ def _validate_implant_steps(project: ProjectV7) -> list[FieldIssue]:
             steps, grid_delta=float(project.domain.gridDelta),
             domain_periodic=(project.domain.boundaryXY == "periodic" if project.dimension == 3
                              else project.domain.xBoundary == "periodic")):
+        issues.append(FieldIssue(f"steps[{index}].{path}" if path else f"steps[{index}]", message))
+    for index, path, message in field_geometry_issues(
+            steps, geometry=project.geometry, dimension=int(project.dimension),
+            grid_delta=float(project.domain.gridDelta),
+            x_extent=float(project.domain.xExtent),
+            y_extent=float(getattr(project.domain, "yExtent", 0.0)),
+            from_domain_state=project.continuationState is not None):
         issues.append(FieldIssue(f"steps[{index}].{path}" if path else f"steps[{index}]", message))
     for index, step in enumerate(steps):
         if step_value(step, "model") not in CELL_SET_STEP_MODELS:
@@ -1315,8 +1322,6 @@ def _validate_implant_steps(project: ProjectV7) -> list[FieldIssue]:
             # step's label provenance check.
             available |= produced_labels(step)
 
-    for index, message in ordering_issues(steps):
-        issues.append(FieldIssue(f"steps[{index}]", message))
     for index, message in label_provenance_issues(steps):
         issues.append(FieldIssue(f"steps[{index}]", message))
     return issues

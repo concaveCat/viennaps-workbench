@@ -1354,11 +1354,15 @@ class StepCellSetV7(StrictModel):
     """The native ``DenseCellSet`` a cell-set field step runs on.
 
     ``viennaps.Domain.generateCellSet(position, coverMaterial, isAboveSurface)``
-    is the only native constructor available (verified on 4.7.0); ``height`` is
-    the distance from the highest surface point to the top of the grid, exactly
-    like ``outputSettings.cellSet``. The grid is generated once, at the first
-    cell-set step, and every later implant/anneal/analysis step reuses the same
-    native grid so the dopant fields stay on one cell topology.
+    is the only native constructor available (verified on 4.7.0). ``height`` is
+    passed as the native ``position`` argument; measured on 4.7.0 that argument
+    is the **absolute** top coordinate of the grid (a plane at ``z = 0.05`` with
+    ``position = 0.5`` produced a grid topping out at ``0.50``). For the default
+    plane at ``z = 0`` it therefore equals the height above the surface. The
+    grid is captured at the first cell-set step and every later
+    implant/anneal/analysis step reuses the same absolute grid (a surface-moving
+    step in between regenerates the native cell set and conservatively remaps
+    the scalar fields).
     """
 
     height: Annotated[Number, Field(gt=0, le=1000)]
