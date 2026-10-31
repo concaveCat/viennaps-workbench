@@ -42,12 +42,16 @@ type SettingsStorage = {
 type SettingsPayload = {
   schemaVersion: number;
   limits: Record<SettingsLimitKey, SettingsLimit>;
+  defaults?: { solverTimeoutSeconds?: number };
   storage: SettingsStorage;
   versions: { viennaps?: string; viennals?: string };
 };
-type SettingsDraft = Record<SettingsLimitKey, string>;
+type SettingsDraft = Record<SettingsLimitKey, string> & { solverTimeoutSeconds: string };
 
 const SETTINGS_LIMIT_KEYS: SettingsLimitKey[] = ['maxDataGiB', 'artifactLimitMiB', 'rssLimitMiB', 'maxLogMiB', 'minFreeGiB'];
+const SOLVER_TIMEOUT_DEFAULT = 600;
+const SOLVER_TIMEOUT_MIN = 5;
+const SOLVER_TIMEOUT_MAX = 86400;
 const SETTINGS_LIMIT_FALLBACK: Record<SettingsLimitKey, { label: string; unit: string }> = {
   maxDataGiB: { label: '数据目录上限', unit: 'GiB' },
   artifactLimitMiB: { label: '单产物上限', unit: 'MiB' },
@@ -58,6 +62,7 @@ const SETTINGS_LIMIT_FALLBACK: Record<SettingsLimitKey, { label: string; unit: s
 const SETTINGS_SOURCE_LABEL: Record<SettingsLimitSource, string> = { settings: '设置', env: '环境变量', default: '默认' };
 const EMPTY_SETTINGS_DRAFT: SettingsDraft = {
   maxDataGiB: '', artifactLimitMiB: '', rssLimitMiB: '', maxLogMiB: '', minFreeGiB: '',
+  solverTimeoutSeconds: '',
 };
 type GdsAsset = { assetId: string; fileName: string };
 type ProjectStep = {
@@ -152,7 +157,7 @@ type CompileInfo = {
   dimension: number;
   stepCount: number;
   authoredSteps?: ProjectStep[];
-  compile: { project: { name: string; dimension: number; steps: ProjectStep[] }; sourceMap?: Array<{ stepId: string; authoredStepId: string }> };
+  compile: { project: { name: string; dimension: number; steps: ProjectStep[]; solver?: { timeoutSeconds?: number; [key: string]: unknown } }; sourceMap?: Array<{ stepId: string; authoredStepId: string }> };
 };
 type RoutePlan = {
   route: { routeId: string; name: string; headAttemptId: string };
@@ -1274,9 +1279,10 @@ async function settingsRequest(init?: RequestInit): Promise<SettingsPayload> {
   return payload as SettingsPayload;
 }
 
-function settingsDraftFrom(limits: SettingsPayload['limits']): SettingsDraft {
-  const draft = { ...EMPTY_SETTINGS_DRAFT };
-  for (const key of SETTINGS_LIMIT_KEYS) draft[key] = String(limits[key]?.value ?? '');
+function settingsDraftFrom(payload: SettingsPayload): SettingsDraft {
+  const draft: SettingsDraft = { ...EMPTY_SETTINGS_DRAFT };
+  for (const key of SETTINGS_LIMIT_KEYS) draft[key] = String(payload.limits[key]?.value ?? '');
+  draft.solverTimeoutSeconds = String(payload.defaults?.solverTimeoutSeconds ?? SOLVER_TIMEOUT_DEFAULT);
   return draft;
 }
 
@@ -2188,8 +2194,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     width: 1, depth: 2, radius: 1, finHeight: 1.2, height: 0,
     taperAngle: 0, maskHeight: 0,
     substrateMaterial: 'Si', maskMaterial: 'Mask',
-    engine: 'cpu', seed: 7, timeout: 60, raysPerPoint: 16, cpuThreads: 1,
+    engine: 'cpu', seed: 7, timeout: SOLVER_TIMEOUT_DEFAULT, raysPerPoint: 16, cpuThreads: 1,
   });
+  const [solverDefaultSeconds, setSolverDefaultSeconds] = useState(SOLVER_TIMEOUT_DEFAULT);
   const [aboutOpen, setAboutOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsData, setSettingsData] = useState<SettingsPayload | null>(null);
@@ -2288,7 +2295,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     const threads = Number(solver.cpuThreads);
     if (!Number.isInteger(threads) || threads < 1) errors['solver.cpuThreads'] = 'cpuThreads 必须是 ≥ 1 的整数';
     const timeout = Number(solver.timeoutSeconds ?? 0);
-    if (!Number.isInteger(timeout) || timeout < 0 || timeout > 600) errors['solver.timeoutSeconds'] = 'timeoutSeconds 必须是 0–600 的整数';
+    if (!Number.isInteger(timeout) || timeout < 0 || timeout > SOLVER_TIMEOUT_MAX) errors['solver.timeoutSeconds'] = `timeoutSeconds 必须是 0–${SOLVER_TIMEOUT_MAX} 的整数`;
     const seed = Number(((solver.random ?? {}) as Record<string, unknown>).seed ?? 0);
     if (!Number.isInteger(seed) || seed < 0 || seed > 4294967295) errors['solver.seed'] = 'seed 必须是 0–4294967295 的整数';
     if (geometrySaveBlock) errors['geometry.source'] = geometrySaveBlock;
@@ -2907,6 +2914,17 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     resetToStart();
   };
 
+  /** New-project solver timeout default, unrelated to the per-run resource limits. */
+  const solverTimeoutFieldError = (): string => {
+    const raw = (settingsDraft.solverTimeoutSeconds ?? '').trim();
+    if (!/^\d+$/.test(raw)) return 'solver.timeoutSeconds 必须是整数';
+    const value = Number(raw);
+    if (!Number.isInteger(value) || value < SOLVER_TIMEOUT_MIN || value > SOLVER_TIMEOUT_MAX) {
+      return `solver.timeoutSeconds 必须是 ${SOLVER_TIMEOUT_MIN}–${SOLVER_TIMEOUT_MAX} 的整数`;
+    }
+    return '';
+  };
+
   /** Mirror the backend limit rules so the draft fails fast and visibly. */
   const settingsFieldError = (key: SettingsLimitKey): string => {
     const limit = settingsData?.limits[key];
@@ -2937,7 +2955,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       const payload = await settingsRequest();
       if (settingsLoadSeq.current !== seq) return;
       setSettingsData(payload);
-      setSettingsDraft(settingsDraftFrom(payload.limits));
+      setSettingsDraft(settingsDraftFrom(payload));
     } catch (err) {
       if (settingsLoadSeq.current !== seq) return;
       setSettingsData(null);
@@ -2950,7 +2968,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
 
   const saveSettings = async () => {
     if (!settingsData || settingsSaving) return;
-    const invalid = SETTINGS_LIMIT_KEYS.map(key => settingsFieldError(key)).find(Boolean);
+    const invalid = [...SETTINGS_LIMIT_KEYS.map(key => settingsFieldError(key)), solverTimeoutFieldError()].find(Boolean);
     if (invalid) { setSettingsError(invalid); setSettingsNotice(''); return; }
     setSettingsSaving('save');
     setSettingsError('');
@@ -2966,10 +2984,14 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       const payload = await settingsRequest({
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ limits }),
+        body: JSON.stringify({
+          limits,
+          defaults: { solverTimeoutSeconds: Number(settingsDraft.solverTimeoutSeconds) },
+        }),
       });
       setSettingsData(payload);
-      setSettingsDraft(settingsDraftFrom(payload.limits));
+      setSettingsDraft(settingsDraftFrom(payload));
+      setSolverDefaultSeconds(payload.defaults?.solverTimeoutSeconds ?? SOLVER_TIMEOUT_DEFAULT);
       setSettingsNotice('已保存，对下一次 run 生效');
     } catch (err) {
       setSettingsError(err instanceof Error ? err.message : '保存设置失败');
@@ -2980,7 +3002,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
 
   const resetSettings = async () => {
     if (!settingsData || settingsSaving) return;
-    if (!window.confirm('将所有资源上限恢复为环境变量或默认值？')) return;
+    if (!window.confirm('将资源上限恢复为环境变量或默认值，并将新工程超时恢复为 600 s？')) return;
     setSettingsSaving('reset');
     setSettingsError('');
     setSettingsNotice('');
@@ -2990,11 +3012,13 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           limits: { maxDataGiB: null, artifactLimitMiB: null, rssLimitMiB: null, maxLogMiB: null, minFreeGiB: null },
+          defaults: { solverTimeoutSeconds: SOLVER_TIMEOUT_DEFAULT },
         }),
       });
       const payload = await settingsRequest();
       setSettingsData(payload);
-      setSettingsDraft(settingsDraftFrom(payload.limits));
+      setSettingsDraft(settingsDraftFrom(payload));
+      setSolverDefaultSeconds(payload.defaults?.solverTimeoutSeconds ?? SOLVER_TIMEOUT_DEFAULT);
       setSettingsNotice('已恢复默认值，对下一次 run 生效');
     } catch (err) {
       setSettingsError(err instanceof Error ? err.message : '恢复默认设置失败');
@@ -3002,6 +3026,22 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       setSettingsSaving(null);
     }
   };
+
+  // New-project defaults are fetched once, independently of the settings
+  // dialog; an older backend without `defaults` must not block the UI.
+  useEffect(() => {
+    let cancelled = false;
+    settingsRequest()
+      .then(payload => {
+        if (cancelled) return;
+        const value = Number(payload.defaults?.solverTimeoutSeconds);
+        if (Number.isInteger(value) && value >= SOLVER_TIMEOUT_MIN && value <= SOLVER_TIMEOUT_MAX) {
+          setSolverDefaultSeconds(value);
+        }
+      })
+      .catch(() => { /* keep the local 600 s fallback */ });
+    return () => { cancelled = true; };
+  }, []);
 
   // Every open starts from a fresh GET, so a closed dialog never keeps a stale
   // draft from the previous visit.
@@ -3937,7 +3977,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setStateNotice('');
     parametricGeometryRef.current = null;
     setSetupMode('new');
-    setDraft(previous => ({ ...previous, name: 'New Project' }));
+    setDraft(previous => ({ ...previous, name: 'New Project', timeout: solverDefaultSeconds }));
     window.localStorage.removeItem(PROJECT_STORAGE_KEY);
   };
 
@@ -4080,7 +4120,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             : 7,
         },
         enginePreference: draft.engine,
-        timeoutSeconds: Math.max(5, Number(draft.timeout) || 60),
+        timeoutSeconds: Math.min(SOLVER_TIMEOUT_MAX, Math.max(SOLVER_TIMEOUT_MIN, Number(draft.timeout) || solverDefaultSeconds)),
       },
       ...(is3d ? { view3D: {
         projection: 'parallel', camera: null, displayMode: 'surface',
@@ -5809,9 +5849,14 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const sleep = (ms: number) => new Promise(resolve => window.setTimeout(resolve, ms));
 
   const waitSegment = async (segmentId: string) => {
-    // The run's own wall-clock budget is 600 s; wait past it so the UI shows
-    // the real terminal status instead of a false "did not finish" at 150 s.
-    const deadline = Date.now() + 16 * 60 * 1000;
+    // Wait past the project's own solver timeout (plus overhead) so the UI
+    // shows the real terminal status instead of a false "did not finish"; the
+    // floor stays at the historical 16 min budget.
+    const rawSolverSeconds = Number(compile?.compile.project.solver?.timeoutSeconds ?? project?.solver?.timeoutSeconds ?? SOLVER_TIMEOUT_DEFAULT);
+    const solverSeconds = Number.isFinite(rawSolverSeconds) ? rawSolverSeconds : SOLVER_TIMEOUT_DEFAULT;
+    const waitMs = Math.max(16 * 60 * 1000, (solverSeconds + 120) * 1000);
+    const waitMinutes = Math.round(waitMs / 60000);
+    const deadline = Date.now() + waitMs;
     let lastStatus = 'planned';
     while (Date.now() < deadline) {
       const current = await api<RoutePlan['segments'][number]>(`/api/v1/workflow/segments/${segmentId}`);
@@ -5819,7 +5864,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       if (['succeeded', 'failed', 'cancelled', 'interrupted', 'timed_out'].includes(lastStatus)) return current;
       await sleep(1000);
     }
-    throw new Error(`segment ${segmentId} did not finish within 16 min (last status: ${lastStatus})`);
+    throw new Error(`segment ${segmentId} did not finish within ${waitMinutes} min (last status: ${lastStatus})`);
   };
 
   const showMetricDetail = (item: Measurement) => run('metric-detail', async () => {
@@ -6799,8 +6844,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         : projectDirty
           ? '有未保存更改 · 保存'
           : `已保存${projectSavedAt ? ` · ${formatDateTime(projectSavedAt)}` : ''}`;
-  const settingsValidationError = SETTINGS_LIMIT_KEYS
-    .map(key => settingsFieldError(key))
+  const solverTimeoutError = solverTimeoutFieldError();
+  const settingsValidationError = [...SETTINGS_LIMIT_KEYS.map(key => settingsFieldError(key)), solverTimeoutError]
     .find(Boolean) ?? '';
   const renderDomainField = (label: string, key: 'gridDelta' | 'xExtent' | 'yExtent', step = '0.01', title?: string) => {
     const error = projectFormErrors[`domain.${key}`];
@@ -6845,7 +6890,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     }
     return <label className={`spx-field${error ? ' invalid' : ''}`} key={key}>
       <span title={title ?? key}>{label}</span>
-      <input aria-label={`工程 ${key}`} type="number" step="1" value={String(value ?? '')}
+      <input aria-label={`工程 ${key}`} type="number" step="1" min={key === 'timeoutSeconds' ? 0 : undefined}
+        max={key === 'timeoutSeconds' ? SOLVER_TIMEOUT_MAX : undefined} value={String(value ?? '')}
         aria-invalid={!!error}
         onChange={event => updateProjectSolver({ [key]: Number(event.target.value) })} />
       {error && <em className="spx-field-error">{error}</em>}
@@ -8971,6 +9017,34 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             {settingsError && <div className="spx-settings-error" role="alert">{settingsError}</div>}
             {settingsNotice && <div className="spx-settings-notice" role="status">{settingsNotice}</div>}
             {settingsData && <>
+              <section className="spx-settings-section" aria-label="运行默认值">
+                <div className="spx-settings-section-title">运行默认值</div>
+                <div className={`spx-settings-row${solverTimeoutError ? ' invalid' : ''}`}>
+                  <div className="spx-settings-meta">
+                    <div className="spx-settings-label">
+                      <strong>solver.timeoutSeconds</strong>
+                      <span className="spx-settings-hint">s</span>
+                    </div>
+                    <div className="spx-settings-hint">新工程默认；已有工程在 01 编辑</div>
+                    {solverTimeoutError && <em className="spx-field-error">{solverTimeoutError}</em>}
+                  </div>
+                  <input
+                    aria-label="设置 solverTimeoutSeconds"
+                    type="number"
+                    step="1"
+                    min={SOLVER_TIMEOUT_MIN}
+                    max={SOLVER_TIMEOUT_MAX}
+                    value={settingsDraft.solverTimeoutSeconds}
+                    aria-invalid={!!solverTimeoutError}
+                    onChange={event => {
+                      setSettingsError('');
+                      setSettingsNotice('');
+                      setSettingsDraft(previous => ({ ...previous, solverTimeoutSeconds: event.target.value }));
+                    }}
+                  />
+                </div>
+              </section>
+
               <section className="spx-settings-section" aria-label="资源上限">
                 <div className="spx-settings-section-title">资源上限</div>
                 {SETTINGS_LIMIT_KEYS.map(key => {
