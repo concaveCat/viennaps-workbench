@@ -47,6 +47,11 @@ from worker.gds_mask import (NATIVE_CONSTRUCTION, NATIVE_REGRID_CONSTRUCTION,
 from worker.specialized import build_specialized_model
 from worker.csv_process import build_csv_process
 from worker.mask_materials import protected_material_names
+from worker.artifacts import (artifact_bytes_used, atomic_json, check_artifact_budget,
+                              file_sha256, output_artifact)
+from worker.engine_policy import (multi_ion_gpu_step, native_slice_position,
+                                  requested_engine_for_step, require_multi_ion_flux_fields,
+                                  require_multi_ion_gpu_policy, verify_worker_engine_evidence)
 MATERIAL_CATALOG = json.loads((ROOT / "docs" / "materials-catalog.json").read_text(encoding="utf-8"))
 MATERIAL_ROWS = MATERIAL_CATALOG["materials"]
 MATERIAL_NAMES = {int(row["id"]): row["name"] for row in MATERIAL_ROWS}
@@ -57,72 +62,6 @@ GPU_MULTIPARTICLE_SPLIT_STRATEGY = "symmetric-operator-splitting-v1"
 GPU_MULTIPARTICLE_FLUX_STRATEGY = "per-species-native-mesh-merge-v1"
 GPU_MULTIPARTICLE_NATIVE_STRATEGY = "native-multi-ion-v1"
 GPU_MULTIPARTICLE_NATIVE_FLUX_STRATEGY = "native-multi-ion-flux-v1"
-
-
-def requested_engine_for_step(project: dict[str, Any], step: dict[str, Any],
-                              step_engines: dict[str, Any]) -> str:
-    """Resolve one worker engine without ever contradicting solver.gpuEngine.
-
-    Direct worker input does not pass through backend.validation, so an
-    omitted ``stepEngines`` entry must not silently downgrade an explicit
-    schema-7 GPU engine to GPU_DISK. A pinned entry that disagrees with the
-    requested engine is a hard error.
-    """
-    explicit = step_engines.get(step["id"])
-    solver = project.get("solver") or {}
-    requested = solver.get("gpuEngine") if project.get("schemaVersion") == 7 else None
-    if requested is not None:
-        if solver.get("enginePreference") != "gpu":
-            raise RuntimeError(
-                "solver.gpuEngine requires solver.enginePreference=gpu in the worker input")
-        if explicit is not None and explicit != requested:
-            raise RuntimeError(
-                f"pinned engine {explicit} for step {step['id']} differs from solver.gpuEngine {requested}")
-        return str(requested)
-    if explicit is not None:
-        return str(explicit)
-    return "GPU_DISK" if solver.get("enginePreference") == "gpu" else "CPU_DISK"
-
-
-def verify_worker_engine_evidence(project: dict[str, Any], step: dict[str, Any], engine: str) -> None:
-    """Apply the API capability gate to direct worker input.
-
-    The worker is independently reachable through a bounded run directory.
-    GPU_TRIANGLE must be checked against the archived product/direct matrix
-    here too, otherwise a normalized but unproven project could still call
-    Process.setFluxEngineType(GPU_TRIANGLE).
-    """
-    if engine != "GPU_TRIANGLE":
-        return
-    model = f"specialized:{step['nativeModel']}" if step.get("model") == "specialized" else step["model"]
-    boundary = project["domain"].get("boundaryXY", project["domain"].get("xBoundary"))
-    signature = gpu_project_signature(project, step)
-    if not capability_verified(project["dimension"], model, step["operation"], boundary, engine,
-                               schema_version=project.get("schemaVersion"), **signature):
-        raise RuntimeError(
-            f"GPU_TRIANGLE has no direct-reference acceptance row for {model} "
-            f"{step['operation']} on {boundary} in {project['dimension']}D; the worker refuses "
-            "the request instead of falling back to GPU_DISK or CPU_DISK")
-
-
-def native_slice_position(position: float, grid_delta: float) -> float:
-    """Reproduce ViennaLS Slice's std::round(position/gridDelta)*gridDelta.
-
-    C++ std::round rounds exact halves away from zero. Comparing the
-    fractional part avoids ``floor(q + 0.5)`` accidentally rounding
-    0.49999999999999994 up to 1.0 when the addition itself is rounded.
-    """
-    quotient = position / grid_delta
-    if quotient >= 0.0:
-        lower = math.floor(quotient)
-        index = lower + 1.0 if quotient - lower >= 0.5 else lower
-    else:
-        upper = math.ceil(quotient)
-        index = upper - 1.0 if upper - quotient >= 0.5 else upper
-    result = index * grid_delta
-    if index == 0.0 and math.copysign(1.0, quotient) < 0.0:
-        return -0.0
-    return result
 
 
 def configure_native_materials(ps: Any, custom_rows: list[dict[str, Any]]) -> None:
@@ -163,52 +102,6 @@ def configure_native_materials(ps: Any, custom_rows: list[dict[str, Any]]) -> No
     MATERIAL_NAMES = {int(row["id"]): row["name"] for row in rows}
     MATERIAL_IDS = {row["name"]: int(row["id"]) for row in rows}
     MATERIAL_COLORS = {int(row["id"]): row["color"] for row in rows}
-
-
-def atomic_json(path: Path, data: Any) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    # Snapshot JSON contains large point/cell arrays. Compact serialization
-    # avoids spending time on indentation and reduces per-run artifact size.
-    # Keep the encode-then-write form: measured on a 7.4 MB snapshot,
-    # json.dump(stream) is ~3.8x slower than json.dumps() + write_text()
-    # (293 ms vs 77 ms), because the stream path writes in small chunks.
-    tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
-
-
-def check_artifact_budget(run_dir: Path) -> None:
-    max_run_bytes = artifact_limit_bytes()
-    total = 0
-    for item in run_dir.rglob("*"):
-        try:
-            # The supervisor atomically replaces manifest.json while this
-            # bounded worker writes snapshots. A temporary manifest can
-            # disappear between is_file() and stat(); temporary files are not
-            # retained artifacts and must not count against the run budget.
-            if item.name.endswith(".tmp") or not item.is_file():
-                continue
-            total += item.stat().st_size
-            if total > max_run_bytes:
-                raise RuntimeError(
-                    f"run artifacts exceeded the {artifact_limit_label()} application cap"
-                )
-        except OSError:
-            # A concurrent atomic replace may remove a file after rglob has
-            # yielded its path. Continue with the remaining committed files.
-            continue
-
-
-def artifact_bytes_used(run_dir: Path) -> int:
-    """Return the committed run payload without raising on a transient file."""
-    total = 0
-    for item in run_dir.rglob("*"):
-        try:
-            if item.name.endswith(".tmp") or not item.is_file():
-                continue
-            total += item.stat().st_size
-        except OSError:
-            continue
-    return total
 
 
 def _surface_vertical_bounds(points: list, *, is3d: bool) -> tuple[float, float]:
@@ -3394,53 +3287,6 @@ def apply_geometry_operation(ps: Any, domain: Any, project: dict[str, Any], step
                 "nativeOperandConstruction": transform["construction"],
                 "maskDiagnostics": transform}
     raise RuntimeError(f"unsupported geometry operation {model!r}")
-
-
-def multi_ion_gpu_step(step: dict[str, Any], engine: str | None) -> bool:
-    """True when a step asks a GPU flux engine to convert more than one ion."""
-    if step.get("model") != "multiParticle" or not str(engine or "").startswith("GPU_"):
-        return False
-    return sum(row.get("kind") == "ion" for row in step.get("species", [])) > 1
-
-
-def require_multi_ion_gpu_policy(step: dict[str, Any], engine: str | None) -> None:
-    """Shared >= 4.7.0 multi-ion GPU policy for the single-pass flux path.
-
-    Applied before any native model or GPU flux call and independently of the
-    recorded flux strategy: on 4.7.0 every GPU flux engine converts one ion per
-    native call, so a multi-ion flux is either silently truncated (stock native
-    call) or unverified (per-species merge, which has 4.6.2 evidence only).
-    ``backend.validation`` rejects API requests and ``backend.supervisor``
-    rejects queued runs with the same helper, but a direct worker caller reaches
-    this function without either, so the gate lives here as well.
-    """
-    if not multi_ion_gpu_step(step, engine):
-        return
-    policy = multi_ion_gpu_error()
-    if policy is not None:
-        raise RuntimeError(policy)
-
-
-def require_multi_ion_flux_fields(report: dict[str, Any], step: dict[str, Any],
-                                  flux_strategy: str | None) -> None:
-    """Reject a native GPU flux mesh that dropped species fields.
-
-    Applies to the single native ``calculateFlux()`` call, including the
-    ``flux_strategy is None`` case: an unstrategised multi-ion GPU flux is not
-    "no strategy needed", it is the exact configuration where the installed
-    binding returns one ``<label><index>`` field and silently ignores the rest.
-    The per-species merge route builds its own fields and is checked by the
-    merge, not here.
-    """
-    if flux_strategy == GPU_MULTIPARTICLE_FLUX_STRATEGY:
-        return
-    expected_fields = {f"{row['label']}{index}" for index, row in enumerate(step["species"])}
-    present_fields = set(report["pointData"]["scalars"]) | set(report["cellData"]["scalars"])
-    if missing := expected_fields - present_fields:
-        raise RuntimeError(
-            f"native GPU MultiParticle flux is missing species fields: {sorted(missing)} "
-            f"(present: {sorted(present_fields)}); the installed binding returned a truncated "
-            f"multi-ion flux, so the run is rejected instead of reporting a partial result")
 
 
 def calculate_single_flux(ps: Any, domain: Any, project: dict[str, Any], step: dict[str, Any],
