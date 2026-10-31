@@ -210,8 +210,10 @@ also sets the matching concentration unit `1e12 cm^-3`; the values are
 recorded in the run document. Labels must be produced by an earlier implant or
 anneal step. The exported units are the same in 2D and 3D: the native implant
 concentration is volumetric (`1/um^3`, `concentrationUnitCm3 = 1e12`). The
-`integralNative` value is `sum · gridDelta^D`: an areal `1/um^2` integral in
-2D, and dimensionless in 3D (the summary omits `integralUnit` there).
+`integralNative` value is `sum · gridDelta^D`: with a `1/um^3` concentration
+the 2D value has unit `1/um` (one cell of `2 um^-3` with `gridDelta = 2 um`
+gives `8 um^-1`), and the 3D value is dimensionless (the summary omits
+`integralUnit` there).
 
 ## 3. Worker integration
 
@@ -300,7 +302,7 @@ concentration is volumetric (`1/um^3`, `concentrationUnitCm3 = 1e12`). The
 
 ## 6. Tests
 
-`tests/test_implant.py` (29 tests, all green on 4.7.0):
+`tests/test_implant.py` (30 tests, all green on 4.7.0):
 
 * schema defaults, label resolution, strict keys, non-finite and range
   rejection, table-source refusal, ordering/provenance, `substrateDepth`
@@ -314,7 +316,7 @@ concentration is volumetric (`1/um^3`, `concentrationUnitCm3 = 1e12`). The
 * real 2D `implant → anneal → analysis` run (manual Pearson IV + Hobler
   damage): native VTU cell labels, per-material dopant split (cover cells
   undoped), activation fraction, junction/null handling, Rsh, exported
-  concentration `1/um^3` (`1e12 cm^-3`) and 2D integral `1/um^2`, and an
+  concentration `1/um^3` (`1e12 cm^-3`) and 2D integral `1/um`, and an
   unchanged surface payload against a run without the field steps;
 * JSON-only output path, real 3D run (hexahedral grid; volumetric
   concentration and no `integralUnit`), replay to identical field digests and
@@ -322,7 +324,9 @@ concentration is volumetric (`1/um^3`, `concentrationUnitCm3 = 1e12`). The
 * direct-worker regressions that bypass the API: reserved labels, non-GAS
   cover in 2D/3D, a later field step with a different `height`/substrate grid,
   a surface-moving step after a field step (and the stale-grid field step that
-  would follow it), plus a positive shared-grid direct run.
+  would follow it), plus a positive shared-grid direct run;
+* `_field_integral` unit regression: `C=2 um^-3`, `delta=2 um` gives
+  `8 um^-1` in 2D and the exported 2D `integralUnit` is `1/um` (3D omits it).
 
 Full suite: the non-evidence tests pass (21 skipped). The remaining
 errors/failures in this worktree are the pre-existing missing

@@ -3363,7 +3363,8 @@ def _field_integral(values: list[float], *, grid_delta: float, dimension: int) -
 
     The native implant concentration is volumetric in both dimensions
     (``1/um^3``; the native cm^-3 conversion is 1e12). ``sum · delta^2`` is
-    therefore reported as the 2D areal integral ``1/um^2``, and the 3D value
+    therefore an integral over the 2D cell area with unit ``1/um`` (e.g. one
+    cell of ``2 um^-3`` with ``delta = 2 um`` gives ``8 um^-1``). The 3D value
     ``sum · delta^3`` is dimensionless and is not given a length unit. It is
     never converted to an areal cm^-2 dose, because a 2D native grid has no
     physical depth.
@@ -3976,11 +3977,11 @@ def write_cell_set_field_outputs(ps: Any, domain: Any, cell_set: Any, project: d
             # The native implant writes a volumetric concentration in both
             # dimensions (SheetResistance converts it with 1e12 cm^-3), so the
             # unit is 1/um^3 in 2D as well. ``integralNative`` is sum*delta^D:
-            # an areal 1/um^2 integral in 2D and dimensionless in 3D (where it
-            # is omitted instead of being labelled with a wrong unit).
+            # with C in 1/um^3 the 2D value has unit 1/um, while the 3D value is
+            # dimensionless and is omitted instead of being labelled.
             "concentrationUnit": f"1/{LENGTH_UNIT_NAME}^3",
             "concentrationUnitCm3": 1e12,
-            **({"integralUnit": f"1/{LENGTH_UNIT_NAME}^2"} if dimension == 2 else {}),
+            **({"integralUnit": f"1/{LENGTH_UNIT_NAME}"} if dimension == 2 else {}),
             "process": record,
         }
         path = artifact_dir / f"{step_id}-cell-set-fields.json"

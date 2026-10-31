@@ -433,12 +433,13 @@ class ImplantWorkflow(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(sheet["sheetResistanceOhmPerSquare"], 0.0)
 
         # Exported units: the native implant concentration is volumetric in 2D
-        # as well (1e12 cm^-3 conversion), while the 2D areal integral is 1/um^2.
+        # as well (1e12 cm^-3 conversion); sum(C)*delta^2 therefore has unit
+        # 1/um, not 1/um^2.
         summary = storage.read_json(storage.run_path(run_id) / "artifacts" /
                                     "analysis_step_01-cell-set-fields.json")
         self.assertEqual(summary["concentrationUnit"], "1/um^3")
         self.assertEqual(summary["concentrationUnitCm3"], 1e12)
-        self.assertEqual(summary["integralUnit"], "1/um^2")
+        self.assertEqual(summary["integralUnit"], "1/um")
         self.assertIn("net_doping", summary["fields"])
 
         # The surface itself must be untouched: the same project without the
@@ -569,6 +570,13 @@ class ImplantWorkerGuards(unittest.TestCase):
             with self.subTest(dimension=dimension):
                 messages = numeric_guard_messages(step, dimension=dimension, grid_delta=0.01)
                 self.assertTrue(any("coverMaterial" in message for message in messages), messages)
+
+    def test_field_integral_units_follow_the_volumetric_concentration(self) -> None:
+        from worker.simulate import _field_integral
+        # One cell with C = 2 um^-3 and delta = 2 um: sum(C)*delta^2 = 8 um^-1.
+        self.assertEqual(_field_integral([2.0], grid_delta=2.0, dimension=2), 8.0)
+        # The 3D value sum(C)*delta^3 = 16 is dimensionless.
+        self.assertEqual(_field_integral([2.0], grid_delta=2.0, dimension=3), 16.0)
 
 
 class ImplantDirectWorkerGuards(unittest.TestCase):
