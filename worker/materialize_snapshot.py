@@ -73,6 +73,8 @@ def materialize(input_path: Path, run_dir: Path, step_id: str) -> dict[str, Any]
                                                 "surfaceMesh", "cellSet", "cellSetSummary"}]
     extra = ({"oxidation": metadata["oxidation"]}
              if isinstance(metadata.get("oxidation"), dict) else None)
+    if isinstance(metadata.get("cellSetProcess"), dict):
+        extra = {**(extra or {}), "cellSetProcess": metadata["cellSetProcess"]}
     produced = sim.save_snapshot(
         ps, domain, run_dir,
         run_id=metadata.get("runId") or config.get("runId") or "",

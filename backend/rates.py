@@ -18,8 +18,9 @@ def is_geometry_step(step: Any) -> bool:
 
 
 def has_motion(step: Any) -> bool:
-    if value(step, "model") in {"specialized", "csvProcess"}:
-        # Native specialized/CSV models own their physical rate law. A
+    if value(step, "model") in {"specialized", "csvProcess", "implant", "anneal", "analysis"}:
+        # Native specialized/CSV models own their physical rate law, and the
+        # 4.7.0 cell-set field steps never use a schema-level scalar rate. A
         # schema-level scalar rate is intentionally absent; always execute.
         return True
     if value(step, "model") == "multiParticle":

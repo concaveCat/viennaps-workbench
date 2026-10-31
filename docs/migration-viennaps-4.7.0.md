@@ -493,3 +493,13 @@ Regenerate the multi-ion table with
 `scripts/bounded_child.py` (`--dimension`, `--engine`, `--ions`,
 `--active-index`); the 2D Faraday pair with
 `python -m worker.probe_faraday_2d --case '{"dimension":2,"cageAngle":0.2,"tiltAngle":0.0,"engine":"CPU_DISK"}'`.
+
+## 11. Implant / anneal / doping capability (schema 7)
+
+The 4.7.0-only `IonImplantation`, `Anneal`, `NetDoping` and `SheetResistance`
+classes are exposed as three additive schema-7 step models (`implant`,
+`anneal`, `analysis`). They operate on the Domain cell set, never on the
+surface, and are rejected on 4.6.2 before a worker starts. The contract, the
+bounded native evidence (`worker/probe_implant_native.py`) and the list of
+intentionally unexposed setters are in
+[`docs/capability-implant.md`](capability-implant.md).
