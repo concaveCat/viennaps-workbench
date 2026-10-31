@@ -2513,7 +2513,28 @@ def save_snapshot(
     """
     v3 = requested["schemaVersion"] >= 3
     if v3:
-        render_domain, levelset_ids = domain, material_map(domain)
+        levelsets = domain.getLevelSets()
+        material_ids = material_map(domain)
+        if any(level_set.getNumberOfPoints() == 0 for level_set in levelsets):
+            # A material can be fully removed by an earlier boolean/process.
+            # The native multi-surface mesher rejects empty level sets, so
+            # render only the surviving interfaces and keep their material IDs.
+            if requested["dimension"] == 3:
+                from mesh3d import make_domain
+                render_domain = make_domain(ps, requested)
+            else:
+                render_domain = _make_render_domain_2d(ps, requested)
+            levelset_ids = []
+            for level_set, material_id in zip(levelsets, material_ids):
+                if level_set.getNumberOfPoints() == 0:
+                    continue
+                render_domain.insertNextLevelSetAsMaterial(
+                    level_set, ps.Material(material_id), False)
+                levelset_ids.append(material_id)
+            if not levelset_ids:
+                raise RuntimeError("cannot render a snapshot with no non-empty level sets")
+        else:
+            render_domain, levelset_ids = domain, material_ids
     else:
         render_domain, levelset_ids = material_surface_domain(ps, domain, requested)
     is3d = requested["dimension"] == 3
