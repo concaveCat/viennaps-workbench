@@ -11,6 +11,7 @@ from backend import storage
 from backend.workflow.store import SCHEMA_VERSION, WorkflowStore
 from backend.workflow.verification import verify_route_plan_compiles
 from tests.workflow_fixtures import compiled_base, compiled_branch, compiled_with_solver, plan_from_compiled
+from tests.test_workflow_adoption import project as project_fixture
 
 
 def downgrade_to_v2(path, *, drop_compiles: bool = False) -> None:
@@ -117,6 +118,32 @@ class WorkflowMigrationTests(unittest.TestCase):
         self.assertEqual(plan.attempts[1].prefixCompatibility.solverDigest, "0" * 64)
         self.assertIsNotNone(plan.attempts[1].legacyCompatibility)
         self.assertIsNotNone(plan.reuse[0].legacyCompatibility)
+
+    def test_v11_database_gains_the_reports_table(self):
+        suffix = uuid.uuid4().hex[:6]
+        path = storage.VAR / f"test-workflow-migrate-reports-{suffix}.sqlite3"
+        store = WorkflowStore(path)
+        store.initialize()
+        with sqlite3.connect(path) as connection:
+            connection.execute("DROP TABLE workflow_reports")
+            connection.execute("UPDATE schema_meta SET value = '11' WHERE key = 'schema_version'")
+        migrated = WorkflowStore(path)
+        migrated.initialize()
+        self.assertEqual(migrated.schema_version(), SCHEMA_VERSION)
+        with sqlite3.connect(path) as connection:
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+        self.assertIn("workflow_reports", tables)
+        record = migrated.create_project({**project_fixture(), "name": f"迁移报告 {suffix}"})[0]
+        saved = migrated.save_report(
+            record["projectId"], "report_migrated", "迁移报告", "<html></html>", "0" * 64
+        )
+        self.assertEqual(saved["reportId"], "report_migrated")
+        self.assertEqual(migrated.get_latest_report(record["projectId"])["title"], "迁移报告")
 
 
 if __name__ == "__main__":

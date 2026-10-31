@@ -41,7 +41,13 @@ from .routes import (
 from .verification import prefix_compatibility, verify_route_plan_compiles
 
 
-SCHEMA_VERSION = "11"
+SCHEMA_VERSION = "12"
+
+# Reports are HTML documents, not build artifacts: they are small enough to keep
+# in SQLite, but a single report may not grow into a blob and one project may not
+# accumulate an unbounded history.
+MAX_REPORT_HTML_BYTES = 2 * 1024 * 1024
+MAX_REPORTS_PER_PROJECT = 50
 
 
 def new_project_id() -> str:
@@ -84,7 +90,7 @@ class WorkflowStore:
                         "SELECT value FROM schema_meta WHERE key = 'schema_version'"
                     ).fetchone()
                     if row is not None and row[0] not in {
-                        "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", SCHEMA_VERSION,
+                        "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", SCHEMA_VERSION,
                     }:
                         raise RuntimeError(
                             f"unsupported workflow schema version {row[0]!r}; "
@@ -286,6 +292,17 @@ class WorkflowStore:
                     state_json TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS workflow_reports (
+                    project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                    report_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    html TEXT NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (project_id, report_id)
+                );
+                CREATE INDEX IF NOT EXISTS workflow_reports_project_idx
+                    ON workflow_reports(project_id, created_at);
                 CREATE TABLE IF NOT EXISTS geometry_bindings (
                     binding_id TEXT PRIMARY KEY,
                     binding_json TEXT NOT NULL,
@@ -402,7 +419,7 @@ class WorkflowStore:
                     "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
                     (SCHEMA_VERSION,),
                 )
-            elif version_row["value"] in {"3", "4", "5", "6", "7", "8", "9", "10"}:
+            elif version_row["value"] in {"3", "4", "5", "6", "7", "8", "9", "10", "11"}:
                 connection.execute(
                     "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
                     (SCHEMA_VERSION,),
@@ -1556,6 +1573,33 @@ class WorkflowStore:
             raise WorkflowNotFound(f"experiment {experiment_id!r} does not exist")
         return json.loads(row["document_json"])
 
+    def delete_experiment(self, experiment_id: str) -> None:
+        """Delete one experiment document, never its runs or measurements.
+
+        A running/queued experiment is refused: deleting its document while the
+        worker still updates it would resurrect a half-written record.
+        """
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT document_json FROM experiments WHERE experiment_id = ?",
+                (experiment_id,),
+            ).fetchone()
+            if row is None:
+                raise WorkflowNotFound(f"experiment {experiment_id!r} does not exist")
+            document = json.loads(row["document_json"])
+            status = str(document.get("status") or "")
+            running = any(
+                str(replicate.get("status") or "") in {"running", "queued"}
+                for variant in document.get("variants") or []
+                for replicate in variant.get("replicates") or []
+            )
+            if status in {"running", "queued"} or running:
+                raise WorkflowConflict("实验运行中，先取消")
+            connection.execute(
+                "DELETE FROM experiments WHERE experiment_id = ?", (experiment_id,)
+            )
+
     def list_experiment_documents(self) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -2545,6 +2589,128 @@ class WorkflowStore:
             connection.execute(
                 "DELETE FROM project_workflow_state WHERE project_id = ?", (project_id,)
             )
+
+    # ------------------------------------------------------------------
+    # Persisted reports (schema 12)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _report_payload(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "reportId": row["report_id"],
+            "title": row["title"],
+            "html": row["html"],
+            "sha256": row["sha256"],
+            "createdAt": row["created_at"],
+        }
+
+    def save_report(
+        self,
+        project_id: str,
+        report_id: str,
+        title: str,
+        html: str,
+        sha256: str,
+        created_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Store one report for a project.
+
+        Two explicit limits keep a project's report history bounded: the HTML
+        body may not exceed 2 MiB and only the newest 50 reports are kept. When
+        a 51st distinct report arrives the oldest one is replaced instead of
+        rejecting the new report, because the report the user just generated is
+        the one they expect to see in 06.
+        """
+
+        encoded = html.encode("utf-8")
+        if len(encoded) > MAX_REPORT_HTML_BYTES:
+            raise WorkflowValidation(
+                f"报告 HTML 超过 {MAX_REPORT_HTML_BYTES} 字节上限（当前 {len(encoded)}）"
+            )
+        timestamp = created_at or self._now()
+        with self._connect() as connection:
+            project = connection.execute(
+                "SELECT project_id FROM projects WHERE project_id = ?", (project_id,)
+            ).fetchone()
+            if project is None:
+                raise WorkflowNotFound(f"project {project_id!r} does not exist")
+            existing = connection.execute(
+                "SELECT 1 FROM workflow_reports WHERE project_id = ? AND report_id = ?",
+                (project_id, report_id),
+            ).fetchone()
+            if existing is None:
+                count = connection.execute(
+                    "SELECT COUNT(*) FROM workflow_reports WHERE project_id = ?",
+                    (project_id,),
+                ).fetchone()[0]
+                overflow = count - (MAX_REPORTS_PER_PROJECT - 1)
+                if overflow > 0:
+                    connection.execute(
+                        "DELETE FROM workflow_reports WHERE rowid IN ("
+                        " SELECT rowid FROM workflow_reports WHERE project_id = ?"
+                        " ORDER BY created_at ASC, rowid ASC LIMIT ?)",
+                        (project_id, overflow),
+                    )
+            connection.execute(
+                "INSERT INTO workflow_reports"
+                " (project_id, report_id, title, html, sha256, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(project_id, report_id) DO UPDATE SET"
+                " title = excluded.title, html = excluded.html,"
+                " sha256 = excluded.sha256, created_at = excluded.created_at",
+                (project_id, report_id, title, html, sha256, timestamp),
+            )
+        return {
+            "reportId": report_id,
+            "title": title,
+            "html": html,
+            "sha256": sha256,
+            "createdAt": timestamp,
+        }
+
+    def get_latest_report(self, project_id: str) -> dict[str, Any] | None:
+        """Return the newest report, or ``None`` when the project has none."""
+
+        with self._connect() as connection:
+            project = connection.execute(
+                "SELECT project_id FROM projects WHERE project_id = ?", (project_id,)
+            ).fetchone()
+            if project is None:
+                raise WorkflowNotFound(f"project {project_id!r} does not exist")
+            row = connection.execute(
+                "SELECT * FROM workflow_reports WHERE project_id = ?"
+                " ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (project_id,),
+            ).fetchone()
+        return None if row is None else self._report_payload(row)
+
+    def get_report(self, project_id: str, report_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            project = connection.execute(
+                "SELECT project_id FROM projects WHERE project_id = ?", (project_id,)
+            ).fetchone()
+            if project is None:
+                raise WorkflowNotFound(f"project {project_id!r} does not exist")
+            row = connection.execute(
+                "SELECT * FROM workflow_reports WHERE project_id = ? AND report_id = ?",
+                (project_id, report_id),
+            ).fetchone()
+        if row is None:
+            raise WorkflowNotFound(
+                f"report {report_id!r} does not exist for project {project_id!r}"
+            )
+        return self._report_payload(row)
+
+    def delete_report(self, project_id: str, report_id: str) -> None:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM workflow_reports WHERE project_id = ? AND report_id = ?",
+                (project_id, report_id),
+            )
+            if cursor.rowcount == 0:
+                raise WorkflowNotFound(
+                    f"report {report_id!r} does not exist for project {project_id!r}"
+                )
 
     @staticmethod
     def _validate_workflow_state_references(

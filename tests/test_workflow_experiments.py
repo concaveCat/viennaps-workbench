@@ -87,6 +87,63 @@ class ExperimentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fetched[0], 200, fetched[2])
         self.assertEqual(len(json_body(fetched)["variants"]), 10)
 
+    async def test_delete_experiment_document(self):
+        from backend.workflow.api import get_store
+
+        p = project()
+        response = await asgi_request(
+            "/api/v1/workflow/experiments", method="POST",
+            payload={
+                "name": "待删除实验", "project": p, "flowId": "flow_exp_delete",
+                "recipeId": self.recipe_id, "recipeVersion": 1,
+                "variants": [{"parameters": {"step_etch_01": {"duration": 0.01}}, "replicates": 1, "seed": 5}],
+            },
+        )
+        self.assertEqual(response[0], 201, response[2])
+        experiment_id = json_body(response)["experimentId"]
+
+        deleted = await asgi_request(
+            f"/api/v1/workflow/experiments/{experiment_id}", method="DELETE"
+        )
+        self.assertEqual(deleted[0], 204, deleted[2])
+        gone = await asgi_request(f"/api/v1/workflow/experiments/{experiment_id}")
+        self.assertEqual(gone[0], 404, gone[2])
+        again = await asgi_request(
+            f"/api/v1/workflow/experiments/{experiment_id}", method="DELETE"
+        )
+        self.assertEqual(again[0], 404, again[2])
+
+        # A running experiment is refused with a Chinese 409 instead of being
+        # removed while its worker keeps writing the document.
+        running = await asgi_request(
+            "/api/v1/workflow/experiments", method="POST",
+            payload={
+                "name": "运行中实验", "project": p, "flowId": "flow_exp_delete",
+                "recipeId": self.recipe_id, "recipeVersion": 1,
+                "variants": [{"parameters": {"step_etch_01": {"duration": 0.01}}, "replicates": 1, "seed": 6}],
+            },
+        )
+        self.assertEqual(running[0], 201, running[2])
+        running_document = json_body(running)
+        running_document["status"] = "running"
+        get_store().save_experiment(running_document["experimentId"], running_document)
+        refused = await asgi_request(
+            f"/api/v1/workflow/experiments/{running_document['experimentId']}", method="DELETE"
+        )
+        self.assertEqual(refused[0], 409, refused[2])
+        self.assertIn("实验运行中，先取消", json_body(refused)["detail"])
+        still_there = await asgi_request(
+            f"/api/v1/workflow/experiments/{running_document['experimentId']}"
+        )
+        self.assertEqual(still_there[0], 200, still_there[2])
+        # Leave no running document behind for later tests.
+        running_document["status"] = "planned"
+        get_store().save_experiment(running_document["experimentId"], running_document)
+        await asgi_request(
+            f"/api/v1/workflow/experiments/{running_document['experimentId']}", method="DELETE"
+        )
+
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1022,11 +1022,14 @@ body {
 .wf-repeat > span:first-child { color: var(--spx-muted); }
 .wf-repeat .wf-status { padding: 0 4px; font-size: 9px; }
 .wf-experiment-list { display: grid; gap: 3px; margin: 0 0 10px; }
-.wf-experiment-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 10px; text-align: left; border: 1px solid var(--spx-line); background: #fff; padding: 4px 7px; cursor: pointer; font: inherit; color: var(--spx-ink); }
+.wf-experiment-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 2px 10px; align-items: center; text-align: left; border: 1px solid var(--spx-line); background: #fff; padding: 4px 7px; font: inherit; color: var(--spx-ink); }
+.wf-experiment-open { display: grid; grid-template-columns: minmax(0, 1fr); gap: 2px; text-align: left; border: 0; background: transparent; padding: 0; cursor: pointer; font: inherit; color: inherit; min-width: 0; }
 .wf-experiment-row:hover { border-color: var(--spx-blue); background: #f7fbff; }
 .wf-experiment-row.active { border-color: var(--spx-blue); background: var(--spx-blue-soft); }
 .wf-experiment-row strong { font-size: 11px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .wf-experiment-row span { color: var(--spx-muted); font-size: 9px; }
+.wf-recipe-current { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; padding: 5px 7px; border: 1px solid var(--spx-line); background: #f7fbff; font-size: 10px; color: var(--spx-ink); }
+.wf-recipe-current strong { font-size: 10px; }
 .wf-variant-table input { width: 100%; }
 .wf-doe-factors { display: grid; gap: 5px; }
 .wf-doe-factor { display: grid; grid-template-columns: minmax(110px, 1fr) minmax(120px, 1fr) minmax(160px, 1.6fr) auto; gap: 5px 8px; align-items: end; border: 1px solid var(--spx-line-soft); background: #fbfcfd; padding: 5px 6px; }

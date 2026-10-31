@@ -812,7 +812,7 @@ class LibraryStoreTests(unittest.TestCase):
             LibraryBundleV1.model_validate(mismatched)
 
     def test_store_schema_is_current_and_bundles_roundtrip(self):
-        self.assertEqual(SCHEMA_VERSION, "10")
+        self.assertEqual(SCHEMA_VERSION, "12")
         self.assertEqual(self.source.schema_version(), SCHEMA_VERSION)
         bundle = self._export()
         stored = self.source.save_library_bundle(bundle)

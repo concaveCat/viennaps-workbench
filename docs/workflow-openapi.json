@@ -7474,6 +7474,17 @@
             ],
             "title": "Measurementid"
           },
+          "projectId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Projectid"
+          },
           "runId": {
             "anyOf": [
               {
@@ -9373,22 +9384,6 @@
   },
   "openapi": "3.1.0",
   "paths": {
-    "/": {
-      "get": {
-        "operationId": "frontend_not_built__get",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          }
-        },
-        "summary": "Frontend Not Built"
-      }
-    },
     "/api/capabilities": {
       "get": {
         "operationId": "capabilities_api_capabilities_get",
@@ -11924,6 +11919,40 @@
       }
     },
     "/api/v1/workflow/experiments/{experiment_id}": {
+      "delete": {
+        "description": "Delete one experiment document; runs and measurements stay intact.",
+        "operationId": "delete_experiment_api_v1_workflow_experiments__experiment_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "experiment_id",
+            "required": true,
+            "schema": {
+              "title": "Experiment Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Experiment",
+        "tags": [
+          "workflow"
+        ]
+      },
       "get": {
         "operationId": "get_experiment_api_v1_workflow_experiments__experiment_id__get",
         "parameters": [
@@ -14040,6 +14069,150 @@
           }
         },
         "summary": "Put Project",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/projects/{project_id}/reports/latest": {
+      "get": {
+        "description": "Return the newest stored report, or ``null`` when the project has none.",
+        "operationId": "get_latest_project_report_api_v1_workflow_projects__project_id__reports_latest_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ReportResponse"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "title": "Response Get Latest Project Report Api V1 Workflow Projects  Project Id  Reports Latest Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Latest Project Report",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/projects/{project_id}/reports/{report_id}": {
+      "delete": {
+        "operationId": "delete_project_report_api_v1_workflow_projects__project_id__reports__report_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "report_id",
+            "required": true,
+            "schema": {
+              "title": "Report Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Project Report",
+        "tags": [
+          "workflow"
+        ]
+      },
+      "get": {
+        "operationId": "get_project_report_api_v1_workflow_projects__project_id__reports__report_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "report_id",
+            "required": true,
+            "schema": {
+              "title": "Report Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReportResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Project Report",
         "tags": [
           "workflow"
         ]

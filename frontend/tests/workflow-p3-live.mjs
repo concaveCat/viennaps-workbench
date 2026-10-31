@@ -31,7 +31,8 @@ try {
 
   // 03 structure timeline: the initial structure and every executed step are
   // visible chips, not a hidden dropdown. Switching back to the initial
-  // structure keeps the 2D canvas and the measurement marker alive.
+  // structure keeps the 2D canvas, but the measurement marker belongs to the
+  // measured step only (round-5 L1), so it is hidden here.
   await page.locator('.wf-structure-timeline').waitFor();
   const stepChips = page.locator('.wf-step-chip');
   assert.ok(await stepChips.count() >= 2, 'timeline must show the initial structure plus at least one step');
@@ -39,9 +40,14 @@ try {
   await initialChip.waitFor();
   await initialChip.click();
   await page.locator('.wf-structure-canvas').waitFor();
-  await page.locator('.wf-marker').first().waitFor();
+  assert.equal(await page.locator('.wf-marker').count(), 0, 'the marker hides on a step it did not measure');
   assert.equal(await initialChip.getAttribute('aria-selected'), 'true');
   assert.ok(await page.locator('.wf-structure-legend i').count() >= 1, '2D legend must stay visible after switching steps');
+  // Back on the measured step the marker returns.
+  await stepChips.last().click();
+  await page.locator('.wf-marker').first().waitFor();
+  await initialChip.click();
+  await page.locator('.wf-structure-canvas').waitFor();
 
   // 2D structure readability: material fill under the interface line, a real
   // height axis with ticks, and no fake XY/XZ/YZ selector on a 2D snapshot.

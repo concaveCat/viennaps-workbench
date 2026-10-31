@@ -286,7 +286,9 @@ try {
   const reportRow = page.locator('.spx-tree-item').filter({ hasText: '报告' }).first();
   const treeText = await reportRow.innerText();
   assert.match(treeText, /\d{4}-\d{2}-\d{2} \d{2}:\d{2}/);
-  assert.equal((treeText.match(/已生成/g) ?? []).length, 1, 'report status appears once, in the badge');
+  // Round 5: the value carries "已生成 · 时间" and the badge repeats the state.
+  assert.ok((treeText.match(/已生成/g) ?? []).length >= 1, 'report status is visible in the tree');
+  assert.match(treeText, /已生成 · \d{4}-\d{2}-\d{2}/, 'the report row shows 已生成 · 时间');
   assert.doesNotMatch(treeText, /report_[a-f0-9]{8,}/, 'left tree must not lead with a report id');
 
   const downloadPromise = page.waitForEvent('download');

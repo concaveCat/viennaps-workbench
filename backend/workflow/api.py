@@ -570,6 +570,7 @@ class ProcessWindowRequest(StrictModel):
 
 class ReportRequest(StrictModel):
     title: Annotated[str, Field(min_length=1, max_length=120)] = "Workflow report"
+    projectId: str | None = None
     experimentId: str | None = None
     runId: str | None = None
     stepId: str | None = None
@@ -734,7 +735,18 @@ async def analyze_process_window(request: ProcessWindowRequest) -> dict:
 @router.post("/analysis/report", response_model=ReportResponse)
 async def analyze_report(request: ReportRequest) -> ReportResponse:
     def operation():
-        return build_report(get_store(), request.model_dump(mode="json"))
+        store = get_store()
+        result = build_report(store, request.model_dump(mode="json"))
+        if request.projectId:
+            store.save_report(
+                request.projectId,
+                result["reportId"],
+                result["title"],
+                result["html"],
+                result["sha256"],
+                result["createdAt"],
+            )
+        return result
     return _call(operation)
 
 
@@ -1171,6 +1183,14 @@ async def get_experiment(experiment_id: str) -> dict:
     return _call(lambda: get_store().get_experiment(experiment_id))
 
 
+@router.delete("/experiments/{experiment_id}", status_code=204)
+async def delete_experiment(experiment_id: str) -> Response:
+    """Delete one experiment document; runs and measurements stay intact."""
+
+    _call(lambda: get_store().delete_experiment(experiment_id))
+    return Response(status_code=204)
+
+
 @router.post("/experiments/{experiment_id}/run", response_model=dict)
 async def run_experiment(experiment_id: str, request: Request) -> dict:
     supervisor = getattr(request.app.state, "supervisor", None)
@@ -1249,6 +1269,32 @@ async def put_project_workflow_state(
 @router.delete("/projects/{project_id}/state", status_code=204)
 async def delete_project_workflow_state(project_id: str) -> Response:
     _call(lambda: get_store().delete_project_workflow_state(project_id))
+    return Response(status_code=204)
+
+
+@router.get(
+    "/projects/{project_id}/reports/latest",
+    response_model=ReportResponse | None,
+    response_model_exclude_none=False,
+)
+async def get_latest_project_report(project_id: str) -> ReportResponse | None:
+    """Return the newest stored report, or ``null`` when the project has none."""
+
+    return _call(lambda: get_store().get_latest_report(project_id))
+
+
+@router.get(
+    "/projects/{project_id}/reports/{report_id}", response_model=ReportResponse
+)
+async def get_project_report(project_id: str, report_id: str) -> ReportResponse:
+    return _call(lambda: get_store().get_report(project_id, report_id))
+
+
+@router.delete(
+    "/projects/{project_id}/reports/{report_id}", status_code=204
+)
+async def delete_project_report(project_id: str, report_id: str) -> Response:
+    _call(lambda: get_store().delete_report(project_id, report_id))
     return Response(status_code=204)
 
 
