@@ -883,6 +883,15 @@ body {
 .wf-structure-head select { height: 22px; border: 1px solid var(--spx-line); background: #fff; font-size: 11px; padding: 0 4px; max-width: 260px; }
 .wf-structure-head .wf-structure-step { color: #26313a; font-size: 11px; }
 .wf-structure-head .wf-muted { margin: 0 0 0 auto; }
+.wf-structure-head .wf-button.ghost { width: auto; height: 22px; min-width: 0; padding: 0 7px; font-size: 11px; }
+.wf-structure-head .wf-button.ghost.active { border-color: #35b7a1; background: #eefaf7; color: #0b6b5c; }
+/* Live run progress: the same manifest poll drives these numbers, the timeline
+   chips and the structure preview, so they cannot drift apart. */
+.wf-run-progress { padding: 5px 7px 6px; border-bottom: 1px solid var(--spx-line); background: #f7fbfa; }
+.wf-run-progress-head { display: flex; align-items: baseline; gap: 8px; font-size: 11px; color: var(--spx-muted); }
+.wf-run-progress-head strong { color: #0b6b5c; font-size: 11px; }
+.wf-run-progress-track { height: 5px; margin-top: 4px; background: #dde7e4; overflow: hidden; }
+.wf-run-progress-track span { display: block; height: 100%; background: #35b7a1; transition: width .3s ease; }
 .wf-structure-body { display: grid; grid-template-columns: minmax(0, 1fr) 172px; gap: 8px; padding: 7px; }
 .wf-structure-canvas-shell { position: relative; display: block; min-width: 0; user-select: none; -webkit-user-select: none; }
 .wf-structure-canvas-shell > svg { display: block; }

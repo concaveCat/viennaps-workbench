@@ -561,6 +561,7 @@ const STATUS_LABELS: Record<string, string> = {
   failed: '失败',
   cancelled: '已取消',
   interrupted: '已中断',
+  timed_out: '超时',
   verified: '已核验',
   measured: '已测量',
   ambiguous: '测量有歧义',
@@ -2162,6 +2163,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [rateSetsText, setRateSetsText] = useState('');
   const [rateSetsError, setRateSetsError] = useState('');
   const [structurePick, setStructurePick] = useState('');
+  const [structureFollow, setStructureFollow] = useState(true);
+  const [runProgress, setRunProgress] = useState<Record<string, { currentStepId: string; completed: string[] }>>({});
   const [structureView, setStructureView] = useState<CandidateView | null>(null);
   const [structureLoading, setStructureLoading] = useState(false);
   const [structureError, setStructureError] = useState('');
@@ -3548,6 +3551,10 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const runningSegment = (route?.segments ?? [])
     .find(item => ['running', 'queued', 'cancelling'].includes(item.status)) ?? null;
   const runningSegmentName = runningSegment ? stepDisplayName(runningSegment.throughStepId) : '';
+  const activeRunProgress = runningSegment?.runId ? runProgress[runningSegment.runId] : null;
+  const totalStepCount = route?.stepOrder.length ?? 0;
+  const completedStepCount = activeRunProgress?.completed.length ?? 0;
+  const currentStepName = activeRunProgress?.currentStepId ? stepDisplayName(activeRunProgress.currentStepId) : '';
   const shortId = (id: string | null | undefined) => (id ? id.slice(-6) : '');
 
   const structureDimension: 2 | 3 = compile?.dimension === 3 || project?.dimension === 3 ? 3 : 2;
@@ -3581,6 +3588,64 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     return () => { cancelled = true; };
   }, [succeededSegmentRuns, runSnapshots]);
 
+  // A running Segment writes one snapshot per completed step. Poll its run
+  // manifest while it is live so the timeline, the progress bar and the
+  // structure preview advance together; the final succeeded fetch above then
+  // takes over.
+  const runningSegmentRuns = useMemo(() => (route?.segments ?? [])
+    .filter(item => !!item.runId && !item.runId.startsWith('pending_')
+      && ['running', 'queued', 'cancelling'].includes(item.status))
+    .map(item => item.runId as string), [route]);
+  const runningRunKey = runningSegmentRuns.join(',');
+  useEffect(() => {
+    if (!runningRunKey) return;
+    let cancelled = false;
+    const tick = async () => {
+      const entries = await Promise.all(runningSegmentRuns.map(async runId => {
+        try {
+          const manifest = await api<{ snapshots?: Array<{ stepId?: unknown }>; currentStepId?: unknown }>(`/api/runs/${runId}`);
+          const steps = (manifest.snapshots ?? [])
+            .map(item => (typeof item?.stepId === 'string' ? item.stepId : ''))
+            .filter(Boolean);
+          const currentStepId = typeof manifest.currentStepId === 'string' ? manifest.currentStepId : '';
+          return { runId, steps, currentStepId };
+        } catch {
+          return { runId, steps: [] as string[], currentStepId: '' };
+        }
+      }));
+      if (cancelled) return;
+      setRunSnapshots(previous => {
+        let changed = false;
+        const next = { ...previous };
+        for (const entry of entries) {
+          const before = previous[entry.runId] ?? [];
+          if (before.length !== entry.steps.length || entry.steps.some((stepId, index) => stepId !== before[index])) {
+            next[entry.runId] = entry.steps;
+            changed = true;
+          }
+        }
+        return changed ? next : previous;
+      });
+      setRunProgress(previous => {
+        let changed = false;
+        const next = { ...previous };
+        for (const entry of entries) {
+          const before = previous[entry.runId];
+          if (!before || before.currentStepId !== entry.currentStepId
+            || before.completed.length !== entry.steps.length
+            || entry.steps.some((stepId, index) => stepId !== before.completed[index])) {
+            next[entry.runId] = { currentStepId: entry.currentStepId, completed: entry.steps };
+            changed = true;
+          }
+        }
+        return changed ? next : previous;
+      });
+    };
+    void tick();
+    const timer = window.setInterval(() => { void tick(); }, 1200);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [runningRunKey]);
+
   const runStructureSteps = useMemo(() => {
     if (!route) return [] as StructureStepRow[];
     const rows: StructureStepRow[] = [];
@@ -3596,9 +3661,11 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       });
       return { item: segmentIndex >= 0 ? route.segments[segmentIndex] : undefined, segmentIndex };
     };
-    const pendingReasonFor = (item: RoutePlan['segments'][number] | undefined, hasSnapshot: boolean): string => {
+    const pendingReasonFor = (item: RoutePlan['segments'][number] | undefined, stepId: string, hasSnapshot: boolean): string => {
       if (!item) return '待执行';
-      if (item.status === 'running') return '运行中';
+      if (item.status === 'running') {
+        return item.runId && runProgress[item.runId]?.currentStepId === stepId ? '运行中' : '待执行';
+      }
       if (item.status === 'failed') return '执行失败';
       if (item.status === 'succeeded' && !hasSnapshot) return '无快照';
       return '待执行';
@@ -3609,7 +3676,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     const firstSegment = route.segments[0];
     const initialSegmentIndex = route.segments.findIndex(item => !!item.runId
       && !item.runId.startsWith('pending_')
-      && item.status === 'succeeded'
+      && ['succeeded', 'running'].includes(item.status)
       && (runSnapshots[item.runId] ?? []).includes('initial'));
     const initialSegment = initialSegmentIndex >= 0 ? route.segments[initialSegmentIndex] : undefined;
     rows.push({
@@ -3620,14 +3687,14 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       kind: 'initial',
       label: '初始结构',
       executed: !!initialSegment,
-      pendingReason: initialSegment ? undefined : pendingReasonFor(firstSegment, false),
+      pendingReason: initialSegment ? undefined : pendingReasonFor(firstSegment, 'initial', false),
     });
 
     for (const stepId of stepOrder) {
       const { item, segmentIndex } = segmentForStep(stepId);
       const snapshots = item?.runId ? runSnapshots[item.runId] : undefined;
       const executed = !!item
-        && item.status === 'succeeded'
+        && ['succeeded', 'running'].includes(item.status)
         && !!item.runId
         && !item.runId.startsWith('pending_')
         && !!snapshots?.includes(stepId);
@@ -3639,13 +3706,24 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         kind: 'step',
         label: stepDisplayName(stepId),
         executed,
-        pendingReason: executed ? undefined : pendingReasonFor(item, !!snapshots?.includes(stepId)),
+        pendingReason: executed ? undefined : pendingReasonFor(item, stepId, !!snapshots?.includes(stepId)),
       });
     }
     return rows;
-  }, [route, runSnapshots, stepDisplayName]);
+  }, [route, runSnapshots, runProgress, stepDisplayName]);
 
   useEffect(() => {
+    // While a Segment is live, follow the newest completed step. The polling
+    // effect above feeds both the timeline and the preview from the same
+    // manifest, so the chip progress and the visible structure stay in sync.
+    if (structureFollow && runningSegment?.runId) {
+      const latest = [...runStructureSteps].reverse().find(row => row.executed);
+      if (latest) {
+        const key = `${latest.runId}:${latest.stepId}`;
+        setStructurePick(previous => previous === key ? previous : key);
+        return;
+      }
+    }
     const measuredKey = measurement?.sourceRunId && measurement.sourceStepId
       ? `${measurement.sourceRunId}:${measurement.sourceStepId}`
       : '';
@@ -3662,7 +3740,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         const fallback = lastExecuted ?? runStructureSteps[0];
         return fallback ? `${fallback.runId}:${fallback.stepId}` : '';
       })());
-  }, [runStructureSteps, measurement?.sourceRunId, measurement?.sourceStepId]);
+  }, [runStructureSteps, measurement?.sourceRunId, measurement?.sourceStepId, structureFollow, runningSegment?.runId]);
 
   const structureSelection = runStructureSteps.find(row => `${row.runId}:${row.stepId}` === structurePick) ?? null;
   /**
@@ -5731,12 +5809,17 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const sleep = (ms: number) => new Promise(resolve => window.setTimeout(resolve, ms));
 
   const waitSegment = async (segmentId: string) => {
-    for (let i = 0; i < 300; i += 1) {
+    // The run's own wall-clock budget is 600 s; wait past it so the UI shows
+    // the real terminal status instead of a false "did not finish" at 150 s.
+    const deadline = Date.now() + 16 * 60 * 1000;
+    let lastStatus = 'planned';
+    while (Date.now() < deadline) {
       const current = await api<RoutePlan['segments'][number]>(`/api/v1/workflow/segments/${segmentId}`);
-      if (['succeeded', 'failed', 'cancelled', 'interrupted'].includes(current.status)) return current;
-      await sleep(500);
+      lastStatus = String(current.status);
+      if (['succeeded', 'failed', 'cancelled', 'interrupted', 'timed_out'].includes(lastStatus)) return current;
+      await sleep(1000);
     }
-    throw new Error('experiment segment did not finish');
+    throw new Error(`segment ${segmentId} did not finish within 16 min (last status: ${lastStatus})`);
   };
 
   const showMetricDetail = (item: Measurement) => run('metric-detail', async () => {
@@ -7910,8 +7993,21 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               {structureSelection
                 ? <span className="wf-structure-step">当前：{structureSelection.label}</span>
                 : <span className="wf-muted">{route ? '待执行步骤以灰色显示' : '尚未创建 Route'}</span>}
+              {runningSegment && <button type="button" className={`wf-button ghost${structureFollow ? ' active' : ''}`}
+                aria-pressed={structureFollow}
+                title={structureFollow ? '自动显示最新完成的步骤' : '已暂停自动跟随；进度条仍会更新'}
+                onClick={() => setStructureFollow(value => !value)}>{structureFollow ? '跟随运行' : '已暂停跟随'}</button>}
               <span className="wf-muted">{structureDimension}D · µm</span>
             </div>
+            {runningSegment && <div className="wf-run-progress" aria-label="运行进度">
+              <div className="wf-run-progress-head">
+                <strong>运行中</strong>
+                <span>已完成 {completedStepCount}/{totalStepCount} 步{currentStepName ? ` · 当前 ${currentStepName}` : ''}</span>
+              </div>
+              <div className="wf-run-progress-track" role="progressbar" aria-valuemin={0} aria-valuemax={totalStepCount} aria-valuenow={completedStepCount}>
+                <span style={{ width: `${totalStepCount ? Math.min(100, Math.round((completedStepCount / totalStepCount) * 100)) : 0}%` }} />
+              </div>
+            </div>}
             {runStructureSteps.length > 0 && <div className="wf-structure-timeline" role="tablist" aria-label="结构步骤时间轴">
               {runStructureSteps.map((row, index) => {
                 const key = `${row.runId}:${row.stepId}`;
@@ -7923,7 +8019,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                     data-step-id={row.stepId} data-run-id={row.runId} data-segment-id={row.segmentId}
                     data-kind={row.kind} data-executed={row.executed ? 'true' : 'false'}
                     title={`${row.label} · ${row.stepId}${row.executed ? ` · ${row.runId}` : ` · ${row.pendingReason ?? '待执行'}`}`}
-                    onClick={() => setStructurePick(key)}>
+                    onClick={() => { setStructureFollow(false); setStructurePick(key); }}>
                     <span className="wf-step-chip-index" aria-hidden="true">{String(index + 1).padStart(2, '0')}</span>
                     <span className="wf-step-chip-label" title={row.label}>{row.label}</span>
                     <span className={`wf-step-chip-state${row.executed ? ' ok' : ' pending'}`}>{row.executed ? '成功' : row.pendingReason ?? '待执行'}</span>
