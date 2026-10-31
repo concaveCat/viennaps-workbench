@@ -1872,14 +1872,26 @@ def _require_gds_bounds_inside_domain(dimension: int, geometry: Any,
     delta = float(project["domain"]["gridDelta"])
     tolerance = max(1e-7, delta * 1e-6)
     bounds = [float(value) for value in geometry.getBounds()]
-    half_x = float(project["domain"]["xExtent"]) / 2.0
-    half_y = float(project["domain"]["yExtent"]) / 2.0 if dimension == 3 else None
-    outside = bounds[0] < -half_x - tolerance or bounds[1] > half_x + tolerance
+    x_extent = float(project["domain"]["xExtent"])
     if dimension == 3:
-        outside = (outside or bounds[2] < -half_y - tolerance
-                   or bounds[3] > half_y + tolerance)
+        half_x = x_extent / 2.0
+        half_y = float(project["domain"]["yExtent"]) / 2.0
+        outside = (bounds[0] < -half_x - tolerance or bounds[1] > half_x + tolerance
+                   or bounds[2] < -half_y - tolerance or bounds[3] > half_y + tolerance)
+    else:
+        # ViennaPS builds the 2D Domain centered, while Stage 5 GDS layouts are
+        # authored in the absolute [0, xExtent] frame. A layout is acceptable
+        # when it fits either frame entirely; anything outside both is still
+        # rejected before the native insert can crash. The native bounds already
+        # include any boundary padding, so no extra margin is subtracted here.
+        absolute = (bounds[0] >= -tolerance and bounds[1] <= x_extent + tolerance)
+        centered = (bounds[0] >= -x_extent / 2.0 - tolerance
+                    and bounds[1] <= x_extent / 2.0 + tolerance)
+        outside = not (absolute or centered)
     if outside:
-        domain_text = (f"xExtent={float(project['domain']['xExtent']):g}"
+        domain_text = (f"xExtent={x_extent:g}"
+                       + ("；2D 允许绝对坐标 [0, xExtent] 或原生居中 [-xExtent/2, xExtent/2]"
+                          if dimension == 2 else "")
                        + (f", yExtent={float(project['domain']['yExtent']):g}"
                           if dimension == 3 else ""))
         layout_text = (f"[{bounds[0]:g}, {bounds[1]:g}]"

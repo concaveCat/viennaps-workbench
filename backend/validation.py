@@ -630,13 +630,25 @@ def _validate_materials(project: ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 |
             if layout_bounds is not None and enforce_gds_domain:
                 bounds = layout_bounds
                 tolerance = max(1e-7, float(project.domain.gridDelta) * 1e-6)
-                half_x = float(project.domain.xExtent) / 2.0 - padding_margin
-                outside = (bounds[0] < -half_x - tolerance
-                           or bounds[2] > half_x + tolerance)
+                x_extent = float(project.domain.xExtent)
                 if project.dimension == 3:
+                    half_x = x_extent / 2.0 - padding_margin
                     half_y = float(project.domain.yExtent) / 2.0 - padding_margin
-                    outside = outside or (bounds[1] < -half_y - tolerance
-                                          or bounds[3] > half_y + tolerance)
+                    outside = (bounds[0] < -half_x - tolerance
+                               or bounds[2] > half_x + tolerance
+                               or bounds[1] < -half_y - tolerance
+                               or bounds[3] > half_y + tolerance)
+                else:
+                    # ViennaPS builds the 2D Domain centered, but Stage 5 GDS
+                    # layouts are authored in the absolute [0, xExtent] frame.
+                    # Accept a layout that fits either frame entirely; blur
+                    # padding shrinks both frames because the Python bounds are
+                    # unpadded while the native read adds it.
+                    absolute = (bounds[0] >= padding_margin - tolerance
+                                and bounds[2] <= x_extent - padding_margin + tolerance)
+                    centered = (bounds[0] >= -x_extent / 2.0 + padding_margin - tolerance
+                                and bounds[2] <= x_extent / 2.0 - padding_margin + tolerance)
+                    outside = not (absolute or centered)
                 if outside:
                     margin_text = (f" and leave {padding_margin:g} um of native blur padding"
                                    if padding_margin else "")
@@ -645,7 +657,10 @@ def _validate_materials(project: ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 |
                         "GDS layout bounds "
                         f"[{bounds[0]:g}, {bounds[2]:g}]"
                         + (f" x [{bounds[1]:g}, {bounds[3]:g}]" if project.dimension == 3 else "")
-                        + f" exceed the simulation domain (xExtent={float(project.domain.xExtent):g}"
+                        + f" exceed the simulation domain (xExtent={x_extent:g}"
+                        + ("; 2D accepts the absolute [0, xExtent] frame or the native "
+                           "centered [-xExtent/2, xExtent/2] frame"
+                           if project.dimension == 2 else "")
                         + (f", yExtent={float(project.domain.yExtent):g}" if project.dimension == 3 else "")
                         + f"); enlarge the domain or move the layout so it fits inside{margin_text}"))
             for step_index, step in enumerate(project.steps):
