@@ -1213,7 +1213,7 @@ def _validate_implant_steps(project: ProjectV7) -> list[FieldIssue]:
     from .implant_models import (
         CELL_SET_STEP_MODELS, cell_set_output_conflict,
         field_sequence_issues, label_provenance_issues, numeric_guard_messages,
-        ordering_issues, produced_labels, step_cell_set, step_value,
+        produced_labels, step_cell_set, step_value,
     )
 
     issues: list[FieldIssue] = []
@@ -1315,8 +1315,6 @@ def _validate_implant_steps(project: ProjectV7) -> list[FieldIssue]:
             # step's label provenance check.
             available |= produced_labels(step)
 
-    for index, message in ordering_issues(steps):
-        issues.append(FieldIssue(f"steps[{index}]", message))
     for index, message in label_provenance_issues(steps):
         issues.append(FieldIssue(f"steps[{index}]", message))
     return issues

@@ -94,7 +94,7 @@ historical request hash (pinned by
 
 ```jsonc
 "cellSet": {
-  "height": 0.5,              // distance from the highest surface point to the top
+  "height": 0.5,              // absolute top of the grid (native position argument)
   "substrateDepth": 0.4,      // required on the first enabled field step
   "coverMaterial": "GAS",     // must be GAS for field steps (see below)
   "periodic": false,          // must equal the domain lateral boundary
@@ -108,6 +108,19 @@ step that asks for a different `height`, `coverMaterial`, `periodic` or
 `substrateDepth` is rejected rather than silently ignored. The same shared-grid
 check runs in the worker preflight, so a hand-edited `input.json` cannot bypass
 it.
+
+Measured on 4.7.0, `Domain.generateCellSet(position, ...)` treats `position` as
+the **absolute** top coordinate of the grid, not a height above the surface: a
+plane at `z = 0.05` with `position = 0.5` produced a cell set spanning
+`[-0.36, 0.50]`. For the default flat plane geometry (`z = 0`) the value equals
+the height above the surface, which is why the field is named `height`. The
+captured grid stores both the absolute bottom (`band bottom`, driven by
+`substrateDepth`) and the absolute top, so later steps can rebuild exactly the
+same grid.
+
+A surface-moving step is allowed **between** field steps. The worker then
+regenerates the native cell set on the captured grid and conservatively remaps
+every scalar field; see §3.1.
 
 `coverMaterial` is fixed to `GAS`. The native generator treats the cover
 material as the phase above the surface and skips cells of that material; a
@@ -217,16 +230,15 @@ gives `8 um^-1`), and the 3D value is dimensionless (the summary omits
 
 ## 3. Worker integration
 
-* A run-wide `field_state` holds the widened deep-copy Domain and the single
-  native `DenseCellSet`; the simulated Domain (and every surface snapshot) is
+* A run-wide `field_state` holds the widened deep-copy Domain and the native
+  `DenseCellSet`; the simulated Domain (and every surface snapshot) is
   untouched.
-* The worker preflight (`field_sequence_issues` + `ordering_issues` in
-  `backend/implant_models.py`) repeats the API's shared-grid and ordering
-  checks before the first native call. A later field step with a different
-  `height`/`substrateDepth`/`coverMaterial`/`periodic`, a surface-moving step
-  after a field step, or a cell-set step after a surface change fails the
-  worker instead of reusing a stale grid. Per-step numeric and label guards run
-  again immediately before each native constructor.
+* The worker preflight (`field_sequence_issues` in
+  `backend/implant_models.py`) repeats the API's shared-grid checks before the
+  first native call. A later field step with a different
+  `height`/`substrateDepth`/`coverMaterial`/`periodic` fails the worker instead
+  of silently reusing a stale grid. Per-step numeric and label guards run again
+  immediately before each native constructor.
 * Each step writes `artifacts/<step>-cell-set-fields.vtu` (kind
   `cellSetFields`) and `artifacts/<step>-cell-set-fields.json` (kind
   `cellSetFieldsSummary`). `format` selects VTU, JSON or both.
@@ -246,6 +258,56 @@ gives `8 um^-1`), and the 3D value is dimensionless (the summary omits
   `worker/materialize_snapshot.py` so a materialised snapshot is identical to
   the eager one, and the two artifact rows are carried as recorded references.
 
+### 3.1 Cell-set regeneration and conservative remap
+
+The first enabled field step captures an absolute grid: origin, top/bottom,
+cell counts, `gridDelta`, `coverMaterial`/id, `periodic`, the native material
+map and the `substrateDepth`-derived band width (`cellSet.grid` /
+`gridCapturedAtStepId`). The grid lives on the domain lattice, so every later
+regeneration is described by whole-cell offsets.
+
+After every surface-moving step that is followed by another enabled field step
+(and lazily if one is ever skipped) the worker:
+
+1. builds a fresh `DenseCellSet` from the **current** level sets on a widened
+   deep copy, passing the captured absolute top as the native `position`
+   argument and choosing the band width that pins the captured absolute bottom
+   (a band of `2` points is the native minimum);
+2. if the surface grew above the captured top it grows the grid upwards, and if
+   an etch went below the captured bottom it grows the grid downwards (band
+   minimum); both are integer cell extensions, never a rescale;
+3. reads the native `Material`/`FillingFraction` (and therefore the material IDs
+   and native filling) unchanged from the regenerated grid;
+4. remaps every non-system scalar label cell-for-cell by absolute position
+   (`backend/field_remap.py`):
+   * **same grid** -> ordered index copy, `O(N)`;
+   * **integer shift / grow** -> axis-aligned overlap copy with `cellOffset`
+     `{x,y,z}` in cells; overlap cells keep their exact value, every new cell is
+     `0`;
+   * a lateral change, a spacing change or a non-integer offset raises
+     `conservative grid remap not implemented` (HTTP 422 semantics: the worker
+     fails before a native process call, no silent interpolation);
+5. drops dopant from cells that became cover material (new material is the
+   cover id, old material was not). Every other cell keeps its value, including
+   cover cells that receive a small native implant tail. Nothing is
+   redistributed to neighbours.
+
+Each remap appends one record to `cellSet.remaps` (also emitted as a
+`cell-set-remap` event) with: `sourceStepId`, `remapOfStepId`,
+`oldGrid`/`newGrid`/`capturedGrid` signatures, `method`, `exact`,
+`oldCellCount`, `newCellCount`, `remappedCells`, `newCells`, `removedCells`
+(`removedByGrid` + `removedByMaterial`), `reactivatedCells`, `cellOffset`,
+`cellVolume`, `labels`, per-label `mass.before/after/lost` (native
+`sum · gridDelta^D` units), `fieldDigests` and the current `materialMap`. The
+record is deterministic: replaying a project reproduces the same record and
+digests.
+
+Conservation rule: `mass.after = mass.before - mass.lost`, exactly. `lost` is
+the sum over cells that became cover (plus, for a shrunk grid, cells outside the
+new grid); new cells contribute `0`. The per-label `lost` is therefore the
+amount physically removed by the etch (`removedCells`) and not a numerical
+residual.
+
 ## 4. Rejection rules (HTTP 422, no worker, no native call)
 
 | condition | message theme |
@@ -264,7 +326,7 @@ gives `8 um^-1`), and the 3D value is dimensionless (the summary omits
 | `periodic` differs from the domain | the cell set can only mirror the domain boundary |
 | analysis before any implant/anneal | `analysis requires an earlier implant or anneal step` |
 | consumed label not produced earlier | `cell-set label(s) not produced by an earlier step` |
-| a surface-moving step after a field step | the native grid would be stale |
+| a regenerated grid off the captured lattice | `conservative grid remap not implemented` (worker, no native process call) |
 | `outputSettings.cellSet` together with field steps | the generic output cannot carry dopant fields |
 | material not in `/api/materials` | same material gate as every other step |
 
@@ -299,6 +361,19 @@ gives `8 um^-1`), and the 3D value is dimensionless (the summary omits
   native classes do.
 * 3D works (65k-cell probe: 1.26 s implant, 0.31 s anneal) but a 3D field grid
   is bounded by the same 2,000,000-cell cap and the preflight byte estimate.
+* A remap keeps a **fixed** lateral grid for the whole run. A surface that grows
+  above the captured top grows the grid upwards (new cells `0`); a surface that
+  is etched below the captured substrate band bottom grows it downwards at the
+  native minimum band width (also new cells `0`). The grid never changes its
+  lateral origin, spacing or `coverMaterial` inside a run; changing those is a
+  hard refusal, not an interpolation.
+* Interface cells are copied as a whole cell: a cell that keeps its solid
+  material keeps its full dopant even if its filling fraction changed. Only a
+  cell that becomes the cover material loses its dopant. This is conservative
+  (no redistribution); a sub-cell partial-fill model is not implemented.
+* The remap is exact on the lattice, not a volume/area-weighted
+  re-projection. A future grid with a different `gridDelta` or lateral extent
+  would need a genuine conservative intersection algorithm and is refused today.
 
 ## 6. Tests
 
@@ -323,10 +398,26 @@ gives `8 um^-1`), and the 3D value is dimensionless (the summary omits
   Rsh, and the 422-before-worker path;
 * direct-worker regressions that bypass the API: reserved labels, non-GAS
   cover in 2D/3D, a later field step with a different `height`/substrate grid,
-  a surface-moving step after a field step (and the stale-grid field step that
-  would follow it), plus a positive shared-grid direct run;
+  an accepted `implant → etch → anneal` run whose analysis artifact records the
+  remap, plus a positive shared-grid direct run;
 * `_field_integral` unit regression: `C=2 um^-3`, `delta=2 um` gives
   `8 um^-1` in 2D and the exported 2D `integralUnit` is `1/um` (3D omits it).
+
+`tests/test_field_remap.py` (18 tests):
+
+* pure-Python mapping: `CellGrid` round-trip from native node points, ordered
+  same-grid copy (`O(N)`, exact digests), integer-shift overlap, grid growth
+  (new cells `0`), shrink (`removedByGrid`), solid→cover mass loss with no
+  redistribution, cover→solid reactivation, deterministic record, and refusals
+  for a non-integer offset, a lateral/spacing change and a gapped lattice;
+* real runs: 2D and 3D `implant → etch → anneal → analysis` (same-grid remap,
+  recorded `sourceStepId`, per-label mass balance, labels preserved, Rsh still
+  computed), `implant → deposit → anneal` (grid unchanged, `mass.lost = 0`),
+  a deep etch that grows the grid downwards conservatively, and replay
+  reproducing the remap record and every field digest bit-identically;
+* schema: a surface step between field steps is accepted, a later step with a
+  different `height` is still rejected, and analysis before an implant is still
+  rejected.
 
 Full suite: the non-evidence tests pass (21 skipped). The remaining
 errors/failures in this worktree are the pre-existing missing
