@@ -35,6 +35,7 @@ from backend.runtime_limits import MAX_CELL_SET_CELLS, artifact_limit_bytes, art
 from backend.preflight import CELL_SET_JSON_BYTES, CELL_SET_VTU_BYTES_PER_CELL
 from backend.validation import (capability_verified, fin_construction_decision,
                                gpu_project_signature, slice_axis_bounds)
+from backend.engine import multi_ion_gpu_error
 from backend.gpu_devices import cuda_devices, resolve_gpu_device
 from backend.gds import MAX_GDS_BLUR_CELLS, blur_exposure_cell_count
 from worker.gds_mask import CONSTRUCTION as GDS_MASK_CONSTRUCTION
@@ -3819,6 +3820,14 @@ def execute(input_path: Path, run_dir: Path) -> None:
                              and configured_engine == "GPU_DISK"
                              and sum(row.get("kind") == "ion" for row in step.get("species", [])) > 1)
             multi_strategy = config.get("stepExecutionStrategies", {}).get(step["id"])
+            if (project["schemaVersion"] == 7 and step.get("model") == "multiParticle"
+                    and str(configured_engine or "").startswith("GPU_")
+                    and sum(row.get("kind") == "ion" for row in step.get("species", [])) > 1):
+                # Defense in depth: a hand-edited worker input must not reach a
+                # GPU engine that silently drops the extra ion species.
+                policy = multi_ion_gpu_error()
+                if policy is not None:
+                    raise RuntimeError(policy)
             if gpu_multi_ion and multi_strategy not in {GPU_MULTIPARTICLE_SPLIT_STRATEGY, GPU_MULTIPARTICLE_NATIVE_STRATEGY}:
                 raise RuntimeError("GPU MultiParticle input did not pin its multi-ion execution strategy")
             if multi_strategy == GPU_MULTIPARTICLE_NATIVE_STRATEGY and not native_engine_fingerprint:

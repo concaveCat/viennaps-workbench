@@ -26,6 +26,7 @@ from .validation import (GPU_MULTIPARTICLE_FLUX_STRATEGY, GPU_MULTIPARTICLE_SPLI
                          select_engine, capability_verified, experimental_cpu_replay_allowed,
                          gpu_project_signature, slice_position_issue)
 from .native_build import configured_runtime
+from .engine import multi_ion_gpu_error
 from .rates import uses_flux
 from .runtime_limits import max_log_bytes, max_log_mib, rss_limit_mib
 from .gpu_devices import cuda_devices, resolve_gpu_device
@@ -374,6 +375,12 @@ class Supervisor:
                 raise ReplayMismatch("replay native engine identity does not match its GPU MultiParticle steps")
             native_engine_fingerprint = None
             if needs_native_patch:
+                # Stock 4.7.0 cannot honour a multi-ion GPU step, and the
+                # patched build is ABI-bound to 4.6.2. Fail with the policy
+                # instead of "no patched runtime is configured".
+                policy = multi_ion_gpu_error()
+                if policy is not None:
+                    raise ReplayMismatch(policy)
                 try:
                     _, native_engine_fingerprint = configured_runtime(requested_fingerprint)
                 except (OSError, RuntimeError, ValueError) as exc:

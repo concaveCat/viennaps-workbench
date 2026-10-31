@@ -1,10 +1,11 @@
 # ViennaPS 4.6.2 → 4.7.0 migration
 
-Status: **4.6.2 remains the production default; 4.7.0 is supported as an
-isolated evaluation runtime with explicit version gates.** Work is on
-`task/v470-migration` (base `1015266`). This document records the install, the
-version-qualified policy, probe evidence, test results and the remaining
-blockers for making 4.7.0 the default.
+Status: **ViennaPS 4.7.0 / ViennaLS 5.10.0 is the default runtime (switch
+validated on `task/capability-v470-default`, base `ceb18c0`). The 4.6.2
+runtime is retained for replay, legacy runs and the two capabilities 4.7.0
+does not provide.** Sections 1–9 record the original isolated-evaluation work
+on `task/v470-migration` (base `1015266`); section 10 records the default
+switch and its evidence.
 
 ## 1. Install method and versions
 
@@ -285,3 +286,176 @@ a 4.7.0 evidence pass.
 - **Artifacts:** isolated venv 127 MiB, wheels 36 MiB; GPU PTX payload inflates
   container images.
 - **Evidence:** 4.6.2 evidence remains the only accepted proof set.
+
+## 10. Default switch (2026-10-31)
+
+Branch `task/capability-v470-default` (base `ceb18c0`), `.venv` → the isolated
+4.7.0 venv (`viennaps 4.7.0` / `viennals 5.10.0`).
+
+### 10.1 Decision
+
+- **Default runtime: ViennaPS 4.7.0 / ViennaLS 5.10.0** (`requirements-v470.lock`).
+- **Retained runtime: ViennaPS 4.6.2 / ViennaLS 5.8.5** (`requirements.lock`).
+  It stays mandatory for three things and is never deleted:
+  1. replay and snapshot/continuation of runs produced before the switch,
+  2. the patched multi-ion GPU build (`PATCHED_RUNTIME_VERSIONS`), and
+  3. the 2D `FaradayCageEtching` kernel.
+- Old runs are **not reinterpreted**: replay, deferred snapshot materialisation
+  and native Domain continuation keep returning the explicit
+  required/installed version pair.
+- Three capabilities are **version-gated instead of silently degraded** on
+  4.7.0: ALD `surfaceDiffusion` (hang), the advanced-oxidation controls
+  (inert setters), the 2D Faraday cage etch (zero velocity), and multi-ion GPU
+  (dropped ions). See 10.4.
+
+### 10.2 Test results
+
+`VIENNAPS_WORKBENCH_DATA_DIR=$PWD/var/test-v470 WORKBENCH_PORT=8767
+.venv/bin/python -m unittest discover -s tests -t . -v`:
+
+```
+Ran 447 tests in 328.8s
+FAILED (failures=2, skipped=13)      # 432 passed
+```
+
+Evidence is not in git, so the run needs the main worktree's
+`docs/*-evidence/` and `var/stage9-*` run artifacts referenced read-only
+(copied into this worktree for the run and deleted afterwards).
+
+- **2 failures, both pre-existing, neither version-specific**:
+  `tests.test_stage5.Stage5Acceptance.test_gds_upload_selection_native_geometry_portable_package_and_replay`
+  fails with `GDS 版图边界 [0.2505, 7.5] 超出当前计算域（xExtent=8）` on **both**
+  runtimes (reproduced with the 4.6.2 interpreter against the same tree) and
+  then cannot import the package it never produced. Open item, not a 4.7.0
+  regression.
+- **13 skips**: 2 gated ALD native cases, 4 `WORKBENCH_GPU_TEST` host-probe
+  gated API cases, 5 2D Faraday cases gated on 4.7.0 (10.4), 1 archived
+  `cpu-nan-debug` guard, 1 GPU matrix run-artifact audit whose `var/` inputs
+  are not archived in a worktree.
+- A 4.6.2 control run of the same tree cannot be used for the API tests: the
+  supervisor starts the worktree `.venv` (4.7.0) and every worker correctly
+  refuses the version mismatch (110 such failures in the control). Only
+  in-process/native tests are comparable, and they were compared individually
+  (10.4, 10.5).
+
+### 10.3 Capabilities verified on 4.7.0
+
+Every row below is a real native run inside the suite; the named test is the
+one that proves it.
+
+| Capability | Status on 4.7.0 | Evidence |
+|---|---|---|
+| A4 masked etch (positive displacement still gated) | pass | `test_particle_shape`: `test_masked_etch_moves_the_substrate_but_not_the_mask`, `test_mask_changes_the_geometry_versus_an_unmasked_native_run`, `test_masked_deposition_segfaults_with_any_non_empty_mask` |
+| GDS native layer bodies + padding | pass | `test_gds_native_bridge.NativeBodyComparison.test_native_2d_and_3d_bodies_match_direct_reference`, `test_gds_boundary` (layer-1 body is now native; see 10.5) |
+| GDS proximity blur + budget | pass | `test_gds_native_bridge.BlurContract`, `GdsNativeBridgeRuns.test_2d_blur_threshold_effect_and_determinism`, `test_3d_blur_uses_the_native_body_and_reports_values`, `test_blur_overflow_and_underflow_are_422_not_500` |
+| `nvFactors` (selective epitaxy) | pass | `NativeSelectiveEpitaxyNvFactors` (3 native/reference cases + validation) |
+| GTD 3D geometric trench | pass | `NativeGeometricTrenchDeposition.test_3d_trench_matches_a_direct_native_reference` |
+| `coverageTolerance` | pass | `FaradayCpuReplay.test_explicit_coverage_tolerance_cpu_run_replays`, `test_coverage_tolerance_rejects_invalid_range_and_wrong_models` |
+| `GPU_TRIANGLE` | pass | `test_gpu_triangle_real_2d_and_3d_product_direct_and_replay` (2D/3D, product vs archived direct reference within 1e-6 µm; exact on the 4.6.2 run that produced it) |
+| any-axis `Slice` | pass | `test_slice_x_y_z_axis_native_coordinates_and_replay`, `test_slice_position_uses_normal_axis_extent`, `test_slice_extruded_fin_uses_actual_y_range`, `test_slice_half_domain_positions_are_bounded` |
+| half/quarter shapes | pass | `test_native_half_shapes_product_direct_symmetry_and_replay` (2D trench/fin, 3D trench/box/hole), `test_boolean_fin_route_keeps_half_fin`, `test_invalid_half_shape_combinations_are_rejected` |
+| Faraday cage 3D (CPU-only) | pass | `NativeFaradayCage.test_real_3d_cpu_run_etches_the_exposed_film`, `FaradayCpuReplay.test_faraday_cage_cpu_run_replays` |
+| Faraday cage 2D (CPU-only) | **gated on 4.7.0** | see 10.4 |
+| per-layer trench | pass | `test_capability_layers.PerLayerTrenchNativeReference.test_per_layer_width_taper_and_mask_are_applied` |
+| 4.7.0-only implant / anneal / doping / sheet resistance | **not integrated** | no Workbench schema, worker builder or test uses `IonImplantation`, `Anneal`, `NetDoping` or `SheetResistance`. Only the bounded migration probe `probe_implant_anneal.py` exercised them (dose conserved 78.313341→78.313352, 89.2 % active). They are not advertised, so the default switch neither adds nor removes them. |
+
+### 10.4 Two new 4.7.0 gates (measured, not assumed)
+
+**2D `FaradayCageEtching` returns no etch on 4.7.0.** Same tree, same model
+builder, same inputs (`worker/probe_faraday_2d.py --case`), only the wheel
+differs:
+
+| Runtime | cageAngle / tiltAngle | beforeTop | afterTop | etchedDepth |
+|---|---|---|---|---|
+| 4.6.2 | 0.2 / 0.0 | 0.8 | 0.7993287183 | **0.000671 µm** |
+| 4.7.0 | 0.2 / 0.0 | 0.8 | 0.8 | **0.0** |
+
+The 4.7.0 call completes in 1.6 ms with every parameter read back correctly and
+all three level sets intact, so the run reports success while nothing moves.
+The suite caught it in five independent direct-native assertions (both 2D
+anchors and the `-0.2°`/threshold cases). `backend/engine.faraday_2d_error()`
+now rejects 2D `faradayCage` on ≥ 4.7.0 with the measured depth, and
+`faraday_cage_2d_engine_error()` (API validation + `build_specialized_model`)
+returns it before a worker exists. 3D is unaffected and still runs.
+
+**Multi-ion GPU drops every ion after the first.** Stock wheel probe
+`scripts/migration-probes/probe_stock_multiion_gpu.py`, rate callback weighted
+on the *second* ion only, 96 rays, fixed seed, RTX 3060 UUID
+`GPU-5532bb0f-735e-bc93-98ca-b7662a8ebf6d` (bounded child, 60 s / 4 GiB / 1 MiB):
+
+| Runtime | Engine | Dim | Ions | Flux callback vector | Native flux fields | Etch depth |
+|---|---|---|---|---|---|---|
+| 4.7.0 | CPU_DISK | 2 | 2 | `[2]` | `ion00`, `ion11` | 0.4963 |
+| 4.7.0 | CPU_DISK | 3 | 2 | `[2]` | `ion00`, `ion11` | 0.4964 |
+| 4.7.0 | GPU_DISK | 2 | 2 | `[1]` | `ion000` | **0.0** |
+| 4.7.0 | GPU_DISK | 3 | 2 | `[1]` | `ion000` | **0.0** |
+| 4.7.0 | GPU_TRIANGLE | 2 | 2 | `[1]` | `ion000` | **0.0** |
+| 4.7.0 | GPU_TRIANGLE | 3 | 2 | `[1]` | `ion000` | **0.0** |
+| 4.7.0 | GPU_DISK | 2 | 4 | `[1]` | `ion000` | **0.0** |
+| 4.7.0 | GPU_DISK | 3 | 4 | `[1]` | `ion000` | **0.0** |
+| 4.7.0 | GPU_DISK | 2 | 2, weight on ion 0 | `[1]` | `ion000` | 0.3580 |
+
+Control: the same probe with `--active-index 0` etches, which proves the run
+itself is fine and only the extra species are lost. Replay is deterministic
+(two separate processes, identical final surface hash); the CUDA UUID readback
+equals the requested `GPU-5532bb0f-…` for every GPU case. A second
+`gpu.Context.createContext()` inside one process aborts OptiX with code 7001,
+so replay checks use two processes.
+
+This is the same defect the 4.6.2 patch fixed, not a new 4.7.0 regression: the
+4.6.2 wheel behaves identically and the Workbench only got multi-ion GPU from
+the patched build. The patch is ABI-bound to ViennaLS 5.8.5.
+
+### 10.5 Multi-ion GPU policy
+
+- **No silent loss.** On ≥ 4.7.0 a schema-7 `multiParticle` step with more than
+  one ion that resolves to a GPU engine is rejected at validation
+  (`steps[i].species`) by `backend/engine.multi_ion_gpu_error()`, naming the
+  measured behaviour and both escapes: the 4.6.2 patched runtime, or
+  `CPU_DISK` on 4.7.0 (which is verified above).
+- `worker/simulate.py` calls the same helper, so a hand-edited `input.json`
+  cannot reach the lossy binding; `backend/supervisor.py` raises the policy
+  instead of the old "patched runtime is not configured" whenever a multi-ion
+  GPU run needs the patched build.
+- Single-ion and multi-ion **CPU_DISK** stay available on 4.7.0. On 4.6.2
+  nothing changes: the patched runtime path, the operator-split strategy and
+  the native strategy are untouched.
+- `PATCHED_RUNTIME_VERSIONS` stays `("4.6.2",)`; `native_build.py` still fails
+  closed if a 4.7.0 package is put in `VIENNAPS_PATCHED_RUNTIME_DIR`.
+
+### 10.6 Version-qualified tests and evidence
+
+- `tests/test_native_multiion_policy.py` — new policy class: 4.7.0 rejects,
+  4.6.2 accepts (both branches exercised through `backend.engine.engine_version`).
+  The historical split-route audit pins its recorded 4.6.2 runtime.
+- `tests/test_engine_batch1_specialized.py` — 2D Faraday native/replay cases
+  are `skipUnless(FARADAY_2D_ETCHES)`; a new
+  `test_2d_policy_matches_the_installed_runtime` asserts the rejection and keeps
+  3D accepted; contracts measured on 4.6.2 pin it through `measured_engine()`.
+- `tests/test_gds_boundary.py` — layer 1 now asserts the native body on ≥ 4.7.0
+  (4.6.2 returns an empty native body and needs the fallback) after the
+  unchanged geometry assertions.
+- `tests/test_native_capability_release.py` — `GPU_TRIANGLE` product/direct
+  comparison is exact only against a reference produced by the same runtime;
+  otherwise it is bounded to 1e-6 µm and the deviation is recorded in the
+  evidence JSON.
+- `tests/test_stage9.py` — matrix audits pin the 4.6.2 runtime their rows were
+  measured on; the run-artifact audit skips (with the count) when `var/`
+  artifacts are absent instead of claiming a code regression.
+
+### 10.7 Files changed for the switch
+
+- `backend/engine.py` — `DEFAULT_ENGINE_VERSION`/`LEGACY_ENGINE_VERSION`,
+  `MULTI_ION_GPU_STOCK_VERSIONS`, `multi_ion_gpu_error()`, `faraday_2d_error()`.
+- `backend/specialized_models.py`, `backend/validation.py`,
+  `backend/supervisor.py`, `worker/simulate.py` — shared gates and fail-fast.
+- `requirements-v470.lock` (default lock), `requirements.lock` (retained
+  legacy), `requirements.in`, `README.md`, `README.zh-CN.md`,
+  `docs/compatibility.md`, this section.
+- `scripts/migration-probes/probe_stock_multiion_gpu.py` and the tests above.
+
+Regenerate the multi-ion table with
+`scripts/migration-probes/probe_stock_multiion_gpu.py` under
+`scripts/bounded_child.py` (`--dimension`, `--engine`, `--ions`,
+`--active-index`); the 2D Faraday pair with
+`python -m worker.probe_faraday_2d --case '{"dimension":2,"cageAngle":0.2,"tiltAngle":0.0,"engine":"CPU_DISK"}'`.

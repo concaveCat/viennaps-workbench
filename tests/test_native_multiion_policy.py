@@ -5,13 +5,48 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from backend.hashing import execution_hash
 from backend.models import ReplayRequirements
 from backend.native_build import fingerprint_package
-from backend.validation import select_engine, validate_project
+from backend.validation import ProjectInputError, select_engine, validate_project
 
 ROOT = Path(__file__).resolve().parents[1]
+EIGHT_ION_PROJECT = (ROOT / "docs/stage9-evidence/gpu-coverage-audit/multiparticle-species-probe"
+                     / "operator-split/eight-ions-2d-128rays.project.json")
+
+
+class MultiIonGpuRuntimePolicyTests(unittest.TestCase):
+    """Stock 4.7.0 GPU engines keep one ion flux field and drop the rest."""
+
+    def project(self, ions: int, preference: str = "gpu") -> dict:
+        project = json.loads(EIGHT_ION_PROJECT.read_text(encoding="utf-8"))
+        step = project["steps"][0]
+        step["species"] = step["species"][:ions]
+        labels = [row["label"] for row in step["species"]]
+        step["rateCoefficients"] = {"defaultBySpecies": {name: 0.025 for name in labels}}
+        project["solver"]["enginePreference"] = preference
+        return project
+
+    def test_stock_47_rejects_multi_ion_gpu_with_an_actionable_policy(self):
+        with patch("backend.engine.engine_version", return_value="4.7.0"):
+            with self.assertRaises(ProjectInputError) as context:
+                validate_project(self.project(2), kind="simulate")
+            messages = " ".join(issue.message for issue in context.exception.issues)
+            self.assertIn("silently drop every ion after the first", messages)
+            self.assertIn("4.6.2 patched runtime", messages)
+            # One ion keeps working, and CPU_DISK is the in-version route.
+            validate_project(self.project(1), kind="simulate")
+            cpu = validate_project(self.project(2, preference="cpu"), kind="simulate")[0]
+            self.assertEqual(select_engine(cpu.model_dump(mode="json"),
+                                           cpu.model_dump(mode="json")["steps"][0]), "CPU_DISK")
+
+    def test_patched_462_runtime_keeps_accepting_multi_ion_gpu(self):
+        with patch("backend.engine.engine_version", return_value="4.6.2"):
+            parsed = validate_project(self.project(2), kind="simulate")[0]
+        normalized = parsed.model_dump(mode="json")
+        self.assertEqual(select_engine(normalized, normalized["steps"][0]), "GPU_DISK")
 
 
 class NativeMultiIonPolicyTests(unittest.TestCase):
@@ -28,7 +63,10 @@ class NativeMultiIonPolicyTests(unittest.TestCase):
             project["solver"]["enginePreference"] = "gpu"
             with self.subTest(profile=failure["solverProfile"], dimension=project["dimension"]):
                 self.assertEqual(select_engine(project, project["steps"][0]), "GPU_DISK")
-                validate_project(project, kind="simulate")
+                # These profiles are 4.6.2 measurements; the multi-ion GPU
+                # policy is version-qualified, so pin the recorded runtime.
+                with patch("backend.engine.engine_version", return_value="4.6.2"):
+                    validate_project(project, kind="simulate")
 
     def test_old_replay_shape_and_new_engine_identity(self):
         old = {"viennapsVersion": "4.6.2", "viennalsVersion": "5.8.5", "cpuThreads": 1,

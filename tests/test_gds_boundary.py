@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import unittest
+from importlib.metadata import version
 from pathlib import Path
 
 from backend import snapshots as snapshot_store
@@ -164,14 +165,21 @@ class GdsFullBoundsPreview(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(constructions[7]["planarPointCount"], 0)
         self.assertGreater(constructions[7]["alignedLayerPointCount"], 0)
         # Layer 7 is the full-bounds polygon: its body comes from the padded
-        # native 3D layerToLevelSet. Layer 1 hits the installed 4.6.2 empty
-        # native body for base 0.2, so it must use the measured fallback.
+        # native 3D layerToLevelSet. Layer 1 used the installed 4.6.2 empty
+        # native body for base 0.2 and needed the measured fallback; 4.7.0
+        # returns a real body for the same layer, so the fallback is no longer
+        # reached (the geometry assertions above already pin the result).
         self.assertEqual(constructions[7]["construction"], "native-layer-to-levelset-v1")
         self.assertIs(constructions[7]["nativeBodyUsed"], True)
         self.assertGreater(constructions[7]["nativeBodyPointCount"], 0)
-        self.assertEqual(constructions[1]["construction"],
-                         "native-extrude-capped-surface-regrid-union-v1")
-        self.assertIs(constructions[1]["nativeBodyUsed"], False)
+        if version("viennaps") == "4.6.2":
+            self.assertEqual(constructions[1]["construction"],
+                             "native-extrude-capped-surface-regrid-union-v1")
+            self.assertIs(constructions[1]["nativeBodyUsed"], False)
+        else:
+            self.assertEqual(constructions[1]["construction"], "native-layer-to-levelset-v1")
+            self.assertIs(constructions[1]["nativeBodyUsed"], True)
+            self.assertGreater(constructions[1]["nativeBodyPointCount"], 0)
 
     async def test_2d_full_bounds_layer_preview_succeeds(self):
         project = gds_project(2, self.asset_id,

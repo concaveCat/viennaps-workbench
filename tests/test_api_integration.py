@@ -709,6 +709,7 @@ class ApiIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_schema7_gpu_project_validation_does_not_gate_multiion_species_signatures(self) -> None:
         from tests.test_stage7 import multi_project
+        from backend.engine import engine_version
 
         base = multi_project(2, "etch")
         base["solver"]["enginePreference"] = "gpu"
@@ -728,6 +729,21 @@ class ApiIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 step["rateCoefficients"] = {"defaultBySpecies": {name: 0.025 for name in labels},
                                              "byMaterial": {"SiO2": {name: 0.04 for name in labels}}}
                 response = await asgi_request("/api/projects/validate", method="POST", payload=candidate)
+                multi_ion = label == "eight-ions"
+                if multi_ion and engine_version() != "4.6.2":
+                    # Stock 4.7.0 GPU engines silently drop every ion after the
+                    # first, so the request fails fast instead of running wrong.
+                    self.assertEqual(response[0], 422, response[2].decode("utf-8", errors="replace"))
+                    message = json.dumps(json_body(response), ensure_ascii=False)
+                    self.assertIn("silently drop every ion", message)
+                    cpu = json.loads(json.dumps(candidate))
+                    cpu["solver"]["enginePreference"] = "cpu"
+                    cpu_response = await asgi_request("/api/projects/validate", method="POST",
+                                                      payload=cpu)
+                    self.assertEqual(cpu_response[0], 200,
+                                     cpu_response[2].decode("utf-8", errors="replace"))
+                    self.assertTrue(json_body(cpu_response)["valid"])
+                    continue
                 self.assertEqual(response[0], 200, response[2].decode("utf-8", errors="replace"))
                 validation = json_body(response)
                 self.assertTrue(validation["valid"])
