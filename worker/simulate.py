@@ -34,7 +34,11 @@ from backend.models import (normalized_geometry_v3, parse_project,
                             strict_finite_number, strict_integer)
 from backend.runtime_limits import MAX_CELL_SET_CELLS, artifact_limit_bytes, artifact_limit_label
 from backend.preflight import CELL_SET_JSON_BYTES, CELL_SET_VTU_BYTES_PER_CELL
-from backend.validation import (capability_verified, fin_construction_decision,
+from backend.validation import (GPU_MULTIPARTICLE_FLUX_STRATEGY,
+                               GPU_MULTIPARTICLE_NATIVE_FLUX_STRATEGY,
+                               GPU_MULTIPARTICLE_NATIVE_STRATEGY,
+                               GPU_MULTIPARTICLE_SPLIT_STRATEGY,
+                               capability_verified, fin_construction_decision,
                                gpu_project_signature, slice_axis_bounds)
 from backend.engine import multi_ion_gpu_error
 from backend.gpu_devices import cuda_devices, resolve_gpu_device
@@ -62,10 +66,6 @@ MATERIAL_NAMES = {int(row["id"]): row["name"] for row in MATERIAL_ROWS}
 MATERIAL_IDS = {row["name"]: int(row["id"]) for row in MATERIAL_ROWS}
 MATERIAL_COLORS = {int(row["id"]): row["color"] for row in MATERIAL_ROWS}
 GPU_MULTIPARTICLE_SPLIT_SWEEPS = 4
-GPU_MULTIPARTICLE_SPLIT_STRATEGY = "symmetric-operator-splitting-v1"
-GPU_MULTIPARTICLE_FLUX_STRATEGY = "per-species-native-mesh-merge-v1"
-GPU_MULTIPARTICLE_NATIVE_STRATEGY = "native-multi-ion-v1"
-GPU_MULTIPARTICLE_NATIVE_FLUX_STRATEGY = "native-multi-ion-flux-v1"
 
 
 def configure_native_materials(ps: Any, custom_rows: list[dict[str, Any]]) -> None:
