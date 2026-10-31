@@ -6265,8 +6265,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               <div><span>步骤</span><strong>{authoredSteps.length}</strong></div>
             </div>
 
-            {compile && <div className={compileStale ? 'wf-summary' : 'wf-summary success'}>
-              <strong>{compileStale ? 'Compile 已过期，需要重新编译' : '编译成功'}</strong>
+            {compile && <div className={compileStale ? 'wf-summary' : compileMissingSteps.length ? 'wf-summary warning' : 'wf-summary success'}>
+              <strong>{compileStale ? 'Compile 已过期，需要重新编译' : compileMissingSteps.length ? '编译结果不完整' : '编译成功'}</strong>
               <span>{enabledCoverageSteps(authoredSteps).length} 个启用步骤 · 编译 {compile.stepCount} 步 · {compile.dimension}D · 工程 {compile.projectName}</span>
               {compileStale && <span>重新编译后才能创建新的 Route。</span>}
               {compileMissingSteps.length > 0 && <div className="wf-block-reason" role="alert" aria-label="编译缺少步骤">
