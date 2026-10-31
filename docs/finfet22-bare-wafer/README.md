@@ -78,6 +78,31 @@ gate 先 dummy CMP 再图形化。
 - `shots/10-final-xy.png` — 最终顶视
 - `shots/04-sd-epi.png`、`06-cb-open.png`、`08-final-gate.png` — 中间截面
 
+## UI（WorkflowApp 01–06）
+
+这条流程已经作为 `finfet22-bare-wafer` starter 接入 01–06 WorkflowApp，并用真实
+workflow API 跑通：
+
+| 项 | 值 |
+|---|---|
+| 项目 | `proj_05ed1c6b482d49399fe1347e` |
+| UI 触发的 run | `5f47973510146db794138a05` |
+| 步数 | 23/23 succeeded |
+| 最终快照 | `bw_m0_pattern`，349,680 点 / 705,952 三角形 |
+| 报告 | `report_30f3246347e00432` |
+| 验收脚本 | `frontend/tests/workflow-finfet22-acceptance.mjs` |
+
+UI 侧为这条流程做的能力对齐：
+
+- 01 接受后端 0.1 µm 的三维域下限（demo 是 0.5 µm），不再强制 1 µm；
+- 02 保留 directional `rateSets`，不再注入标量占位；geometry-only 步骤不再带 `duration`；
+- 02 增加 `gdsBoolean.gdsMask`、`planarize`、`removeMaterial`、`specialized.nativeParameters`、directional `rateSets` 的可编辑字段；
+- GDS starter 通过真实 Clip/Layout 绑定解析；
+- 默认一个 Segment 跑完整 23 步，不再在倒数第二步强制拆段。
+
+截图：`ui/01-project.png`、`ui/02-flow-23-steps.png`、`ui/03-gdsboolean-editor.png`、
+`ui/04-run-final.png`、`ui/05-report.png`。
+
 ## 已知限制
 
 1. **本 demo 不含 implant/anneal/analysis。** 0.005 µm 网格 + 0.5 µm 域的
@@ -94,6 +119,8 @@ gate 先 dummy CMP 再图形化。
 7. Fin 顶是圆/尖头（各向同性 STI recess 造成）；10 nm fin 在 5 nm 网格上只有 2 格。
 8. 0.0025 µm 的高分辨率尝试跑完 22/23 步后在 600 s run 上限处超时，**不是**
    验收版本；验收版本是上面的 0.005 µm run。
+9. 02 还没有 implant/anneal/analysis 的专用编辑器（本 demo 不使用这三类步骤）；
+   这批能力已在后端，但 UI 表单留到下一轮。
 
 ## 复现
 
