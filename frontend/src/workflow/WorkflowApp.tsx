@@ -1,5 +1,5 @@
 import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
-import type { PointerEvent as ReactPointerEvent } from 'react';
+import type { CSSProperties, PointerEvent as ReactPointerEvent } from 'react';
 import './workflow.css';
 import { SAMPLE_EXAMPLES } from './samples';
 import { executionCompileBasis } from './fingerprint';
@@ -11,7 +11,7 @@ import {
   skippedCoverageSteps,
 } from './compileCoverage';
 import WorkflowViewer3D from './viewer3d/WorkflowViewer3D';
-import type { Viewer3DMarker, Viewer3DStats } from './viewer3d/types';
+import type { Viewer3DMarker } from './viewer3d/types';
 
 type Health = { status: string; applicationVersion?: string; viennaps?: string; viennals?: string; activeRunId?: string | null };
 /** Global settings contract: GET/PUT /api/settings. */
@@ -557,6 +557,16 @@ const ZONES = [
   { id: 'analyze', num: '05', label: '分析', title: '分析', desc: '候选对比、结构差异、工艺窗口与基础标定。' },
   { id: 'report', num: '06', label: '报告', title: '报告', desc: '生成包含来源证据、结构视图与实验结果的 HTML 报告。' },
 ] as const;
+
+/** Read a persisted pane size, clamped to the layout's safe range. */
+function readStoredSize(key: string, fallback: number, minimum: number, maximum: number): number {
+  try {
+    const raw = Number(window.localStorage.getItem(key));
+    return Number.isFinite(raw) && raw >= minimum && raw <= maximum ? raw : fallback;
+  } catch {
+    return fallback;
+  }
+}
 
 const STATUS_LABELS: Record<string, string> = {
   planned: '待执行',
@@ -2169,8 +2179,13 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [rateSetsText, setRateSetsText] = useState('');
   const [rateSetsError, setRateSetsError] = useState('');
   const [structurePick, setStructurePick] = useState('');
-  const [structureFollow, setStructureFollow] = useState(true);
   const [runProgress, setRunProgress] = useState<Record<string, { currentStepId: string; completed: string[] }>>({});
+  // Free-form workspace sizing, persisted per browser. The splitter columns are
+  // real grid tracks, so the left tree and the 3D viewport resize live.
+  const [leftWidth, setLeftWidth] = useState(() => readStoredSize('wb.ui.leftWidth', 224, 180, 520));
+  const [previewHeight, setPreviewHeight] = useState(() => readStoredSize('wb.ui.previewHeight', 420, 240, 760));
+  const leftDrag = useRef<{ startX: number; width: number } | null>(null);
+  const previewDrag = useRef<{ startY: number; height: number } | null>(null);
   const [structureView, setStructureView] = useState<CandidateView | null>(null);
   const [structureLoading, setStructureLoading] = useState(false);
   const [structureError, setStructureError] = useState('');
@@ -2178,7 +2193,6 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   /** A rebuilt Route or re-run Segment dropped a measurement that used to exist. */
   const [measurementInvalidated, setMeasurementInvalidated] = useState(false);
   const [runSnapshots, setRunSnapshots] = useState<Record<string, string[]>>({});
-  const [structureStats, setStructureStats] = useState<Viewer3DStats | null>(null);
   const [rebuildRouteArmed, setRebuildRouteArmed] = useState(false);
   const [replaceTemplateArmed, setReplaceTemplateArmed] = useState(false);
   const [materialTarget, setMaterialTarget] = useState<{ itemName: string; material: string; target: string; stepName?: string } | null>(null);
@@ -2340,7 +2354,6 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setStructureView(null);
     setStructureError('');
     setStructureLoading(false);
-    setStructureStats(null);
     setSelectedFlowStepId(null);
     setExperimentDoc(null);
     setExperimentTable(null);
@@ -3590,12 +3603,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   /** The one Segment that currently owns the supervisor slot, if any. */
   const runningSegment = (route?.segments ?? [])
     .find(item => ['running', 'queued', 'cancelling'].includes(item.status)) ?? null;
-  const runningSegmentName = runningSegment ? stepDisplayName(runningSegment.throughStepId) : '';
   const activeRunProgress = runningSegment?.runId ? runProgress[runningSegment.runId] : null;
   const totalStepCount = route?.stepOrder.length ?? 0;
   const completedStepCount = activeRunProgress?.completed.length ?? 0;
-  const currentStepName = activeRunProgress?.currentStepId ? stepDisplayName(activeRunProgress.currentStepId) : '';
-  const shortId = (id: string | null | undefined) => (id ? id.slice(-6) : '');
 
   const structureDimension: 2 | 3 = compile?.dimension === 3 || project?.dimension === 3 ? 3 : 2;
 
@@ -3604,7 +3614,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   // clickable; only a succeeded run with a real manifest snapshot can be
   // previewed. This is why a split Route no longer hides its last step.
   const succeededSegmentRuns = useMemo(() => (route?.segments ?? [])
-    .filter(item => !!item.runId && !item.runId.startsWith('pending_') && item.status === 'succeeded')
+    .filter(item => !!item.runId && !item.runId.startsWith('pending_')
+      && ['succeeded', 'timed_out', 'failed', 'cancelled', 'interrupted'].includes(item.status))
     .map(item => item.runId as string), [route]);
 
   useEffect(() => {
@@ -3707,6 +3718,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         return item.runId && runProgress[item.runId]?.currentStepId === stepId ? '运行中' : '待执行';
       }
       if (item.status === 'failed') return '执行失败';
+      if (item.status === 'timed_out') return '超时';
+      if (item.status === 'cancelled') return '已取消';
+      if (item.status === 'interrupted') return '已中断';
       if (item.status === 'succeeded' && !hasSnapshot) return '无快照';
       return '待执行';
     };
@@ -3716,8 +3730,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     const firstSegment = route.segments[0];
     const initialSegmentIndex = route.segments.findIndex(item => !!item.runId
       && !item.runId.startsWith('pending_')
-      && ['succeeded', 'running'].includes(item.status)
-      && (runSnapshots[item.runId] ?? []).includes('initial'));
+      && !!runSnapshots[item.runId]?.includes('initial'));
     const initialSegment = initialSegmentIndex >= 0 ? route.segments[initialSegmentIndex] : undefined;
     rows.push({
       runId: initialSegment?.runId ?? '',
@@ -3733,8 +3746,10 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     for (const stepId of stepOrder) {
       const { item, segmentIndex } = segmentForStep(stepId);
       const snapshots = item?.runId ? runSnapshots[item.runId] : undefined;
+      // A timed-out or failed Segment still leaves every completed step's
+      // snapshot on disk; keep those steps inspectable instead of hiding them
+      // behind the terminal status.
       const executed = !!item
-        && ['succeeded', 'running'].includes(item.status)
         && !!item.runId
         && !item.runId.startsWith('pending_')
         && !!snapshots?.includes(stepId);
@@ -3756,7 +3771,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     // While a Segment is live, follow the newest completed step. The polling
     // effect above feeds both the timeline and the preview from the same
     // manifest, so the chip progress and the visible structure stay in sync.
-    if (structureFollow && runningSegment?.runId) {
+    if (runningSegment?.runId) {
       const latest = [...runStructureSteps].reverse().find(row => row.executed);
       if (latest) {
         const key = `${latest.runId}:${latest.stepId}`;
@@ -3780,9 +3795,46 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         const fallback = lastExecuted ?? runStructureSteps[0];
         return fallback ? `${fallback.runId}:${fallback.stepId}` : '';
       })());
-  }, [runStructureSteps, measurement?.sourceRunId, measurement?.sourceStepId, structureFollow, runningSegment?.runId]);
+  }, [runStructureSteps, measurement?.sourceRunId, measurement?.sourceStepId, runningSegment?.runId]);
 
   const structureSelection = runStructureSteps.find(row => `${row.runId}:${row.stepId}` === structurePick) ?? null;
+
+  const onLeftSplitterDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    leftDrag.current = { startX: event.clientX, width: leftWidth };
+  };
+  const onLeftSplitterMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = leftDrag.current;
+    if (!drag) return;
+    setLeftWidth(Math.min(520, Math.max(180, drag.width + event.clientX - drag.startX)));
+  };
+  const onLeftSplitterUp = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = leftDrag.current;
+    if (!drag) return;
+    leftDrag.current = null;
+    const next = Math.min(520, Math.max(180, drag.width + event.clientX - drag.startX));
+    setLeftWidth(next);
+    try { window.localStorage.setItem('wb.ui.leftWidth', String(Math.round(next))); } catch { /* storage may be full */ }
+  };
+  const onPreviewSplitterDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    previewDrag.current = { startY: event.clientY, height: previewHeight };
+  };
+  const onPreviewSplitterMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = previewDrag.current;
+    if (!drag) return;
+    setPreviewHeight(Math.min(760, Math.max(240, drag.height + event.clientY - drag.startY)));
+  };
+  const onPreviewSplitterUp = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = previewDrag.current;
+    if (!drag) return;
+    previewDrag.current = null;
+    const next = Math.min(760, Math.max(240, drag.height + event.clientY - drag.startY));
+    setPreviewHeight(next);
+    try { window.localStorage.setItem('wb.ui.previewHeight', String(Math.round(next))); } catch { /* storage may be full */ }
+  };
   /**
    * A measurement belongs to the run/step that produced it. Switching the 03
    * timeline to another step hides its marker instead of drawing the old X on
@@ -3800,7 +3852,6 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     () => (structureRunId ? (runSnapshots[structureRunId] ?? [structureStepId]) : []),
     [structureRunId, structureStepId, runSnapshots],
   );
-  const structureStatsForStep = structureStats && structureStats.stepId === structureStepId ? structureStats : null;
   const structureViewExtent = useMemo(
     () => (structureView ? structureExtent(structureView, 'xy') : null),
     [structureView],
@@ -6977,7 +7028,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
 
       {error && <div className="wf-error spx-error spx-banner" role="alert"><span className="spx-banner-text" title={error}>{error}</span><BannerClose onClose={() => setError('')} /></div>}
 
-      <div className="spx-body">
+      <div className="spx-body" style={{ '--spx-left-width': `${leftWidth}px` } as CSSProperties}>
         <aside className="spx-left">
           <div className="spx-panel">
             <div className="spx-panel-title"><span>工程</span></div>
@@ -7097,6 +7148,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             <span>v0.1.0</span>
           </div>
         </aside>
+        <div className="spx-splitter" role="separator" aria-orientation="vertical" aria-label="调整左栏宽度"
+          onPointerDown={onLeftSplitterDown} onPointerMove={onLeftSplitterMove}
+          onPointerUp={onLeftSplitterUp} onPointerCancel={onLeftSplitterUp} />
 
         <section className="spx-center">
           <div className="spx-doc-header">
@@ -8001,25 +8055,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         </section>
 
         <section className={`wf-card wf-run ${zone === 'run' ? '' : 'wf-hidden'}`}>
-          <div className="wf-card-head"><span>03</span><h2>运行与测量</h2></div>
-          {(runningSegment || health?.activeRunId) && <div className="wf-running-banner" role="status" aria-label="正在运行">
-            <span className="wf-running-dot" aria-hidden="true" />
-            <span className="wf-running-text">
-              {runningSegment
-                ? <>正在运行：<strong>{runningSegmentName}</strong> · Segment <code title={runningSegment.segmentId}>{shortId(runningSegment.segmentId)}</code></>
-                : <>有运行中的任务 · Run <code title={health?.activeRunId ?? ''}>{shortId(health?.activeRunId)}</code></>}
-              {runningSegment?.status === 'cancelling' && <span className="wf-muted"> · 停止中</span>}
-            </span>
-            <button type="button" className="wf-button" disabled={stoppingRun} onClick={() => void stopRunningRun()}>
-              {stoppingRun ? '停止中…' : '停止运行'}
-            </button>
-          </div>}
           {runNotice && <div className="wf-run-notice" role="status" aria-label="运行提示">{runNotice}</div>}
           {!route && <div className="wf-empty">在 02 编译流程并创建 Route 后，这里执行 Segment 与测量。</div>}
-          {route && <div className="wf-summary success">
-            <strong>Route 已创建</strong>
-            <span>{route.route.name} · {route.segments.length} Segment · {route.stepOrder.length} 步</span>
-            {structureSelection && <span>结构：{structureSelection.label}</span>}
+          {(routeStale || needsRemeasure) && <div className="wf-summary success">
             {routeStale && <span className="wf-rerun">流程已变更，现有 Segment 待重跑</span>}
             {needsRemeasure && <span className="wf-rerun">测量已失效，需重新测量</span>}
           </div>}
@@ -8034,25 +8072,14 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
           </div>}
 
           <div className="wf-structure-panel" aria-label="当前 Run 结构">
-            <div className="wf-structure-head">
-              <strong>结构</strong>
-              {structureSelection
-                ? <span className="wf-structure-step">当前：{structureSelection.label}</span>
-                : <span className="wf-muted">{route ? '待执行步骤以灰色显示' : '尚未创建 Route'}</span>}
-              {runningSegment && <button type="button" className={`wf-button ghost${structureFollow ? ' active' : ''}`}
-                aria-pressed={structureFollow}
-                title={structureFollow ? '自动显示最新完成的步骤' : '已暂停自动跟随；进度条仍会更新'}
-                onClick={() => setStructureFollow(value => !value)}>{structureFollow ? '跟随运行' : '已暂停跟随'}</button>}
-              <span className="wf-muted">{structureDimension}D · µm</span>
-            </div>
-            {runningSegment && <div className="wf-run-progress" aria-label="运行进度">
-              <div className="wf-run-progress-head">
-                <strong>运行中</strong>
-                <span>已完成 {completedStepCount}/{totalStepCount} 步{currentStepName ? ` · 当前 ${currentStepName}` : ''}</span>
-              </div>
-              <div className="wf-run-progress-track" role="progressbar" aria-valuemin={0} aria-valuemax={totalStepCount} aria-valuenow={completedStepCount}>
+            {(runningSegment || health?.activeRunId) && <div className="wf-run-progress" aria-label="运行进度"
+              title={runningSegment ? `已完成 ${completedStepCount}/${totalStepCount} 步` : undefined}>
+              {runningSegment && <div className="wf-run-progress-track" role="progressbar" aria-valuemin={0} aria-valuemax={totalStepCount} aria-valuenow={completedStepCount}>
                 <span style={{ width: `${totalStepCount ? Math.min(100, Math.round((completedStepCount / totalStepCount) * 100)) : 0}%` }} />
-              </div>
+              </div>}
+              <button type="button" className="wf-button" disabled={stoppingRun} onClick={() => void stopRunningRun()}>
+                {stoppingRun ? '停止中…' : '停止运行'}
+              </button>
             </div>}
             {runStructureSteps.length > 0 && <div className="wf-structure-timeline" role="tablist" aria-label="结构步骤时间轴">
               {runStructureSteps.map((row, index) => {
@@ -8065,7 +8092,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                     data-step-id={row.stepId} data-run-id={row.runId} data-segment-id={row.segmentId}
                     data-kind={row.kind} data-executed={row.executed ? 'true' : 'false'}
                     title={`${row.label} · ${row.stepId}${row.executed ? ` · ${row.runId}` : ` · ${row.pendingReason ?? '待执行'}`}`}
-                    onClick={() => { setStructureFollow(false); setStructurePick(key); }}>
+                    onClick={() => setStructurePick(key)}>
                     <span className="wf-step-chip-index" aria-hidden="true">{String(index + 1).padStart(2, '0')}</span>
                     <span className="wf-step-chip-label" title={row.label}>{row.label}</span>
                     <span className={`wf-step-chip-state${row.executed ? ' ok' : ' pending'}`}>{row.executed ? '成功' : row.pendingReason ?? '待执行'}</span>
@@ -8080,21 +8107,13 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                     runId={structureSelection.runId}
                     stepId={structureSelection.stepId}
                     dimension={3}
-                    height={420}
+                    height={previewHeight}
                     stepIds={structureStepIds}
                     marker={viewer3dMarker}
-                    onStats={setStructureStats}
                   />
-                  <div className="wf-structure-3d-stats" aria-label="三维结构统计" role="status">
-                    {structureStatsForStep
-                      ? <>
-                        <span>三角形 <code>{structureStatsForStep.triangles.toLocaleString('en-US')}</code></span>
-                        <span>点 <code>{structureStatsForStep.points.toLocaleString('en-US')}</code></span>
-                        <span>解析耗时 <code>{structureStatsForStep.parseMs} ms</code></span>
-                        {structureStatsForStep.simplified && <span className="warn">简化 {Number(structureStatsForStep.sourceTriangles ?? structureStatsForStep.triangles).toLocaleString('en-US')} → {structureStatsForStep.triangles.toLocaleString('en-US')} 面</span>}
-                      </>
-                      : <span className="wf-muted">等待三维统计…</span>}
-                  </div>
+                  <div className="wf-preview-resizer" role="separator" aria-orientation="horizontal" aria-label="调整预览高度"
+                    onPointerDown={onPreviewSplitterDown} onPointerMove={onPreviewSplitterMove}
+                    onPointerUp={onPreviewSplitterUp} onPointerCancel={onPreviewSplitterUp} />
                 </div>
                 <div className="wf-structure-side">
                   <div className="wf-structure-info">
@@ -8170,54 +8189,6 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
           </div>
 
           {segment && <>
-            <div className="wf-status-row">
-              <span className={`wf-status ${segment.status}`}>{statusLabel(segment.status)}</span>
-              <code title={segment.runId ?? ''}>{`第 ${segmentNumber} 段 · ${statusLabel(segment.status)}`}</code>
-              {measurement && <code title={measurement.measurementId}>
-                {`第 ${segmentNumber} 段 · ${measurementHasValue(measurement) ? '已测量' : statusLabel(measurement.status)}`}
-              </code>}
-            </div>
-            {route && <div className="wf-route-tree">
-              {route.attempts.map((attempt, attemptIndex) => {
-                const attemptSegments = route.segments.filter(item => item.attemptId === attempt.attemptId);
-                const attemptStatus = attemptSegments.some(item => item.status === 'failed')
-                  ? 'failed'
-                  : attemptSegments.some(item => item.status === 'running')
-                    ? 'running'
-                    : attemptSegments.length > 0 && attemptSegments.every(item => item.status === 'succeeded')
-                      ? 'succeeded'
-                      : attempt.status;
-                return <div key={attempt.attemptId} className="wf-attempt">
-                <div className="wf-attempt-title"><strong>尝试 {attemptIndex + 1}/{route.attempts.length}</strong><span>{statusLabel(attemptStatus)}</span></div>
-                {route.reuse.filter(item => item.attemptId === attempt.attemptId).map(item => <div key={item.reuseId} className="wf-segment-row"><span className="wf-status verified">复用</span><code>{stepDisplayName(item.fromStepId)} → {stepDisplayName(item.toStepId)}</code></div>)}
-                {route.segments.filter(item => item.attemptId === attempt.attemptId).map(item => {
-                  const structureRow = runStructureSteps.find(row => row.runId === item.runId && row.stepId === item.throughStepId);
-                  return <div key={item.segmentId}
-                    className={`wf-segment-row${segment?.segmentId === item.segmentId ? ' selected' : ''}`}
-                    role="button" tabIndex={0}
-                    aria-current={segment?.segmentId === item.segmentId ? 'true' : undefined}
-                    title="选中该 Segment（可查看状态并执行/停止）"
-                    onClick={() => { setSegment(item); setRunNotice(''); }}
-                    onKeyDown={event => {
-                      if (event.key === 'Enter' || event.key === ' ') {
-                        event.preventDefault();
-                        setSegment(item);
-                        setRunNotice('');
-                      }
-                    }}>
-                    <span className={`wf-status ${item.status}`}>{statusLabel(item.status)}</span>
-                    <code>{item.startAfterStepId ? `自 ${stepDisplayName(item.startAfterStepId)} 之后` : '从首步'} → {stepDisplayName(item.throughStepId)}</code>
-                    {(item.status === 'planned' && routeStale) || (item.status === 'succeeded' && routeStale) ? <span className="wf-rerun">待重跑</span> : null}
-                    <button type="button" className="wf-link wf-segment-structure"
-                      disabled={!structureRow}
-                      title={structureRow ? `查看 ${stepDisplayName(item.throughStepId)} 的结构` : '先执行该 Segment'}
-                      onClick={event => { event.stopPropagation(); if (structureRow) setStructurePick(`${structureRow.runId}:${structureRow.stepId}`); }}>
-                      查看结构
-                    </button>
-                  </div>;
-                })}
-              </div>;})}
-            </div>}
             <div className="spx-run-actions">
               <button className="wf-button primary" disabled={!canRun}
                 title={needsPredecessors

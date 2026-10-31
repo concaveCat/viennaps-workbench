@@ -501,8 +501,11 @@ body {
 .spx-functions button:hover { background: #e9f0f8; }
 .spx-functions button.active { background: var(--spx-blue); color: #fff; }
 
-.spx-body { flex: 1; min-height: 0; display: grid; grid-template-columns: 224px minmax(0, 1fr); }
+.spx-body { flex: 1; min-height: 0; display: grid; grid-template-columns: var(--spx-left-width, 224px) 6px minmax(0, 1fr); }
 .spx-left { min-height: 0; overflow: auto; background: var(--spx-panel); border-right: 1px solid var(--spx-line); display: flex; flex-direction: column; }
+.spx-splitter { position: relative; cursor: col-resize; background: #eef1f4; border-left: 1px solid var(--spx-line); border-right: 1px solid var(--spx-line); touch-action: none; }
+.spx-splitter::after { content: ""; position: absolute; top: 50%; left: 1px; width: 2px; height: 28px; margin-top: -14px; background: #c3ccd4; border-radius: 1px; }
+.spx-splitter:hover::after { background: var(--spx-blue); }
 .spx-panel { border-bottom: 1px solid var(--spx-line); }
 .spx-panel-title { height: 24px; display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 0 7px; background: #e9ecef; border-bottom: 1px solid var(--spx-line); color: #26313a; font-size: 11px; font-weight: 600; }
 .spx-panel-tools { color: var(--spx-muted); font-weight: 400; }
@@ -529,6 +532,9 @@ body {
 .spx-state-pill.ok { border-color: #a9c9b0; background: #edf7ef; color: var(--spx-green); }
 .spx-doc-body { display: block !important; overflow: auto; padding: 10px 12px; margin: 0; min-height: 0; }
 .spx-doc-body .wf-card { min-height: 0; margin: 0 0 10px; padding: 10px 12px; background: #fff; border: 1px solid var(--spx-line); border-radius: 0; box-shadow: none; }
+/* The 03 run page is a single working surface; its outer card frame added a
+   second border around every element. Keep the inner panels, drop the frame. */
+.spx-doc-body .wf-card.wf-run { margin: 0; padding: 0; border: 0; background: transparent; }
 .spx-doc-body .wf-card-head { margin: -10px -12px 9px; padding: 5px 8px; background: #eef1f4; border-bottom: 1px solid var(--spx-line); gap: 7px; }
 .spx-doc-body .wf-card-head span { width: 22px; height: 18px; border: 1px solid var(--spx-line); border-radius: 0; background: #fff; color: var(--spx-blue); font: 10px "Consolas", monospace; }
 .spx-doc-body .wf-card-head h2 { font-size: 12px; font-weight: 600; }
@@ -599,12 +605,13 @@ body {
 .wf-legacy { border-radius: 0; color: var(--spx-blue); border-color: var(--spx-line); }
 
 @media (max-width: 1100px) {
-  .spx-body { grid-template-columns: 190px minmax(0, 1fr); }
+  .spx-body { grid-template-columns: 190px 6px minmax(0, 1fr); }
   .wf-grid { grid-template-columns: 1fr; }
 }
 @media (max-width: 760px) {
   .spx-body { grid-template-columns: 1fr; }
   .spx-left { display: none; }
+  .spx-splitter { display: none; }
   .spx-toolbar { height: auto; flex-wrap: wrap; padding: 3px 6px; }
   .spx-functions { flex-wrap: wrap; }
   .spx-functions button { border-bottom: 1px solid var(--spx-line); }
@@ -887,10 +894,11 @@ body {
 .wf-structure-head .wf-button.ghost.active { border-color: #35b7a1; background: #eefaf7; color: #0b6b5c; }
 /* Live run progress: the same manifest poll drives these numbers, the timeline
    chips and the structure preview, so they cannot drift apart. */
-.wf-run-progress { padding: 5px 7px 6px; border-bottom: 1px solid var(--spx-line); background: #f7fbfa; }
+.wf-run-progress { padding: 5px 7px 6px; border-bottom: 1px solid var(--spx-line); background: #f7fbfa; display: flex; align-items: center; gap: 8px; }
+.wf-run-progress .wf-button { width: auto; min-width: 0; height: 22px; padding: 0 8px; font-size: 11px; }
 .wf-run-progress-head { display: flex; align-items: baseline; gap: 8px; font-size: 11px; color: var(--spx-muted); }
 .wf-run-progress-head strong { color: #0b6b5c; font-size: 11px; }
-.wf-run-progress-track { height: 5px; margin-top: 4px; background: #dde7e4; overflow: hidden; }
+.wf-run-progress-track { flex: 1; height: 5px; margin-top: 0; background: #dde7e4; overflow: hidden; }
 .wf-run-progress-track span { display: block; height: 100%; background: #35b7a1; transition: width .3s ease; }
 .wf-structure-body { display: grid; grid-template-columns: minmax(0, 1fr) 172px; gap: 8px; padding: 7px; }
 .wf-structure-canvas-shell { position: relative; display: block; min-width: 0; user-select: none; -webkit-user-select: none; }
@@ -972,6 +980,8 @@ body {
    theme; only colours are overridden here, layout stays untouched. */
 .wf-structure-body--3d { align-items: start; }
 .wf-structure-3d { min-width: 0; }
+.wf-preview-resizer { height: 7px; margin-top: 3px; cursor: row-resize; background: #eef1f4; border-top: 1px solid var(--spx-line); border-bottom: 1px solid var(--spx-line); touch-action: none; }
+.wf-preview-resizer:hover { background: #dfe7ec; }
 .wf-structure-body--3d .wb-viewer3d { border-color: var(--spx-line); border-radius: 0; background: #fff; }
 .wf-structure-body--3d .wb-viewer3d__bar { background: #eef1f4; border-color: var(--spx-line); }
 .wf-structure-body--3d .wb-viewer3d__button { background: #f4f5f6; border-color: var(--spx-line); color: #26313a; }
