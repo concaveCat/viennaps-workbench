@@ -3111,14 +3111,19 @@ def apply_geometry_operation(ps: Any, domain: Any, project: dict[str, Any], step
         enum_name = {"union": "UNION", "intersection": "INTERSECT", "difference": "RELATIVE_COMPLEMENT"}[step["booleanOperation"]]
         operation = getattr(ps.ls.BooleanOperationEnum, enum_name)
         apply_to_all = bool(step["applyToAll"])
+        before = [int(level_set.getNumberOfPoints()) for level_set in domain.getLevelSets()]
         domain.applyBooleanOperation(operand, operation, apply_to_all)
         remaining = [int(level_set.getNumberOfPoints()) for level_set in domain.getLevelSets()]
-        if not remaining or any(points == 0 for points in remaining):
-            # A boolean that erases a level set is not a usable pattern: fail
-            # loudly rather than saving a structure with a vanished material.
+        erased = [index for index, (was, now) in enumerate(zip(before, remaining))
+                  if was > 0 and now == 0]
+        if not remaining or erased:
+            # A boolean that erases a previously non-empty level set is not a
+            # usable pattern: fail loudly. A level set that was already empty
+            # before the operation is unrelated (e.g. a material removed by an
+            # earlier step) and must not block a top-only mask operation.
             raise RuntimeError(
                 "GDS boolean operand erased a material level set; adjust the mask region, "
-                f"retained region or operation (level-set point counts: {remaining})")
+                f"retained region or operation (level-set point counts: {remaining}, erased: {erased})")
         return {"geometryOperation": "gdsBoolean", "booleanOperation": step["booleanOperation"],
                 "operand": "gds-mask", "nativeBooleanEnum": enum_name,
                 "applyToAll": apply_to_all,
