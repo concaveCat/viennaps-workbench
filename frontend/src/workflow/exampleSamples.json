@@ -151,9 +151,9 @@
   {
     "id": "bosch",
     "label": "Bosch Process",
-    "meta": "3D · hole · SF6/C4F8",
+    "meta": "3D · hole · 10 cycles",
     "source": "examples/boschProcess",
-    "note": "源码为 10 循环；这里用单步 SF6/C4F8 近似。",
+    "note": "源码为 10 个沉积→刻蚀循环；这里展开为 20 步（singleParticle 沉积 + sf6o2 刻蚀）。源码的自定义 MultiParticle rate function 仍不能完全表达。",
     "sample": {
       "schemaVersion": 7,
       "name": "Bosch Process",
@@ -182,21 +182,324 @@
       },
       "steps": [
         {
-          "id": "sample_01",
-          "name": "Bosch SF6/C4F8",
+          "id": "bosch_dep_01",
+          "name": "Cycle 1 deposition",
+          "enabled": true,
+          "operation": "deposit",
+          "model": "singleParticle",
+          "duration": 1.0,
+          "rateMagnitude": 0.075,
+          "rateMode": "uniform",
+          "depositMaterial": "SiO2",
+          "stickingProbability": 0.01,
+          "sourceExponent": 1.0
+        },
+        {
+          "id": "bosch_etch_01",
+          "name": "Cycle 1 etch",
           "enabled": true,
           "operation": "etch",
           "model": "specialized",
-          "nativeModel": "sf6c4f8",
+          "nativeModel": "sf6o2",
+          "duration": 1.5,
           "nativeParameters": {
-            "ionFlux": 1.0,
-            "etchantFlux": 1.0,
-            "meanEnergy": 100,
-            "sigmaEnergy": 10,
-            "ionExponent": 1000,
-            "etchStopDepth": -10
-          },
-          "duration": 11.0
+            "ionFlux": 10.0,
+            "etchantFlux": 4500.0,
+            "oxygenFlux": 800.0,
+            "meanIonEnergy": 100.0,
+            "sigmaIonEnergy": 10.0,
+            "ionExponent": 1000.0,
+            "oxySputterYield": 2.0,
+            "etchStopDepth": -10.0
+          }
+        },
+        {
+          "id": "bosch_dep_02",
+          "name": "Cycle 2 deposition",
+          "enabled": true,
+          "operation": "deposit",
+          "model": "singleParticle",
+          "duration": 1.0,
+          "rateMagnitude": 0.075,
+          "rateMode": "uniform",
+          "depositMaterial": "SiO2",
+          "stickingProbability": 0.01,
+          "sourceExponent": 1.0
+        },
+        {
+          "id": "bosch_etch_02",
+          "name": "Cycle 2 etch",
+          "enabled": true,
+          "operation": "etch",
+          "model": "specialized",
+          "nativeModel": "sf6o2",
+          "duration": 1.5,
+          "nativeParameters": {
+            "ionFlux": 10.0,
+            "etchantFlux": 4500.0,
+            "oxygenFlux": 800.0,
+            "meanIonEnergy": 100.0,
+            "sigmaIonEnergy": 10.0,
+            "ionExponent": 1000.0,
+            "oxySputterYield": 2.0,
+            "etchStopDepth": -10.0
+          }
+        },
+        {
+          "id": "bosch_dep_03",
+          "name": "Cycle 3 deposition",
+          "enabled": true,
+          "operation": "deposit",
+          "model": "singleParticle",
+          "duration": 1.0,
+          "rateMagnitude": 0.075,
+          "rateMode": "uniform",
+          "depositMaterial": "SiO2",
+          "stickingProbability": 0.01,
+          "sourceExponent": 1.0
+        },
+        {
+          "id": "bosch_etch_03",
+          "name": "Cycle 3 etch",
+          "enabled": true,
+          "operation": "etch",
+          "model": "specialized",
+          "nativeModel": "sf6o2",
+          "duration": 1.5,
+          "nativeParameters": {
+            "ionFlux": 10.0,
+            "etchantFlux": 4500.0,
+            "oxygenFlux": 800.0,
+            "meanIonEnergy": 100.0,
+            "sigmaIonEnergy": 10.0,
+            "ionExponent": 1000.0,
+            "oxySputterYield": 2.0,
+            "etchStopDepth": -10.0
+          }
+        },
+        {
+          "id": "bosch_dep_04",
+          "name": "Cycle 4 deposition",
+          "enabled": true,
+          "operation": "deposit",
+          "model": "singleParticle",
+          "duration": 1.0,
+          "rateMagnitude": 0.075,
+          "rateMode": "uniform",
+          "depositMaterial": "SiO2",
+          "stickingProbability": 0.01,
+          "sourceExponent": 1.0
+        },
+        {
+          "id": "bosch_etch_04",
+          "name": "Cycle 4 etch",
+          "enabled": true,
+          "operation": "etch",
+          "model": "specialized",
+          "nativeModel": "sf6o2",
+          "duration": 1.5,
+          "nativeParameters": {
+            "ionFlux": 10.0,
+            "etchantFlux": 4500.0,
+            "oxygenFlux": 800.0,
+            "meanIonEnergy": 100.0,
+            "sigmaIonEnergy": 10.0,
+            "ionExponent": 1000.0,
+            "oxySputterYield": 2.0,
+            "etchStopDepth": -10.0
+          }
+        },
+        {
+          "id": "bosch_dep_05",
+          "name": "Cycle 5 deposition",
+          "enabled": true,
+          "operation": "deposit",
+          "model": "singleParticle",
+          "duration": 1.0,
+          "rateMagnitude": 0.075,
+          "rateMode": "uniform",
+          "depositMaterial": "SiO2",
+          "stickingProbability": 0.01,
+          "sourceExponent": 1.0
+        },
+        {
+          "id": "bosch_etch_05",
+          "name": "Cycle 5 etch",
+          "enabled": true,
+          "operation": "etch",
+          "model": "specialized",
+          "nativeModel": "sf6o2",
+          "duration": 1.5,
+          "nativeParameters": {
+            "ionFlux": 10.0,
+            "etchantFlux": 4500.0,
+            "oxygenFlux": 800.0,
+            "meanIonEnergy": 100.0,
+            "sigmaIonEnergy": 10.0,
+            "ionExponent": 1000.0,
+            "oxySputterYield": 2.0,
+            "etchStopDepth": -10.0
+          }
+        },
+        {
+          "id": "bosch_dep_06",
+          "name": "Cycle 6 deposition",
+          "enabled": true,
+          "operation": "deposit",
+          "model": "singleParticle",
+          "duration": 1.0,
+          "rateMagnitude": 0.075,
+          "rateMode": "uniform",
+          "depositMaterial": "SiO2",
+          "stickingProbability": 0.01,
+          "sourceExponent": 1.0
+        },
+        {
+          "id": "bosch_etch_06",
+          "name": "Cycle 6 etch",
+          "enabled": true,
+          "operation": "etch",
+          "model": "specialized",
+          "nativeModel": "sf6o2",
+          "duration": 1.5,
+          "nativeParameters": {
+            "ionFlux": 10.0,
+            "etchantFlux": 4500.0,
+            "oxygenFlux": 800.0,
+            "meanIonEnergy": 100.0,
+            "sigmaIonEnergy": 10.0,
+            "ionExponent": 1000.0,
+            "oxySputterYield": 2.0,
+            "etchStopDepth": -10.0
+          }
+        },
+        {
+          "id": "bosch_dep_07",
+          "name": "Cycle 7 deposition",
+          "enabled": true,
+          "operation": "deposit",
+          "model": "singleParticle",
+          "duration": 1.0,
+          "rateMagnitude": 0.075,
+          "rateMode": "uniform",
+          "depositMaterial": "SiO2",
+          "stickingProbability": 0.01,
+          "sourceExponent": 1.0
+        },
+        {
+          "id": "bosch_etch_07",
+          "name": "Cycle 7 etch",
+          "enabled": true,
+          "operation": "etch",
+          "model": "specialized",
+          "nativeModel": "sf6o2",
+          "duration": 1.5,
+          "nativeParameters": {
+            "ionFlux": 10.0,
+            "etchantFlux": 4500.0,
+            "oxygenFlux": 800.0,
+            "meanIonEnergy": 100.0,
+            "sigmaIonEnergy": 10.0,
+            "ionExponent": 1000.0,
+            "oxySputterYield": 2.0,
+            "etchStopDepth": -10.0
+          }
+        },
+        {
+          "id": "bosch_dep_08",
+          "name": "Cycle 8 deposition",
+          "enabled": true,
+          "operation": "deposit",
+          "model": "singleParticle",
+          "duration": 1.0,
+          "rateMagnitude": 0.075,
+          "rateMode": "uniform",
+          "depositMaterial": "SiO2",
+          "stickingProbability": 0.01,
+          "sourceExponent": 1.0
+        },
+        {
+          "id": "bosch_etch_08",
+          "name": "Cycle 8 etch",
+          "enabled": true,
+          "operation": "etch",
+          "model": "specialized",
+          "nativeModel": "sf6o2",
+          "duration": 1.5,
+          "nativeParameters": {
+            "ionFlux": 10.0,
+            "etchantFlux": 4500.0,
+            "oxygenFlux": 800.0,
+            "meanIonEnergy": 100.0,
+            "sigmaIonEnergy": 10.0,
+            "ionExponent": 1000.0,
+            "oxySputterYield": 2.0,
+            "etchStopDepth": -10.0
+          }
+        },
+        {
+          "id": "bosch_dep_09",
+          "name": "Cycle 9 deposition",
+          "enabled": true,
+          "operation": "deposit",
+          "model": "singleParticle",
+          "duration": 1.0,
+          "rateMagnitude": 0.075,
+          "rateMode": "uniform",
+          "depositMaterial": "SiO2",
+          "stickingProbability": 0.01,
+          "sourceExponent": 1.0
+        },
+        {
+          "id": "bosch_etch_09",
+          "name": "Cycle 9 etch",
+          "enabled": true,
+          "operation": "etch",
+          "model": "specialized",
+          "nativeModel": "sf6o2",
+          "duration": 1.5,
+          "nativeParameters": {
+            "ionFlux": 10.0,
+            "etchantFlux": 4500.0,
+            "oxygenFlux": 800.0,
+            "meanIonEnergy": 100.0,
+            "sigmaIonEnergy": 10.0,
+            "ionExponent": 1000.0,
+            "oxySputterYield": 2.0,
+            "etchStopDepth": -10.0
+          }
+        },
+        {
+          "id": "bosch_dep_10",
+          "name": "Cycle 10 deposition",
+          "enabled": true,
+          "operation": "deposit",
+          "model": "singleParticle",
+          "duration": 1.0,
+          "rateMagnitude": 0.075,
+          "rateMode": "uniform",
+          "depositMaterial": "SiO2",
+          "stickingProbability": 0.01,
+          "sourceExponent": 1.0
+        },
+        {
+          "id": "bosch_etch_10",
+          "name": "Cycle 10 etch",
+          "enabled": true,
+          "operation": "etch",
+          "model": "specialized",
+          "nativeModel": "sf6o2",
+          "duration": 1.5,
+          "nativeParameters": {
+            "ionFlux": 10.0,
+            "etchantFlux": 4500.0,
+            "oxygenFlux": 800.0,
+            "meanIonEnergy": 100.0,
+            "sigmaIonEnergy": 10.0,
+            "ionExponent": 1000.0,
+            "oxySputterYield": 2.0,
+            "etchStopDepth": -10.0
+          }
         }
       ],
       "solver": {
