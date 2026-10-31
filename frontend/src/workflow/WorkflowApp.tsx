@@ -887,6 +887,22 @@ const RATE_MODE_STEP_MODELS = new Set(['isotropic', 'singleParticle']);
 const DEPOSIT_STEP_MODELS = new Set(['isotropic', 'singleParticle', 'directional', 'multiParticle', 'specialized']);
 
 /**
+ * Hard masks and resists are pattern materials, not deposition sources. The
+ * backend StepV7 accepts any material string, so the editor keeps this list
+ * explicit instead of offering the whole catalog.
+ */
+const NON_DEPOSIT_MATERIAL_CATEGORIES = new Set(['Hardmask']);
+function isDepositableMaterial(row: MaterialRow): boolean {
+  if (NON_DEPOSIT_MATERIAL_CATEGORIES.has(String(row.category ?? ''))) return false;
+  return !/(mask|resist|photoresist)/i.test(row.name);
+}
+function depositableMaterialNames(catalog: MaterialRow[]): string[] {
+  const names = catalog.filter(isDepositableMaterial).map(row => row.name);
+  // SiO2 is the least surprising default for a new deposition step.
+  return names.sort((left, right) => (left === 'SiO2' ? -1 : right === 'SiO2' ? 1 : 0));
+}
+
+/**
  * Drop fields the selected operation/model does not accept, and fill the ones
  * the schema requires. Backend validators reject `depositMaterial` on etch and
  * particle fields on isotropic, so an operation/model switch must clean up
@@ -2591,6 +2607,14 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     () => libraryItems.filter(item => item.category === 'process'),
     [libraryItems],
   );
+  const depositMaterialOptions = useMemo(() => {
+    const byName = new Map(materialCatalog.map(row => [row.name, row]));
+    return depositableMaterialNames(materialCatalog)
+      .map(name => byName.get(name))
+      .filter((row): row is MaterialRow => !!row);
+  }, [materialCatalog]);
+  const selectedDepositMaterialInvalid = !!selectedFlowStep?.depositMaterial
+    && !depositMaterialOptions.some(row => row.name === selectedFlowStep.depositMaterial);
   const selectedStepModel = String(selectedFlowStep?.model ?? '');
   const selectedStepOperation = String(selectedFlowStep?.operation ?? 'etch');
   const stepModelOptions = Array.from(new Set([selectedStepModel, ...EDITABLE_STEP_MODELS].filter(Boolean)));
@@ -4452,7 +4476,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
 
   const updateSelectedStep = (patch: Record<string, unknown>) => {
     if (!selectedFlowStepId) return;
-    const materialNames = materialCatalog.map(row => row.name);
+    const materialNames = depositableMaterialNames(materialCatalog);
     commitSteps(steps => steps.map(step => (step.id === selectedFlowStepId
       ? sanitizeProjectStep({ ...step, ...patch }, materialNames)
       : step)));
@@ -5314,10 +5338,10 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             </label>
             <label className="spx-field"><span>速率 (µm/s)</span><input aria-label="库工艺速率" type="number" step="0.01" value={managerForm.rateMagnitude ?? ''} onChange={event => setManagerForm(prev => ({ ...prev, rateMagnitude: event.target.value }))} /></label>
             <label className="spx-field"><span>时长 (s)</span><input aria-label="库工艺时长" type="number" step="0.01" value={managerForm.duration ?? ''} onChange={event => setManagerForm(prev => ({ ...prev, duration: event.target.value }))} /></label>
-            {managerForm.operation === 'deposit' && <label className="spx-field"><span>沉积材料</span>
+            {managerForm.operation === 'deposit' && <label className="spx-field"><span title="只列可沉积材料（排除硬掩膜/光刻胶）">沉积材料</span>
               <select aria-label="库工艺沉积材料" value={managerForm.depositMaterial ?? ''} onChange={event => setManagerForm(prev => ({ ...prev, depositMaterial: event.target.value }))}>
                 <option value="">选择材料</option>
-                {materialCatalog.map(row => <option key={row.name} value={row.name}>{row.name}</option>)}
+                {depositMaterialOptions.map(row => <option key={row.name} value={row.name}>{row.name}</option>)}
               </select>
             </label>}
             {managerForm.model === 'singleParticle' && <>
@@ -6424,11 +6448,12 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                       {selectedStepOperation === 'etch' && <option value="material">按材料 (material)</option>}
                     </select>
                   </label>}
-                  {stepSupportsDepositMaterial && <label className="spx-field" data-field="depositMaterial"><span title="depositMaterial">沉积材料</span>
+                  {stepSupportsDepositMaterial && <label className="spx-field" data-field="depositMaterial"><span title="depositMaterial · 只列可沉积材料（排除硬掩膜/光刻胶）">沉积材料</span>
                     <select aria-label="步骤沉积材料" value={String(selectedFlowStep.depositMaterial ?? '')} onChange={event => updateSelectedStep({ depositMaterial: event.target.value || undefined })}>
                       <option value="">—</option>
-                      {materialCatalog.map(row => <option key={row.name} value={row.name}>{row.name}{materialPreset === row.name ? ' · 库' : ''}{materialTarget?.material === row.name ? ' · 当前材料' : ''}</option>)}
+                      {depositMaterialOptions.map(row => <option key={row.name} value={row.name}>{row.name}{materialPreset === row.name ? ' · 库' : ''}{materialTarget?.material === row.name ? ' · 当前材料' : ''}</option>)}
                     </select>
+                    {selectedDepositMaterialInvalid && <em className="spx-field-error">当前材料 {String(selectedFlowStep.depositMaterial)} 不可沉积，请重新选择</em>}
                   </label>}
                   {stepShowsParticleFields && <>
                     <label className="spx-field" data-field="stickingProbability"><span title="stickingProbability">粘附系数</span><input aria-label="步骤 stickingProbability" type="number" step="0.01" value={Number(selectedFlowStep.stickingProbability ?? 1)} onChange={event => updateSelectedStep({ stickingProbability: Number(event.target.value) })} /></label>
@@ -6615,9 +6640,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                     data-kind={row.kind} data-executed={row.executed ? 'true' : 'false'}
                     title={`${row.label} · ${row.stepId}${row.executed ? ` · ${row.runId}` : ` · ${row.pendingReason ?? '待执行'}`}`}
                     onClick={() => setStructurePick(key)}>
-                    <span className="wf-step-chip-index">{String(index + 1).padStart(2, '0')}</span>
-                    <span className="wf-step-chip-label">{row.label}</span>
-                    {!row.executed && <span className="wf-step-chip-state">{row.pendingReason ?? '待执行'}</span>}
+                    <span className="wf-step-chip-index" aria-hidden="true">{String(index + 1).padStart(2, '0')}</span>
+                    <span className="wf-step-chip-label" title={row.label}>{row.label}</span>
+                    <span className={`wf-step-chip-state${row.executed ? ' ok' : ' pending'}`}>{row.executed ? '成功' : row.pendingReason ?? '待执行'}</span>
                   </button>
                 </Fragment>;
               })}

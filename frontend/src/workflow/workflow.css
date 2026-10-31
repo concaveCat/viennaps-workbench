@@ -881,7 +881,7 @@ body {
   align-items: center;
   gap: 5px;
   flex: none;
-  max-width: 190px;
+  max-width: 240px;
   padding: 3px 8px;
   border: 1px solid var(--spx-line);
   background: #fff;
@@ -895,15 +895,20 @@ body {
 .wf-step-chip.active { border-color: var(--spx-blue); background: var(--spx-blue); color: #fff; }
 .wf-step-chip.initial { border-style: dashed; }
 .wf-step-chip.initial.active { border-style: solid; }
-.wf-step-chip-index { font: 9px "Consolas", monospace; opacity: 0.72; }
-.wf-step-chip-label { overflow: hidden; text-overflow: ellipsis; }
+.wf-step-chip-index { flex: none; font: 9px "Consolas", monospace; opacity: 0.72; }
+/* The step name is the chip's primary content; never let it collapse to a
+   zero-width ellipsis next to the index and the status badge. */
+.wf-step-chip-label { flex: 1 1 auto; min-width: 2.5em; overflow: hidden; text-overflow: ellipsis; }
 .wf-step-chip-sep { flex: none; color: #8a949c; font-size: 10px; }
 /* Steps whose Segment has not run stay in the timeline, but cannot fake a
    snapshot: dashed grey chip plus a "待执行" badge. */
 .wf-step-chip.pending { border-style: dashed; background: #f4f5f6; color: #8a949c; }
 .wf-step-chip.pending:hover { border-color: #8a949c; color: #5f6b76; }
 .wf-step-chip.pending.active { border-style: solid; border-color: #8a949c; background: #e8ebee; color: #34404b; }
-.wf-step-chip-state { font-size: 9px; border: 1px solid currentColor; padding: 0 3px; line-height: 1.4; }
+.wf-step-chip-state { flex: none; font-size: 9px; border: 1px solid currentColor; padding: 0 3px; line-height: 1.4; }
+.wf-step-chip-state.ok { border-color: #a9c9b0; background: #edf7ef; color: var(--spx-green); }
+.wf-step-chip.active .wf-step-chip-state { background: rgba(255, 255, 255, 0.16); border-color: rgba(255, 255, 255, 0.7); color: #fff; }
+.wf-step-chip.pending.active .wf-step-chip-state { background: #fff; border-color: #8a949c; color: #34404b; }
 .wf-skip-note { margin-top: 6px; padding: 5px 8px; border: 1px solid #e0c68d; border-left: 3px solid #d68b00; background: #fffaf0; color: #6b4a00; font-size: 10px; }
 .wf-skip-note strong { font-weight: 600; }
 

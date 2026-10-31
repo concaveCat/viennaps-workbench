@@ -85,7 +85,7 @@ await postJson('/api/v1/workflow/projects', baseProject('Round11 跳过', [
   etchStep(1, '第一步'), etchStep(2, '第二步'), etchStep(3, '最后一步'),
 ]));
 await postJson('/api/v1/workflow/projects', baseProject('Round11 五步', [
-  etchStep(1, '一'), etchStep(2, '二'), etchStep(3, '三'), etchStep(4, '四'), etchStep(5, '五'),
+  etchStep(1, 'one'), etchStep(2, 'two'), etchStep(3, 'three'), etchStep(4, 'four'), etchStep(5, 'five'),
 ]));
 
 const projectIdByName = async name => {
@@ -218,6 +218,16 @@ try {
   assert.equal(await page.getByLabel('步骤速率模式').isDisabled(), true);
   assert.deepEqual(await page.getByLabel('步骤速率模式').locator('option').evaluateAll(nodes => nodes.map(node => node.value)),
     ['uniform']);
+  await page.getByLabel('步骤沉积材料').locator('option[value="SiO2"]').waitFor({ state: 'attached' });
+  const depositOptions = await page.getByLabel('步骤沉积材料').locator('option').evaluateAll(nodes => nodes.map(node => node.value));
+  for (const material of ['SiO2', 'SiGe', 'PolySi']) {
+    assert.ok(depositOptions.includes(material), `deposit materials include ${material}: ${depositOptions.join(',')}`);
+  }
+  for (const material of ['Mask', 'PMMA']) {
+    assert.ok(!depositOptions.includes(material), `deposit materials exclude ${material}: ${depositOptions.join(',')}`);
+  }
+  assert.equal(await page.getByLabel('步骤沉积材料').inputValue(), 'SiO2',
+    'switching to deposit defaults to a depositable material, never Mask');
 
   // singleParticle: particle fields appear; deposit material still follows operation.
   await page.getByLabel('步骤模型').selectOption('singleParticle');
@@ -245,7 +255,7 @@ try {
   const savedStep = saved.steps[0];
   assert.equal(savedStep.operation, 'deposit');
   assert.equal(savedStep.model, 'isotropic');
-  assert.ok(savedStep.depositMaterial, 'deposit keeps its material');
+  assert.equal(savedStep.depositMaterial, 'SiO2', 'deposit keeps the selected depositable material');
   assert.equal(savedStep.stickingProbability, undefined, 'isotropic must not carry stickingProbability');
   assert.equal(savedStep.sourceExponent, undefined, 'isotropic must not carry sourceExponent');
   assert.equal(savedStep.rateMode, 'uniform', 'deposit rateMode is always uniform');
@@ -285,10 +295,18 @@ try {
   assert.match(await page.locator('.wf-run .wf-summary').first().innerText(), /5 步/);
   assert.equal(await page.locator('.wf-structure-timeline [data-kind="initial"]').count(), 1);
   assert.equal(await timelineSteps().count(), 5, 'a split Route still lists its last step before it runs');
+  const pendingTexts = await timelineSteps().allInnerTexts();
+  for (const stepName of ['one', 'two', 'three', 'four', 'five']) {
+    assert.ok(pendingTexts.some(text => text.includes(stepName)),
+      `pending chip keeps the step name ${stepName}: ${JSON.stringify(pendingTexts)}`);
+  }
+  assert.equal(pendingTexts.filter(text => /待执行/.test(text)).length, 5, 'every pending chip has a 待执行 badge');
+  assert.ok(!pendingTexts.some(text => /^\d+\s*\n?\s*待执行/.test(text)),
+    'a chip must not replace the step name with its sequence number');
   const lastChip = timelineSteps().last();
   assert.equal(await lastChip.getAttribute('data-executed'), 'false');
   assert.match(await lastChip.innerText(), /待执行/);
-  assert.match(await lastChip.innerText(), /五/);
+  assert.match(await lastChip.innerText(), /five/);
   await page.screenshot({ path: path.join(shotDir, 'round11-timeline-pending.png'), fullPage: true });
 
   // A pending chip must not fake a snapshot.
@@ -305,9 +323,14 @@ try {
   );
   assert.equal(await timelineSteps().count(), 5);
   assert.equal(await timelineSteps().filter({ hasText: '待执行' }).count(), 0);
+  const executedTexts = await timelineSteps().allInnerTexts();
+  for (const stepName of ['one', 'two', 'three', 'four', 'five']) {
+    assert.ok(executedTexts.some(text => text.includes(stepName) && /成功/.test(text)),
+      `executed chip keeps the step name ${stepName} and a 成功 badge: ${JSON.stringify(executedTexts)}`);
+  }
   await lastChip.click();
   await page.locator('.wf-structure-canvas').waitFor({ timeout: 60000 });
-  assert.match(await page.locator('.wf-structure-head .wf-structure-step').innerText(), /五/);
+  assert.match(await page.locator('.wf-structure-head .wf-structure-step').innerText(), /five/);
   await page.screenshot({ path: path.join(shotDir, 'round11-timeline-executed.png'), fullPage: true });
 
   // ---- C fallback: a Compile that drops an enabled step blocks Route ------
@@ -324,8 +347,8 @@ try {
   await flowBar().getByRole('button', { name: /重新编译/ }).click();
   const gapAlert = page.locator('.wf-flow [aria-label="编译缺少步骤"]');
   await gapAlert.waitFor({ timeout: 120000 });
-  assert.match(await gapAlert.innerText(), /编译结果缺少步骤 五，已阻止创建 Route/);
-  assert.match(await page.locator('.wf-error[role="alert"]').innerText(), /编译结果缺少步骤 五/);
+  assert.match(await gapAlert.innerText(), /编译结果缺少步骤 five，已阻止创建 Route/);
+  assert.match(await page.locator('.wf-error[role="alert"]').innerText(), /编译结果缺少步骤 five/);
   const routeButton = flowBar().getByRole('button', { name: '创建 Route', exact: true });
   assert.equal(await routeButton.isDisabled(), true, '创建 Route is disabled while a step is missing');
   await page.screenshot({ path: path.join(shotDir, 'round11-compile-missing-step.png'), fullPage: true });
