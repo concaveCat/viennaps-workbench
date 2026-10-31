@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import json
 import os
 import re
@@ -14,12 +16,16 @@ os.environ.setdefault("WORKBENCH_PORT", "8767")
 
 from backend.main import app  # noqa: E402
 from backend.workflow.analysis import (  # noqa: E402
+    _fmt_number,
     _measurement_has_value,
+    _method_label,
     _reason_detail,
     _reason_text,
+    _sig4,
     _status_label,
     _svg_for_snapshot,
     compare_snapshots,
+    experiment_csv,
     process_window,
 )
 from tests.test_api_integration import asgi_request, json_body  # noqa: E402
@@ -387,6 +393,83 @@ class ReportRenderingTests(unittest.TestCase):
         coords = first_polygon.split('points="', 1)[1].split('"', 1)[0].split()
         self.assertTrue(any(point.endswith(",308.000") for point in coords), coords)
 
+    def test_numbers_keep_four_significant_digits(self):
+        # 0.200006 used to print as 0.200006 in reports/CSV while the UI showed 0.2.
+        self.assertEqual(_fmt_number(0.200006), "0.2")
+        self.assertEqual(_fmt_number(1.234567), "1.235")
+        self.assertEqual(_fmt_number(0), "0")
+        self.assertEqual(_fmt_number(12000), "12000")
+        self.assertEqual(_sig4(0.200006), "0.2")
+        self.assertEqual(_sig4(None), "")
+
+    def test_method_names_are_localized(self):
+        self.assertEqual(_method_label("etch_depth"), "刻蚀深度")
+        self.assertEqual(_method_label("cd_at_height"), "指定高度 CD")
+        self.assertEqual(_method_label("brand_new_method"), "brand_new_method")
+
+    def test_experiment_csv_uses_chinese_status_reason_and_um(self):
+        class Measurement:
+            def __init__(self, status, value, unit, reason):
+                self.status, self.value, self.unit, self.reason = status, value, unit, reason
+
+        class Store:
+            def get_measurement(self, measurement_id):
+                if measurement_id == "mea_1":
+                    return Measurement("measured", 0.200006, "um", None)
+                return Measurement("ambiguous", None, None, "no material surface found at the measurement x")
+
+        document = {
+            "experimentId": "exp_csv",
+            "variants": [{
+                "variantId": "var_1", "ordinal": 1,
+                "parameters": {"step_01": {"duration": 0.200006}},
+                "replicates": [
+                    {
+                        "replicateId": "rep_1", "seed": 700, "status": "succeeded",
+                        "value": 0.200006, "unit": "um", "measurementId": "mea_1",
+                        "statisticalSample": True, "attemptCount": 1,
+                    },
+                    {
+                        "replicateId": "rep_2", "seed": 701, "status": "succeeded",
+                        "value": None, "unit": None, "measurementId": "mea_2",
+                        "statisticalSample": True, "attemptCount": 1,
+                    },
+                    {
+                        "replicateId": "rep_3", "seed": 702, "status": "planned",
+                        "value": None, "unit": None,
+                        "statisticalSample": False, "attemptCount": 0,
+                    },
+                ],
+            }],
+            "aggregation": {"unit": "um", "rows": [{
+                "variantId": "var_1", "ordinal": 1, "n": 1,
+                "mean": 0.200006, "std": None, "ci95": None, "min": 0.200006, "max": 0.200006,
+            }]},
+        }
+        rows = list(csv.DictReader(io.StringIO(experiment_csv(document, Store()))))
+        self.assertEqual(len(rows), 3)
+        header = rows[0]
+        for column in ("status", "reason", "value", "unit"):
+            self.assertIn(column, header)
+        measured, ambiguous, planned = rows
+        self.assertEqual(measured["status"], "成功")
+        self.assertEqual(measured["value"], "0.2")
+        self.assertEqual(measured["unit"], "µm")
+        self.assertEqual(measured["reason"], "")
+        self.assertEqual(measured["mean"], "0.2")
+        self.assertEqual(ambiguous["status"], "成功")
+        self.assertEqual(ambiguous["value"], "")
+        self.assertEqual(ambiguous["unit"], "")
+        self.assertEqual(ambiguous["reason"], "测量位置 X 处没有找到材料界面。")
+        self.assertEqual(planned["status"], "待执行")
+        self.assertEqual(planned["reason"], "")
+        self.assertNotIn("测量无有效值", planned["reason"])
+        # Runner messages are localized; unknown text keeps its own words.
+        from backend.workflow.analysis import _replicate_reason_text
+        self.assertEqual(_replicate_reason_text("segment finished with failed"), "Segment 运行结束：失败")
+        self.assertEqual(_replicate_reason_text("interrupted by server restart"), "服务重启导致中断")
+        self.assertEqual(_replicate_reason_text("brand new runner message"), "brand new runner message")
+
     def test_3d_svg_is_an_isometric_projection(self):
         snapshot = {
             "dimension": 3, "axisMap": {"x": 0, "y": 1, "z": 2}, "coordinateUnit": "um",
@@ -406,6 +489,18 @@ class ReportRenderingTests(unittest.TestCase):
         self.assertIn("Si", svg)
         self.assertIn("Mask", svg)
         self.assertIn(" µm</text>", svg)  # scale bar keeps its unit
+        # 8 % margin on every side: the projected top face must not touch the frame.
+        coords = [
+            tuple(float(value) for value in pair.split(","))
+            for polygon in svg.split("<polygon")[1:]
+            for pair in polygon.split('points="', 1)[1].split('"', 1)[0].split()
+        ]
+        xs = [x for x, _ in coords]
+        ys = [y for _, y in coords]
+        self.assertGreater(min(xs), 62 + 480 * 0.05)
+        self.assertLess(max(xs), 62 + 480 * 0.95)
+        self.assertGreater(min(ys), 18 + 290 * 0.05)
+        self.assertLess(max(ys), 18 + 290 * 0.95)
 
 
 if __name__ == "__main__":

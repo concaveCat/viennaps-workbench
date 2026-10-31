@@ -119,7 +119,7 @@ type GpuDeviceInventory = { status: 'available' | 'unavailable' | 'error'; devic
 
 const defaultProject: Project = {
   schemaVersion: 7,
-  name: '未命名项目',
+  name: '传统工作区项目',
   dimension: 2,
   units: { length: 'um', time: 's', rate: 'um/s', angle: 'deg' },
   domain: { gridDelta: 0.1, xExtent: 5, xBoundary: 'reflective' },
@@ -2184,7 +2184,7 @@ export default function App() {
     <TopBar>
       <header className="topbar topbar-shell">
         <div className="brand-block"><div className="brand-mark">V<span>PS</span></div><div className="brand-copy"><strong>ViennaPS 工艺工作台</strong><span>二维 / 三维本机仿真 · µm · s</span></div></div>
-        <div className="topbar-project"><span className="muted-label">项目</span><input value={project.name} aria-label="项目名称" onChange={event => updateProject(previous => ({ ...previous, name: event.target.value }))} /><span className="save-state">{!projectId ? '未保存' : savedProjectJson === JSON.stringify(project) ? '已保存' : '有未保存修改'}</span></div>
+        <div className="topbar-project"><span className="muted-label">项目</span><input value={project.name} aria-label="项目名称" title="传统工作区是独立项目，不继承工作流中的当前工程" onChange={event => updateProject(previous => ({ ...previous, name: event.target.value }))} /><span className="save-state">{!projectId ? '未保存' : savedProjectJson === JSON.stringify(project) ? '已保存' : '有未保存修改'}</span></div>
         <nav className="toolbar" aria-label="项目操作">
           <Menu label="项目">
             <button className="button" onClick={() => newProject(project.dimension)} disabled={loading || active}>新建工程</button>

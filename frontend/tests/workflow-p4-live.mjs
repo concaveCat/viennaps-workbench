@@ -175,7 +175,7 @@ try {
   // even when another zone is active.
   await page.getByRole('button', { name: '01 工程' }).click();
   await libraryTree.locator('.spx-tree-item').filter({ hasText: '材料' }).first().click();
-  await page.locator('.spx-doc-header h1').filter({ hasText: '流程编辑' }).waitFor();
+  await page.locator('.spx-doc-header h1').filter({ hasText: '材料库' }).waitFor();
   await page.locator('.spx-library-category-head strong').filter({ hasText: '材料库' }).waitFor();
   await libraryTree.locator('.spx-tree-item').filter({ hasText: '工艺' }).first().click();
   await page.locator('.spx-library-category-head strong').filter({ hasText: '工艺库' }).waitFor();

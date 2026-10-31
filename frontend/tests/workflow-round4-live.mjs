@@ -250,8 +250,9 @@ try {
   }
   assert.doesNotMatch(menubarText, /\b(File|Edit|View|Project|Run|Tools|Help)\b/);
   assert.equal(await page.locator('.spx-command').count(), 3, 'the start page shows the three entry cards');
-  assert.equal((await page.locator('.spx-doc-state').innerText()).match(/未打开工程/g)?.length, 1,
-    'only the dimension pill may say 未打开工程');
+  assert.equal((await page.locator('.spx-doc-state').innerText()).match(/未打开工程/g)?.length ?? 0, 0,
+    'the empty project chip is hidden');
+  assert.match(await page.locator('.spx-tree-root').innerText(), /未打开工程/, 'the left tree keeps the empty-project state');
   assert.equal(await page.locator('.spx-save-button').count(), 0, 'no save pill without a project');
   assert.equal(await page.locator('.spx-sheet-title').filter({ hasText: '最近工程' }).count(), 1);
   assert.equal(await page.locator('.spx-sheet-title').filter({ hasText: '示例工程' }).count(), 1);

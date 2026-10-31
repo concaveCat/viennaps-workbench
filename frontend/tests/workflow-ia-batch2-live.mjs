@@ -57,9 +57,9 @@ try {
   await page.locator('[aria-label="最近工程列表"]').waitFor();
   assert.match(await page.locator('[aria-label="最近工程列表"]').innerText(), /还没有已保存工程/);
   await page.locator('input[type=file]').nth(1).setInputFiles(projectPath);
-  await page.locator('.spx-project-status strong').filter({ hasText: '草稿（未保存）' }).waitFor();
+  await page.locator('.spx-save-button').filter({ hasText: '草稿（未保存）' }).waitFor();
   await page.getByRole('button', { name: '保存工程', exact: true }).click();
-  await page.locator('.spx-project-status strong').filter({ hasText: '已保存' }).waitFor();
+  await page.locator('.spx-project-status').filter({ hasText: '已写入服务端' }).waitFor();
   const saved = await getJson('/api/v1/workflow/projects');
   assert.equal(saved.projects.length, 1, JSON.stringify(saved));
   assert.equal(saved.projects[0].stepCount, 5);
@@ -67,7 +67,7 @@ try {
 
   // ---- Reload restores the saved project (steps survive, no compile/route).
   await page.reload();
-  await page.locator('.spx-project-status strong').filter({ hasText: '已保存' }).waitFor();
+  await page.locator('.spx-project-status').filter({ hasText: '已写入服务端' }).waitFor();
   assert.equal(await page.locator('.spx-summary-grid').filter({ hasText: '步骤' }).innerText().then(text => text.includes('5')), true);
   assert.equal((await getJson('/api/v1/workflow/compiles')).compiles.length, 0, 'opening a project must not compile');
 
@@ -98,7 +98,7 @@ try {
   await page.getByRole('button', { name: '确认覆盖' }).waitFor();
   assert.equal((await getJson('/api/v1/workflow/projects')).projects.length, 1, 'a 409 must not create a second row');
   await page.getByRole('button', { name: '确认覆盖' }).click();
-  await page.locator('.spx-project-status strong').filter({ hasText: '已保存' }).waitFor();
+  await page.locator('.spx-project-status').filter({ hasText: '已写入服务端' }).waitFor();
   const overwritten = await getJson('/api/v1/workflow/projects');
   assert.equal(overwritten.projects.length, 1);
   assert.equal(overwritten.projects[0].stepCount, 1, 'overwrite must replace the steps with the edited ones');

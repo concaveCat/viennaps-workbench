@@ -593,6 +593,14 @@ const LIBRARY_CATEGORY_LABELS: Record<LibraryCategory, string> = {
   experiment: '实验库',
 };
 
+/** Short names for the 02 insert-source tabs. */
+const LIBRARY_CATEGORY_SHORT: Record<LibraryCategory, string> = {
+  material: '材料',
+  process: '工艺',
+  flow: '流程',
+  experiment: '实验',
+};
+
 /** Empty `ProjectWorkflowStateV1`; unset server state reads exactly like this. */
 function emptyWorkflowState(): ProjectWorkflowState {
   return { schemaVersion: 1, compileId: null, routeId: null, segmentRuns: [], measurementIds: [], experimentIds: [] };
@@ -739,6 +747,13 @@ const METRIC_METHOD_LABELS: Record<string, string> = {
   cd_at_height: '指定高度 CD',
 };
 
+/** The compare table stays readable at 4 candidates; every view still loads. */
+const COMPARE_CANDIDATE_LIMIT = 4;
+
+function candidateKey(row: { runId: string; stepId: string }): string {
+  return `${row.runId}:${row.stepId}`;
+}
+
 function metricMethodLabel(method: string): string {
   return METRIC_METHOD_LABELS[method] ?? method;
 }
@@ -881,20 +896,26 @@ const STEP_LABELS: Record<string, string> = {
 };
 
 function errorText(payload: unknown): string {
-  if (typeof payload === 'string') return payload;
-  if (payload && typeof payload === 'object') {
+  let text = '请求失败';
+  if (typeof payload === 'string') {
+    text = payload;
+  } else if (payload && typeof payload === 'object') {
     const detail = (payload as { detail?: unknown }).detail;
-    if (typeof detail === 'string') return detail;
-    if (Array.isArray(detail)) return detail.map(item => {
-      if (item && typeof item === 'object') {
-        const record = item as { msg?: unknown; message?: unknown };
-        return String(record.msg ?? record.message ?? JSON.stringify(item));
-      }
-      return String(item);
-    }).join('; ');
-    return JSON.stringify(payload);
+    if (typeof detail === 'string') {
+      text = detail;
+    } else if (Array.isArray(detail)) {
+      text = detail.map(item => {
+        if (item && typeof item === 'object') {
+          const record = item as { msg?: unknown; message?: unknown };
+          return String(record.msg ?? record.message ?? JSON.stringify(item));
+        }
+        return String(item);
+      }).join('; ');
+    } else {
+      text = JSON.stringify(payload);
+    }
   }
-  return '请求失败';
+  return translateBackendError(text);
 }
 
 /**
@@ -913,6 +934,14 @@ const BACKEND_ERROR_PATTERNS: Array<[RegExp, (match: RegExpMatchArray) => string
   [/^route compatibility verification failed: (.+)$/, match => `Route 与当前编译不兼容：${translateBackendError(match[1])}`],
   [/^Segment project is invalid: (.+)$/, match => `Segment 工程无效：${match[1]}`],
   [/^segment run could not start: (.+)$/, match => `Segment 无法启动：${match[1]}`],
+  // Pydantic validation messages are English API text; the user gets a Chinese
+  // sentence instead of "List should have at most 4 items after validation".
+  [/^List should have at most (\d+) items after validation, not (\d+)$/, match => `数量超出上限：最多 ${match[1]} 个，当前 ${match[2]} 个。`],
+  [/^List should have at least (\d+) items after validation, not (\d+)$/, match => `数量不足：至少 ${match[1]} 个，当前 ${match[2]} 个。`],
+  [/^String should have at most (\d+) characters$/, match => `文本过长：最多 ${match[1]} 个字符。`],
+  [/^String should have at least (\d+) characters$/, match => `文本过短：至少 ${match[1]} 个字符。`],
+  [/^Field required$/, () => '缺少必填字段。'],
+  [/^Input should be a valid (.+)$/, match => `输入格式无效：${match[1]}。`],
 ];
 
 function translateBackendError(message: string): string {
@@ -1437,6 +1466,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [compareCandidates, setCompareCandidates] = useState<Array<{ runId: string; stepId: string; label: string }>>([]);
   const [comparison, setComparison] = useState<CompareResult | null>(null);
   const [candidateViews, setCandidateViews] = useState<Record<string, CandidateView>>({});
+  const [candidateViewErrors, setCandidateViewErrors] = useState<Record<string, string>>({});
+  const [compareCoverage, setCompareCoverage] = useState<{ compared: string[]; total: number; prefix: boolean } | null>(null);
+  const [comparePick, setComparePick] = useState<string[]>([]);
   const [syncZoom, setSyncZoom] = useState(1);
   const [syncAxis, setSyncAxis] = useState<'xy' | 'xz' | 'yz'>('xy');
   const [windowLower, setWindowLower] = useState('');
@@ -1689,6 +1721,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setComparison(null);
     setCompareCandidates([]);
     setCandidateViews({});
+    setCandidateViewErrors({});
+    setCompareCoverage(null);
+    setComparePick([]);
     setSyncZoom(1);
     setSyncAxis('xy');
     setWindowLower('');
@@ -2422,6 +2457,22 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const routeStale = !!route && !!compile && route.attempts.some(attempt => attempt.compileId !== compile.compileId);
   /** A rebuilt Route or re-run Segment drops its measurement; say so in 03. */
   const needsRemeasure = !!route && !measurement && (measurementInvalidated || route.segments.some(item => item.status === 'succeeded'));
+  /** Left tree and the right property panel must describe the measurement the same way. */
+  const measurementState = !measurement
+    ? { label: needsRemeasure ? '需重新测量' : '未测量', hasValue: false }
+    : measurementHasValue(measurement)
+      ? { label: '已测量', hasValue: true }
+      : { label: statusLabel(measurement.status), hasValue: false };
+  /** Why "测量" is disabled, shown next to the button instead of only in a tooltip. */
+  const measureBlockedReason = recipeXOutOfDomain
+    ? `X 超出计算域（${recipeDomainText}），请先调整 X 位置`
+    : !segment
+      ? '还没有 Run：先创建 Route 并执行 Segment'
+      : segment.status !== 'succeeded'
+        ? '当前 Segment 尚未成功：先执行完成再测量'
+        : !segment.runId
+          ? '当前 Run 缺少快照：先重新执行 Segment'
+          : '';
 
   const stepDisplayName = useCallback((stepId: string): string => {
     const compiled = compile?.compile.project.steps.find(step => step.id === stepId);
@@ -2673,7 +2724,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       setProjectId('');
       setSavedProjectJson('');
       setProjectSavedAt('');
-      setProjectNotice('草稿（未保存）· 导入的工程尚未写入服务端');
+      setProjectNotice('导入的工程尚未写入服务端');
       const geometry = (parsed.geometry ?? {}) as Record<string, unknown>;
       if (geometry.kind !== 'gds') parametricGeometryRef.current = geometry;
       setProjectGeometrySource(geometry.kind === 'gds'
@@ -2725,7 +2776,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setProjectId('');
     setSavedProjectJson('');
     setProjectSavedAt('');
-    setProjectNotice('草稿（未保存）');
+    setProjectNotice('');
     resetProjectScopedState();
     setProjectGeometrySource({ kind: 'parametric' });
     setProjectState(emptyWorkflowState());
@@ -2827,7 +2878,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setProjectId('');
     setSavedProjectJson('');
     setProjectSavedAt('');
-    setProjectNotice('草稿（未保存）· 点击“保存工程”写入服务端');
+    setProjectNotice('');
     setSetupMode('project');
     setActivityLog(previous => [...previous.slice(-79), `${clockTime()}  新工程草稿已建立: ${name}`]);
   };
@@ -3323,6 +3374,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setExperimentTable(null);
     setComparison(null);
     setCandidateViews({});
+    setCandidateViewErrors({});
+    setCompareCoverage(null);
+    setComparePick([]);
     setAutoAnalysisId('');
     setShowAllCandidates(false);
     setExperimentInputsOpen(false);
@@ -3356,6 +3410,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setExperimentTable(null);
     setComparison(null);
     setCandidateViews({});
+    setCandidateViewErrors({});
+    setCompareCoverage(null);
+    setComparePick([]);
     setShowAllCandidates(false);
     setAutoAnalysisId('');
     autoAnalysisRef.current = '';
@@ -3376,6 +3433,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       setExperimentTable(null);
       setComparison(null);
       setCandidateViews({});
+      setCandidateViewErrors({});
+      setCompareCoverage(null);
+      setComparePick([]);
       setAutoAnalysisId('');
       autoAnalysisRef.current = '';
     }
@@ -3484,11 +3544,13 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   });
 
   const selectClip = (clip: Clip) => {
+    // `selectStructure` clears the preview canvas; select the structure first so
+    // the Clip (with its annotations) is the last thing that sets the canvas.
+    if (activeLayout) selectStructure(activeLayout, clip.structure);
     setActiveClip(clip);
     setCanvas(clip);
     setClipName(clip.name);
     setClipNotice('');
-    if (activeLayout) selectStructure(activeLayout, clip.structure);
     setClipBounds({ ...clip.bbox });
     setLayerMaterials(previous => Object.fromEntries(clip.layers.map(item => [`${item.layer}:${item.datatype ?? 0}`, item.material || 'Si'])
       .map(([key, value]) => [key, previous[key] ?? value])));
@@ -4170,6 +4232,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setExperimentTable(null);
     setComparison(null);
     setCandidateViews({});
+    setCandidateViewErrors({});
+    setCompareCoverage(null);
+    setComparePick([]);
     setAutoAnalysisId('');
     setExperimentInputsOpen(false);
     recordExperiment(document.experimentId);
@@ -4243,23 +4308,41 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const loadAnalysis = async (rows: Array<{ runId: string; stepId: string; label: string }>) => {
     const candidates = rows.filter(item => item.runId && item.stepId);
     if (!candidates.length) throw new Error('实验还没有可分析的 Run');
-    if (candidates.length >= 2) {
+    const total = candidates.length;
+    // Only the first COMPARE_CANDIDATE_LIMIT candidates go to the pairwise
+    // comparison; every candidate still gets its own structure view.
+    const picked = comparePick.length
+      ? candidates.filter(item => comparePick.includes(candidateKey(item)))
+      : [];
+    const compareRows = (picked.length ? picked : candidates).slice(0, COMPARE_CANDIDATE_LIMIT);
+    const prefix = compareRows.every((row, index) => candidateKey(row) === candidateKey(candidates[index]));
+    if (compareRows.length >= 2) {
       const result = await postJson<CompareResult>('/api/v1/workflow/analysis/compare', {
-        candidates, tolerance: 1e-4,
+        candidates: compareRows, tolerance: 1e-4,
       });
       setComparison(result);
     } else {
       setComparison(null);
     }
-    const views = await Promise.all(candidates.map(item => api<CandidateView>(
+    setCompareCoverage({ compared: compareRows.map(candidateKey), total, prefix });
+    const outcomes = await Promise.allSettled(candidates.map(item => api<CandidateView>(
       `/api/v1/workflow/analysis/candidates/${item.runId}/${item.stepId}/view`,
     )));
-    setCandidateViews(Object.fromEntries(candidates.map((item, index) => [`${item.runId}:${item.stepId}`, views[index]])));
+    const views: Record<string, CandidateView> = {};
+    const failures: Record<string, string> = {};
+    outcomes.forEach((outcome, index) => {
+      const key = candidateKey(candidates[index]);
+      if (outcome.status === 'fulfilled') views[key] = outcome.value;
+      else failures[key] = outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason);
+    });
+    setCandidateViews(views);
+    setCandidateViewErrors(failures);
   };
 
   const loadExperimentCandidates = () => {
     const rows = experimentCandidates(experimentDoc);
     if (!rows.length) return;
+    setComparePick([]);
     setCompareCandidates(rows);
   };
 
@@ -4276,12 +4359,14 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       };
     }).filter(row => row.runId && row.stepId);
     if (!rows.length) return;
+    setComparePick([]);
     setCompareCandidates(rows);
     void run('compare', () => loadAnalysis(rows)).catch(() => undefined);
   };
 
   const addCurrentCandidate = () => {
     if (!hasExecutedRun || !segment?.runId) return;
+    setComparePick([]);
     setCompareCandidates(previous => [
       ...previous.filter(item => item.runId !== segment.runId),
       { runId: segment.runId!, stepId: segment.throughStepId, label: `当前 Run · ${statusLabel(segment.status)}` },
@@ -4294,6 +4379,17 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     await loadAnalysis(candidates);
   });
 
+  /** Checked candidates in the compare table: the last run's choice, else the first 4. */
+  const comparedCandidateKeys = compareCoverage?.compared
+    ?? compareCandidates.slice(0, COMPARE_CANDIDATE_LIMIT).map(candidateKey);
+
+  /** Pick which ≤4 candidates the compare table covers; views are unaffected. */
+  const toggleCompareCandidate = (key: string) => {
+    const current = comparedCandidateKeys;
+    if (current.includes(key)) setComparePick(current.filter(item => item !== key));
+    else if (current.length < COMPARE_CANDIDATE_LIMIT) setComparePick([...current, key]);
+  };
+
   // 04 → 05 hand-off: once the experiment has results, 05 presents them without
   // asking the user to press "load candidates" again.
   useEffect(() => {
@@ -4304,6 +4400,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     if (!rows.length) return;
     autoAnalysisRef.current = experimentDoc.experimentId;
     setAutoAnalysisId(experimentDoc.experimentId);
+    setComparePick([]);
     setCompareCandidates(rows);
     void run('compare', () => loadAnalysis(rows)).catch(() => undefined);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -4394,6 +4491,18 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     }).length;
     return { total, runSucceeded, validMetrics };
   }, [experimentDoc, replicateMeasurements]);
+
+  /**
+   * A planned/queued experiment has no result yet: 04 must say "尚未运行" instead
+   * of judging every replicate as "测量无有效值".
+   */
+  const experimentNotRun = useMemo(() => {
+    if (!experimentDoc) return true;
+    const rows = experimentDoc.variants.flatMap(variant => variant.replicates);
+    if (!rows.length) return true;
+    const finished = rows.filter(replicate => ['succeeded', 'failed'].includes(replicate.status)).length;
+    return finished === 0 && ['planned', 'queued', 'draft', 'created'].includes(experimentDoc.status);
+  }, [experimentDoc]);
 
   const windowBlockedReason = !experimentDoc
     ? '先完成实验或测量：还没有可分析的实验。'
@@ -4694,7 +4803,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const renderLibraryManager = () => (
     <div className="spx-library-view" aria-label="库管理">
       <nav className="spx-breadcrumb" aria-label="面包屑">
-        <button type="button" className="spx-link" aria-label="返回流程" onClick={() => navigateZone('flow')}>02 流程</button>
+        <button type="button" className="spx-link" aria-label="返回流程" title="返回流程编辑"
+          onClick={() => navigateZone('flow')}>02 流程</button>
         <span aria-hidden="true">/</span>
         <span>{LIBRARY_CATEGORY_LABELS[managerCategory]}</span>
       </nav>
@@ -4916,6 +5026,12 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     const uHasOrigin = xTicks.some(tick => Math.abs(tick) < 1e-9);
     const legendRows = Array.from(new Set(source.polygons.map(polygon => polygon.layer)))
       .map(layer => ({ layer, material: clipLayerMaterial(layer), color: materialColor(materialCatalog, clipLayerMaterial(layer)) }));
+    // `setCanvas(clip)` keeps the saved Clip (with its annotations); a bare
+    // preview has no clipId and belongs to whatever Clip is active.
+    const canvasClipId = (source as Partial<Clip>).clipId;
+    const canvasAnnotations = activeClip && (!canvasClipId || canvasClipId === activeClip.clipId)
+      ? activeClip.annotations
+      : [];
     return <div className="wf-canvas-wrap">
       <svg viewBox={`${-marginLeft} ${-marginTop} ${source.width + marginLeft + marginRight} ${source.height + marginTop + marginBottom}`}
         className="wf-clip-canvas" role="img" aria-label="版图 Clip 画布">
@@ -4944,10 +5060,22 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             strokeWidth={strokeWidth}
           />;
         })}
-        {activeClip?.annotations.map(annotation => <g key={annotation.annotationId}>
-          <circle cx={annotation.x} cy={activeClip.height - annotation.y} r={Math.max(source.width, source.height) / 80} className="wf-annotation" />
-          <text x={annotation.x} y={activeClip.height - annotation.y} className="wf-annotation-text">{annotation.text}</text>
-        </g>)}
+        {/* Annotations are stored in layout µm; the canvas is drawn in pixels. */}
+        {canvasAnnotations.map(annotation => {
+          const spanX = (source.bbox.x1 - source.bbox.x0) || 1;
+          const spanY = (source.bbox.y1 - source.bbox.y0) || 1;
+          const cx = ((annotation.x - source.bbox.x0) / spanX) * source.width;
+          const cy = source.height - ((annotation.y - source.bbox.y0) / spanY) * source.height;
+          return <g key={annotation.annotationId} className="wf-annotation-group"
+            data-x={annotation.x} data-y={annotation.y} data-cx={cx.toFixed(3)} data-cy={cy.toFixed(3)}>
+            <circle cx={cx} cy={cy} r={Math.max(fontSize * 0.5, span / 80)} className="wf-annotation"
+              strokeWidth={Math.max(fontSize * 0.08, span / 800)} />
+            <text x={cx + fontSize * 0.6} y={cy - fontSize * 0.3} className="wf-annotation-text"
+              fontSize={fontSize} style={{ fontSize }} fill="#07121d" stroke="#ffffff" strokeWidth={tickHalo * 2} paintOrder="stroke">
+              {annotation.text}
+            </text>
+          </g>;
+        })}
         <g className="wf-axes wf-axis-line">
           <line x1={0} y1={source.height} x2={source.width} y2={source.height} stroke="#6b7a8a" strokeWidth={strokeWidth} />
           <line x1={0} y1={source.height} x2={0} y2={0} stroke="#6b7a8a" strokeWidth={strokeWidth} />
@@ -5027,11 +5155,17 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       {clipNotice && <div className="spx-clip-conflict spx-banner" role="status"><span className="spx-banner-text">{clipNotice}</span><BannerClose onClose={() => setClipNotice('')} /></div>}
       {canvas && renderClipCanvas(canvas)}
       {activeClip && <div className="wf-summary"><strong>{activeClip.name}</strong><span>{activeClip.layers.length} 层 · {activeClip.polygonCount} 多边形</span><span><code>{activeClip.clipHash.slice(0, 12)}…</code></span><span>{activeClip.annotations.length} 标注</span></div>}
-      {activeClip && <div className="wf-template-row">
-        <input aria-label="标注文本" value={annotationText} onChange={event => setAnnotationText(event.target.value)} placeholder="标注文本" />
-        <input aria-label="标注 X" value={annotationX} onChange={event => setAnnotationX(event.target.value)} />
-        <input aria-label="标注 Y" value={annotationY} onChange={event => setAnnotationY(event.target.value)} />
-        <button className="wf-button ghost" disabled={!!busy} onClick={() => void addAnnotation()}>添加标注</button>
+      {activeClip && <div className="wf-template-row wf-annotation-form">
+        <label className="spx-field"><span>标注文本</span>
+          <input aria-label="标注文本" value={annotationText} onChange={event => setAnnotationText(event.target.value)} placeholder="例如：孔口" />
+        </label>
+        <label className="spx-field"><span>标注 X（µm）</span>
+          <input aria-label="标注 X" value={annotationX} onChange={event => setAnnotationX(event.target.value)} />
+        </label>
+        <label className="spx-field"><span>标注 Y（µm）</span>
+          <input aria-label="标注 Y" value={annotationY} onChange={event => setAnnotationY(event.target.value)} />
+        </label>
+        <button className="wf-button ghost" disabled={!!busy || !annotationText.trim()} onClick={() => void addAnnotation()}>添加标注</button>
       </div>}
       {showList && clips.length > 0 && <div className="spx-clip-summary-list" aria-label="Clip 列表">
         {clips.map(clip => <button key={clip.clipId} type="button" title={`${clip.clipId} · ${clip.gdsFileName}`} className={activeClip?.clipId === clip.clipId ? 'active' : ''} onClick={() => selectClip(clip)}>
@@ -5078,7 +5212,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     { label: 'Route', value: route?.route.name ?? '—', title: route?.route.routeId },
     { label: 'Segment', value: segment ? statusLabel(segment.status) : '—', title: segment?.segmentId },
     { label: 'Run', value: segment?.runId ? '已记录' : '—', title: segment?.runId ?? undefined },
-    { label: '测量', value: measurement ? measurementValueText(measurement) : '—', title: measurement?.measurementId },
+    { label: '测量', value: measurementState.hasValue && measurement ? measurementValueText(measurement) : measurementState.label, title: measurement?.measurementId },
     { label: '引擎', value: health ? `ViennaPS ${health.viennaps ?? '—'}` : '—' },
   ];
 
@@ -5153,7 +5287,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 <button role="menuitem" onClick={() => { setOpenMenu(null); closeProject(); }}>关闭工程 / 返回开始页</button>
               </>}
               {id === 'edit' && <>
-                <button role="menuitem" onClick={() => { setOpenMenu(null); setActivityLog([]); }}>清空 Output</button>
+                <button role="menuitem" onClick={() => { setOpenMenu(null); setActivityLog([]); }}>清空输出日志</button>
                 <button role="menuitem" onClick={() => { setOpenMenu(null); setComparison(null); setCandidateViews({}); setSyncZoom(1); setSyncAxis('xy'); }}>重置分析视图</button>
               </>}
               {id === 'view' && <>
@@ -5174,7 +5308,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                   {needsPredecessors ? '执行前序并运行' : '执行当前 Segment'}
                 </button>
                 <button role="menuitem" disabled={!route} onClick={() => { setOpenMenu(null); void executeAll(); }}>执行全部 Segment</button>
-                <button role="menuitem" disabled={!canMeasure} onClick={() => { setOpenMenu(null); void measure(); }}>测量并绑定 Provenance</button>
+                <button role="menuitem" disabled={!canMeasure} onClick={() => { setOpenMenu(null); void measure(); }}>测量并绑定来源证据</button>
                 <button role="menuitem" disabled={!route || !decisionPrefixId} onClick={() => { setOpenMenu(null); void decideMeasurementBranch(); }}>测量驱动分支</button>
               </>}
               {id === 'tools' && <>
@@ -5240,9 +5374,11 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 {
                   label: '测量',
                   target: 'run' as const,
-                  value: measurement ? `第 ${segmentNumber} 段 · ${measurementHasValue(measurement) ? '已测量' : statusLabel(measurement.status)}` : '—',
-                  badge: measurement ? (measurementHasValue(measurement) ? '已测量' : statusLabel(measurement.status)) : needsRemeasure ? '需重新测量' : '未测量',
-                  badgeClass: measurement ? (measurementHasValue(measurement) ? 'measured' : measurement.status) : 'planned',
+                  value: measurement ? `第 ${segmentNumber} 段 · ${measurementState.label}` : '—',
+                  badge: measurementState.label,
+                  badgeClass: measurement
+                    ? (measurementHasValue(measurement) ? 'measured' : measurement.status)
+                    : 'planned',
                   title: measurement ? `${measurementValueText(measurement)} · Measurement ${measurement.measurementId}` : needsRemeasure ? 'Route 已重建或 Segment 重跑，旧测量已失效，需重新测量' : '尚未测量',
                 },
                 {
@@ -5328,11 +5464,11 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
           <div className="spx-doc-header">
             <div>
               <div className="spx-eyebrow">WORKFLOW / {currentSection.num}</div>
-              <h1>{currentSection.title}</h1>
-              <p>{currentSection.desc}</p>
+              <h1>{libraryManagerOpen ? LIBRARY_CATEGORY_LABELS[managerCategory] : currentSection.title}</h1>
+              <p>{libraryManagerOpen ? '按分类维护可复用条目' : currentSection.desc}</p>
             </div>
             <div className="spx-doc-state">
-              <span className="spx-state-pill">{project ? `${project.dimension ?? '?'}D · ${geometrySourceLabel}` : '未打开工程'}</span>
+              {project && <span className="spx-state-pill">{`${project.dimension ?? '?'}D · ${geometrySourceLabel}`}</span>}
               {project && <button
                 type="button"
                 className={`spx-state-pill spx-save-button${projectId && !projectDirty ? ' ok' : ''}`}
@@ -5576,9 +5712,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
           {setupMode === 'project' && project && <div className="spx-sheet">
             <div className="spx-sheet-title">工程定义 / {project.name ?? '未命名工程'}</div>
             <div className="spx-project-status" role="status" title={projectId ? `工程 ${projectId}` : undefined}>
-              <strong className={projectId && !projectDirty ? 'ok' : ''}>{projectId ? (projectDirty ? '有未保存更改' : '已保存') : '草稿（未保存）'}</strong>
-              <span>{projectId ? '已写入服务端' : '尚未写入服务端'}</span>
-              {projectSavedAt && <span>更新于 {formatDateTime(projectSavedAt)}</span>}
+              <strong className={projectId && !projectDirty ? 'ok' : ''}>工程详情</strong>
+              <span>{projectId ? `已写入服务端${projectSavedAt ? ` · 更新于 ${formatDateTime(projectSavedAt)}` : ''}` : '尚未写入服务端'}</span>
               {projectNotice && <span className="spx-project-notice spx-banner-inline">{projectNotice}<BannerClose onClose={() => setProjectNotice('')} /></span>}
             </div>
             <div className="spx-summary-grid">
@@ -5746,7 +5881,11 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         </section>
 
         <section className={`wf-card wf-flow ${zone === 'flow' ? '' : 'wf-hidden'}`}>
-          <div className="wf-card-head"><span>02</span><h2>流程编辑</h2></div>
+          <div className="wf-card-head">
+            <span>02</span>
+            <h2>{libraryManagerOpen ? LIBRARY_CATEGORY_LABELS[managerCategory] : '流程编辑'}</h2>
+            {libraryManagerOpen && <p className="wf-card-desc">按分类维护可复用条目</p>}
+          </div>
           {!project && !libraryManagerOpen && <div className="wf-empty">先在 01 创建或导入工程；库管理不需要打开工程。</div>}
           {project && !libraryManagerOpen && renderFlowBar()}
           {libraryManagerOpen && renderLibraryManager()}
@@ -5788,12 +5927,13 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 <div className="spx-library-note">管理库请用左侧库树</div>
                 <div className="spx-library-tabs">
                   {([
-                    ['material', 'Materials'],
-                    ['process', 'Processes'],
-                    ['flow', 'Flows'],
-                    ['experiment', 'Experiments'],
+                    ['material', LIBRARY_CATEGORY_SHORT.material],
+                    ['process', LIBRARY_CATEGORY_SHORT.process],
+                    ['flow', LIBRARY_CATEGORY_SHORT.flow],
+                    ['experiment', LIBRARY_CATEGORY_SHORT.experiment],
                   ] as Array<[LibraryCategory, string]>).map(([category, label]) => <button
                     key={category} type="button" className={libraryCategory === category ? 'active' : ''}
+                    title={LIBRARY_CATEGORY_LABELS[category]}
                     onClick={() => setLibraryCategory(category)}
                   >{label}<span className="spx-count">{libraryItems.filter(item => item.category === category).length}</span></button>)}
                 </div>
@@ -5874,7 +6014,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                   <button type="button" className="wf-button ghost" onClick={addAuthoredStep}>＋ 添加步骤</button>
                 </div>
                 {authoredSteps.length === 0
-                  ? <div className="wf-empty">把左侧 Process 拖到这里，或点击“插入”。</div>
+                  ? <div className="wf-empty">把左侧{LIBRARY_CATEGORY_SHORT[libraryCategory]}拖到这里，或点击“插入”。</div>
                   : <table className="wf-table" aria-label="流程步骤">
                     <thead><tr><th>#</th><th>步骤</th><th>模型</th><th>操作</th><th>材料</th><th>启用</th><th>结构</th></tr></thead>
                     <tbody>{authoredSteps.map((step, index) => {
@@ -6252,18 +6392,19 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 前序 {blockingPredecessors.length} 个 Segment 尚未成功：会按顺序执行到当前 Segment，失败即停止。
               </span>}
               <button className="wf-button" disabled={!canMeasure || recipeXOutOfDomain}
-                title={recipeXOutOfDomain ? `X 超出计算域（${recipeDomainText}），请先调整 X 位置` : '按当前配方测量当前 Run'}
+                title={measureBlockedReason || '按当前配方测量当前 Run'}
                 onClick={() => void measure()}>
                 {busy === 'measure' ? '测量中…' : '测量'}
               </button>
             </div>
+            {measureBlockedReason && <div className="wf-block-reason" aria-label="测量禁用原因">{measureBlockedReason}</div>}
             <div className="wf-recipe spx-recipe-inline">
               <div className="wf-recipe-title">测量配方 · 作用于当前 Run 的 {stepDisplayName(segment.throughStepId)}</div>
               <div className="wf-recipe-fields">
                 <label><span>测量方法</span>
                   <select aria-label="测量方法" value={recipeMethod} onChange={event => setRecipeMethod(event.target.value as typeof recipeMethod)}>
-                    <option value="etch_depth">深度 (etch_depth)</option>
-                    <option value="cd_at_height">指定高度 CD (cd_at_height)</option>
+                    <option value="etch_depth" title="etch_depth">刻蚀深度</option>
+                    <option value="cd_at_height" title="cd_at_height">指定高度 CD</option>
                   </select>
                 </label>
                 <label><span>测量材料</span>
@@ -6308,7 +6449,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               <td>{measurementHasValue(item) ? formatNumber(item.value) : '—'}</td>
               <td>{measurementUnitText(item)}</td>
               <td>{measurementHasValue(item) ? '—' : measurementReasonText(item.reason)}</td>
-              <td>{item.recipeId} v{item.recipeVersion} · {item.method} · {item.material} · {stepDisplayName(item.sourceStepId ?? '')}</td>
+              <td>{item.recipeId} v{item.recipeVersion} · <span title={item.method}>{metricMethodLabel(item.method)}</span> · {item.material} · {stepDisplayName(item.sourceStepId ?? '')}</td>
               <td>{bindingLabel(item.bindingStatus)} / {bindingLabel(item.equivalenceStatus)}</td>
               <td><button className="wf-link" aria-label={`查看 ${item.measurementId} 证据`} onClick={() => void showMetricDetail(item)}>详情</button></td>
             </tr>)}</tbody></table>}
@@ -6435,15 +6576,20 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 : '本地 CPU · 无云成本'}</span>
               <span>重试 {experimentDoc.queue.retries}</span>
             </div>}
-            {experimentMetricSummary.total > 0 && <div
-              className={`wf-summary${experimentMetricSummary.validMetrics === 0 ? ' warning' : ''}`}
-              aria-label="实验指标汇总" role={experimentMetricSummary.validMetrics === 0 ? 'alert' : 'status'}>
-              <strong>指标汇总</strong>
-              <span>{experimentMetricSummary.runSucceeded}/{experimentMetricSummary.total} 运行成功 · {experimentMetricSummary.validMetrics}/{experimentMetricSummary.total} 有有效指标</span>
-              {experimentMetricSummary.validMetrics === 0 && <span>没有有效指标：运行本身成功，但测量结果全部为歧义或无值。请在 03 调整测量位置/材料后重新测量，均值与统计暂不可用。</span>}
-            </div>}
+            {experimentMetricSummary.total > 0 && (experimentNotRun
+              ? <div className="wf-summary" aria-label="实验指标汇总" role="status">
+                <strong>指标汇总</strong>
+                <span>尚未运行：运行实验后才会出现每个变体的运行与指标状态。</span>
+              </div>
+              : <div
+                className={`wf-summary${experimentMetricSummary.validMetrics === 0 ? ' warning' : ''}`}
+                aria-label="实验指标汇总" role={experimentMetricSummary.validMetrics === 0 ? 'alert' : 'status'}>
+                <strong>指标汇总</strong>
+                <span>{experimentMetricSummary.runSucceeded}/{experimentMetricSummary.total} 运行成功 · {experimentMetricSummary.validMetrics}/{experimentMetricSummary.total} 有有效指标</span>
+                {experimentMetricSummary.validMetrics === 0 && <span>没有有效指标：运行本身成功，但测量结果全部为歧义或无值。请在 03 调整测量位置/材料后重新测量，均值与统计暂不可用。</span>}
+              </div>)}
             {experimentResultRows.length > 0 ? <table className="wf-table wf-result-table" aria-label="实验结果表">
-              <thead><tr><th>变体</th><th>条件</th><th>重复（运行状态 / 指标）</th><th>均值（{experimentMetricSummary.validMetrics > 0 ? displayUnit(experimentResultRows[0].unit) : '—'}）</th><th>标准差（{experimentMetricSummary.validMetrics > 0 ? displayUnit(experimentResultRows[0].unit) : '—'}）</th><th>运行 / 指标</th></tr></thead>
+              <thead><tr><th>变体</th><th>条件</th><th>重复（运行状态 / 指标）</th><th>均值（{displayUnit(experimentResultRows[0]?.unit ?? experimentDoc?.unit)}）</th><th>标准差（{displayUnit(experimentResultRows[0]?.unit ?? experimentDoc?.unit)}）</th><th>运行 / 指标</th></tr></thead>
               <tbody>{experimentResultRows.map(row => <tr key={row.ordinal}>
                 <td>V{row.ordinal}</td>
                 <td className="wf-condition">{row.condition}</td>
@@ -6453,15 +6599,16 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                   <code>{replicate.metricValue === null ? '—' : formatNumber(replicate.metricValue)}</code>
                   <span>{replicate.metricValue === null ? '' : displayUnit(replicate.unit ?? row.unit)}</span>
                   <span className={`wf-status ${replicate.metricStatus || 'planned'}`}>
-                    {replicate.metricStatus ? statusLabel(replicate.metricStatus) : '无指标'}
+                    {replicate.metricStatus ? statusLabel(replicate.metricStatus) : experimentNotRun ? '待运行' : '无指标'}
                   </span>
-                  {replicate.metricValue === null && <span className="wf-muted">说明：{measurementReasonText(replicate.metricReason)}</span>}
+                  {replicate.metricValue === null && !experimentNotRun && ['succeeded', 'failed'].includes(replicate.status)
+                    && <span className="wf-muted">说明：{measurementReasonText(replicate.metricReason)}</span>}
                 </span>)}</div></td>
                 <td>{row.mean === null ? '—' : formatNumber(row.mean)}</td>
                 <td>{row.std === null ? '—' : formatNumber(row.std)}</td>
                 <td>
                   <span className={`wf-status ${row.status}`}>{statusLabel(row.status)}</span>
-                  <span className="wf-muted"> · {row.validMetrics}/{row.total} 有效</span>
+                  <span className="wf-muted"> · {experimentNotRun ? '尚未运行' : `${row.validMetrics}/${row.total} 有效`}</span>
                 </td>
               </tr>)}</tbody>
             </table> : <div className="wf-empty">实验已创建，点击“运行实验”后在这里显示每个变体的重复测量与统计。</div>}
@@ -6681,21 +6828,40 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               </div>
             </div>}
 
-            {compareCandidates.length > 0 && <table className="wf-table" aria-label="候选表">
-              <thead><tr><th>候选</th><th>步骤</th><th>状态</th><th>来源</th></tr></thead>
+            {compareCandidates.length > 0 && <table className="wf-table" id="wf-candidate-table" aria-label="候选表">
+              <thead><tr><th>候选</th><th>步骤</th><th>状态</th><th>来源</th><th>对比</th></tr></thead>
               <tbody>{compareCandidates.map(candidate => {
                 const variant = experimentDoc?.variants.find(item =>
                   item.replicates.some(replicate => replicate.runId === candidate.runId));
-                return <tr key={`${candidate.runId}:${candidate.stepId}`} title={`${candidate.runId} / ${candidate.stepId}`}>
+                const key = candidateKey(candidate);
+                const checked = comparedCandidateKeys.includes(key);
+                return <tr key={key} title={`${candidate.runId} / ${candidate.stepId}`}>
                   <td>{candidate.label}</td>
                   <td>{stepDisplayName(candidate.stepId)}</td>
                   <td><span className={`wf-status ${variant ? experimentVariantStatus(variant) : 'succeeded'}`}>
                     {variant ? statusLabel(experimentVariantStatus(variant)) : '已记录'}
                   </span></td>
                   <td title={candidate.runId}>{variant ? '实验 Run' : '当前 Run'}</td>
+                  <td>
+                    <input type="checkbox" aria-label={`对比候选 ${candidate.label}`} checked={checked}
+                      disabled={!checked && comparedCandidateKeys.length >= COMPARE_CANDIDATE_LIMIT}
+                      title={checked ? '从对比表中移除（仍显示结构视图）'
+                        : comparedCandidateKeys.length >= COMPARE_CANDIDATE_LIMIT
+                          ? `对比表最多 ${COMPARE_CANDIDATE_LIMIT} 个候选；先取消一个再选`
+                          : '加入对比表（结构视图始终全部显示）'}
+                      onChange={() => toggleCompareCandidate(key)} />
+                  </td>
                 </tr>;
               })}</tbody>
             </table>}
+
+            {compareCoverage && compareCoverage.total > COMPARE_CANDIDATE_LIMIT && <div className="wf-block-reason" aria-label="对比候选说明">
+              对比{compareCoverage.prefix ? '前' : '所选'} {compareCoverage.compared.length}/{compareCoverage.total} 个候选；
+              其余候选的结构视图仍全部加载与显示。
+              <button type="button" className="wf-link" onClick={() => document.getElementById('wf-candidate-table')?.scrollIntoView({ block: 'center' })}>选择对比候选</button>
+              <button type="button" className="wf-link" disabled={!!busy}
+                onClick={() => void run('compare', () => loadAnalysis(compareCandidates)).catch(() => undefined)}>显示全部视图</button>
+            </div>}
 
             {Object.keys(candidateViews).length > 0 && <div className="wf-compare-controls">
               <label>同步缩放 <input aria-label="同步缩放" type="range" min="0.5" max="3" step="0.1" value={syncZoom} onChange={event => setSyncZoom(Number(event.target.value))} /></label>
@@ -6714,6 +6880,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             {compareCandidates.length > 0 && <div className="wf-compare-grid">
               {compareCandidates.map((candidate, index) => {
                 const view = candidateViews[`${candidate.runId}:${candidate.stepId}`];
+                const viewError = candidateViewErrors[`${candidate.runId}:${candidate.stepId}`];
                 const firstLabel = comparison?.candidates[0]?.label ?? compareCandidates[0]?.label;
                 const pairRow = index > 0
                   ? comparison?.pairwise.find(row =>
@@ -6722,7 +6889,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 return <figure key={`${candidate.runId}:${candidate.stepId}`} title={`${candidate.runId} / ${candidate.stepId}`}>
                   <figcaption>
                     <strong>{candidate.label}</strong>
-                    <span>{view ? `${view.dimension}D · ${topologyLabel(view.topology)} · ${view.dimension === 2 ? 'X–高度' : syncAxis.toUpperCase()} · ${structureUnit(view)}` : '视图加载中…'}</span>
+                    <span>{view ? `${view.dimension}D · ${topologyLabel(view.topology)} · ${view.dimension === 2 ? 'X–高度' : syncAxis.toUpperCase()} · ${structureUnit(view)}` : viewError ? `视图加载失败：${viewError}` : '视图加载中…'}</span>
                     {pairRow && <span>与 {firstLabel} 最大点偏差 {formatNumber(pairRow.maxPointDelta)} µm · 边界偏差 {formatNumber(pairRow.boundsDelta)} µm</span>}
                   </figcaption>
                   {view && analysisFrame ? <StructureCanvas
@@ -6732,7 +6899,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                     note={view.dimension === 2 ? structureSurfaceNote(view, syncAxis) : null}
                     className="wf-compare-canvas"
                     label={`候选 ${index + 1} 结构视图`}
-                  /> : <div className="wf-empty">视图加载中…</div>}
+                  /> : <div className="wf-empty">{viewError ? `视图加载失败：${viewError}` : '视图加载中…'}</div>}
                   {view && <div className="wf-compare-legend">
                     {structureLegend(view).map(row => <span key={row.id}><i style={{ background: row.color }} aria-hidden="true" />{row.name}<em>{row.count}</em></span>)}
                   </div>}
@@ -6889,7 +7056,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               <input aria-label="报告标题" value={reportTitle} onChange={event => setReportTitle(event.target.value)} />
             </label>
             <label className="spx-field span-2"><span>结论 / 候选说明（写入报告）</span>
-              <textarea aria-label="报告结论" value={reportConclusions} onChange={event => setReportConclusions(event.target.value)} placeholder="例如：选择 V2（0.02 s），CD 在公差内。" />
+              <textarea aria-label="报告结论" value={reportConclusions} onChange={event => setReportConclusions(event.target.value)} placeholder="填写本次结论 / 候选选择说明" />
             </label>
           </div>
 
@@ -6903,7 +7070,6 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             </button>
             <button className="wf-button ghost" disabled={!reportDocument} onClick={openReport}>打开报告</button>
             <button className="wf-button ghost" disabled={!reportDocument} onClick={downloadReportHtml}>下载 HTML</button>
-            {!reportReady && <button className="wf-button ghost" onClick={() => navigateZone('run')}>去 03 运行测量</button>}
           </div>
 
           {!reportReady && <div className="wf-empty" aria-label="报告空态">

@@ -198,6 +198,8 @@ export async function createVtkScene(container: HTMLElement): Promise<VtkScene> 
   let rafId: number | null = null;
   let destroyed = false;
   let cameraInitialized = false;
+  /** Viewport aspect used by the last fit; a resize past this re-frames. */
+  let lastFitAspect = 0;
   let scaleListener: ((unitsPerPixel: number) => void) | null = null;
   let lastReportedScale = 0;
 
@@ -257,6 +259,12 @@ export async function createVtkScene(container: HTMLElement): Promise<VtkScene> 
     win.resize();
     const bounds = unionBounds(visibleBounds() ?? fullBounds(), markerBounds);
     if (bounds) applyClippingRange(bounds);
+    // The fit depends on the viewport aspect: a resize that makes the stage
+    // narrower/taller can push the top face or the hole opening out of frame.
+    const aspect = (container.clientWidth || 1) / Math.max(1, container.clientHeight || 1);
+    if (cameraInitialized && Math.abs(aspect - lastFitAspect) > 0.02 && bounds) {
+      fitToBounds(bounds, camera.getDirectionOfProjection(), camera.getViewUp());
+    }
     renderNow();
   });
   resizeObserver.observe(container);
@@ -461,11 +469,14 @@ export async function createVtkScene(container: HTMLElement): Promise<VtkScene> 
     const heightPx = container.clientHeight || 1;
     const aspect = widthPx / Math.max(1, heightPx);
     const diagonal = Math.hypot(bounds[3] - bounds[0], bounds[4] - bounds[1], bounds[5] - bounds[2]) || 1;
+    // 8 % of the viewport stays free on every side, so the top face and the
+    // hole opening never touch (or cross) the canvas edge after XZ/YZ/fit.
+    const fitPadding = 0.08;
     return {
       center,
       dir,
       upAxis,
-      halfHeight: Math.max(halfUp, halfRight / aspect, diagonal * 1e-4) * 1.12,
+      halfHeight: Math.max(halfUp, halfRight / aspect, diagonal * 1e-4) * (1 + 2 * fitPadding),
       diagonal,
     };
   };
@@ -488,6 +499,7 @@ export async function createVtkScene(container: HTMLElement): Promise<VtkScene> 
     camera.setViewUp(upAxis[0], upAxis[1], upAxis[2]);
     camera.setParallelScale(halfHeight);
     cameraInitialized = true;
+    lastFitAspect = (container.clientWidth || 1) / Math.max(1, container.clientHeight || 1);
     // Also sets the near/far range (including the marker when present).
     updateMarkerGeometry(bounds);
     if (!markerSpec) applyClippingRange(bounds);

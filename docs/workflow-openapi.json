@@ -232,7 +232,7 @@
             "items": {
               "$ref": "#/components/schemas/AnalysisCandidateV1"
             },
-            "maxItems": 4,
+            "maxItems": 6,
             "minItems": 2,
             "title": "Candidates",
             "type": "array"

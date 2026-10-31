@@ -373,6 +373,20 @@ def _status_label(value: Any) -> str:
     return STATUS_LABELS.get(text, text)
 
 
+# One mapping for 03/05/report/CSV; the technical id stays in parentheses/details.
+METRIC_METHOD_LABELS = {
+    "etch_depth": "刻蚀深度",
+    "cd_at_height": "指定高度 CD",
+}
+
+
+def _method_label(value: Any) -> str:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return "未记录"
+    text = str(value)
+    return METRIC_METHOD_LABELS.get(text, text)
+
+
 def _display(value: Any, empty: str = "未记录") -> str:
     """Render a readable cell value, never a blank or ``None``."""
 
@@ -411,6 +425,8 @@ def _token_label(value: Any, empty: str = "未记录") -> str:
 
 
 def _fmt_number(value: Any) -> str:
+    """Report numbers keep 4 significant digits (0.200006 reads as 0.2)."""
+
     if value is None or (isinstance(value, str) and not value.strip()):
         return "未记录"
     if isinstance(value, bool):
@@ -419,8 +435,19 @@ def _fmt_number(value: Any) -> str:
         number = float(value)
         if number.is_integer() and abs(number) < 1e15:
             return str(int(number))
-        return f"{number:.6g}"
+        return f"{number:.4g}"
     return _escape(value)
+
+
+def _sig4(value: Any) -> str:
+    """Bare 4-significant-digit number for CSV cells; empty when there is no value."""
+
+    number = _number(value)
+    if number is None:
+        return ""
+    if number == 0:
+        return "0"
+    return f"{number:.4g}"
 
 
 def _code(value: Any, empty: str = "未记录") -> str:
@@ -906,7 +933,10 @@ def _svg_isometric(view: dict[str, Any], width: int = 560, height: int = 360) ->
     left, right, top, bottom = 62, 18, 18, 52
     plot_width = max(1.0, width - left - right)
     plot_height = max(1.0, height - top - bottom)
-    scale = min(plot_width / u_span, plot_height / v_span)
+    # Keep 8 % of the plot free on every side: the projected top face and the
+    # hole opening used to touch (and sometimes cross) the frame.
+    iso_padding = 0.08
+    scale = min(plot_width / u_span, plot_height / v_span) * (1.0 - 2.0 * iso_padding)
     offset_x = left + (plot_width - u_span * scale) / 2.0
     offset_y = top + (plot_height - v_span * scale) / 2.0
 
@@ -1036,6 +1066,9 @@ def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
     binding = None
     measurement_id = request.get("measurementId")
     replicate_ref = None
+    # True when `run_id` was borrowed from an experiment replicate rather than
+    # sent by 03: the report must not call an experiment candidate "当前 Run".
+    run_from_experiment = False
     if experiment and not run_id:
         for variant in experiment.get("variants") or []:
             replicate = (variant.get("replicates") or [{}])[0]
@@ -1043,6 +1076,7 @@ def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
                 run_id = replicate["runId"]
                 replicate_ref = replicate
                 measurement = replicate
+                run_from_experiment = True
                 break
     if run_id:
         run_dir = storage.run_path(str(run_id))
@@ -1263,7 +1297,7 @@ def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
         rows: list[tuple[str, str]] = [
             ("指标", _escape(metric_label)),
             ("配方", "%s v%s" % (_escape(measurement.recipeId), _display(measurement.recipeVersion, ""))),
-            ("方法", "%s · %s" % (_display(measurement.method), _display(measurement.material))),
+            ("方法", "%s · %s" % (_escape(_method_label(measurement.method)), _display(measurement.material))),
             ("数值", value_text),
             ("状态", status_text),
         ]
@@ -1359,6 +1393,15 @@ def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
     # -- 结构视图 ----------------------------------------------------------
     sections.append("<h2>结构视图</h2>")
     view_snapshots: list[tuple[dict[str, Any], str]] = []
+    shown_runs: set[str] = set()
+    # 03 hands over the current Run: its snapshot is the same picture the user
+    # just looked at, so the report starts with it and labels it honestly.
+    if run_id and step_id and not run_from_experiment:
+        try:
+            view_snapshots.append((load_snapshot(str(run_id), str(step_id)), "当前 Run · %s" % _step_label(step_id, step_names)))
+            shown_runs.add(str(run_id))
+        except Exception:
+            pass
     if experiment:
         # Same snapshot as 03: the first replicate that actually ran, at the
         # last step of that run (not the step of some other run).
@@ -1367,6 +1410,8 @@ def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
             if not replicate:
                 continue
             run_for_view = str(replicate["runId"])
+            if run_for_view in shown_runs:
+                continue
             step_for_view = _run_step_id(store, run_for_view)
             if not step_for_view:
                 continue
@@ -1374,7 +1419,8 @@ def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
                 snapshot = load_snapshot(run_for_view, step_for_view)
             except Exception:
                 continue
-            caption_parts = [_step_label(step_for_view, step_names)]
+            ordinal = variant.get("ordinal") or index + 1
+            caption_parts = ["实验候选 V%s" % _fmt_number(ordinal)]
             conditions = _variant_conditions(variant)
             if conditions:
                 caption_parts.append(conditions)
@@ -1382,9 +1428,10 @@ def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
             if seed is not None:
                 caption_parts.append(f"seed {_fmt_number(seed)}")
             view_snapshots.append((snapshot, " · ".join(caption_parts)))
-    elif run_id and step_id:
+            shown_runs.add(run_for_view)
+    elif run_id and step_id and not view_snapshots:
         try:
-            view_snapshots.append((load_snapshot(run_id, step_id), _step_label(step_id, step_names)))
+            view_snapshots.append((load_snapshot(str(run_id), str(step_id)), "当前 Run · %s" % _step_label(step_id, step_names)))
         except Exception:
             pass
     if view_snapshots:
@@ -1427,3 +1474,86 @@ def build_report(store: Any, request: dict[str, Any]) -> dict[str, Any]:
 <button onclick="window.print()">打印 / 保存为 PDF</button>{body}</body></html>"""
     digest = hashlib.sha256(document.encode("utf-8")).hexdigest()
     return {"reportId": f"report_{digest[:16]}", "title": title, "html": document, "sha256": digest, "createdAt": created_at}
+
+
+# Replicate failures are stored as English runner messages. The CSV is a
+# user-facing artifact, so known ones get a Chinese sentence; anything else
+# keeps the raw text instead of pretending there was no reason.
+_REPLICATE_REASON_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"^interrupted by server restart$"), "服务重启导致中断"),
+    (re.compile(r"^waiting for an available run slot$"), "等待可用的运行槽位"),
+    (re.compile(r"^segment finished with (\w+)$"), "Segment 运行结束：{0}"),
+    (re.compile(r"^preparation failed: (.+)$"), "运行准备失败：{0}"),
+    (re.compile(r"^start failed: (.+)$"), "运行启动失败：{0}"),
+)
+
+
+def _replicate_reason_text(reason: Any) -> str:
+    if reason is None or (isinstance(reason, str) and not reason.strip()):
+        return ""
+    text = str(reason)
+    for pattern, template in _REPLICATE_REASON_PATTERNS:
+        match = pattern.match(text)
+        if match:
+            groups = match.groups()
+            if groups and template.endswith("{0}"):
+                return template.format(_status_label(groups[0]))
+            return template
+    # Known metrology codes become Chinese; an unknown runner message keeps its
+    # own words instead of being reported as "测量无有效值".
+    detail = _reason_detail(text)
+    return detail if detail is not None else _reason_text(text)
+
+
+def experiment_csv(document: dict[str, Any], store: Any = None) -> str:
+    """Experiment CSV with the same names/units/precision as the UI and report.
+
+    `status` and `reason` are Chinese, numbers keep 4 significant digits, the
+    unit is `µm`, and a replicate without a valid metric leaves value and unit
+    empty instead of writing a placeholder number.
+    """
+
+    import csv
+    import io
+
+    from .experiments import experiment_table
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow([
+        "experiment_id", "variant_id", "ordinal", "parameters", "replicate_id", "seed",
+        "status", "reason", "value", "unit", "run_id", "statistical_sample", "attempt_count",
+        "n", "mean", "std", "ci95", "min", "max",
+    ])
+    table = experiment_table(document)
+    by_variant = {row["variantId"]: row for row in table["rows"]}
+    for variant in document.get("variants") or []:
+        summary = by_variant.get(variant.get("variantId"), {})
+        for replicate in variant.get("replicates") or []:
+            measurement = None
+            if store is not None and replicate.get("measurementId"):
+                try:
+                    measurement = store.get_measurement(str(replicate["measurementId"]))
+                except Exception:
+                    measurement = None
+            if measurement is not None:
+                has_value = _measurement_has_value(measurement)
+                value = measurement.value if has_value else None
+                unit = "µm" if has_value else ""
+                reason = "" if has_value else _reason_text(measurement.reason)
+            else:
+                value = replicate.get("value") if _number(replicate.get("value")) is not None else None
+                has_value = value is not None and str(replicate.get("status")) == "succeeded"
+                unit = "µm" if has_value else ""
+                reason = "" if has_value else _replicate_reason_text(replicate.get("reason"))
+            writer.writerow([
+                document.get("experimentId"), variant.get("variantId"), variant.get("ordinal"),
+                json.dumps(variant.get("parameters") or {}, sort_keys=True, separators=(",", ":")),
+                replicate.get("replicateId"), replicate.get("seed"),
+                _status_label(replicate.get("status")), reason,
+                _sig4(value), unit, replicate.get("runId"),
+                bool(replicate.get("statisticalSample")), int(replicate.get("attemptCount") or 0),
+                summary.get("n"), _sig4(summary.get("mean")), _sig4(summary.get("std")),
+                _sig4(summary.get("ci95")), _sig4(summary.get("min")), _sig4(summary.get("max")),
+            ])
+    return buffer.getvalue()

@@ -135,6 +135,12 @@ button, input { font: inherit; }
   letter-spacing: -0.02em;
 }
 
+.wf-card-head .wf-card-desc {
+  margin: 0;
+  color: var(--wf-muted);
+  font-size: 12px;
+}
+
 .wf-muted {
   color: var(--wf-muted);
   font-size: 12px;
@@ -379,8 +385,8 @@ button, input { font: inherit; }
 .wf-bounds input, .wf-doe-row input, .wf-doe-row select { min-width: 0; background: var(--wf-panel-2); color: var(--wf-text); border: 1px solid var(--wf-line); border-radius: 6px; padding: 6px; font-size: 10px; }
 .wf-canvas-wrap { border: 1px solid var(--wf-line); border-radius: 9px; padding: 8px; background: rgba(8, 20, 33, 0.8); }
 .wf-clip-canvas { width: 100%; height: 180px; display: block; background: #07121d; border-radius: 6px; }
-.wf-annotation { fill: var(--wf-amber); stroke: #07121d; stroke-width: 2; }
-.wf-annotation-text { fill: var(--wf-amber); font-size: 3px; }
+.wf-annotation { fill: var(--wf-amber); stroke: #07121d; }
+.wf-annotation-text { fill: var(--wf-amber); font-weight: 600; }
 .wf-clip-list { display: flex; flex-wrap: wrap; gap: 5px; }
 .wf-clip-list button { background: var(--wf-panel-2); color: var(--wf-muted); border: 1px solid var(--wf-line); border-radius: 999px; padding: 4px 9px; font-size: 10px; cursor: pointer; }
 .wf-clip-list button.active { color: var(--wf-text); border-color: var(--wf-accent); }

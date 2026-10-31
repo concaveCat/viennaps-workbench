@@ -46,9 +46,9 @@ try {
 
   // ---- 01: import a project and save it so projectNotice has something to say.
   await page.locator('input[type=file]').nth(1).setInputFiles(projectPath);
-  await page.locator('.spx-project-status strong').filter({ hasText: '草稿（未保存）' }).waitFor();
+  await page.locator('.spx-save-button').filter({ hasText: '草稿（未保存）' }).waitFor();
   await page.getByRole('button', { name: '保存工程', exact: true }).click();
-  await page.locator('.spx-project-status strong').filter({ hasText: '已保存' }).waitFor();
+  await page.locator('.spx-project-status').filter({ hasText: '已写入服务端' }).waitFor();
 
   const projectNotice = page.locator('.spx-project-notice');
   await projectNotice.waitFor();
@@ -57,7 +57,7 @@ try {
   assert.equal(await noticeClose.count(), 1, 'project notice must expose a × with aria-label 关闭提示');
   await noticeClose.click();
   await projectNotice.waitFor({ state: 'detached' });
-  assert.equal(await page.locator('.spx-project-status strong').filter({ hasText: '已保存' }).count(), 1, 'closing the notice must not touch project state');
+  assert.equal(await page.locator('.spx-project-status').filter({ hasText: '已写入服务端' }).count(), 1, 'closing the notice must not touch project state');
 
   // ---- 02 has no view switch, no manager header and no manager category tabs.
   await page.getByRole('button', { name: '02 流程' }).click();

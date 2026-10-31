@@ -16,7 +16,15 @@ from .. import snapshots, storage
 from ..models import ProjectV7, StepV7, StrictModel
 from .metrology import MeasurementResultV1, MetrologyRecipeV1, MetricDefinitionV1, SnapshotPayloadV1, snapshot_content_hash
 from .adoption import adopt_project, first_route
-from .analysis import build_report, candidate_view, compare_snapshots as compare_analysis_snapshots, load_snapshot, process_window, snapshot_summary
+from .analysis import (
+    build_report,
+    candidate_view,
+    compare_snapshots as compare_analysis_snapshots,
+    experiment_csv,
+    load_snapshot,
+    process_window,
+    snapshot_summary,
+)
 from .calibration import create_dataset, run_fit
 from .branches import create_branch
 from .decisions import (
@@ -35,7 +43,6 @@ from .experiments import (
     apply_experiment_retention,
     create_doe_document,
     create_experiment_document,
-    experiment_csv,
     experiment_table,
     resolve_experiment_base,
     retention_preview,
@@ -551,7 +558,7 @@ class AnalysisCandidateV1(StrictModel):
 
 
 class AnalysisCompareRequest(StrictModel):
-    candidates: Annotated[list[AnalysisCandidateV1], Field(min_length=2, max_length=4)]
+    candidates: Annotated[list[AnalysisCandidateV1], Field(min_length=2, max_length=6)]
     tolerance: Annotated[float, Field(ge=0, le=1_000_000)] = 1e-6
     materialTolerance: Annotated[float, Field(ge=0, le=1_000_000)] | None = None
 
@@ -1166,9 +1173,10 @@ async def get_experiment_table(
 
 @router.get("/experiments/{experiment_id}/export.csv", response_class=Response)
 async def export_experiment_csv(experiment_id: str) -> Response:
-    document = _call(lambda: get_store().get_experiment(experiment_id))
+    store = get_store()
+    document = _call(lambda: store.get_experiment(experiment_id))
     return Response(
-        content=experiment_csv(document), media_type="text/csv",
+        content=experiment_csv(document, store), media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{experiment_id}.csv"'},
     )
 
