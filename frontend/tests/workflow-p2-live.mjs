@@ -85,12 +85,12 @@ try {
   await page.getByRole('button', { name: '测量', exact: true }).click();
   await page.getByText(/绑定 \(binding\)：已绑定/).first().waitFor();
 
-  // 03 timeline spans every executed segment: the project's initial structure
-  // plus the continuation segment's own starting state, and every segment row
-  // can jump straight to its through-step structure.
+  // 03 timeline is one initial structure plus every Route step; it no longer
+  // repeats a per-segment starting state.
   await page.locator('.wf-structure-timeline').waitFor();
-  assert.equal(await page.locator('.wf-step-chip[data-step-id="initial"]').count(), 2);
-  assert.equal(await page.locator('.wf-step-chip').filter({ hasText: 'Segment 2 起始' }).count(), 1);
+  assert.equal(await page.locator('.wf-step-chip[data-step-id="initial"]').count(), 1);
+  assert.equal(await page.locator('.wf-step-chip').filter({ hasText: 'Segment 2 起始' }).count(), 0);
+  assert.equal(await page.locator('.wf-step-chip[data-kind="step"]').count(), 5);
   assert.equal(await page.locator('.wf-segment-structure:not([disabled])').count(), 2);
 
   await page.getByRole('button', { name: '04 实验' }).click();

@@ -469,10 +469,8 @@ body {
 .spx-functions button:hover { background: #e9f0f8; }
 .spx-functions button.active { background: var(--spx-blue); color: #fff; }
 
-.spx-body { flex: 1; min-height: 0; display: grid; grid-template-columns: 224px minmax(0, 1fr) 264px; }
-.spx-left, .spx-right { min-height: 0; overflow: auto; background: var(--spx-panel); }
-.spx-left { border-right: 1px solid var(--spx-line); display: flex; flex-direction: column; }
-.spx-right { border-left: 1px solid var(--spx-line); }
+.spx-body { flex: 1; min-height: 0; display: grid; grid-template-columns: 224px minmax(0, 1fr); }
+.spx-left { min-height: 0; overflow: auto; background: var(--spx-panel); border-right: 1px solid var(--spx-line); display: flex; flex-direction: column; }
 .spx-panel { border-bottom: 1px solid var(--spx-line); }
 .spx-panel-title { height: 24px; display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 0 7px; background: #e9ecef; border-bottom: 1px solid var(--spx-line); color: #26313a; font-size: 11px; font-weight: 600; }
 .spx-panel-tools { color: var(--spx-muted); font-weight: 400; }
@@ -513,11 +511,9 @@ body {
 .spx-log.muted { color: var(--spx-muted); }
 .spx-log.error { color: var(--spx-red); }
 
-.spx-props { padding: 3px 0 6px; }
 .spx-prop { display: grid; grid-template-columns: 82px minmax(0,1fr); gap: 6px; padding: 3px 7px; font-size: 10px; border-bottom: 1px solid #e6eaee; }
 .spx-prop span { color: var(--spx-muted); }
 .spx-prop code { color: #1d252d; font: 10px "Consolas", monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.spx-right-foot { padding: 7px; color: var(--spx-muted); font-size: 10px; border-top: 1px solid var(--spx-line); }
 .spx-connection-dot { display: inline-block; width: 6px; height: 6px; background: var(--spx-green); margin-right: 4px; }
 
 .spx-statusbar { flex: none; height: 24px; display: flex; align-items: center; gap: 18px; padding: 0 8px; background: #e8ebee; border-top: 1px solid var(--spx-line); color: #34404b; font-size: 10px; }
@@ -572,7 +568,6 @@ body {
 
 @media (max-width: 1100px) {
   .spx-body { grid-template-columns: 190px minmax(0, 1fr); }
-  .spx-right { display: none; }
   .wf-grid { grid-template-columns: 1fr; }
 }
 @media (max-width: 760px) {
@@ -682,10 +677,6 @@ body {
 .spx-flow-list .wf-table tbody tr { cursor: pointer; }
 .spx-flow-list .wf-table tbody tr:hover { background: #f2f7fc; }
 .spx-flow-list .wf-table tbody tr.selected { background: var(--spx-blue-soft); }
-.spx-step-inspector { border: 1px solid var(--spx-line); background: #fbfcfd; min-height: 150px; }
-.spx-step-inspector-title { padding: 4px 7px; background: #eef1f4; border-bottom: 1px solid var(--spx-line); font-size: 11px; font-weight: 600; }
-.spx-step-inspector .spx-prop { grid-template-columns: 76px minmax(0,1fr); }
-.spx-step-inspector .spx-help { padding: 0 7px 6px; margin: 4px 0 0; }
 .spx-advanced-body { padding: 8px 10px; }
 .spx-advanced-body textarea { min-height: 70px; }
 
@@ -710,31 +701,57 @@ body {
 --------------------------------------------------------------------------- */
 .spx-source-pick { margin-bottom: 7px; }
 .spx-inline-section .wf-clip-editor { padding: 0; border: 0; }
-.spx-flow-editor { display: grid; grid-template-columns: 268px minmax(0, 1fr); gap: 9px; align-items: start; margin-top: 8px; }
-.spx-library-browser { border: 1px solid var(--spx-line); background: #fbfcfd; min-width: 0; }
+/* 02 is a three-column editor: process presets | step graph | step parameters.
+   The columns get their own scroll areas so a long step list never pushes the
+   document sideways at 1600x1000. */
+.spx-flow-editor {
+  display: grid;
+  grid-template-columns: 240px minmax(0, 1fr) 300px;
+  gap: 9px;
+  align-items: stretch;
+  margin-top: 8px;
+  height: clamp(380px, calc(100vh - 470px), 640px);
+  min-height: 0;
+}
+.spx-library-browser, .spx-flow-steps, .spx-step-inspector {
+  border: 1px solid var(--spx-line);
+  background: #fff;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.spx-library-browser { background: #fbfcfd; }
 .spx-library-head { display: flex; align-items: center; justify-content: space-between; padding: 4px 7px; background: #eef1f4; border-bottom: 1px solid var(--spx-line); font-size: 11px; font-weight: 600; }
-.spx-library-tabs { display: flex; flex-wrap: wrap; border-bottom: 1px solid var(--spx-line); }
-.spx-library-tabs button { flex: 1 1 50%; min-width: 0; height: 25px; border: 0; border-right: 1px solid var(--spx-line-soft); border-bottom: 1px solid var(--spx-line-soft); background: #f6f7f8; color: #34404b; font-size: 10px; cursor: pointer; display: flex; align-items: center; justify-content: space-between; padding: 0 6px; }
-.spx-library-tabs button.active { background: var(--spx-blue-soft); color: #0a3f73; font-weight: 600; }
-.spx-library-list { max-height: 360px; overflow: auto; padding: 3px; }
+.spx-library-list { flex: 1; min-height: 0; overflow: auto; padding: 3px; }
 .spx-library-empty { padding: 8px 5px; }
 .spx-library-item { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 6px; padding: 5px 6px; border-bottom: 1px solid #e6eaee; cursor: grab; }
 .spx-library-item:hover { background: #f2f7fc; }
 .spx-library-item-main { min-width: 0; display: grid; gap: 1px; }
 .spx-library-item-main strong { font-size: 11px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .spx-library-item-main span { color: var(--spx-muted); font-size: 9px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.spx-library-confirm { grid-column: 1 / -1; display: flex; align-items: center; gap: 4px; padding: 4px 0 1px; color: var(--spx-muted); font-size: 10px; }
-.spx-library-confirm .wf-button { width: auto; margin: 0; padding: 2px 6px; }
-.spx-flow-steps { border: 1px solid var(--spx-line); background: #fff; min-width: 0; min-height: 220px; }
-.spx-flow-steps-head { display: flex; align-items: center; justify-content: space-between; padding: 3px 6px; background: #eef1f4; border-bottom: 1px solid var(--spx-line); font-size: 11px; font-weight: 600; }
+.spx-flow-steps-head { flex: none; display: flex; align-items: center; justify-content: space-between; padding: 3px 6px; background: #eef1f4; border-bottom: 1px solid var(--spx-line); font-size: 11px; font-weight: 600; }
 .spx-flow-steps-head .wf-button { width: auto; margin: 0; }
-.spx-flow-steps .wf-table { margin: 0; border-left: 0; border-right: 0; }
+.spx-flow-step-scroll { flex: 1; min-height: 0; overflow: auto; }
+.spx-flow-steps .wf-table { margin: 0; border-left: 0; border-right: 0; table-layout: fixed; width: 100%; }
+.spx-flow-steps .wf-table th, .spx-flow-steps .wf-table td { padding: 4px 5px; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.spx-flow-steps .wf-table th:nth-child(1), .spx-flow-steps .wf-table td:nth-child(1) { width: 28px; }
+.spx-flow-steps .wf-table th:nth-child(5), .spx-flow-steps .wf-table td:nth-child(5) { width: 42px; }
+.spx-flow-steps .wf-table th:nth-child(6), .spx-flow-steps .wf-table td:nth-child(6) { width: 52px; }
 .spx-flow-steps .wf-table tbody tr { cursor: pointer; }
 .spx-flow-steps .wf-table tbody tr:hover { background: #f2f7fc; }
 .spx-flow-steps .wf-table tbody tr.selected { background: var(--spx-blue-soft); }
-.spx-step-form { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px 10px; padding: 7px; }
+.wf-step-name { font-weight: 600; }
+.wf-step-order { text-align: right; white-space: nowrap; }
+.wf-step-move { width: 20px; height: 20px; padding: 0; border: 1px solid var(--spx-line); background: #f7f8f9; color: #26313a; font-size: 11px; line-height: 1; cursor: pointer; }
+.wf-step-move:disabled { opacity: .35; cursor: not-allowed; }
+.spx-step-inspector-title { flex: none; padding: 4px 7px; background: #eef1f4; border-bottom: 1px solid var(--spx-line); font-size: 11px; font-weight: 600; }
+.spx-step-inspector .spx-help { padding: 0 7px 6px; margin: 4px 0 0; }
+.spx-step-empty { padding: 10px 8px; }
+.spx-step-form { flex: 1; min-height: 0; overflow: auto; display: grid; grid-template-columns: minmax(0, 1fr); gap: 7px; padding: 7px; align-content: start; }
 .spx-step-form .spx-field input, .spx-step-form .spx-field select { width: 100%; }
-.spx-step-form-actions { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; gap: 8px; border-top: 1px solid var(--spx-line-soft); padding-top: 6px; }
+.spx-step-form-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; border-top: 1px solid var(--spx-line-soft); padding-top: 6px; }
 .spx-step-form-actions code { color: var(--spx-muted); font: 10px "Consolas", monospace; }
 .spx-step-form-actions .wf-button { width: auto; margin: 0; }
 .spx-run-actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 9px 0 2px; }
@@ -760,11 +777,12 @@ body {
 .spx-library-manager-form-actions .wf-button { width: auto; min-width: 76px; margin: 0; }
 .spx-library-manager-form .wf-summary { grid-column: 1 / -1; }
 @media (max-width: 1100px) {
-  .spx-flow-editor { grid-template-columns: 220px minmax(0, 1fr); }
-  .spx-step-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .spx-flow-editor { grid-template-columns: 200px minmax(0, 1fr); height: auto; }
+  .spx-step-inspector { grid-column: 1 / -1; max-height: 420px; }
 }
 @media (max-width: 820px) {
   .spx-flow-editor { grid-template-columns: 1fr; }
+  .spx-library-browser, .spx-flow-steps { max-height: 360px; }
   .spx-library-manager-body { grid-template-columns: 180px 42px minmax(0, 1fr); }
   .spx-library-manager-form { grid-template-columns: 1fr; }
 }
@@ -880,6 +898,14 @@ body {
 .wf-step-chip-index { font: 9px "Consolas", monospace; opacity: 0.72; }
 .wf-step-chip-label { overflow: hidden; text-overflow: ellipsis; }
 .wf-step-chip-sep { flex: none; color: #8a949c; font-size: 10px; }
+/* Steps whose Segment has not run stay in the timeline, but cannot fake a
+   snapshot: dashed grey chip plus a "待执行" badge. */
+.wf-step-chip.pending { border-style: dashed; background: #f4f5f6; color: #8a949c; }
+.wf-step-chip.pending:hover { border-color: #8a949c; color: #5f6b76; }
+.wf-step-chip.pending.active { border-style: solid; border-color: #8a949c; background: #e8ebee; color: #34404b; }
+.wf-step-chip-state { font-size: 9px; border: 1px solid currentColor; padding: 0 3px; line-height: 1.4; }
+.wf-skip-note { margin-top: 6px; padding: 5px 8px; border: 1px solid #e0c68d; border-left: 3px solid #d68b00; background: #fffaf0; color: #6b4a00; font-size: 10px; }
+.wf-skip-note strong { font-weight: 600; }
 
 /* 3D viewer inside the light workflow shell. The viewer ships its own dark
    theme; only colours are overridden here, layout stays untouched. */
@@ -919,7 +945,6 @@ body {
 .wf-structure-info strong { font-size: 11px; color: #26313a; }
 .wf-structure-info code { font: 10px "Consolas", monospace; color: #26313a; overflow: hidden; text-overflow: ellipsis; }
 .wf-segment-structure { margin-left: auto; flex: none; }
-.wf-step-structure { width: 46px; text-align: right; }
 .wf-link:disabled { color: #a3adb6; cursor: not-allowed; }
 .wf-axes line, .wf-axes path { stroke: #9aa3ab; }
 /* Tick text stays dark on the light plot: #5f6b76 washed out next to the

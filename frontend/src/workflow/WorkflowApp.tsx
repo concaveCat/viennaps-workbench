@@ -2,6 +2,13 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'rea
 import './workflow.css';
 import { SAMPLE_2D_PLANE, SAMPLE_2D_TRENCH, SAMPLE_3D_HOLE } from './samples';
 import { executionCompileBasis } from './fingerprint';
+import {
+  coverageStepNames,
+  enabledCoverageSteps,
+  missingCompiledSteps,
+  missingRouteSteps,
+  skippedCoverageSteps,
+} from './compileCoverage';
 import WorkflowViewer3D from './viewer3d/WorkflowViewer3D';
 import type { Viewer3DMarker, Viewer3DStats } from './viewer3d/types';
 
@@ -596,14 +603,6 @@ const LIBRARY_CATEGORY_LABELS: Record<LibraryCategory, string> = {
   experiment: '实验库',
 };
 
-/** Short names for the 02 insert-source tabs. */
-const LIBRARY_CATEGORY_SHORT: Record<LibraryCategory, string> = {
-  material: '材料',
-  process: '工艺',
-  flow: '流程',
-  experiment: '实验',
-};
-
 /** Empty `ProjectWorkflowStateV1`; unset server state reads exactly like this. */
 function emptyWorkflowState(): ProjectWorkflowState {
   return {
@@ -880,6 +879,64 @@ function blankStep(): ProjectStep {
   };
 }
 
+/** Models this step editor can create without extra model-specific fields. */
+const EDITABLE_STEP_MODELS = ['isotropic', 'singleParticle'];
+const OPERATION_STEP_MODELS = new Set(['isotropic', 'singleParticle', 'directional', 'multiParticle']);
+const RATE_STEP_MODELS = new Set(['isotropic', 'singleParticle', 'directional']);
+const RATE_MODE_STEP_MODELS = new Set(['isotropic', 'singleParticle']);
+const DEPOSIT_STEP_MODELS = new Set(['isotropic', 'singleParticle', 'directional', 'multiParticle', 'specialized']);
+
+/**
+ * Drop fields the selected operation/model does not accept, and fill the ones
+ * the schema requires. Backend validators reject `depositMaterial` on etch and
+ * particle fields on isotropic, so an operation/model switch must clean up
+ * instead of carrying stale values into the next Compile.
+ */
+function sanitizeProjectStep(step: ProjectStep, materialNames: string[]): ProjectStep {
+  const next: ProjectStep = { ...step };
+  const model = String(next.model ?? 'isotropic');
+  const operation = String(next.operation ?? 'etch');
+  if (OPERATION_STEP_MODELS.has(model)) {
+    if (operation !== 'deposit' && operation !== 'etch') next.operation = 'etch';
+  } else if (model !== 'specialized') {
+    delete next.operation;
+  }
+  if (operation !== 'deposit' || !DEPOSIT_STEP_MODELS.has(model)) {
+    delete next.depositMaterial;
+  } else if (!next.depositMaterial) {
+    next.depositMaterial = materialNames[0] ?? 'SiO2';
+  }
+  if (model !== 'singleParticle') {
+    delete next.stickingProbability;
+    delete next.sourceExponent;
+  } else {
+    if (typeof next.stickingProbability !== 'number') next.stickingProbability = 1;
+    if (typeof next.sourceExponent !== 'number') next.sourceExponent = 1;
+  }
+  if (!RATE_MODE_STEP_MODELS.has(model)) {
+    delete next.rateMode;
+    delete next.materialRates;
+  } else if (operation !== 'etch') {
+    next.rateMode = 'uniform';
+    delete next.materialRates;
+  } else if (next.rateMode === 'material') {
+    if (!next.materialRates || typeof next.materialRates !== 'object') next.materialRates = {};
+  } else {
+    next.rateMode = 'uniform';
+    delete next.materialRates;
+  }
+  if (!RATE_STEP_MODELS.has(model)) {
+    delete next.rateMagnitude;
+    delete next.directionalRateMagnitude;
+  } else if (model === 'directional') {
+    delete next.rateMagnitude;
+    if (typeof next.directionalRateMagnitude !== 'number') next.directionalRateMagnitude = 0.02;
+  } else {
+    delete next.directionalRateMagnitude;
+  }
+  return next;
+}
+
 function stepFromLibrary(payload: Record<string, unknown>, name: string): ProjectStep {
   const step = { ...payload } as Record<string, unknown>;
   delete step.id;
@@ -1016,6 +1073,9 @@ type StructureStepRow = {
   segmentIndex: number;
   kind: 'initial' | 'step';
   label: string;
+  /** False until the owning Segment succeeded and produced this snapshot. */
+  executed: boolean;
+  pendingReason?: string;
 };
 
 function structureUnit(view: CandidateView): string {
@@ -1532,7 +1592,6 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [openMenu, setOpenMenu] = useState<string | null>(null);
   const [compileStale, setCompileStale] = useState(true);
   const [libraryItems, setLibraryItems] = useState<LibraryItem[]>([]);
-  const [libraryCategory, setLibraryCategory] = useState<LibraryCategory>('process');
   const [libraryManagerOpen, setLibraryManagerOpen] = useState(false);
   const [managerCategory, setManagerCategory] = useState<LibraryCategory>('material');
   const [managerItems, setManagerItems] = useState<LibraryItem[]>([]);
@@ -1553,7 +1612,6 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [materialPreset, setMaterialPreset] = useState('');
   const [flowDefinitions, setFlowDefinitions] = useState<FlowDefinitionSummary[]>([]);
   const [recipes, setRecipes] = useState<RecipeSummary[]>([]);
-  const [confirmLibraryItemId, setConfirmLibraryItemId] = useState('');
   const [outputTab, setOutputTab] = useState<'output' | 'problems' | 'provenance'>('output');
   const [flowAdvancedOpen, setFlowAdvancedOpen] = useState(false);
   const [libraryAdvancedOpen, setLibraryAdvancedOpen] = useState(false);
@@ -2505,6 +2563,50 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const selectedFlowStep = authoredSteps.find(step => step.id === selectedFlowStepId) ?? null;
   const canCompile = !!project && authoredSteps.length > 0 && !busy;
   /**
+   * The Compile maps every authored step back through its SourceMap. When an
+   * enabled step has no mapping the server dropped it; never offer "创建 Route"
+   * in that state. Disabled steps are a normal skip and are reported separately.
+   * Coverage only applies to Compiles built from the authored project: a
+   * definition Compile expands modules into different step ids, so comparing
+   * it with project.steps would report every step as missing.
+   */
+  const compileCoverageApplies = useMemo(() => {
+    if (!compile) return false;
+    const compiledAuthored = new Set((compile.authoredSteps ?? []).map(step => step.id));
+    return authoredSteps.some(step => compiledAuthored.has(step.id));
+  }, [compile, authoredSteps]);
+  const compileMissingSteps = useMemo(
+    () => (compile && !compileStale && compileCoverageApplies
+      ? missingCompiledSteps(authoredSteps, (compile.compile.sourceMap ?? []).map(entry => entry.authoredStepId))
+      : []),
+    [compile, compileStale, compileCoverageApplies, authoredSteps],
+  );
+  const compileSkippedSteps = useMemo(
+    () => (compile && !compileStale && compileCoverageApplies ? skippedCoverageSteps(authoredSteps) : []),
+    [compile, compileStale, compileCoverageApplies, authoredSteps],
+  );
+  const compileMissingText = coverageStepNames(compileMissingSteps);
+  const compileSkippedText = coverageStepNames(compileSkippedSteps);
+  const processLibraryItems = useMemo(
+    () => libraryItems.filter(item => item.category === 'process'),
+    [libraryItems],
+  );
+  const selectedStepModel = String(selectedFlowStep?.model ?? '');
+  const selectedStepOperation = String(selectedFlowStep?.operation ?? 'etch');
+  const stepModelOptions = Array.from(new Set([selectedStepModel, ...EDITABLE_STEP_MODELS].filter(Boolean)));
+  const stepSupportsOperation = OPERATION_STEP_MODELS.has(selectedStepModel);
+  const stepSupportsRate = RATE_STEP_MODELS.has(selectedStepModel);
+  const stepSupportsRateMode = RATE_MODE_STEP_MODELS.has(selectedStepModel);
+  const stepSupportsDepositMaterial = selectedStepOperation === 'deposit'
+    && DEPOSIT_STEP_MODELS.has(selectedStepModel);
+  const stepShowsParticleFields = selectedStepModel === 'singleParticle';
+  const selectedRateField = selectedStepModel === 'directional' ? 'directionalRateMagnitude' : 'rateMagnitude';
+  const selectedRateValue = Number(
+    selectedStepModel === 'directional'
+      ? selectedFlowStep?.directionalRateMagnitude ?? 0
+      : selectedFlowStep?.rateMagnitude ?? 0,
+  );
+  /**
    * A Route is stale when none of its attempts was built from the current
    * Compile. Branch attempts legitimately use derived Compiles, so any matching
    * attempt keeps the Route runnable; a Route created before a recompile has no
@@ -2512,7 +2614,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
    */
   const routeStale = !!route && !!compile
     && !route.attempts.some(attempt => attempt.compileId === compile.compileId);
-  const canRoute = !!compile && !compileStale && !busy;
+  const canRoute = !!compile && !compileStale && !busy && compileMissingSteps.length === 0;
   const canRun = !!segment && segment.status === 'planned' && !busy && !compileStale && !routeStale;
   /** A continued Segment can only start from a successful predecessor checkpoint. */
   const attemptSegments = segment && route
@@ -2616,10 +2718,10 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
 
   const structureDimension: 2 | 3 = compile?.dimension === 3 || project?.dimension === 3 ? 3 : 2;
 
-  // The 03 timeline lists the initial structure of every executed segment plus
-  // the step snapshots that run actually produced. The manifest is the source
-  // of truth: older runs may not have every step, and continuation segments
-  // start from a saved Domain state instead of the project geometry.
+  // The 03 timeline always lists every Route step in `route.stepOrder`, even
+  // when the owning Segment has not run yet. Pending rows are grey and not
+  // clickable; only a succeeded run with a real manifest snapshot can be
+  // previewed. This is why a split Route no longer hides its last step.
   const succeededSegmentRuns = useMemo(() => (route?.segments ?? [])
     .filter(item => !!item.runId && !item.runId.startsWith('pending_') && item.status === 'succeeded')
     .map(item => item.runId as string), [route]);
@@ -2648,35 +2750,64 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const runStructureSteps = useMemo(() => {
     if (!route) return [] as StructureStepRow[];
     const rows: StructureStepRow[] = [];
-    route.segments.forEach((item, segmentIndex) => {
-      if (!item.runId || item.runId.startsWith('pending_') || item.status !== 'succeeded') return;
-      const snapshots = runSnapshots[item.runId];
-      if (!snapshots) return;
-      if (snapshots.includes('initial')) {
-        rows.push({
-          runId: item.runId,
-          stepId: 'initial',
-          segmentId: item.segmentId,
-          segmentIndex,
-          kind: 'initial',
-          label: segmentIndex === 0 ? '初始结构' : `Segment ${segmentIndex + 1} 起始`,
-        });
-      }
-      const start = item.startAfterStepId ? route.stepOrder.indexOf(item.startAfterStepId) + 1 : 0;
-      const end = route.stepOrder.indexOf(item.throughStepId);
-      if (end < 0) return;
-      for (const stepId of route.stepOrder.slice(start, end + 1)) {
-        if (!snapshots.includes(stepId)) continue;
-        rows.push({
-          runId: item.runId,
-          stepId,
-          segmentId: item.segmentId,
-          segmentIndex,
-          kind: 'step',
-          label: stepDisplayName(stepId),
-        });
-      }
+    const stepOrder = route.stepOrder;
+    /** The Segment that executes `stepId`, by its [startAfter, through] range. */
+    const segmentForStep = (stepId: string) => {
+      const index = stepOrder.indexOf(stepId);
+      if (index < 0) return { item: undefined, segmentIndex: -1 };
+      const segmentIndex = route.segments.findIndex(item => {
+        const start = item.startAfterStepId ? stepOrder.indexOf(item.startAfterStepId) + 1 : 0;
+        const end = stepOrder.indexOf(item.throughStepId);
+        return end >= 0 && index >= start && index <= end;
+      });
+      return { item: segmentIndex >= 0 ? route.segments[segmentIndex] : undefined, segmentIndex };
+    };
+    const pendingReasonFor = (item: RoutePlan['segments'][number] | undefined, hasSnapshot: boolean): string => {
+      if (!item) return '待执行';
+      if (item.status === 'running') return '运行中';
+      if (item.status === 'failed') return '执行失败';
+      if (item.status === 'succeeded' && !hasSnapshot) return '无快照';
+      return '待执行';
+    };
+
+    // Initial structure: the first succeeded Segment that recorded an
+    // `initial` snapshot. Before that it is a grey pending chip, not a fake view.
+    const firstSegment = route.segments[0];
+    const initialSegmentIndex = route.segments.findIndex(item => !!item.runId
+      && !item.runId.startsWith('pending_')
+      && item.status === 'succeeded'
+      && (runSnapshots[item.runId] ?? []).includes('initial'));
+    const initialSegment = initialSegmentIndex >= 0 ? route.segments[initialSegmentIndex] : undefined;
+    rows.push({
+      runId: initialSegment?.runId ?? '',
+      stepId: 'initial',
+      segmentId: initialSegment?.segmentId ?? firstSegment?.segmentId ?? '',
+      segmentIndex: initialSegmentIndex >= 0 ? initialSegmentIndex : 0,
+      kind: 'initial',
+      label: '初始结构',
+      executed: !!initialSegment,
+      pendingReason: initialSegment ? undefined : pendingReasonFor(firstSegment, false),
     });
+
+    for (const stepId of stepOrder) {
+      const { item, segmentIndex } = segmentForStep(stepId);
+      const snapshots = item?.runId ? runSnapshots[item.runId] : undefined;
+      const executed = !!item
+        && item.status === 'succeeded'
+        && !!item.runId
+        && !item.runId.startsWith('pending_')
+        && !!snapshots?.includes(stepId);
+      rows.push({
+        runId: executed ? (item?.runId as string) : '',
+        stepId,
+        segmentId: item?.segmentId ?? '',
+        segmentIndex: Math.max(0, segmentIndex),
+        kind: 'step',
+        label: stepDisplayName(stepId),
+        executed,
+        pendingReason: executed ? undefined : pendingReasonFor(item, !!snapshots?.includes(stepId)),
+      });
+    }
     return rows;
   }, [route, runSnapshots, stepDisplayName]);
 
@@ -2691,8 +2822,11 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setStructurePick(previous => runStructureSteps.some(row => `${row.runId}:${row.stepId}` === previous)
       ? previous
       : (() => {
-        const last = runStructureSteps[runStructureSteps.length - 1];
-        return last ? `${last.runId}:${last.stepId}` : '';
+        // Prefer the last step that actually has a snapshot; pending chips stay
+        // selectable (they show the "尚未执行" empty state) but are not default.
+        const lastExecuted = [...runStructureSteps].reverse().find(row => row.executed);
+        const fallback = lastExecuted ?? runStructureSteps[0];
+        return fallback ? `${fallback.runId}:${fallback.stepId}` : '';
       })());
   }, [runStructureSteps, measurement?.sourceRunId, measurement?.sourceStepId]);
 
@@ -3057,6 +3191,13 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setSegment(null);
     setMeasurement(null);
     setProvenance(null);
+    // A missing enabled step is never a silent skip: say which step vanished
+    // and keep 创建 Route disabled (canRoute reads the same SourceMap).
+    const compiledAuthored = (result.compile.sourceMap ?? []).map(entry => entry.authoredStepId);
+    const missing = missingCompiledSteps(nextProject.steps ?? [], compiledAuthored);
+    if (missing.length) {
+      setError(`编译结果缺少步骤 ${coverageStepNames(missing)}，已阻止创建 Route`);
+    }
     setActivityLog(previous => [...previous.slice(-79), `${clockTime()}  流程已编译 · ${result.stepCount} 步`]);
   });
 
@@ -3105,6 +3246,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const createRoute = (rebuild = false) => run('route', async () => {
     if (!compile) throw new Error('先编译流程');
     if (compileStale) throw new Error('流程已修改，请重新编译');
+    if (compileMissingSteps.length) {
+      throw new Error(`编译结果缺少步骤 ${compileMissingText}，已阻止创建 Route`);
+    }
     if (route && !rebuild) { navigateZone('run'); return; }
     const enabledSteps = compile.compile.project.steps.filter(step => step.enabled);
     const splitAfterStepId = enabledSteps.length > 1 ? enabledSteps[enabledSteps.length - 2].id : undefined;
@@ -3113,6 +3257,13 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       name: `${compile.projectName} · Route`,
       splitAfterStepId,
     });
+    // Never replace a working Route with one that silently dropped an enabled
+    // compiled step: the old Route stays intact and the banner explains why.
+    const missingInRoute = missingRouteSteps(enabledSteps.map(step => step.id), result.plan.stepOrder);
+    if (missingInRoute.length) {
+      const missingNames = coverageStepNames(enabledSteps.filter(step => missingInRoute.includes(step.id)));
+      throw new Error(`Route 缺少步骤 ${missingNames}，已阻止创建 Route，旧 Route 保持不变`);
+    }
     setRoute(result.plan);
     setSegment(result.plan.segments[0] ?? null);
     setMeasurementInvalidated(!!measurement);
@@ -4301,7 +4452,34 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
 
   const updateSelectedStep = (patch: Record<string, unknown>) => {
     if (!selectedFlowStepId) return;
-    commitSteps(steps => steps.map(step => step.id === selectedFlowStepId ? { ...step, ...patch } : step));
+    const materialNames = materialCatalog.map(row => row.name);
+    commitSteps(steps => steps.map(step => (step.id === selectedFlowStepId
+      ? sanitizeProjectStep({ ...step, ...patch }, materialNames)
+      : step)));
+  };
+
+  const moveAuthoredStep = (stepId: string, delta: number) => {
+    commitSteps(steps => {
+      const index = steps.findIndex(step => step.id === stepId);
+      const target = index + delta;
+      if (index < 0 || target < 0 || target >= steps.length) return steps;
+      const next = [...steps];
+      [next[index], next[target]] = [next[target], next[index]];
+      return next;
+    });
+  };
+
+  const reorderAuthoredStep = (stepId: string, targetId: string) => {
+    if (stepId === targetId) return;
+    commitSteps(steps => {
+      const from = steps.findIndex(step => step.id === stepId);
+      const to = steps.findIndex(step => step.id === targetId);
+      if (from < 0 || to < 0) return steps;
+      const next = [...steps];
+      const [moved] = next.splice(from, 1);
+      next.splice(to, 0, moved);
+      return next;
+    });
   };
 
   const addAuthoredStep = () => {
@@ -4343,7 +4521,6 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       const step = stepFromLibrary(item.payload, item.name);
       commitSteps(steps => flowMode === 'replace' ? [step] : [...steps, step]);
       setSelectedFlowStepId(step.id);
-      setConfirmLibraryItemId('');
       setActivityLog(previous => [...previous.slice(-79), `${clockTime()}  已从库插入 process: ${item.name}`]);
       return;
     }
@@ -4369,7 +4546,6 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     if (!inserted.length) throw new Error('流程预设没有步骤');
     commitSteps(steps => flowMode === 'replace' ? inserted : [...steps, ...inserted]);
     setSelectedFlowStepId(inserted[0].id);
-    setConfirmLibraryItemId('');
     setActivityLog(previous => [...previous.slice(-79), `${clockTime()}  已插入流程 ${item.name} · ${inserted.length} 步`]);
   });
 
@@ -5408,18 +5584,6 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         : projectDirty
           ? '有未保存更改 · 保存'
           : `已保存${projectSavedAt ? ` · ${formatDateTime(projectSavedAt)}` : ''}`;
-  const propertyRows: Array<{ label: string; value: string; title?: string }> = [
-    { label: '工程', value: project?.name ?? '—' },
-    { label: '维度', value: project ? `${project.dimension ?? '?'}D` : '—' },
-    { label: '编译', value: compile ? (compileStale ? '需重新编译' : '已编译') : '—', title: compile?.compileId },
-    { label: '绑定 (binding)', value: compile?.bindingId ? '已记录' : '—', title: compile?.bindingId },
-    { label: 'Route', value: route?.route.name ?? '—', title: route?.route.routeId },
-    { label: 'Segment', value: segment ? statusLabel(segment.status) : '—', title: segment?.segmentId },
-    { label: 'Run', value: segment?.runId ? '已记录' : '—', title: segment?.runId ?? undefined },
-    { label: '测量', value: measurementState.hasValue && measurement ? measurementValueText(measurement) : measurementState.label, title: measurement?.measurementId },
-    { label: '引擎', value: health ? `ViennaPS ${health.viennaps ?? '—'}` : '—' },
-  ];
-
   const renderDomainField = (label: string, key: 'gridDelta' | 'xExtent' | 'yExtent', step = '0.01', title?: string) => {
     const error = projectFormErrors[`domain.${key}`];
     return <label className={`spx-field${error ? ' invalid' : ''}`} key={key}>
@@ -6103,8 +6267,14 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
 
             {compile && <div className={compileStale ? 'wf-summary' : 'wf-summary success'}>
               <strong>{compileStale ? 'Compile 已过期，需要重新编译' : '编译成功'}</strong>
-              <span>{compile.stepCount} 步 · {compile.dimension}D · 工程 {compile.projectName}</span>
+              <span>{enabledCoverageSteps(authoredSteps).length} 个启用步骤 · 编译 {compile.stepCount} 步 · {compile.dimension}D · 工程 {compile.projectName}</span>
               {compileStale && <span>重新编译后才能创建新的 Route。</span>}
+              {compileMissingSteps.length > 0 && <div className="wf-block-reason" role="alert" aria-label="编译缺少步骤">
+                编译结果缺少步骤 {compileMissingText}，已阻止创建 Route
+              </div>}
+              {compileSkippedSteps.length > 0 && <div className="wf-skip-note" role="status" aria-label="已跳过步骤">
+                已跳过 {compileSkippedSteps.length} 个未启用步骤：{compileSkippedText}
+              </div>}
               <details className="spx-compile-details">
                 <summary>查看编译详情</summary>
                 <dl>
@@ -6124,49 +6294,25 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               <button type="button" className="wf-button primary" disabled={!!busy} onClick={() => void createRoute(true)}>确认重建</button>
             </div>}
             <div className="spx-flow-editor">
-              <div className="spx-library-browser">
-                <div className="spx-library-head">
-                  <span>插入源</span>
-                </div>
-                <div className="spx-library-note">管理库请用左侧库树</div>
-                <div className="spx-library-tabs">
-                  {([
-                    ['material', LIBRARY_CATEGORY_SHORT.material],
-                    ['process', LIBRARY_CATEGORY_SHORT.process],
-                    ['flow', LIBRARY_CATEGORY_SHORT.flow],
-                    ['experiment', LIBRARY_CATEGORY_SHORT.experiment],
-                  ] as Array<[LibraryCategory, string]>).map(([category, label]) => <button
-                    key={category} type="button" className={libraryCategory === category ? 'active' : ''}
-                    title={LIBRARY_CATEGORY_LABELS[category]}
-                    onClick={() => setLibraryCategory(category)}
-                  >{label}<span className="spx-count">{libraryItems.filter(item => item.category === category).length}</span></button>)}
-                </div>
+              <div className="spx-library-browser" aria-label="插入源">
+                <div className="spx-library-head"><span>插入源 · 工艺预设</span></div>
+                <div className="spx-library-note">材料 / 流程 / 实验在左树“库”管理</div>
                 <div className="spx-library-category-head compact">
-                  <strong>{LIBRARY_CATEGORY_LABELS[libraryCategory]}</strong>
+                  <strong>工艺预设</strong>
                   <span className={libraryError ? 'spx-library-load-error' : 'wf-muted'}>
-                    {libraryLoading ? '加载中…' : libraryError ? '加载失败' : `${libraryItems.filter(item => item.category === libraryCategory).length} 条`}
+                    {libraryLoading ? '加载中…' : libraryError ? '加载失败' : `${processLibraryItems.length} 条`}
                   </span>
                   {libraryError && <button type="button" className="wf-button ghost" onClick={() => void loadLibraryItems()}>重试</button>}
                 </div>
-                <div className="spx-library-list" aria-label="库条目">
+                <div className="spx-library-list" aria-label="工艺预设">
                   {libraryLoading && <div className="wf-muted spx-library-empty">加载中…</div>}
                   {!libraryLoading && libraryError && <div className="wf-muted spx-library-empty">加载失败：{libraryError}<button type="button" className="wf-button ghost" onClick={() => void loadLibraryItems()}>重试</button></div>}
-                  {!libraryLoading && !libraryError && libraryItems.filter(item => item.category === libraryCategory).length === 0 && <div className="wf-muted spx-library-empty">
-                    {libraryCategory === 'flow'
-                      ? '还没有流程条目。先在 02 保存流程模板，再到左树“库 → 流程”引用它。'
-                      : libraryCategory === 'experiment'
-                        ? '还没有实验模板。先在 03 完成一次测量生成配方，再到左树“库 → 实验”引用它。'
-                        : '该分类暂无条目，可从左树“库”分类进入库管理新增。'}
+                  {!libraryLoading && !libraryError && processLibraryItems.length === 0 && <div className="wf-muted spx-library-empty">
+                    工艺库暂无条目。可在左树“库 → 工艺”新增工艺预设。
                   </div>}
-                  {!libraryLoading && !libraryError && libraryItems.filter(item => item.category === libraryCategory).map(item => {
-                    const needsProject = item.category !== 'experiment';
-                    const blocked = needsProject && !project;
-                    const meta = item.category === 'process'
-                      ? `${item.payload.operation === 'deposit' ? '沉积' : '刻蚀'} · ${STEP_LABELS[String(item.payload.model ?? '')] ?? String(item.payload.model ?? '')} · ${String(item.payload.rateMagnitude ?? '—')} µm/s · ${String(item.payload.duration ?? '—')} s`
-                      : item.category === 'material'
-                        ? `${String(item.payload.catalog ?? '')} · ${String(item.payload.material ?? '')} · ${String(item.payload.role ?? '')}`
-                        : item.category === 'flow' ? '流程引用' : '实验模板';
-                    const swatch = item.category === 'material' && isHexColor(String(item.payload.color ?? '')) ? String(item.payload.color) : '';
+                  {!libraryLoading && !libraryError && processLibraryItems.map(item => {
+                    const blocked = !project;
+                    const meta = `${item.payload.operation === 'deposit' ? '沉积' : '刻蚀'} · ${STEP_LABELS[String(item.payload.model ?? '')] ?? String(item.payload.model ?? '')} · ${String(item.payload.rateMagnitude ?? '—')} µm/s · ${String(item.payload.duration ?? '—')} s`;
                     return <div
                       key={item.itemId}
                       className="spx-library-item"
@@ -6175,28 +6321,16 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                       onDragStart={event => { event.dataTransfer.setData('text/plain', item.itemId); event.dataTransfer.effectAllowed = 'copy'; }}
                     >
                       <div className="spx-library-item-main">
-                        <strong>{swatch && <i className="spx-library-swatch" style={{ background: swatch }} aria-hidden="true" />}{item.name}{libraryDuplicateNames.has(item.name) ? '（重名）' : ''}</strong>
+                        <strong>{item.name}{libraryDuplicateNames.has(item.name) ? '（重名）' : ''}</strong>
                         <span>{meta}</span>
                       </div>
-                      {item.category === 'experiment'
-                        ? <button type="button" className="spx-link" onClick={() => { navigateZone('experiment'); setActivityLog(previous => [...previous.slice(-79), `${clockTime()}  实验模板 ${item.name} 在 04 中使用`]); }}>去 04</button>
-                        : <button type="button" className="spx-link" disabled={blocked}
-                          title={blocked ? '先在 01 创建或导入工程' : item.category === 'material' ? '插入到当前沉积步骤或工程基底材料' : '插入到流程'}
-                          onClick={() => {
-                            if (item.category === 'flow') setConfirmLibraryItemId(confirmLibraryItemId === item.itemId ? '' : item.itemId);
-                            else void insertLibraryItem(item);
-                          }}>插入</button>}
-                      {confirmLibraryItemId === item.itemId && <div className="spx-library-confirm">
-                        <span>插入方式</span>
-                        <button type="button" className="wf-button ghost" disabled={!!busy} onClick={() => void insertLibraryItem(item, 'append')}>追加</button>
-                        <button type="button" className="wf-button ghost" disabled={!!busy} onClick={() => void insertLibraryItem(item, 'replace')}>替换</button>
-                        <button type="button" className="spx-link" onClick={() => setConfirmLibraryItemId('')}>取消</button>
-                      </div>}
+                      <button type="button" className="spx-link" disabled={blocked}
+                        title={blocked ? '先在 01 创建或导入工程' : '插入到流程末尾'}
+                        onClick={() => void insertLibraryItem(item)}>插入</button>
                     </div>;
                   })}
                 </div>
-                {libraryCategory === 'material' && !project && <p className="spx-material-blocked">插入材料需要先创建工程（01）；当前只能查看预设。</p>}
-                {(libraryCategory === 'process' || libraryCategory === 'flow') && !project && <p className="spx-material-blocked">插入流程内容需要先创建工程（01）。</p>}
+                {!project && <p className="spx-material-blocked">插入工艺预设需要先创建工程（01）。</p>}
                 {materialTarget && <div className="spx-material-badge" role="status">
                   <i style={{ background: materialColor(materialCatalog, materialTarget.material) }} aria-hidden="true" />
                   <span>当前材料 <code>{materialTarget.material}</code>（预设 {materialTarget.itemName}）→ {materialTarget.target}{materialTarget.stepName ? ` · ${materialTarget.stepName}` : ''}</span>
@@ -6208,8 +6342,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 onDragOver={event => { event.preventDefault(); event.dataTransfer.dropEffect = 'copy'; }}
                 onDrop={event => {
                   event.preventDefault();
+                  if (event.dataTransfer.getData('application/x-workflow-step')) return;
                   const itemId = event.dataTransfer.getData('text/plain');
-                  const item = libraryItems.find(row => row.itemId === itemId);
+                  const item = processLibraryItems.find(row => row.itemId === itemId);
                   if (item) void insertLibraryItem(item);
                 }}
               >
@@ -6218,79 +6353,103 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                   <button type="button" className="wf-button ghost" onClick={addAuthoredStep}>＋ 添加步骤</button>
                 </div>
                 {authoredSteps.length === 0
-                  ? <div className="wf-empty">把左侧{LIBRARY_CATEGORY_SHORT[libraryCategory]}拖到这里，或点击“插入”。</div>
-                  : <table className="wf-table" aria-label="流程步骤">
-                    <thead><tr><th>#</th><th>步骤</th><th>模型</th><th>操作</th><th>材料</th><th>启用</th><th>结构</th></tr></thead>
-                    <tbody>{authoredSteps.map((step, index) => {
-                      const compiledStepId = compiledByAuthored.get(step.id);
-                      const structureRow = compiledStepId
-                        ? runStructureSteps.find(row => row.kind === 'step' && row.stepId === compiledStepId)
-                        : undefined;
-                      return (
-                        <tr key={step.id}
+                  ? <div className="wf-empty">把左侧工艺预设拖到这里，或点击“插入”。</div>
+                  : <div className="spx-flow-step-scroll">
+                    <table className="wf-table" aria-label="流程步骤">
+                      <thead><tr><th>#</th><th>步骤</th><th>操作 / 模型</th><th>时长 / 速率</th><th>启用</th><th>排序</th></tr></thead>
+                      <tbody>{authoredSteps.map((step, index) => {
+                        const rate = step.model === 'directional'
+                          ? Number(step.directionalRateMagnitude ?? 0)
+                          : Number(step.rateMagnitude ?? 0);
+                        const rateText = RATE_STEP_MODELS.has(step.model) ? `${rate} µm/s` : '—';
+                        return <tr key={step.id}
+                          draggable
                           className={`${selectedFlowStepId === step.id ? 'selected' : ''}${materialTarget && step.depositMaterial === materialTarget.material ? ' material-match' : ''}`}
-                          onClick={() => setSelectedFlowStepId(step.id)}>
+                          onClick={() => setSelectedFlowStepId(step.id)}
+                          onDragStart={event => {
+                            event.dataTransfer.setData('application/x-workflow-step', step.id);
+                            event.dataTransfer.effectAllowed = 'move';
+                          }}
+                          onDragOver={event => {
+                            if (!event.dataTransfer.types.includes('application/x-workflow-step')) return;
+                            event.preventDefault();
+                            event.dataTransfer.dropEffect = 'move';
+                          }}
+                          onDrop={event => {
+                            const dragged = event.dataTransfer.getData('application/x-workflow-step');
+                            if (!dragged) return;
+                            event.preventDefault();
+                            event.stopPropagation();
+                            reorderAuthoredStep(dragged, step.id);
+                          }}
+                        >
                           <td>{String(index + 1).padStart(2, '0')}</td>
-                          <td>{step.name}</td>
-                          <td>{STEP_LABELS[step.model] ?? step.model}</td>
-                          <td>{step.operation === 'deposit' ? '沉积' : step.operation === 'etch' ? '刻蚀' : step.operation ?? '—'}</td>
-                          <td>{step.depositMaterial ?? '—'}</td>
-                          <td>{step.enabled ? '是' : '否'}</td>
-                          <td className="wf-step-structure">
-                            <button type="button" className="wf-link"
-                              disabled={!structureRow}
-                              title={structureRow ? `在 03 查看 ${step.name} 的结构` : '先执行包含该步骤的 Segment'}
-                              onClick={event => {
-                                event.stopPropagation();
-                                if (!structureRow) return;
-                                setZone('run');
-                                setStructurePick(`${structureRow.runId}:${structureRow.stepId}`);
-                              }}>
-                              结构
-                            </button>
+                          <td className="wf-step-name" title={step.name}>{step.name}</td>
+                          <td>{step.operation === 'deposit' ? '沉积' : step.operation === 'etch' ? '刻蚀' : (step.operation ?? '—')} · {STEP_LABELS[step.model] ?? step.model}</td>
+                          <td>{`${Number(step.duration ?? 0)} s · ${rateText}`}</td>
+                          <td>{step.enabled ? '启用' : '跳过'}</td>
+                          <td className="wf-step-order">
+                            <button type="button" className="wf-step-move" aria-label={`上移 ${step.name}`} disabled={index === 0}
+                              onClick={event => { event.stopPropagation(); moveAuthoredStep(step.id, -1); }}>↑</button>
+                            <button type="button" className="wf-step-move" aria-label={`下移 ${step.name}`} disabled={index === authoredSteps.length - 1}
+                              onClick={event => { event.stopPropagation(); moveAuthoredStep(step.id, 1); }}>↓</button>
                           </td>
-                        </tr>
-                      );
-                    })}</tbody>
-                  </table>}
-                <div className="spx-step-inspector">
-                  <div className="spx-step-inspector-title">步骤参数</div>
-                  {selectedFlowStep ? <div className="spx-step-form">
-                    <label className="spx-field"><span>名称</span><input aria-label="步骤名称" value={selectedFlowStep.name} onChange={event => updateSelectedStep({ name: event.target.value })} /></label>
-                    <label className="spx-field"><span>启用</span><input aria-label="步骤启用" type="checkbox" checked={selectedFlowStep.enabled} onChange={event => updateSelectedStep({ enabled: event.target.checked })} /></label>
-                    <label className="spx-field"><span>操作</span>
-                      <select aria-label="步骤操作" value={selectedFlowStep.operation ?? 'etch'} onChange={event => updateSelectedStep({ operation: event.target.value })}>
-                        <option value="etch">刻蚀 (etch)</option>
-                        <option value="deposit">沉积 (deposit)</option>
-                      </select>
-                    </label>
-                    <label className="spx-field"><span>模型</span>
-                      <select aria-label="步骤模型" value={selectedFlowStep.model} onChange={event => updateSelectedStep({ model: event.target.value })}>
-                        {[selectedFlowStep.model, 'isotropic', 'singleParticle', 'directional', 'multiParticle', 'removeMaterial', 'planarize']
-                          .filter((value, index, list) => list.indexOf(value) === index)
-                          .map(model => <option key={model} value={model}>{STEP_LABELS[model] ?? model}</option>)}
-                      </select>
-                    </label>
-                    <label className="spx-field"><span title="duration">时长（s）</span><input aria-label="步骤时长" type="number" step="0.01" value={Number(selectedFlowStep.duration ?? 0)} onChange={event => updateSelectedStep({ duration: Number(event.target.value) })} /></label>
-                    <label className="spx-field"><span title="rateMagnitude">速率（µm/s）</span><input aria-label="步骤速率" type="number" step="0.01" value={Number(selectedFlowStep.rateMagnitude ?? selectedFlowStep.directionalRateMagnitude ?? 0)} onChange={event => updateSelectedStep({ rateMagnitude: Number(event.target.value) })} /></label>
-                    <label className="spx-field"><span title="depositMaterial">沉积材料</span>
-                      <select aria-label="步骤沉积材料" value={String(selectedFlowStep.depositMaterial ?? '')} onChange={event => updateSelectedStep({ depositMaterial: event.target.value || undefined })}>
-                        <option value="">—</option>
-                        {materialCatalog.map(row => <option key={row.name} value={row.name}>{row.name}{materialPreset === row.name ? ' · 库' : ''}{materialTarget?.material === row.name ? ' · 当前材料' : ''}</option>)}
-                      </select>
-                    </label>
-                    {(selectedFlowStep.model === 'singleParticle') && <>
-                      <label className="spx-field"><span>stickingProbability</span><input aria-label="步骤 stickingProbability" type="number" step="0.01" value={Number(selectedFlowStep.stickingProbability ?? 1)} onChange={event => updateSelectedStep({ stickingProbability: Number(event.target.value) })} /></label>
-                      <label className="spx-field"><span>sourceExponent</span><input aria-label="步骤 sourceExponent" type="number" step="0.1" value={Number(selectedFlowStep.sourceExponent ?? 1)} onChange={event => updateSelectedStep({ sourceExponent: Number(event.target.value) })} /></label>
-                    </>}
-                    <div className="spx-step-form-actions" title={selectedFlowStep.id}>
-                      <button type="button" className="wf-button ghost" onClick={() => deleteAuthoredStep(selectedFlowStep.id)}>删除步骤</button>
-                    </div>
-                  </div> : <p className="spx-help">选择左侧步骤查看并编辑参数。</p>}
-                </div>
+                        </tr>;
+                      })}</tbody>
+                    </table>
+                  </div>}
+              </div>
+
+              <div className="spx-step-inspector" aria-label="步骤参数编辑">
+                <div className="spx-step-inspector-title">步骤参数</div>
+                {selectedFlowStep ? <div className="spx-step-form">
+                  <label className="spx-field" data-field="name"><span title="name">名称</span><input aria-label="步骤名称" value={selectedFlowStep.name} onChange={event => updateSelectedStep({ name: event.target.value })} /></label>
+                  <label className="spx-field" data-field="enabled"><span title="enabled">启用</span><input aria-label="步骤启用" type="checkbox" checked={selectedFlowStep.enabled} onChange={event => updateSelectedStep({ enabled: event.target.checked })} /></label>
+                  {stepSupportsOperation && <label className="spx-field" data-field="operation"><span title="operation">操作</span>
+                    <select aria-label="步骤操作" value={selectedStepOperation} onChange={event => updateSelectedStep({ operation: event.target.value })}>
+                      <option value="etch">刻蚀 (etch)</option>
+                      <option value="deposit">沉积 (deposit)</option>
+                    </select>
+                  </label>}
+                  <label className="spx-field" data-field="model"><span title="model">模型</span>
+                    <select aria-label="步骤模型" value={selectedStepModel} onChange={event => updateSelectedStep({ model: event.target.value })}>
+                      {stepModelOptions.map(model => <option key={model} value={model}>{STEP_LABELS[model] ?? model}</option>)}
+                    </select>
+                  </label>
+                  <label className="spx-field" data-field="duration"><span title="duration">时长（s）</span><input aria-label="步骤时长" type="number" step="0.01" value={Number(selectedFlowStep.duration ?? 0)} onChange={event => updateSelectedStep({ duration: Number(event.target.value) })} /></label>
+                  {stepSupportsRate && <label className="spx-field" data-field="rate"><span title={selectedRateField}>速率（µm/s）</span><input aria-label="步骤速率" type="number" step="0.01" value={selectedRateValue} onChange={event => updateSelectedStep({ [selectedRateField]: Number(event.target.value) })} /></label>}
+                  {stepSupportsRateMode && <label className="spx-field" data-field="rateMode"><span title="rateMode">速率模式</span>
+                    <select aria-label="步骤速率模式" value={String(selectedFlowStep.rateMode ?? 'uniform')} disabled={selectedStepOperation !== 'etch'} onChange={event => updateSelectedStep({ rateMode: event.target.value })}>
+                      <option value="uniform">均匀 (uniform)</option>
+                      {selectedStepOperation === 'etch' && <option value="material">按材料 (material)</option>}
+                    </select>
+                  </label>}
+                  {stepSupportsDepositMaterial && <label className="spx-field" data-field="depositMaterial"><span title="depositMaterial">沉积材料</span>
+                    <select aria-label="步骤沉积材料" value={String(selectedFlowStep.depositMaterial ?? '')} onChange={event => updateSelectedStep({ depositMaterial: event.target.value || undefined })}>
+                      <option value="">—</option>
+                      {materialCatalog.map(row => <option key={row.name} value={row.name}>{row.name}{materialPreset === row.name ? ' · 库' : ''}{materialTarget?.material === row.name ? ' · 当前材料' : ''}</option>)}
+                    </select>
+                  </label>}
+                  {stepShowsParticleFields && <>
+                    <label className="spx-field" data-field="stickingProbability"><span title="stickingProbability">粘附系数</span><input aria-label="步骤 stickingProbability" type="number" step="0.01" value={Number(selectedFlowStep.stickingProbability ?? 1)} onChange={event => updateSelectedStep({ stickingProbability: Number(event.target.value) })} /></label>
+                    <label className="spx-field" data-field="sourceExponent"><span title="sourceExponent">源指数</span><input aria-label="步骤 sourceExponent" type="number" step="0.1" value={Number(selectedFlowStep.sourceExponent ?? 1)} onChange={event => updateSelectedStep({ sourceExponent: Number(event.target.value) })} /></label>
+                  </>}
+                  <div className="spx-step-form-actions" title={selectedFlowStep.id}>
+                    {compiledByAuthored.get(selectedFlowStep.id) && <button type="button" className="wf-button ghost"
+                      disabled={!runStructureSteps.find(row => row.kind === 'step' && row.stepId === compiledByAuthored.get(selectedFlowStep.id))}
+                      title="在 03 查看该步骤的结构"
+                      onClick={() => {
+                        const compiledStepId = compiledByAuthored.get(selectedFlowStep.id);
+                        const row = runStructureSteps.find(item => item.kind === 'step' && item.stepId === compiledStepId);
+                        if (!row) return;
+                        setZone('run');
+                        setStructurePick(`${row.runId}:${row.stepId}`);
+                      }}>查看结构</button>}
+                    <button type="button" className="wf-button ghost" onClick={() => deleteAuthoredStep(selectedFlowStep.id)}>删除步骤</button>
+                  </div>
+                </div> : <p className="spx-help spx-step-empty">选择步骤后编辑参数</p>}
               </div>
             </div>
-
             <details className="spx-advanced">
               <summary>模板（可选）</summary>
               <div className="spx-advanced-body">
@@ -6426,6 +6585,12 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             {routeStale && <span className="wf-rerun">流程已变更，现有 Segment 待重跑</span>}
             {needsRemeasure && <span className="wf-rerun">测量已失效，需重新测量</span>}
           </div>}
+          {compileSkippedSteps.length > 0 && <div className="wf-skip-note" role="status" aria-label="已跳过步骤">
+            已跳过 {compileSkippedSteps.length} 个未启用步骤：{compileSkippedText}
+          </div>}
+          {compileMissingSteps.length > 0 && <div className="wf-block-reason" role="alert" aria-label="编译缺少步骤">
+            编译结果缺少步骤 {compileMissingText}，已阻止创建 Route
+          </div>}
           {(compileStale || routeStale) && <div className="wf-block-reason" role="alert" aria-label="执行禁用原因">
             {compileStale ? '编译已过期，先重新编译并重建 Route。' : 'Route 基于旧 Compile，先重新编译并重建 Route。'}
           </div>}
@@ -6435,7 +6600,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               <strong>结构</strong>
               {structureSelection
                 ? <span className="wf-structure-step">当前：{structureSelection.label}</span>
-                : <span className="wf-muted">{route ? '执行 Segment 后生成结构时间轴' : '尚未创建 Route'}</span>}
+                : <span className="wf-muted">{route ? '待执行步骤以灰色显示' : '尚未创建 Route'}</span>}
               <span className="wf-muted">{structureDimension}D · µm</span>
             </div>
             {runStructureSteps.length > 0 && <div className="wf-structure-timeline" role="tablist" aria-label="结构步骤时间轴">
@@ -6445,17 +6610,19 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 return <Fragment key={key}>
                   {index > 0 && <span className="wf-step-chip-sep" aria-hidden="true">→</span>}
                   <button type="button" role="tab" aria-selected={active}
-                    className={`wf-step-chip${active ? ' active' : ''}${row.kind === 'initial' ? ' initial' : ''}`}
+                    className={`wf-step-chip${active ? ' active' : ''}${row.kind === 'initial' ? ' initial' : ''}${row.executed ? '' : ' pending'}`}
                     data-step-id={row.stepId} data-run-id={row.runId} data-segment-id={row.segmentId}
-                    title={`${row.label} · ${row.stepId} · ${row.runId}`}
+                    data-kind={row.kind} data-executed={row.executed ? 'true' : 'false'}
+                    title={`${row.label} · ${row.stepId}${row.executed ? ` · ${row.runId}` : ` · ${row.pendingReason ?? '待执行'}`}`}
                     onClick={() => setStructurePick(key)}>
                     <span className="wf-step-chip-index">{String(index + 1).padStart(2, '0')}</span>
                     <span className="wf-step-chip-label">{row.label}</span>
+                    {!row.executed && <span className="wf-step-chip-state">{row.pendingReason ?? '待执行'}</span>}
                   </button>
                 </Fragment>;
               })}
             </div>}
-            {structureSelection && structureDimension === 3
+            {structureSelection && structureSelection.executed && structureDimension === 3
               ? <div className="wf-structure-body wf-structure-body--3d">
                 <div className="wf-structure-3d">
                   <WorkflowViewer3D
@@ -6535,11 +6702,13 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 : <div className="wf-structure-empty">
                   <div className="wf-empty">
                     {structureSelection
-                      ? structureLoading
-                        ? '结构快照加载中…'
-                        : structureError
-                          ? `暂无结构快照：${structureError}`
-                          : '结构视图准备中…'
+                      ? !structureSelection.executed
+                        ? `该步骤尚未执行（${structureSelection.pendingReason ?? '待执行'}），执行对应 Segment 后显示结构。`
+                        : structureLoading
+                          ? '结构快照加载中…'
+                          : structureError
+                            ? `暂无结构快照：${structureError}`
+                            : '结构视图准备中…'
                       : segment?.status === 'running'
                         ? 'Segment 运行中，完成后显示结构。'
                         : route
@@ -7362,24 +7531,13 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
           </div>
         </section>
 
-        <aside className="spx-right">
-          <div className="spx-panel-title"><span>属性</span></div>
-          <div className="spx-props">
-            {propertyRows.map(row => <div className="spx-prop" key={row.label} title={row.title}><span>{row.label}</span><code>{row.value}</code></div>)}
-          </div>
-          <div className="spx-panel-title"><span>工作流</span></div>
-          <div className="spx-props">
-            <div className="spx-prop" title={health?.activeRunId ?? undefined}><span>活动运行</span><code>{health?.activeRunId ? '已记录' : '—'}</code></div>
-            <div className="spx-prop"><span>ViennaPS</span><code>{health?.viennaps ?? '—'}</code></div>
-            <div className="spx-prop"><span>ViennaLS</span><code>{health?.viennals ?? '—'}</code></div>
-          </div>
-        </aside>
       </div>
 
       <footer className="spx-statusbar">
         <span>ViennaPS Workbench</span>
         <span>ViennaPS {health?.viennaps ?? '—'}</span>
         <span title={compile?.compileId ?? undefined}>Compile {compile ? (compileStale ? '需重新编译' : '已编译') : '—'}</span>
+        <span title={compile?.bindingId ?? undefined}>绑定 {compile?.bindingId ? '已记录' : '—'}</span>
         <span title={segment?.runId ?? undefined}>Run {segment?.runId ? statusLabel(segment.status) : '—'}</span>
         <span className="spx-status-right">{busy ? `${busy} running…` : 'localhost'}</span>
       </footer>

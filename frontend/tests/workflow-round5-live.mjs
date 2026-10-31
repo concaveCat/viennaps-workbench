@@ -226,7 +226,7 @@ try {
   await page.locator('.wf-step-chip').first().click();
   await page.waitForTimeout(300);
   assert.equal(await page.locator('.wf-marker').count(), 0, 'the marker must hide on another step');
-  await page.locator('.wf-step-chip').last().click();
+  await page.locator('.wf-step-chip[data-executed="true"]').last().click();
   await page.waitForTimeout(300);
   assert.ok(await page.locator('.wf-marker').count() >= 1, 'the marker returns on its own step');
 

@@ -315,8 +315,9 @@ try {
 
   // ---- 02 step row "结构" jumps back to the same step ---------------------
   await page.getByRole('button', { name: '02 流程', exact: true }).click();
-  const stepRow = page.locator('table[aria-label="流程步骤"] tbody tr').filter({ hasText: 'etch' }).first();
-  const structureButton = stepRow.getByRole('button', { name: '结构' });
+  const stepRow = page.locator('table[aria-label="流程步骤"] tbody tr').first();
+  await stepRow.click();
+  const structureButton = page.locator('.spx-step-inspector').getByRole('button', { name: '查看结构' });
   await structureButton.waitFor();
   assert.equal(await structureButton.isDisabled(), false, 'structure button must be enabled for an executed step');
   await page.screenshot({ path: screenshot.replace(/\.png$/, '-02.png'), fullPage: true });

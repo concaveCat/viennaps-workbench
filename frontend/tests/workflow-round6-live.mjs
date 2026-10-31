@@ -485,15 +485,15 @@ try {
   await page.waitForFunction(() => document.querySelector('.spx-doc-header h1')?.textContent === '流程编辑');
   assert.equal(await page.locator('.spx-library-view').count(), 0, 'the breadcrumb returns to the flow editor');
 
-  // ---- G/H: 02 insert source is Chinese and really filters ---------------
+  // ---- G/H: 02 insert source is process-only; other categories stay in 库 --
   await openProject('Round6 空白');
   await openZone('02 流程');
-  const tabs = page.locator('.spx-library-tabs button');
-  await tabs.first().waitFor();
-  assert.deepEqual((await tabs.allInnerTexts()).map(text => text.replace(/[\s\d]+/g, '')), ['材料', '工艺', '流程', '实验']);
-  await tabs.filter({ hasText: '工艺' }).click();
-  await page.waitForFunction(() => document.querySelector('.spx-library-category-head strong')?.textContent === '工艺库');
-  assert.match(await page.locator('.spx-flow-steps').innerText(), /把左侧工艺拖到这里/);
+  await page.locator('.spx-library-browser').waitFor();
+  assert.equal(await page.locator('.spx-library-tabs').count(), 0, '02 must not show category tabs');
+  const insertSource = page.locator('.spx-library-browser');
+  assert.match(await insertSource.innerText(), /工艺预设/);
+  assert.doesNotMatch(await insertSource.innerText(), /材料库|流程库|实验库/);
+  assert.match(await page.locator('.spx-flow-steps').innerText(), /把左侧工艺预设拖到这里/);
 
   // ---- H: a single 06 CTA ------------------------------------------------
   await openZone('06 报告');
