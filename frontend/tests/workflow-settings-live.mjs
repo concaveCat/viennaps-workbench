@@ -86,6 +86,11 @@ function assertSettingsPayload(payload, label) {
   for (const key of STORAGE_KEYS.slice(1)) {
     assert.ok(Number.isFinite(payload.storage[key]), `${label}: storage.${key} must be a number`);
   }
+  assert.ok(payload.defaults && typeof payload.defaults === 'object', `${label}: defaults key is missing`);
+  assert.ok(Number.isInteger(payload.defaults.solverTimeoutSeconds)
+    && payload.defaults.solverTimeoutSeconds >= 5
+    && payload.defaults.solverTimeoutSeconds <= 86400,
+    `${label}: defaults.solverTimeoutSeconds must be an integer in 5..86400`);
   assert.ok(payload.versions && typeof payload.versions === 'object', `${label}: versions key is missing`);
   for (const key of ['viennaps', 'viennals']) {
     assert.ok(key in payload.versions, `${label}: versions.${key} is missing`);
@@ -110,13 +115,16 @@ async function openSettings(page) {
   await dialog.locator('[aria-label="设置 maxDataGiB"]').waitFor();
   assert.equal(await page.locator('[role="dialog"][aria-label="设置"]').count(), 1,
     'exactly one 设置 dialog must be open');
-  assert.equal(await dialog.locator('input[aria-label^="设置 "]').count(), LIMIT_KEYS.length,
-    `the 设置 dialog must expose ${LIMIT_KEYS.length} limit inputs`);
+  assert.equal(await dialog.locator('input[aria-label^="设置 "]').count(), LIMIT_KEYS.length + 1,
+    `the 设置 dialog must expose ${LIMIT_KEYS.length} limit inputs and the solver timeout default`);
   return dialog;
 }
 
 async function restoreOriginal(limit, baseline) {
-  const body = { limits: { maxDataGiB: limit.source === 'settings' ? limit.value : null } };
+  const body = {
+    limits: { maxDataGiB: limit.source === 'settings' ? limit.value : null },
+    defaults: { solverTimeoutSeconds: baseline.defaults.solverTimeoutSeconds },
+  };
   const response = await putSettings(body);
   assert.equal(response.status, 200,
     `restore PUT returned ${response.status}: ${JSON.stringify(response.payload).slice(0, 400)}`);
@@ -125,6 +133,8 @@ async function restoreOriginal(limit, baseline) {
   assertSettingsPayload(current.payload, 'restore GET');
   assert.equal(current.payload.limits.maxDataGiB.value, limit.value,
     `restored maxDataGiB must be ${limit.value}, got ${current.payload.limits.maxDataGiB.value}`);
+  assert.equal(current.payload.defaults.solverTimeoutSeconds, baseline.defaults.solverTimeoutSeconds,
+    `restoring maxDataGiB must restore solverTimeoutSeconds ${baseline.defaults.solverTimeoutSeconds}`);
   for (const key of LIMIT_KEYS.filter(item => item !== 'maxDataGiB')) {
     assert.equal(current.payload.limits[key].value, baseline.limits[key].value,
       `restoring maxDataGiB must not change ${key}`);
@@ -150,6 +160,8 @@ let baseline = null;
 let original = null;
 let edited = null;
 let restored = null;
+let originalSolver = null;
+let editedSolver = null;
 let rejection = null;
 let needsRestore = false;
 let failure = null;
@@ -163,6 +175,8 @@ try {
   baseline = first.payload;
   original = { ...baseline.limits.maxDataGiB };
   edited = nextMaxDataGiB(original);
+  originalSolver = baseline.defaults.solverTimeoutSeconds;
+  editedSolver = originalSolver === 1200 ? 600 : 1200;
 
   // 2. UI: 文件 → 设置… exposes the dialog and all five inputs.
   browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
@@ -182,8 +196,12 @@ try {
   const input = dialog.locator('[aria-label="设置 maxDataGiB"]');
   assert.equal(Number(await input.inputValue()), original.value,
     'the dialog must start from the effective maxDataGiB');
+  const solverInput = dialog.locator('[aria-label="设置 solverTimeoutSeconds"]');
+  assert.equal(Number(await solverInput.inputValue()), originalSolver,
+    'the dialog must start from the effective solverTimeoutSeconds');
   needsRestore = true;
   await input.fill(String(edited));
+  await solverInput.fill(String(editedSolver));
   await dialog.getByRole('button', { name: '保存设置', exact: true }).click();
   await dialog.getByText(/已保存/).waitFor();
 
@@ -194,6 +212,8 @@ try {
     `GET must reflect the saved maxDataGiB ${edited}`);
   assert.equal(afterSave.payload.limits.maxDataGiB.source, 'settings',
     'a saved maxDataGiB must report source=settings');
+  assert.equal(afterSave.payload.defaults.solverTimeoutSeconds, editedSolver,
+    `GET must reflect the saved solverTimeoutSeconds ${editedSolver}`);
   for (const key of LIMIT_KEYS.filter(item => item !== 'maxDataGiB')) {
     assert.equal(afterSave.payload.limits[key].value, baseline.limits[key].value,
       `saving maxDataGiB must not change ${key}`);
@@ -206,6 +226,9 @@ try {
   await persisted.waitFor();
   assert.equal(await persisted.inputValue(), String(edited),
     `the dialog must show the persisted maxDataGiB ${edited} after reload`);
+  const persistedSolver = dialog.locator('[aria-label="设置 solverTimeoutSeconds"]');
+  assert.equal(await persistedSolver.inputValue(), String(editedSolver),
+    `the dialog must show the persisted solverTimeoutSeconds ${editedSolver} after reload`);
   await dialog.getByRole('button', { name: '关闭', exact: true }).click();
   await dialog.waitFor({ state: 'detached' });
   assert.deepEqual(pageErrors, []);
@@ -271,6 +294,9 @@ if (failure !== null) {
     },
     editedMaxDataGiB: edited,
     restoredMaxDataGiB: restored,
+    originalSolverTimeoutSeconds: originalSolver,
+    editedSolverTimeoutSeconds: editedSolver,
+    restoredSolverTimeoutSeconds: baseline.defaults.solverTimeoutSeconds,
     rejection,
   }));
 }
