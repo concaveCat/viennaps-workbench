@@ -14,6 +14,51 @@ import WorkflowViewer3D from './viewer3d/WorkflowViewer3D';
 import type { Viewer3DMarker, Viewer3DStats } from './viewer3d/types';
 
 type Health = { status: string; applicationVersion?: string; viennaps?: string; viennals?: string; activeRunId?: string | null };
+/** Global settings contract: GET/PUT /api/settings. */
+type SettingsLimitKey = 'maxDataGiB' | 'artifactLimitMiB' | 'rssLimitMiB' | 'maxLogMiB' | 'minFreeGiB';
+type SettingsLimitSource = 'default' | 'env' | 'settings';
+type SettingsLimit = {
+  value: number;
+  source: SettingsLimitSource;
+  default: number;
+  minimum: number;
+  maximum: number | null;
+  envVariable?: string | null;
+  envValue?: number | null;
+  unit?: string;
+  label?: string;
+};
+type SettingsStorage = {
+  dataDirectory: string;
+  usedBytes: number;
+  freeBytes: number;
+  totalBytes: number;
+  runs: number;
+  projects: number;
+  domainStates: number;
+  gdsAssets: number;
+  csvAssets: number;
+};
+type SettingsPayload = {
+  schemaVersion: number;
+  limits: Record<SettingsLimitKey, SettingsLimit>;
+  storage: SettingsStorage;
+  versions: { viennaps?: string; viennals?: string };
+};
+type SettingsDraft = Record<SettingsLimitKey, string>;
+
+const SETTINGS_LIMIT_KEYS: SettingsLimitKey[] = ['maxDataGiB', 'artifactLimitMiB', 'rssLimitMiB', 'maxLogMiB', 'minFreeGiB'];
+const SETTINGS_LIMIT_FALLBACK: Record<SettingsLimitKey, { label: string; unit: string }> = {
+  maxDataGiB: { label: '数据目录上限', unit: 'GiB' },
+  artifactLimitMiB: { label: '单产物上限', unit: 'MiB' },
+  rssLimitMiB: { label: '进程内存上限', unit: 'MiB' },
+  maxLogMiB: { label: '日志上限', unit: 'MiB' },
+  minFreeGiB: { label: '最小剩余空间', unit: 'GiB' },
+};
+const SETTINGS_SOURCE_LABEL: Record<SettingsLimitSource, string> = { settings: '设置', env: '环境变量', default: '默认' };
+const EMPTY_SETTINGS_DRAFT: SettingsDraft = {
+  maxDataGiB: '', artifactLimitMiB: '', rssLimitMiB: '', maxLogMiB: '', minFreeGiB: '',
+};
 type GdsAsset = { assetId: string; fileName: string };
 type ProjectStep = {
   id: string; name: string; model: string; operation?: string; enabled: boolean;
@@ -1205,6 +1250,49 @@ function errorText(payload: unknown): string {
   return translateBackendError(text);
 }
 
+/** 422 detail is a list of {path,message}; the dialog shows the first message. */
+function firstValidationMessage(payload: unknown): string {
+  const detail = payload && typeof payload === 'object' ? (payload as { detail?: unknown }).detail : null;
+  if (Array.isArray(detail) && detail.length > 0) {
+    const first = detail[0] as unknown;
+    if (first && typeof first === 'object') {
+      const record = first as { message?: unknown; msg?: unknown };
+      return String(record.message ?? record.msg ?? JSON.stringify(first));
+    }
+    return String(first);
+  }
+  return errorText(payload);
+}
+
+async function settingsRequest(init?: RequestInit): Promise<SettingsPayload> {
+  const response = await fetch('/api/settings', init);
+  const text = await response.text();
+  let payload: unknown = text;
+  try { payload = text ? JSON.parse(text) : {}; } catch { /* keep text */ }
+  if (!response.ok) throw new Error(firstValidationMessage(payload));
+  return payload as SettingsPayload;
+}
+
+function settingsDraftFrom(limits: SettingsPayload['limits']): SettingsDraft {
+  const draft = { ...EMPTY_SETTINGS_DRAFT };
+  for (const key of SETTINGS_LIMIT_KEYS) draft[key] = String(limits[key]?.value ?? '');
+  return draft;
+}
+
+/** Human-readable bytes for the read-only storage panel. */
+function formatBytes(bytes: number): string {
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'];
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  let value = bytes;
+  let index = 0;
+  while (value >= 1024 && index < units.length - 1) {
+    value /= 1024;
+    index += 1;
+  }
+  const rounded = index === 0 || value >= 100 ? Math.round(value) : Math.round(value * 10) / 10;
+  return `${rounded} ${units[index]}`;
+}
+
 /**
  * Backend conflicts are English by design (they are API codes). The UI never
  * shows them verbatim: known ones are translated, the rest get a Chinese prefix
@@ -2095,6 +2183,14 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     engine: 'cpu', seed: 7, timeout: 60, raysPerPoint: 16, cpuThreads: 1,
   });
   const [aboutOpen, setAboutOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsData, setSettingsData] = useState<SettingsPayload | null>(null);
+  const [settingsDraft, setSettingsDraft] = useState<SettingsDraft>(EMPTY_SETTINGS_DRAFT);
+  const [settingsLoading, setSettingsLoading] = useState(false);
+  const [settingsSaving, setSettingsSaving] = useState<'save' | 'reset' | null>(null);
+  const [settingsError, setSettingsError] = useState('');
+  const [settingsNotice, setSettingsNotice] = useState('');
+  const settingsLoadSeq = useRef(0);
   const [projectState, setProjectState] = useState<ProjectWorkflowState>(emptyWorkflowState);
   const [stateNotice, setStateNotice] = useState('');
   const [restoreNotice, setRestoreNotice] = useState('');
@@ -2803,16 +2899,138 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     resetToStart();
   };
 
+  /** Mirror the backend limit rules so the draft fails fast and visibly. */
+  const settingsFieldError = (key: SettingsLimitKey): string => {
+    const limit = settingsData?.limits[key];
+    if (!limit) return '';
+    const fallback = SETTINGS_LIMIT_FALLBACK[key];
+    const label = limit.label || fallback.label;
+    const unit = limit.unit || fallback.unit;
+    const raw = (settingsDraft[key] ?? '').trim();
+    if (!/^-?\d+$/.test(raw)) return `${label} 必须是整数`;
+    const value = Number(raw);
+    // minFreeGiB is a floor: the env value is the smallest value the backend
+    // will accept, not a cap like the other four limits.
+    const floor = key === 'minFreeGiB' && limit.envValue != null
+      ? Math.max(limit.minimum, limit.envValue)
+      : limit.minimum;
+    if (!Number.isInteger(value) || value < floor) return `${label} 不能小于 ${floor} ${unit}`;
+    if (limit.maximum != null && value > limit.maximum) return `${label} 不能大于 ${limit.maximum} ${unit}`;
+    return '';
+  };
+
+  const loadSettings = async () => {
+    const seq = settingsLoadSeq.current + 1;
+    settingsLoadSeq.current = seq;
+    setSettingsLoading(true);
+    setSettingsError('');
+    setSettingsNotice('');
+    try {
+      const payload = await settingsRequest();
+      if (settingsLoadSeq.current !== seq) return;
+      setSettingsData(payload);
+      setSettingsDraft(settingsDraftFrom(payload.limits));
+    } catch (err) {
+      if (settingsLoadSeq.current !== seq) return;
+      setSettingsData(null);
+      setSettingsDraft(EMPTY_SETTINGS_DRAFT);
+      setSettingsError(err instanceof Error ? err.message : '读取设置失败');
+    } finally {
+      if (settingsLoadSeq.current === seq) setSettingsLoading(false);
+    }
+  };
+
+  const saveSettings = async () => {
+    if (!settingsData || settingsSaving) return;
+    const invalid = SETTINGS_LIMIT_KEYS.map(key => settingsFieldError(key)).find(Boolean);
+    if (invalid) { setSettingsError(invalid); setSettingsNotice(''); return; }
+    setSettingsSaving('save');
+    setSettingsError('');
+    setSettingsNotice('');
+    try {
+      const limits: Record<SettingsLimitKey, number> = {
+        maxDataGiB: Number(settingsDraft.maxDataGiB),
+        artifactLimitMiB: Number(settingsDraft.artifactLimitMiB),
+        rssLimitMiB: Number(settingsDraft.rssLimitMiB),
+        maxLogMiB: Number(settingsDraft.maxLogMiB),
+        minFreeGiB: Number(settingsDraft.minFreeGiB),
+      };
+      const payload = await settingsRequest({
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ limits }),
+      });
+      setSettingsData(payload);
+      setSettingsDraft(settingsDraftFrom(payload.limits));
+      setSettingsNotice('已保存，对下一次 run 生效');
+    } catch (err) {
+      setSettingsError(err instanceof Error ? err.message : '保存设置失败');
+    } finally {
+      setSettingsSaving(null);
+    }
+  };
+
+  const resetSettings = async () => {
+    if (!settingsData || settingsSaving) return;
+    if (!window.confirm('将所有资源上限恢复为环境变量或默认值？')) return;
+    setSettingsSaving('reset');
+    setSettingsError('');
+    setSettingsNotice('');
+    try {
+      await settingsRequest({
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          limits: { maxDataGiB: null, artifactLimitMiB: null, rssLimitMiB: null, maxLogMiB: null, minFreeGiB: null },
+        }),
+      });
+      const payload = await settingsRequest();
+      setSettingsData(payload);
+      setSettingsDraft(settingsDraftFrom(payload.limits));
+      setSettingsNotice('已恢复默认值，对下一次 run 生效');
+    } catch (err) {
+      setSettingsError(err instanceof Error ? err.message : '恢复默认设置失败');
+    } finally {
+      setSettingsSaving(null);
+    }
+  };
+
+  // Every open starts from a fresh GET, so a closed dialog never keeps a stale
+  // draft from the previous visit.
   useEffect(() => {
-    if (!openMenu && !aboutOpen) return;
+    if (!settingsOpen) return;
+    setSettingsData(null);
+    setSettingsDraft(EMPTY_SETTINGS_DRAFT);
+    setSettingsError('');
+    setSettingsNotice('');
+    void loadSettings();
+  }, [settingsOpen]);
+
+  // Ctrl/Cmd+, is the standard preferences shortcut; it opens the same dialog
+  // as 文件 → 设置… and does not toggle it closed.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.key !== ',') return;
+      event.preventDefault();
+      setOpenMenu(null);
+      setAboutOpen(false);
+      setSettingsOpen(true);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
+
+  useEffect(() => {
+    if (!openMenu && !aboutOpen && !settingsOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
       setOpenMenu(null);
       setAboutOpen(false);
+      setSettingsOpen(false);
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [openMenu, aboutOpen]);
+  }, [openMenu, aboutOpen, settingsOpen]);
 
   // Ctrl/Cmd+S saves the current project instead of opening the browser's
   // "save page" dialog; every zone shares the same save entry point.
@@ -6493,6 +6711,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         : projectDirty
           ? '有未保存更改 · 保存'
           : `已保存${projectSavedAt ? ` · ${formatDateTime(projectSavedAt)}` : ''}`;
+  const settingsValidationError = SETTINGS_LIMIT_KEYS
+    .map(key => settingsFieldError(key))
+    .find(Boolean) ?? '';
   const renderDomainField = (label: string, key: 'gridDelta' | 'xExtent' | 'yExtent', step = '0.01', title?: string) => {
     const error = projectFormErrors[`domain.${key}`];
     // gridDelta has no backend floor beyond > 0; extents use the dimension's
@@ -6567,6 +6788,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 <button role="menuitem" disabled={!project} onClick={() => { setOpenMenu(null); exportProjectJson(); }}>导出工程 JSON…</button>
                 <button role="menuitem" onClick={() => { setOpenMenu(null); setSetupMode('new'); setDraft(prev => ({ ...prev, source: 'layout' })); gdsInput.current?.click(); }}>上传 GDS 版图…</button>
                 <button role="menuitem" onClick={() => { setOpenMenu(null); closeProject(); }}>关闭工程 / 返回开始页</button>
+                <button role="menuitem" title="Ctrl+," onClick={() => { setOpenMenu(null); setAboutOpen(false); setSettingsOpen(true); }}>设置…</button>
               </>}
               {id === 'edit' && <>
                 <button role="menuitem" onClick={() => { setOpenMenu(null); setActivityLog([]); }}>清空输出日志</button>
@@ -8640,6 +8862,88 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         <span title={segment?.runId ?? undefined}>Run {segment?.runId ? statusLabel(segment.status) : '—'}</span>
         <span className="spx-status-right">{busy ? `${busy} running…` : 'localhost'}</span>
       </footer>
+      {settingsOpen && <div className="spx-modal-backdrop" onClick={() => setSettingsOpen(false)}>
+        <div className="spx-modal spx-modal-wide" role="dialog" aria-label="设置" onClick={event => event.stopPropagation()}>
+          <div className="spx-modal-title">设置</div>
+          <div className="spx-modal-body spx-settings-body">
+            {settingsLoading && <div className="spx-settings-status">正在读取设置…</div>}
+            {settingsError && <div className="spx-settings-error" role="alert">{settingsError}</div>}
+            {settingsNotice && <div className="spx-settings-notice" role="status">{settingsNotice}</div>}
+            {settingsData && <>
+              <section className="spx-settings-section" aria-label="资源上限">
+                <div className="spx-settings-section-title">资源上限</div>
+                {SETTINGS_LIMIT_KEYS.map(key => {
+                  const limit = settingsData.limits[key];
+                  if (!limit) return null;
+                  const fallback = SETTINGS_LIMIT_FALLBACK[key];
+                  const unit = limit.unit || fallback.unit;
+                  const fieldError = settingsFieldError(key);
+                  const isFloor = key === 'minFreeGiB';
+                  const floor = isFloor && limit.envValue != null
+                    ? Math.max(limit.minimum, limit.envValue)
+                    : limit.minimum;
+                  const envBound = limit.envValue ?? (limit.source === 'env' ? limit.value : null);
+                  return <div className={`spx-settings-row${fieldError ? ' invalid' : ''}`} key={key}>
+                    <div className="spx-settings-meta">
+                      <div className="spx-settings-label">
+                        <strong>{limit.label || fallback.label}</strong>
+                        <span className={`spx-settings-source ${limit.source}`}>{SETTINGS_SOURCE_LABEL[limit.source] ?? '默认'}</span>
+                      </div>
+                      <div className="spx-settings-hint">
+                        当前有效 {limit.value} {unit} · 最小 {floor} {unit}
+                        {limit.maximum != null ? ` · 最大 ${limit.maximum} ${unit}` : ''}
+                        {limit.envVariable && envBound != null ? ` · ${isFloor ? '环境下限' : '环境上限'} ${envBound} ${unit}` : ''}
+                      </div>
+                      {limit.envVariable && <div className="spx-settings-env" title={`环境变量 ${limit.envVariable}`}>{limit.envVariable}{limit.envValue != null ? `=${limit.envValue}` : ''}</div>}
+                      {fieldError && <em className="spx-field-error">{fieldError}</em>}
+                    </div>
+                    <input
+                      aria-label={`设置 ${key}`}
+                      type="number"
+                      step="1"
+                      min={floor}
+                      max={limit.maximum ?? undefined}
+                      value={settingsDraft[key]}
+                      aria-invalid={!!fieldError}
+                      onChange={event => {
+                        setSettingsError('');
+                        setSettingsNotice('');
+                        setSettingsDraft(previous => ({ ...previous, [key]: event.target.value }));
+                      }}
+                    />
+                  </div>;
+                })}
+              </section>
+
+              <section className="spx-settings-section" aria-label="存储">
+                <div className="spx-settings-section-title">存储</div>
+                <div className="spx-settings-kv"><span>数据目录</span><code title={settingsData.storage.dataDirectory}>{settingsData.storage.dataDirectory || '—'}</code></div>
+                <div className="spx-settings-kv"><span>已用空间</span><strong>{formatBytes(settingsData.storage.usedBytes)}</strong></div>
+                <div className="spx-settings-kv"><span>可用空间</span><strong>{formatBytes(settingsData.storage.freeBytes)}</strong></div>
+                <div className="spx-settings-kv"><span>总空间</span><strong>{formatBytes(settingsData.storage.totalBytes)}</strong></div>
+                <div className="spx-settings-kv"><span>运行</span><strong>{settingsData.storage.runs}</strong></div>
+                <div className="spx-settings-kv"><span>工程</span><strong>{settingsData.storage.projects}</strong></div>
+                <div className="spx-settings-kv"><span>Domain 状态</span><strong>{settingsData.storage.domainStates}</strong></div>
+                <div className="spx-settings-kv"><span>GDS / CSV 资产</span><strong>{settingsData.storage.gdsAssets} / {settingsData.storage.csvAssets}</strong></div>
+              </section>
+
+              <section className="spx-settings-section" aria-label="运行时">
+                <div className="spx-settings-section-title">运行时</div>
+                <div className="spx-settings-kv"><span>ViennaPS</span><code>{settingsData.versions.viennaps || '—'}</code></div>
+                <div className="spx-settings-kv"><span>ViennaLS</span><code>{settingsData.versions.viennals || '—'}</code></div>
+              </section>
+            </>}
+          </div>
+          <div className="spx-modal-actions spx-settings-actions">
+            <button className="wf-button ghost" disabled={!settingsData || settingsLoading || !!settingsSaving}
+              onClick={() => void resetSettings()}>{settingsSaving === 'reset' ? '恢复中…' : '恢复默认'}</button>
+            <span className="spx-settings-actions-spacer" />
+            <button className="wf-button primary" disabled={!settingsData || settingsLoading || !!settingsSaving || !!settingsValidationError}
+              onClick={() => void saveSettings()}>{settingsSaving === 'save' ? '保存中…' : '保存设置'}</button>
+            <button className="wf-button" onClick={() => setSettingsOpen(false)}>关闭</button>
+          </div>
+        </div>
+      </div>}
       {aboutOpen && <div className="spx-modal-backdrop" onClick={() => setAboutOpen(false)}>
         <div className="spx-modal" role="dialog" aria-label="About ViennaPS Workbench" onClick={event => event.stopPropagation()}>
           <div className="spx-modal-title">About ViennaPS Workbench</div>

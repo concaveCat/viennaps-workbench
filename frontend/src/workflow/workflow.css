@@ -1242,3 +1242,65 @@ body {
   font: 11px/1.5 "Consolas", monospace; white-space: pre-wrap;
 }
 .wf-csv-format { margin-top: 6px; }
+
+/* ---------------------------------------------------------------------------
+   Global settings dialog: 文件 → 设置… (Ctrl/Cmd+,). The wide variant keeps
+   the compact 11-12px property-sheet language but gives each limit a
+   two-column row: label/effective value on the left, editable value on the
+   right. Read-only storage and runtime sections reuse the same key/value grid.
+--------------------------------------------------------------------------- */
+.spx-modal.spx-modal-wide {
+  width: min(760px, 94vw);
+  max-height: min(88vh, 820px);
+  display: flex;
+  flex-direction: column;
+}
+.spx-modal-wide .spx-modal-body { overflow: auto; min-height: 0; }
+.spx-settings-body { padding: 10px 12px; display: flex; flex-direction: column; gap: 10px; }
+.spx-settings-status { padding: 18px 6px; color: var(--spx-muted); font-size: 11px; text-align: center; }
+.spx-settings-error {
+  padding: 5px 8px; border-left: 2px solid var(--spx-red);
+  background: #fdf1f0; color: #8a2f28; font-size: 11px;
+}
+.spx-settings-notice {
+  padding: 5px 8px; border-left: 2px solid var(--spx-green);
+  background: #eef7f0; color: #1f5f34; font-size: 11px;
+}
+.spx-settings-section { border: 1px solid var(--spx-line); background: #fff; }
+.spx-settings-section-title {
+  padding: 5px 9px; background: #eef1f4; border-bottom: 1px solid var(--spx-line);
+  color: #26313a; font-size: 11px; font-weight: 600;
+}
+.spx-settings-row {
+  display: grid; grid-template-columns: minmax(0, 1fr) 148px; gap: 12px;
+  align-items: center; padding: 7px 9px; border-bottom: 1px solid var(--spx-line-soft);
+}
+.spx-settings-row:last-child { border-bottom: 0; }
+.spx-settings-row input {
+  width: 100%; height: 24px; border: 1px solid var(--spx-line); background: #fff;
+  color: var(--spx-ink); padding: 2px 5px; font-size: 11px; border-radius: 0;
+}
+.spx-settings-row.invalid input { border-color: #d08a84; background: #fdf7f6; }
+.spx-settings-meta { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.spx-settings-label { display: flex; align-items: center; gap: 6px; }
+.spx-settings-label strong { color: var(--spx-ink); font-size: 11px; font-weight: 600; }
+.spx-settings-source {
+  display: inline-block; padding: 0 5px; border: 1px solid var(--spx-line);
+  background: #f4f5f6; color: var(--spx-muted); font-size: 9px; line-height: 14px;
+}
+.spx-settings-source.settings { border-color: #9dc3e6; background: var(--spx-blue-soft); color: #0a3f73; }
+.spx-settings-source.env { border-color: #e2c489; background: #fdf4e3; color: #7a4a00; }
+.spx-settings-source.default { border-color: var(--spx-line); background: #f4f5f6; color: var(--spx-muted); }
+.spx-settings-hint { color: var(--spx-muted); font-size: 10px; line-height: 1.35; }
+.spx-settings-env { color: #7a5a20; font: 9px/1.3 "Consolas", monospace; overflow-wrap: anywhere; }
+.spx-settings-kv {
+  display: grid; grid-template-columns: 140px minmax(0, 1fr); gap: 10px;
+  align-items: baseline; padding: 4px 9px; border-bottom: 1px solid #eef1f4; font-size: 11px;
+}
+.spx-settings-kv:last-child { border-bottom: 0; }
+.spx-settings-kv span { color: var(--spx-muted); font-size: 10px; }
+.spx-settings-kv strong { color: var(--spx-ink); font-size: 11px; font-weight: 600; }
+.spx-settings-kv code { color: #26313a; font: 10px/1.35 "Consolas", monospace; overflow-wrap: anywhere; }
+.spx-settings-actions { gap: 6px; align-items: center; }
+.spx-settings-actions-spacer { flex: 1; }
+.spx-settings-actions .wf-button { margin: 0; min-width: 76px; }
