@@ -22,6 +22,17 @@ type ProjectStep = {
   rateMode?: string;
   [key: string]: unknown;
 };
+/** One `/api/specialized-models` field hint; the editor only renders label/kind. */
+type SpecializedFieldHint = { key: string; label?: string; kind?: string };
+type SpecializedModelSpec = {
+  id: string;
+  label?: string;
+  operation?: string;
+  dimensions?: number[];
+  depositMaterial?: string;
+  fields?: SpecializedFieldHint[];
+  optionalFields?: SpecializedFieldHint[];
+};
 type ProjectGeometrySource = {
   kind: 'parametric' | 'layout';
   clipId?: string;
@@ -1015,6 +1026,84 @@ function sanitizeProjectStep(step: ProjectStep, materialNames: string[]): Projec
   return next;
 }
 
+/**
+ * Parse a specialized model's `nativeParameters` draft. The backend requires a
+ * JSON object; invalid JSON or an array must never reach `updateSelectedStep`.
+ */
+function parseNativeParametersText(text: string): { value: Record<string, unknown> | null; error: string } {
+  if (!text.trim()) return { value: null, error: '参数不能为空，请填写 JSON 对象' };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : '无法解析';
+    return { value: null, error: `JSON 语法错误：${reason}` };
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { value: null, error: '必须是 JSON 对象，例如 {"rate111": 0.5}' };
+  }
+  return { value: parsed as Record<string, unknown>, error: '' };
+}
+
+/**
+ * Parse the `rateSets` draft against the strict `DirectionalRateSetV5` shape.
+ * Values are written verbatim, so the UI checks every field the model needs
+ * (non-zero 3-component direction, non-negative velocities, unique materials).
+ */
+function parseRateSetsText(text: string): { value: Array<Record<string, unknown>> | null; error: string } {
+  if (!text.trim()) return { value: null, error: 'rateSets 不能为空，请填写 JSON 数组' };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : '无法解析';
+    return { value: null, error: `JSON 语法错误：${reason}` };
+  }
+  if (!Array.isArray(parsed)) return { value: null, error: '必须是 JSON 数组，例如 [{"direction":[0,0,-1],...}]' };
+  if (parsed.length === 0) return { value: null, error: '至少需要一个 rateSet' };
+  if (parsed.length > 8) return { value: null, error: '最多 8 个 rateSet' };
+  for (let index = 0; index < parsed.length; index += 1) {
+    const entry: unknown = parsed[index];
+    const at = `第 ${index + 1} 项`;
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      return { value: null, error: `${at}必须是 JSON 对象` };
+    }
+    const row = entry as Record<string, unknown>;
+    const direction = row.direction;
+    if (!Array.isArray(direction) || direction.length !== 3
+      || direction.some(value => typeof value !== 'number' || !Number.isFinite(value))) {
+      return { value: null, error: `${at} direction 必须是 3 个数字` };
+    }
+    if (direction.every(value => Math.abs(Number(value)) <= 1e-12)) {
+      return { value: null, error: `${at} direction 不能是零向量` };
+    }
+    const velocityError = (name: string, value: unknown, required: boolean) => {
+      if (value === undefined && !required) return '';
+      if (typeof value !== 'number' || !Number.isFinite(value)) return `${at} ${name} 必须是数字`;
+      if (value < 0 || value > 2) return `${at} ${name} 必须在 0–2 µm/s`;
+      return '';
+    };
+    const directionalError = velocityError('directionalVelocity', row.directionalVelocity, true);
+    if (directionalError) return { value: null, error: directionalError };
+    const isotropicError = velocityError('isotropicVelocity', row.isotropicVelocity, false);
+    if (isotropicError) return { value: null, error: isotropicError };
+    if (row.maskMaterials !== undefined && row.maskMaterials !== null) {
+      const maskMaterials = row.maskMaterials;
+      if (!Array.isArray(maskMaterials)
+        || maskMaterials.some(name => typeof name !== 'string' || !name.trim())) {
+        return { value: null, error: `${at} maskMaterials 必须是材料名数组` };
+      }
+      if (new Set(maskMaterials).size !== maskMaterials.length) {
+        return { value: null, error: `${at} maskMaterials 不能包含重复材料` };
+      }
+    }
+    if (row.calculateVisibility !== undefined && typeof row.calculateVisibility !== 'boolean') {
+      return { value: null, error: `${at} calculateVisibility 必须是布尔值` };
+    }
+  }
+  return { value: parsed as Array<Record<string, unknown>>, error: '' };
+}
+
 function stepFromLibrary(payload: Record<string, unknown>, name: string): ProjectStep {
   const step = { ...payload } as Record<string, unknown>;
   delete step.id;
@@ -1972,6 +2061,13 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [newProjectArmed, setNewProjectArmed] = useState(false);
   const [deleteArmedId, setDeleteArmedId] = useState('');
   const [selectedFlowStepId, setSelectedFlowStepId] = useState<string | null>(null);
+  // 02 step inspector: the specialized model allowlist is fetched once; the
+  // JSON drafts stay local until their 应用 button validates them.
+  const [specializedModels, setSpecializedModels] = useState<SpecializedModelSpec[]>([]);
+  const [nativeParametersText, setNativeParametersText] = useState('');
+  const [nativeParametersError, setNativeParametersError] = useState('');
+  const [rateSetsText, setRateSetsText] = useState('');
+  const [rateSetsError, setRateSetsError] = useState('');
   const [structurePick, setStructurePick] = useState('');
   const [structureView, setStructureView] = useState<CandidateView | null>(null);
   const [structureLoading, setStructureLoading] = useState(false);
@@ -2009,6 +2105,10 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const stateSaveTimer = useRef<number | null>(null);
   const lastStateJson = useRef('');
   const restorePending = useRef(false);
+  // Incremented by an explicit Compile/Route action. A restore that started on
+  // page load must not overwrite that newer user action when it resolves late
+  // (the restored Route/Compile would be stale and disable 03).
+  const restoreEpoch = useRef(0);
 
   const projectDirty = !!project && JSON.stringify(project) !== savedProjectJson;
 
@@ -2245,6 +2345,12 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
    * collected compile never blanks the whole page.
    */
   const restoreWorkflowState = async (id: string, document?: ProjectDoc) => {
+    const epoch = restoreEpoch.current;
+    const superseded = () => epoch !== restoreEpoch.current;
+    // A Compile/Route action owns restorePending until it records the new
+    // state, so an aborted restore must not unblock the debounced state save
+    // with a half-restored projectState.
+    const abandon = (): boolean => superseded();
     let stored: ProjectWorkflowState;
     try {
       stored = await api<ProjectWorkflowState>(`/api/v1/workflow/projects/${id}/state`);
@@ -2252,6 +2358,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       restorePending.current = false;
       return;
     }
+    if (abandon()) return;
     const notices: string[] = [];
     const next: ProjectWorkflowState = {
       ...emptyWorkflowState(),
@@ -2271,6 +2378,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     if (next.routeId) {
       try {
         const data = await api<{ plan: RoutePlan }>(`/api/v1/workflow/routes/${next.routeId}`);
+        if (abandon()) return;
         restoredRoute = data.plan;
         setRoute(data.plan);
         // Resume at the planned Segment of a branch attempt (a branch Route
@@ -2328,10 +2436,12 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         if (branchCompileId) {
           if (branchCompileId !== next.compileId) {
             const branchEnvelope = await api<CompiledEnvelope>(`/api/v1/workflow/compiles/${branchCompileId}`);
+            if (abandon()) return;
             info = compileInfoFromEnvelope(branchEnvelope);
           }
           next.compileId = branchCompileId;
         }
+        if (abandon()) return;
         setCompile(info);
         // The basis is the fingerprint of the authored project at compile
         // time, so it is the only input to staleness. A definition/branch
@@ -2400,6 +2510,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         next.measurementIds = [];
       }
     }
+    if (abandon()) return;
     setProjectState(next);
     lastStateJson.current = notices.length ? '' : JSON.stringify(workflowStatePayload(next));
     restorePending.current = false;
@@ -2755,6 +2866,26 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // The specialized model allowlist never changes while the app is open, so a
+  // single fetch is enough. A failure leaves the select usable with the step's
+  // current nativeModel instead of blocking the whole inspector.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const payload = await api<{ models?: unknown }>('/api/specialized-models');
+        if (cancelled || !Array.isArray(payload.models)) return;
+        const rows = payload.models.filter((row): row is SpecializedModelSpec => (
+          !!row && typeof row === 'object' && typeof (row as { id?: unknown }).id === 'string'
+        ));
+        setSpecializedModels(rows);
+      } catch {
+        /* keep the inspector usable without catalog hints */
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
   const loadLibraryItems = async () => {
     setLibraryLoading(true);
     setLibraryError('');
@@ -3000,7 +3131,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const stepModelOptions = Array.from(new Set([selectedStepModel, ...EDITABLE_STEP_MODELS].filter(Boolean)));
   const stepSupportsOperation = OPERATION_STEP_MODELS.has(selectedStepModel);
   const stepSupportsDuration = DURATION_STEP_MODELS.has(selectedStepModel);
-  const stepSupportsRate = RATE_STEP_MODELS.has(selectedStepModel);
+  const stepSupportsRate = RATE_STEP_MODELS.has(selectedStepModel) && selectedStepModel !== 'directional';
   const stepSupportsRateMode = RATE_MODE_STEP_MODELS.has(selectedStepModel);
   const stepSupportsDepositMaterial = selectedStepOperation === 'deposit'
     && DEPOSIT_STEP_MODELS.has(selectedStepModel);
@@ -3011,6 +3142,75 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       ? selectedFlowStep?.directionalRateMagnitude ?? 0
       : selectedFlowStep?.rateMagnitude ?? 0,
   );
+  /**
+   * Model-specific payloads the generic scalar editors cannot express. The
+   * readers below only fall back to a default for display; a value is written
+   * back only when the user edits the matching field.
+   */
+  const selectedGdsMask = (() => {
+    const value = selectedFlowStep?.gdsMask;
+    return value && typeof value === 'object' && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : {};
+  })();
+  const gdsMaskNumber = (key: string, fallback: number): number => {
+    const value = selectedGdsMask[key];
+    return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+  };
+  const gdsMaskPosition = (() => {
+    const value = selectedGdsMask.position;
+    return Array.isArray(value) && value.length === 3 && value.every(entry => typeof entry === 'number' && Number.isFinite(entry))
+      ? value as [number, number, number]
+      : [0, 0, 0] as [number, number, number];
+  })();
+  const gdsMaskRetainedRegion = selectedGdsMask.retainedRegion === 'outside' ? 'outside' : 'inside';
+  const planarizeUsesStopMaterial = selectedStepModel === 'planarize'
+    && typeof selectedFlowStep?.stopMaterial === 'string';
+  const directionalUsesRateSets = selectedStepModel === 'directional'
+    && Array.isArray(selectedFlowStep?.rateSets)
+    && selectedFlowStep.rateSets.length > 0;
+  const selectedDirection = (() => {
+    const value = selectedFlowStep?.direction;
+    return Array.isArray(value) && value.length === 3
+      && value.every(entry => typeof entry === 'number' && Number.isFinite(entry))
+      ? value as [number, number, number]
+      : [0, 0, -1] as [number, number, number];
+  })();
+  const selectedNativeModel = String(selectedFlowStep?.nativeModel ?? '');
+  const specializedModelOptions = useMemo(() => {
+    if (selectedStepModel !== 'specialized') return [] as SpecializedModelSpec[];
+    const dimension = project?.dimension;
+    return specializedModels.filter(model => (
+      (!dimension || !Array.isArray(model.dimensions) || model.dimensions.includes(dimension))
+      && (!model.operation || model.operation === selectedStepOperation)
+    ));
+  }, [specializedModels, selectedStepModel, selectedStepOperation, project?.dimension]);
+  const selectedSpecializedModel = specializedModelOptions.find(model => model.id === selectedNativeModel) ?? null;
+  const stepMaterialNames = useMemo(() => materialCatalog.map(row => row.name), [materialCatalog]);
+  // Re-seed the JSON drafts when the inspected step (or its model) changes, not
+  // on every keystroke, so in-progress edits are never clobbered.
+  useEffect(() => {
+    if (selectedStepModel !== 'specialized') {
+      setNativeParametersText('');
+      setNativeParametersError('');
+      return;
+    }
+    setNativeParametersText(JSON.stringify(selectedFlowStep?.nativeParameters ?? {}, null, 2));
+    setNativeParametersError('');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedFlowStepId, selectedStepModel]);
+  useEffect(() => {
+    if (selectedStepModel !== 'directional') {
+      setRateSetsText('');
+      setRateSetsError('');
+      return;
+    }
+    setRateSetsText(directionalUsesRateSets
+      ? JSON.stringify(selectedFlowStep?.rateSets, null, 2)
+      : '');
+    setRateSetsError('');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedFlowStepId, selectedStepModel]);
   /**
    * A Route is stale when none of its attempts was built from the current
    * Compile. Branch attempts legitimately use derived Compiles, so any matching
@@ -3602,6 +3802,12 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   };
 
   const compileFlow = () => run('compile-flow', async () => {
+    restoreEpoch.current += 1;
+    // A restore may have left a fresh-looking "编译成功" summary for the
+    // previous Compile. Mark it stale before the request so anything waiting
+    // for that banner waits for *this* Compile instead of acting on the old
+    // Compile/Route pair.
+    setCompileStale(true);
     if (!project) throw new Error('先创建或导入工程');
     const steps = project.steps ?? [];
     if (!steps.length) throw new Error('流程还没有步骤，先在 02 插入或添加步骤');
@@ -3621,6 +3827,14 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setCompile(result);
     setCompileStale(false);
     setRestoreNotice('');
+    // Drop the old Route in the same commit that makes the new Compile fresh.
+    // Otherwise the success summary is visible while the previous Route is
+    // still current, and 创建 Route would take its "route already exists"
+    // shortcut and leave 03 without a Segment.
+    setRoute(null);
+    setSegment(null);
+    setMeasurement(null);
+    setProvenance(null);
     // The basis must describe the project *after* the Compile wrote its
     // authored steps (and after the server filled defaults); the pre-compile
     // closure made a 6-step template project look compiled as its old 5
@@ -3632,10 +3846,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     };
     setProject(nextProject);
     recordCompile(result.compileId, executionCompileBasis(nextProject));
-    setRoute(null);
-    setSegment(null);
-    setMeasurement(null);
-    setProvenance(null);
+    restorePending.current = false;
     // A missing enabled step is never a silent skip: say which step vanished
     // and keep 创建 Route disabled (canRoute reads the same SourceMap).
     const compiledAuthored = (result.compile.sourceMap ?? []).map(entry => entry.authoredStepId);
@@ -3689,6 +3900,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   });
 
   const createRoute = (rebuild = false) => run('route', async () => {
+    restoreEpoch.current += 1;
     if (!compile) throw new Error('先编译流程');
     if (compileStale) throw new Error('流程已修改，请重新编译');
     if (compileMissingSteps.length) {
@@ -3720,6 +3932,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setMetricDetail(null);
     setProvenance(null);
     recordRoute(result.plan, true);
+    restorePending.current = false;
     setRebuildRouteArmed(false);
     navigateZone('run');
     setActivityLog(previous => [...previous.slice(-79), `${clockTime()}  Route 已创建 · ${result.plan.segments.length} Segment`]);
@@ -4999,6 +5212,141 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     commitSteps(steps => steps.map(step => (step.id === selectedFlowStepId
       ? sanitizeProjectStep({ ...step, ...patch }, materialNames)
       : step)));
+  };
+
+  /**
+   * Mutating variant for the truly-exclusive modes (planarize cutoff vs
+   * stopMaterial, directional scalar vs rateSets): `delete` removes a key
+   * instead of leaving an `undefined` that still serializes into the step.
+   */
+  const updateSelectedStepWith = (mutate: (draft: ProjectStep) => void) => {
+    if (!selectedFlowStepId) return;
+    const materialNames = depositableMaterialNames(materialCatalog);
+    commitSteps(steps => steps.map(step => {
+      if (step.id !== selectedFlowStepId) return step;
+      const draft: ProjectStep = { ...step };
+      mutate(draft);
+      return sanitizeProjectStep(draft, materialNames);
+    }));
+  };
+
+  /**
+   * Merge one gdsMask key. The required defaults make the first edit of a step
+   * without a mask produce a complete, backend-valid GdsBooleanMaskV7 instead
+   * of a partial object that the strict model rejects.
+   */
+  const patchSelectedGdsMask = (patch: Record<string, unknown>) => {
+    updateSelectedStep({
+      gdsMask: {
+        layer: gdsMaskNumber('layer', 0),
+        datatype: gdsMaskNumber('datatype', 0),
+        unitScale: gdsMaskNumber('unitScale', 1),
+        position: [...gdsMaskPosition],
+        baseHeight: gdsMaskNumber('baseHeight', 0),
+        height: gdsMaskNumber('height', 0.1),
+        retainedRegion: gdsMaskRetainedRegion,
+        ...selectedGdsMask,
+        ...patch,
+      },
+    });
+  };
+
+  const patchSelectedGdsMaskPosition = (axis: 0 | 1 | 2, value: number) => {
+    const position: [number, number, number] = [gdsMaskPosition[0], gdsMaskPosition[1], gdsMaskPosition[2]];
+    position[axis] = value;
+    patchSelectedGdsMask({ position });
+  };
+
+  const patchSelectedDirection = (axis: 0 | 1 | 2, value: number) => {
+    const direction: [number, number, number] = [selectedDirection[0], selectedDirection[1], selectedDirection[2]];
+    direction[axis] = value;
+    updateSelectedStep({
+      direction,
+      // Scalar directional steps require all three fields; editing a direction
+      // of a hand-written step must not leave isotropicRateMagnitude absent.
+      isotropicRateMagnitude: typeof selectedFlowStep?.isotropicRateMagnitude === 'number'
+        ? selectedFlowStep.isotropicRateMagnitude : 0,
+    });
+  };
+
+  const switchPlanarizeMode = (mode: string) => {
+    updateSelectedStepWith(draft => {
+      if (mode === 'stopMaterial') {
+        delete draft.cutoffHeight;
+        if (typeof draft.stopMaterial !== 'string' || !draft.stopMaterial) {
+          draft.stopMaterial = materialCatalog.find(row => row.name === 'SiO2')?.name
+            ?? materialCatalog[0]?.name ?? 'SiO2';
+        }
+        if (typeof draft.overPolish !== 'number') draft.overPolish = 0;
+      } else {
+        delete draft.stopMaterial;
+        delete draft.overPolish;
+        if (typeof draft.cutoffHeight !== 'number') draft.cutoffHeight = 0;
+      }
+    });
+  };
+
+  const switchDirectionalMode = (mode: string) => {
+    if (mode === 'rateSets') {
+      const rateSets = [{
+        direction: [selectedDirection[0], selectedDirection[1], selectedDirection[2]],
+        directionalVelocity: typeof selectedFlowStep?.directionalRateMagnitude === 'number'
+          ? selectedFlowStep.directionalRateMagnitude : 0.02,
+        isotropicVelocity: typeof selectedFlowStep?.isotropicRateMagnitude === 'number'
+          ? selectedFlowStep.isotropicRateMagnitude : 0,
+        calculateVisibility: true,
+      }];
+      updateSelectedStepWith(draft => {
+        delete draft.direction;
+        delete draft.directionalRateMagnitude;
+        delete draft.isotropicRateMagnitude;
+        delete draft.calculateVisibility;
+        draft.rateSets = rateSets;
+      });
+      setRateSetsText(JSON.stringify(rateSets, null, 2));
+      setRateSetsError('');
+      return;
+    }
+    const first = Array.isArray(selectedFlowStep?.rateSets) && selectedFlowStep.rateSets.length > 0
+      ? selectedFlowStep.rateSets[0] as Record<string, unknown>
+      : null;
+    const firstDirection = Array.isArray(first?.direction) && first.direction.length === 3
+      && first.direction.every(entry => typeof entry === 'number' && Number.isFinite(entry))
+      ? first.direction as [number, number, number]
+      : selectedDirection;
+    updateSelectedStepWith(draft => {
+      delete draft.rateSets;
+      delete draft.calculateVisibility;
+      draft.direction = [firstDirection[0], firstDirection[1], firstDirection[2]];
+      draft.directionalRateMagnitude = typeof first?.directionalVelocity === 'number'
+        ? first.directionalVelocity
+        : typeof draft.directionalRateMagnitude === 'number' ? draft.directionalRateMagnitude : 0.02;
+      draft.isotropicRateMagnitude = typeof first?.isotropicVelocity === 'number'
+        ? first.isotropicVelocity
+        : typeof draft.isotropicRateMagnitude === 'number' ? draft.isotropicRateMagnitude : 0;
+    });
+    setRateSetsText('');
+    setRateSetsError('');
+  };
+
+  const applyNativeParametersText = () => {
+    const { value, error } = parseNativeParametersText(nativeParametersText);
+    if (error || !value) {
+      setNativeParametersError(error || '参数格式无效');
+      return;
+    }
+    setNativeParametersError('');
+    updateSelectedStep({ nativeParameters: value });
+  };
+
+  const applyRateSetsText = () => {
+    const { value, error } = parseRateSetsText(rateSetsText);
+    if (error || !value) {
+      setRateSetsError(error || 'rateSets 格式无效');
+      return;
+    }
+    setRateSetsError('');
+    updateSelectedStep({ rateSets: value });
   };
 
   const moveAuthoredStep = (stepId: string, delta: number) => {
@@ -7019,6 +7367,135 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                     <label className="spx-field" data-field="stickingProbability"><span title="stickingProbability">粘附系数</span><input aria-label="步骤 stickingProbability" type="number" step="0.01" value={Number(selectedFlowStep.stickingProbability ?? 1)} onChange={event => updateSelectedStep({ stickingProbability: Number(event.target.value) })} /></label>
                     <label className="spx-field" data-field="sourceExponent"><span title="sourceExponent">源指数</span><input aria-label="步骤 sourceExponent" type="number" step="0.1" value={Number(selectedFlowStep.sourceExponent ?? 1)} onChange={event => updateSelectedStep({ sourceExponent: Number(event.target.value) })} /></label>
                   </>}
+                  {selectedStepModel === 'gdsBoolean' && <>
+                    <label className="spx-field" data-field="booleanOperation"><span title="booleanOperation">布尔操作</span>
+                      <select aria-label="GDS 布尔操作" value={String(selectedFlowStep.booleanOperation ?? 'union')} onChange={event => updateSelectedStep({ booleanOperation: event.target.value })}>
+                        <option value="intersection">intersection · 交集</option>
+                        <option value="difference">difference · 差集</option>
+                        <option value="union">union · 并集</option>
+                      </select>
+                    </label>
+                    <label className="spx-field" data-field="applyToAll"><span title="applyToAll">应用到全部</span>
+                      <input aria-label="GDS 布尔应用到全部" type="checkbox" checked={selectedFlowStep.applyToAll !== false} onChange={event => updateSelectedStep({ applyToAll: event.target.checked })} />
+                    </label>
+                    <label className="spx-field" data-field="gdsMask.layer"><span title="gdsMask.layer">掩膜层 layer</span>
+                      <input aria-label="GDS 掩膜层 layer" type="number" min={0} max={65535} step={1} value={gdsMaskNumber('layer', 0)} onChange={event => patchSelectedGdsMask({ layer: Math.max(0, Math.trunc(Number(event.target.value) || 0)) })} />
+                    </label>
+                    <label className="spx-field" data-field="gdsMask.datatype"><span title="gdsMask.datatype">掩膜数据类型 datatype</span>
+                      <input aria-label="GDS 掩膜数据类型 datatype" type="number" min={0} max={32767} step={1} value={gdsMaskNumber('datatype', 0)} onChange={event => patchSelectedGdsMask({ datatype: Math.max(0, Math.trunc(Number(event.target.value) || 0)) })} />
+                    </label>
+                    <label className="spx-field" data-field="gdsMask.unitScale"><span title="gdsMask.unitScale">单位缩放 unitScale</span>
+                      <input aria-label="GDS 掩膜单位缩放 unitScale" type="number" min={0.000001} max={1000000} step={0.0001} value={gdsMaskNumber('unitScale', 1)} onChange={event => { const value = Number(event.target.value); patchSelectedGdsMask({ unitScale: Number.isFinite(value) && value > 0 ? value : 1 }); }} />
+                    </label>
+                    <label className="spx-field" data-field="gdsMask.baseHeight"><span title="gdsMask.baseHeight">起始高度 baseHeight（µm）</span>
+                      <input aria-label="GDS 掩膜起始高度 baseHeight（µm）" type="number" min={0} step={0.01} value={gdsMaskNumber('baseHeight', 0)} onChange={event => patchSelectedGdsMask({ baseHeight: Number(event.target.value) })} />
+                    </label>
+                    <label className="spx-field" data-field="gdsMask.height"><span title="gdsMask.height">掩膜高度 height（µm）</span>
+                      <input aria-label="GDS 掩膜高度 height（µm）" type="number" min={0} step={0.01} value={gdsMaskNumber('height', 0.1)} onChange={event => { const value = Number(event.target.value); patchSelectedGdsMask({ height: Number.isFinite(value) && value > 0 ? value : 0.1 }); }} />
+                    </label>
+                    <label className="spx-field" data-field="gdsMask.retainedRegion"><span title="gdsMask.retainedRegion">保留区域 retainedRegion</span>
+                      <select aria-label="GDS 掩膜保留区域 retainedRegion" value={gdsMaskRetainedRegion} onChange={event => patchSelectedGdsMask({ retainedRegion: event.target.value })}>
+                        <option value="inside">inside · 保留内部</option>
+                        <option value="outside">outside · 保留外部</option>
+                      </select>
+                    </label>
+                    <label className="spx-field" data-field="gdsMask.position.x"><span title="gdsMask.position[0]">位置 X（µm）</span>
+                      <input aria-label="GDS 掩膜位置 X（µm）" type="number" step={0.01} value={gdsMaskPosition[0]} onChange={event => patchSelectedGdsMaskPosition(0, Number(event.target.value))} />
+                    </label>
+                    <label className="spx-field" data-field="gdsMask.position.y"><span title="gdsMask.position[1]">位置 Y（µm）</span>
+                      <input aria-label="GDS 掩膜位置 Y（µm）" type="number" step={0.01} value={gdsMaskPosition[1]} onChange={event => patchSelectedGdsMaskPosition(1, Number(event.target.value))} />
+                    </label>
+                    <label className="spx-field" data-field="gdsMask.position.z"><span title="gdsMask.position[2]">位置 Z（µm）</span>
+                      <input aria-label="GDS 掩膜位置 Z（µm）" type="number" step={0.01} value={gdsMaskPosition[2]} onChange={event => patchSelectedGdsMaskPosition(2, Number(event.target.value))} />
+                    </label>
+                  </>}
+                  {selectedStepModel === 'planarize' && <>
+                    <label className="spx-field" data-field="planarizeMode"><span title="cutoffHeight | stopMaterial">平坦化模式</span>
+                      <select aria-label="平坦化模式" value={planarizeUsesStopMaterial ? 'stopMaterial' : 'cutoffHeight'} onChange={event => switchPlanarizeMode(event.target.value)}>
+                        <option value="cutoffHeight">按高度截止 (cutoffHeight)</option>
+                        <option value="stopMaterial">停在材料 (stopMaterial)</option>
+                      </select>
+                    </label>
+                    {!planarizeUsesStopMaterial && <label className="spx-field" data-field="cutoffHeight"><span title="cutoffHeight">截止高度 cutoffHeight（µm）</span>
+                      <input aria-label="平坦化截止高度（µm）" type="number" step={0.01} value={typeof selectedFlowStep.cutoffHeight === 'number' ? selectedFlowStep.cutoffHeight : 0} onChange={event => updateSelectedStep({ cutoffHeight: Number(event.target.value) })} />
+                    </label>}
+                    {planarizeUsesStopMaterial && <>
+                      <label className="spx-field" data-field="stopMaterial"><span title="stopMaterial">停止材料 stopMaterial</span>
+                        <select aria-label="平坦化停止材料" value={String(selectedFlowStep.stopMaterial ?? '')} onChange={event => { if (event.target.value) updateSelectedStep({ stopMaterial: event.target.value }); }}>
+                          {!stepMaterialNames.includes(String(selectedFlowStep.stopMaterial ?? '')) && <option value={String(selectedFlowStep.stopMaterial ?? '')}>{String(selectedFlowStep.stopMaterial ?? '—')}</option>}
+                          {materialCatalog.map(row => <option key={row.name} value={row.name}>{row.name} · {row.category ?? 'Generic'}</option>)}
+                        </select>
+                      </label>
+                      <label className="spx-field" data-field="overPolish"><span title="overPolish">过抛光 overPolish（µm）</span>
+                        <input aria-label="平坦化过抛光 overPolish（µm）" type="number" min={0} max={100} step={0.01} value={typeof selectedFlowStep.overPolish === 'number' ? selectedFlowStep.overPolish : 0} onChange={event => updateSelectedStep({ overPolish: Number(event.target.value) })} />
+                      </label>
+                    </>}
+                  </>}
+                  {selectedStepModel === 'removeMaterial' && <label className="spx-field" data-field="material"><span title="material">移除材料 material</span>
+                    <select aria-label="移除材料" value={String(selectedFlowStep.material ?? '')} onChange={event => { if (event.target.value) updateSelectedStep({ material: event.target.value }); }}>
+                      <option value="">—</option>
+                      {!stepMaterialNames.includes(String(selectedFlowStep.material ?? '')) && String(selectedFlowStep.material ?? '') !== '' && <option value={String(selectedFlowStep.material)}>{String(selectedFlowStep.material)}</option>}
+                      {materialCatalog.map(row => <option key={row.name} value={row.name}>{row.name} · {row.category ?? 'Generic'}</option>)}
+                    </select>
+                  </label>}
+                  {selectedStepModel === 'specialized' && <>
+                    <label className="spx-field" data-field="nativeModel"><span title="nativeModel">原生模型 nativeModel</span>
+                      <select aria-label="专用模型 nativeModel" value={selectedNativeModel} onChange={event => updateSelectedStep({ nativeModel: event.target.value })}>
+                        {!selectedNativeModel && <option value="">选择原生模型</option>}
+                        {selectedNativeModel && !specializedModelOptions.some(model => model.id === selectedNativeModel)
+                          && <option value={selectedNativeModel}>{selectedNativeModel}</option>}
+                        {specializedModelOptions.map(model => <option key={model.id} value={model.id}>{model.label ? `${model.label} · ${model.id}` : model.id}</option>)}
+                      </select>
+                    </label>
+                    {specializedModelOptions.length === 0 && <em className="spx-field-error">当前维度与操作没有可用的专用模型</em>}
+                    {!!selectedSpecializedModel && ((selectedSpecializedModel.fields?.length ?? 0) > 0 || (selectedSpecializedModel.optionalFields?.length ?? 0) > 0) && <div className="spx-help" aria-label="专用模型字段说明">
+                      {(selectedSpecializedModel.fields ?? []).map(field => <div key={field.key}>{field.label ?? field.key} · {field.kind ?? 'value'}</div>)}
+                      {(selectedSpecializedModel.optionalFields ?? []).map(field => <div key={`optional-${field.key}`}>{field.label ?? field.key} · {field.kind ?? 'value'}（可选）</div>)}
+                    </div>}
+                    <label className="spx-field" data-field="nativeParameters"><span title="nativeParameters">nativeParameters（JSON 对象）</span>
+                      <textarea aria-label="专用模型参数 JSON" value={nativeParametersText} spellCheck={false} onChange={event => setNativeParametersText(event.target.value)} />
+                    </label>
+                    {nativeParametersError && <em className="spx-field-error">{nativeParametersError}</em>}
+                    <div className="spx-step-form-actions">
+                      <button type="button" className="wf-button" onClick={applyNativeParametersText}>应用</button>
+                      <span className="wf-muted">仅写入合法的 JSON 对象</span>
+                    </div>
+                  </>}
+                  {selectedStepModel === 'directional' && <>
+                    <label className="spx-field" data-field="directionalMode"><span title="mode">速率模式</span>
+                      <select aria-label="定向速率模式" value={directionalUsesRateSets ? 'rateSets' : 'scalar'} onChange={event => switchDirectionalMode(event.target.value)}>
+                        <option value="scalar">标量（direction + 速率）</option>
+                        <option value="rateSets">rateSets（多速率组）</option>
+                      </select>
+                    </label>
+                    {!directionalUsesRateSets && <>
+                      <label className="spx-field" data-field="direction.x"><span title="direction[0]">方向 X</span>
+                        <input aria-label="定向方向 X" type="number" step={0.01} value={selectedDirection[0]} onChange={event => patchSelectedDirection(0, Number(event.target.value))} />
+                      </label>
+                      <label className="spx-field" data-field="direction.y"><span title="direction[1]">方向 Y</span>
+                        <input aria-label="定向方向 Y" type="number" step={0.01} value={selectedDirection[1]} onChange={event => patchSelectedDirection(1, Number(event.target.value))} />
+                      </label>
+                      <label className="spx-field" data-field="direction.z"><span title="direction[2]">方向 Z</span>
+                        <input aria-label="定向方向 Z" type="number" step={0.01} value={selectedDirection[2]} onChange={event => patchSelectedDirection(2, Number(event.target.value))} />
+                      </label>
+                      <label className="spx-field" data-field="directionalRateMagnitude"><span title="directionalRateMagnitude">定向速率（µm/s）</span>
+                        <input aria-label="定向速率（µm/s）" type="number" min={0} max={2} step={0.01} value={Number(selectedFlowStep.directionalRateMagnitude ?? 0.02)} onChange={event => updateSelectedStep({ directionalRateMagnitude: Number(event.target.value) })} />
+                      </label>
+                      <label className="spx-field" data-field="isotropicRateMagnitude"><span title="isotropicRateMagnitude">各向同性速率（µm/s）</span>
+                        <input aria-label="各向同性速率（µm/s）" type="number" min={0} max={2} step={0.01} value={Number(selectedFlowStep.isotropicRateMagnitude ?? 0)} onChange={event => updateSelectedStep({ isotropicRateMagnitude: Number(event.target.value) })} />
+                      </label>
+                    </>}
+                    {directionalUsesRateSets && <>
+                      <label className="spx-field" data-field="rateSets"><span title="rateSets">rateSets（JSON 数组）</span>
+                        <textarea aria-label="rateSets JSON" value={rateSetsText} spellCheck={false} onChange={event => setRateSetsText(event.target.value)} />
+                      </label>
+                      {rateSetsError && <em className="spx-field-error">{rateSetsError}</em>}
+                      <div className="spx-step-form-actions">
+                        <button type="button" className="wf-button" onClick={applyRateSetsText}>应用</button>
+                        <span className="wf-muted">direction 3 个数字；速率 0–2 µm/s</span>
+                      </div>
+                    </>}
+                  </>}
                   <div className="spx-step-form-actions" title={selectedFlowStep.id}>
                     {compiledByAuthored.get(selectedFlowStep.id) && <button type="button" className="wf-button ghost"
                       disabled={!runStructureSteps.find(row => row.kind === 'step' && row.stepId === compiledByAuthored.get(selectedFlowStep.id))}
@@ -7032,6 +7509,13 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                       }}>查看结构</button>}
                     <button type="button" className="wf-button ghost" onClick={() => deleteAuthoredStep(selectedFlowStep.id)}>删除步骤</button>
                   </div>
+                  <details className="spx-advanced">
+                    <summary>高级字段（JSON）</summary>
+                    <div className="spx-advanced-body">
+                      <p className="spx-help">只读视图：编辑器未覆盖的后端字段也会显示在这里，渲染与展开都不会写入工程。</p>
+                      <pre aria-label="步骤字段 JSON" style={{ margin: 0, maxHeight: 220, overflow: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word', font: '10px/1.5 "Consolas", monospace' }}>{JSON.stringify(selectedFlowStep, null, 2)}</pre>
+                    </div>
+                  </details>
                 </div> : <p className="spx-help spx-step-empty">选择步骤后编辑参数</p>}
               </div>
             </div>
