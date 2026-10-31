@@ -28,12 +28,20 @@ class RateContract(unittest.TestCase):
             for name,value in [('Si',-1.),('Si',True),('UnknownMaterial',.1),('Si',float('inf')),('Si',3.)]:
                 q=copy.deepcopy(p);q['steps'][0]['materialRates'][name]=value
                 with self.assertRaises(ProjectInputError):validate_project(q)
+            # Material rate tables are now valid for deposition as well as etch.
+            # The deposited material is created by duplicateTopLevelSet, so it is
+            # a legal table key even though it is absent at the step start.
             q=copy.deepcopy(p);q['steps'][0].update(operation='deposit',depositMaterial='W')
-            with self.assertRaises(ProjectInputError):validate_project(q)
+            q['steps'][0]['materialRates']['W']=.1
+            validate_project(q)
             q=copy.deepcopy(p)
             q['geometry']={'kind':'trench','width':1.6,'depth':1.,'taperAngle':0.,'maskHeight':.6,'maskTaperAngle':0.,'substrateMaterial':'Si','maskMaterial':'UnknownMaterial'}
             with self.assertRaises(ProjectInputError):validate_project(q)
             q['geometry']['maskMaterial']='Si3N4'
+            # The trench geometry now only carries Si and Si3N4; keep the rate
+            # table to materials that exist at this step under the stricter
+            # availability check.
+            q['steps'][0]['materialRates']={'Si':.2,'Si3N4':0.}
             validate_project(q)
         q=project(2,'singleParticle');q['domain'].update(xExtent=40.,gridDelta=.005);q['solver']['raysPerPoint']=4096
         validate_project(q)

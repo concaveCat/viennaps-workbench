@@ -189,6 +189,8 @@ def validate_project(payload: Any, *, kind: str = "project") -> tuple[Project, l
         warnings.extend(_planarize_warnings(project))
         warnings.extend(_gds_boolean_warnings(project))
         warnings.extend(_directional_rate_set_warnings(project))
+        issues.extend(_validate_isotropic_dispatch(project))
+        warnings.extend(_isotropic_dispatch_warnings(project))
         if project.schemaVersion == 7:
             warnings.extend(_specialized_model_warnings(project))
         if project.schemaVersion == 7:
@@ -440,6 +442,89 @@ def _directional_rate_set_warnings(project: Any) -> list[str]:
     return warnings
 
 
+def _validate_isotropic_dispatch(project: Any) -> list[FieldIssue]:
+    """Reject the geometric isotropic configurations the native path cannot do safely.
+
+    ``isotropicMethod`` and ``isotropicTimeStepRatio`` are schema 4+ fields. The
+    model already guarantees they only appear on isotropic steps and that an
+    explicit ``geometric`` never carries ``rateMode=material``. What needs the
+    whole project is the geometric safety envelope (native ``SphereDistribution``
+    followed by one geometric advection):
+
+    * one uniform offset only, so per-material rates are invalid;
+    * the offset must span at least one grid interval or the sparse level set
+      does not resolve it;
+    * a positive (deposition) geometric advection cannot be masked, so a
+      deposition with geometry mask materials is rejected while an etch may use
+      ``addMaskMaterial``;
+    * ``auto`` is always admitted: the worker resolves it to ``levelSet`` unless
+      the configuration is both safe and faster (2D, uniform, at least one grid
+      interval thick, no masked deposition).
+    """
+    issues: list[FieldIssue] = []
+    if getattr(project, "schemaVersion", 0) not in (4, 5, 6, 7):
+        return issues
+    delta = float(project.domain.gridDelta)
+    geometry_masks = geometry_mask_material_names(project.geometry)
+    for index, step in enumerate(project.steps):
+        if step_value(step, "model") != "isotropic":
+            continue
+        if step_value(step, "isotropicMethod") != "geometric":
+            continue
+        if (step_value(step, "rateMode", "uniform") != "uniform"
+                or step_value(step, "materialRates") is not None):
+            issues.append(FieldIssue(
+                f"steps[{index}].isotropicMethod",
+                "geometric isotropic advection applies one uniform offset and cannot carry a "
+                "per-material rate table; use rateMode uniform or isotropicMethod levelSet"))
+        thickness = float(step_value(step, "rateMagnitude")) * float(step_value(step, "duration"))
+        if thickness < delta - 1e-12:
+            issues.append(FieldIssue(
+                f"steps[{index}].isotropicMethod",
+                f"geometric thickness rateMagnitude * duration = {thickness:g} um is below one grid "
+                f"interval ({delta:g} um); SphereDistribution cannot resolve a sub-grid offset. "
+                "Increase the rate/duration or use isotropicMethod levelSet"))
+        if step_value(step, "operation") == "deposit" and geometry_masks:
+            issues.append(FieldIssue(
+                f"steps[{index}].isotropicMethod",
+                "geometric deposition cannot protect mask materials (a positive masked geometric "
+                f"advection is unsafe), but the geometry defines mask material(s) "
+                f"{', '.join(geometry_masks)}; use isotropicMethod levelSet or remove the masks"))
+    return issues
+
+
+def _isotropic_dispatch_warnings(project: Any) -> list[str]:
+    """State which path ``isotropicMethod`` will take and what it costs."""
+    warnings: list[str] = []
+    if getattr(project, "schemaVersion", 0) not in (4, 5, 6, 7):
+        return warnings
+    for index, step in enumerate(project.steps):
+        if step_value(step, "model") != "isotropic":
+            continue
+        method = step_value(step, "isotropicMethod")
+        ratio = step_value(step, "isotropicTimeStepRatio")
+        if method == "geometric":
+            if project.dimension == 3:
+                warnings.append(
+                    f"steps[{index}].isotropicMethod: explicit geometric in 3D is allowed but usually "
+                    "3-30x slower than the level-set IsotropicProcess for the same offset (including "
+                    "plane geometry). Keep it only as a deliberate override.")
+            if ratio is not None:
+                warnings.append(
+                    f"steps[{index}].isotropicTimeStepRatio is ignored for geometric: the native "
+                    "SphereDistribution applies one geometric advection and runs no level-set PDE.")
+        elif method == "auto":
+            if project.dimension == 3:
+                warnings.append(
+                    f"steps[{index}].isotropicMethod: auto in 3D resolves to levelSet, because the "
+                    "measured 3D geometric path is much slower and never worth selecting silently.")
+            elif step_value(step, "rateMode", "uniform") != "uniform":
+                warnings.append(
+                    f"steps[{index}].isotropicMethod: auto resolves to levelSet because a material "
+                    "rate table cannot be expressed by a single geometric offset.")
+    return warnings
+
+
 def _validate_particle_shape_steps(project: Any) -> list[FieldIssue]:
     """Reject the native particle-shape configurations that are not safe.
 
@@ -532,6 +617,38 @@ def _gds_boolean_warnings(project: Any) -> list[str]:
             "它只改变几何：不包含光刻胶、光学邻近/偏置、侧壁角或材料选择比，也不等同于带掩膜的刻蚀。"
             "真正的接触孔/M0 图形化仍需后续选择性刻蚀或沉积步骤。")
     return warnings
+
+
+def _material_table_issues(path: str, table: Any, names: set[str], available: set[str], *,
+                           own_material: str | None = None,
+                           zero_entries: set[str] | None = None) -> list[FieldIssue]:
+    """Validate the material keys of a name-keyed rate table.
+
+    ``materialRates`` is a JSON object, so duplicate names are impossible by
+    construction and the schema already bounds every value to [0, 2]. What is
+    left is catalog membership and whether the material exists when the step
+    runs. ``own_material`` is the step's own deposition material, which
+    ``duplicateTopLevelSet`` creates before the native process runs, so it is a
+    legal table key even though it is absent at the step start.
+    ``zero_entries`` names rows whose every rate is zero: an explicit zero row
+    cannot move anything, so it stays valid even for a material that does not
+    exist yet (the native call only needs its registered handle). A nonzero row
+    for an absent material is still rejected.
+    """
+    zero_entries = zero_entries or set()
+    issues: list[FieldIssue] = []
+    for name in (table or {}):
+        field_path = f"{path}.{name}"
+        if name not in names:
+            issues.append(FieldIssue(
+                field_path,
+                f"unknown or unavailable material {name!r}; choose a material from /api/materials"))
+        elif name not in available and name != own_material and name not in zero_entries:
+            issues.append(FieldIssue(
+                field_path,
+                f"material {name!r} is not present when this step runs; a material rate table can "
+                "only address a material from the initial geometry or an earlier enabled deposition"))
+    return issues
 
 
 def _validate_materials(project: ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 | ProjectV7, *,
@@ -707,12 +824,41 @@ def _validate_materials(project: ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 |
                 continue
             add(layer["material"],layer["role"] if uniform_protection else "film",f"geometry.layers[{i}].material")
     for i,step in enumerate(project.steps):
-        if step_value(step,"model") == "directional" and step_value(step,"rateSets") is not None:
-            for set_index, rate_set in enumerate(step_value(step,"rateSets")):
-                for mask_index, name in enumerate(step_value(rate_set,"maskMaterials") or []):
-                    if name not in names:
-                        issues.append(FieldIssue(f"steps[{i}].rateSets[{set_index}].maskMaterials[{mask_index}]",
-                                                 f"unknown or unavailable material {name!r}; choose a material from /api/materials"))
+        executed_names, planned_names = available_by_step[i]
+        available_names = executed_names if step_value(step,"enabled") else planned_names
+        # ``duplicateTopLevelSet`` creates this step's own deposition material
+        # before the native process runs, so its table may address it even
+        # though it does not exist at the step start.
+        own_deposit = (step_value(step,"depositMaterial")
+                       if step_value(step,"operation") == "deposit" else None)
+        if step_value(step,"model") == "directional":
+            if step_value(step,"rateSets") is not None:
+                for set_index, rate_set in enumerate(step_value(step,"rateSets")):
+                    for mask_index, name in enumerate(step_value(rate_set,"maskMaterials") or []):
+                        if name not in names:
+                            issues.append(FieldIssue(f"steps[{i}].rateSets[{set_index}].maskMaterials[{mask_index}]",
+                                                     f"unknown or unavailable material {name!r}; choose a material from /api/materials"))
+            else:
+                directional_table = step_value(step,"materialRates") or {}
+                directional_zero = {
+                    name for name, row in directional_table.items()
+                    if float(step_value(row,"directional",0.0)) <= 0.0
+                    and float(step_value(row,"isotropic",0.0)) <= 0.0
+                }
+                issues.extend(_material_table_issues(
+                    f"steps[{i}].materialRates", directional_table, names,
+                    available_names, own_material=own_deposit,
+                    zero_entries=directional_zero))
+        if project.schemaVersion in (4,5,6,7) and step_value(step,"rateMode") == "material":
+            isotropic_table = step_value(step,"materialRates") or {}
+            isotropic_zero = {name for name, rate in isotropic_table.items() if float(rate) == 0.0}
+            issues.extend(_material_table_issues(
+                f"steps[{i}].materialRates", isotropic_table, names,
+                available_names, own_material=own_deposit,
+                zero_entries=isotropic_zero))
+            reference=step_value(step,"selectivityReference")
+            if reference is not None and reference not in names:
+                issues.append(FieldIssue(f"steps[{i}].selectivityReference",f"unknown reference material {reference!r}"))
         if is_geometry_step(step) and step_value(step,"model")=="removeMaterial" and step_value(step,"material") not in names:
             issues.append(FieldIssue(f"steps[{i}].material",f"unknown or unavailable material {step_value(step,'material')!r}"))
         if is_geometry_step(step) and step_value(step,"model")=="planarize":
@@ -726,8 +872,6 @@ def _validate_materials(project: ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 |
                 else:
                     # The CMP stop height is measured from the exposed surface of
                     # this material when the step runs, so it must exist by then.
-                    executed_names, planned_names = available_by_step[i]
-                    available_names = executed_names if step_value(step,"enabled") else planned_names
                     if stop_material not in available_names:
                         issues.append(FieldIssue(f"steps[{i}].stopMaterial",
                             f"material {stop_material!r} is not present when this step runs; a stopMaterial CMP measures its exposed top, so it must come from the initial geometry or an earlier enabled deposition"))
@@ -758,12 +902,6 @@ def _validate_materials(project: ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 |
             if name not in names: issues.append(FieldIssue(f"steps[{i}].depositMaterial", f"unknown or unavailable material {name!r}"))
             if step_value(step,"enabled") and has_motion(step):
                 roles.setdefault(name,set()).add("film")
-        if project.schemaVersion in (4,5,6,7) and step_value(step,"rateMode") == "material":
-            for name in (step_value(step,"materialRates") or {}):
-                if name not in names: issues.append(FieldIssue(f"steps[{i}].materialRates.{name}",f"unknown or unavailable material {name!r}"))
-            reference=step_value(step,"selectivityReference")
-            if reference is not None and reference not in names:
-                issues.append(FieldIssue(f"steps[{i}].selectivityReference",f"unknown reference material {reference!r}"))
     for material,material_roles in roles.items():
         if "mask" in material_roles and len(material_roles)>1:
             issues.append(FieldIssue("geometry",f"material {material!r} is used as both mask and non-mask; native material IDs cannot distinguish these roles"))

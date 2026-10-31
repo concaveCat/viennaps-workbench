@@ -81,7 +81,18 @@ def requested_input(project: Project | ProjectV3 | ProjectV4 | ProjectV5 | Proje
         if project.schemaVersion in (4,5,6,7):
             item.pop("selectivityReference",None)
         if project.schemaVersion in (5,6,7) and item.get("model") == "directional":
-            if item.get("rateSets") is not None:
+            material_mode = (item.get("materialRates") is not None
+                             or item.get("defaultMaterialRate") is not None)
+            if material_mode:
+                # The native RateMap consumes the direction even when only an
+                # isotropic component is nonzero; unlike the scalar overload
+                # there is no visibility flag to drop. Keep the normalized
+                # direction in the hash.
+                direction = item.get("direction", [0.0, 0.0, 0.0])
+                norm = math.sqrt(sum(float(value) ** 2 for value in direction))
+                if norm > 0.0:
+                    item["direction"] = [float(value) / norm for value in direction]
+            elif item.get("rateSets") is not None:
                 # The multi-set surface is additive: each set normalizes its own
                 # direction, and a set without a directional magnitude cannot
                 # consume its direction or visibility natively. Mirroring the

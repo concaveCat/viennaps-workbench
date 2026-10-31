@@ -664,10 +664,23 @@ def native_mesh_report(mesh: Any) -> dict[str, Any]:
             "meshIdentity": mesh_identity, "fields": fields}
 
 
-def configure_advection(ps: Any, project: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
+def configure_advection(ps: Any, project: dict[str, Any],
+                        time_step_ratio: float | None = None) -> tuple[Any, dict[str, Any]]:
+    """Build the step's native AdvectionParameters.
+
+    ``time_step_ratio`` is the step-level ``isotropicTimeStepRatio`` override.
+    It is applied to a freshly configured parameter object (never to the
+    saved project's solver defaults) and recorded under ``timeStepRatio`` so a
+    run remains auditable.
+    """
     params = ps.AdvectionParameters()
     params.timeStepRatio = float(project["solver"]["timeStepRatio"])
     actual: dict[str, Any] = {"timeStepRatio": float(params.timeStepRatio)}
+    if time_step_ratio is not None:
+        params.timeStepRatio = float(time_step_ratio)
+        actual["timeStepRatio"] = float(params.timeStepRatio)
+        actual["solverTimeStepRatio"] = float(project["solver"]["timeStepRatio"])
+        actual["timeStepRatioSource"] = "step.isotropicTimeStepRatio"
     if project["schemaVersion"] >= 7:
         requested = project["solver"]["advection"]
         params.spatialScheme = getattr(ps.ls.SpatialSchemeEnum, requested["spatialScheme"])
@@ -1157,6 +1170,228 @@ def native_rate_sets(ps: Any, records: list[dict[str, Any]]) -> list[Any]:
                    bool(record["requestedCalculateVisibility"]) and record["directionalRateMagnitude"] > 0.0)
         for record in records
     ]
+
+
+DIRECTIONAL_MATERIAL_OVERLOAD = (
+    "DirectionalProcess(direction, materialRates: Mapping[Material, (directional, isotropic)], "
+    "defaultDirectionalRate, defaultIsotropicRate)")
+
+
+def directional_material_mode(step: dict[str, Any]) -> bool:
+    """True when the step uses the native directional material rate map."""
+    return step.get("materialRates") is not None or step.get("defaultMaterialRate") is not None
+
+
+def _directional_rate_pair(raw: Any, label: str) -> tuple[float, float]:
+    if raw is None:
+        return 0.0, 0.0
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"{label} must be an object with directional and isotropic rates")
+    pair = []
+    for key in ("directional", "isotropic"):
+        value = float(raw.get(key, 0.0))
+        if not math.isfinite(value) or value < 0.0 or value > 2.0:
+            raise RuntimeError(f"{label}.{key} {value} is outside the finite 0..2 um/s schema range")
+        pair.append(value)
+    return pair[0], pair[1]
+
+
+def directional_material_rate_records(step: dict[str, Any]) -> dict[str, Any]:
+    """Signed native rate map plus an auditable record for the material overload.
+
+    The request carries nonnegative operation magnitudes only.  The native
+    ``DirectionalVelocityFieldSimple`` uses two different sign conventions:
+    a positive directional rate moves *along* ``direction`` (an etch when the
+    direction points into the surface), while a positive isotropic rate grows
+    the surface (a deposition).  Therefore the operation mapping is::
+
+        etch:    directional +magnitude, isotropic -magnitude
+        deposit: directional -magnitude, isotropic +magnitude
+
+    Applying one uniform sign to both components (as the scalar overload does)
+    makes a material-mode "etch" grow the surface.  Both native signs are
+    recorded so the run is auditable.
+    """
+    if not directional_material_mode(step):
+        raise RuntimeError("directional step does not use the material rate map overload")
+    etch = step["operation"] == "etch"
+    directional_sign = 1.0 if etch else -1.0
+    isotropic_sign = -1.0 if etch else 1.0
+    rows: list[dict[str, Any]] = []
+    native: dict[str, tuple[float, float]] = {}
+    for name, raw in (step.get("materialRates") or {}).items():
+        if name not in MATERIAL_IDS:
+            raise RuntimeError(f"materialRates material {name!r} is absent from the material catalog")
+        directional, isotropic = _directional_rate_pair(raw, f"materialRates.{name}")
+        rows.append({
+            "name": name,
+            "id": MATERIAL_IDS[name],
+            "directionalRateMagnitude": directional,
+            "isotropicRateMagnitude": isotropic,
+            "nativeDirectionalRate": directional * directional_sign,
+            "nativeIsotropicRate": isotropic * isotropic_sign,
+        })
+        native[name] = (directional * directional_sign, isotropic * isotropic_sign)
+    default_directional, default_isotropic = _directional_rate_pair(
+        step.get("defaultMaterialRate"), "defaultMaterialRate")
+    return {
+        "rows": rows,
+        "native": native,
+        "requestedDefault": {"directional": default_directional, "isotropic": default_isotropic},
+        "nativeDefault": (default_directional * directional_sign,
+                          default_isotropic * isotropic_sign),
+        "defaultOmitted": step.get("defaultMaterialRate") is None,
+        "directionalSign": directional_sign,
+        "isotropicSign": isotropic_sign,
+    }
+
+
+def isotropic_thickness(step: dict[str, Any]) -> float:
+    """Uniform displacement ``rateMagnitude * duration`` in um."""
+    return abs(float(step.get("rateMagnitude", 0.0))) * float(step["duration"])
+
+
+def _isotropic_time_step_ratio(project: dict[str, Any], step: dict[str, Any]) -> tuple[float, str]:
+    requested = step.get("isotropicTimeStepRatio")
+    if requested is None:
+        return float(project["solver"]["timeStepRatio"]), "solver.timeStepRatio"
+    ratio = float(requested)
+    if not math.isfinite(ratio) or not 0.05 <= ratio <= 0.5:
+        raise RuntimeError(
+            f"isotropicTimeStepRatio {ratio} is outside the finite 0.05..0.5 schema range")
+    return ratio, "step.isotropicTimeStepRatio"
+
+
+def resolve_isotropic_method(project: dict[str, Any], step: dict[str, Any]) -> tuple[str, str]:
+    """Resolve ``auto``/``geometric``/``levelSet`` into the actual native path.
+
+    ``auto`` only selects the geometric distribution where it is measured both
+    safe and faster: 2D, uniform rate, one full grid interval of displacement,
+    and an unmasked deposition. 3D auto always stays on the level-set PDE
+    because measured 3D ``SphereDistribution`` is 3-30x slower than
+    ``IsotropicProcess`` for the 22 nm cell / 5 nm grid, plane included.
+    """
+    requested = step.get("isotropicMethod") or "levelSet"
+    if requested not in {"auto", "levelSet", "geometric"}:
+        raise RuntimeError(f"unknown isotropicMethod {requested!r}")
+    if step.get("isotropicTimeStepRatio") is not None:
+        # Validate the range even when the geometric path will ignore it.
+        _isotropic_time_step_ratio(project, step)
+    if requested == "levelSet":
+        reason = ("explicit level-set request" if step.get("isotropicMethod") == "levelSet"
+                  else "isotropicMethod absent: legacy level-set PDE path")
+        return "levelSet", reason
+    dimension = int(project["dimension"])
+    grid_delta = float(project["domain"]["gridDelta"])
+    thickness = isotropic_thickness(step)
+    blockers: list[str] = []
+    if str(step.get("rateMode", "uniform")) != "uniform":
+        blockers.append(f"rateMode={step.get('rateMode')} requires the native material rate table")
+    elif step.get("materialRates"):
+        blockers.append("materialRates requires the native material rate table")
+    if thickness + 1e-12 < grid_delta:
+        blockers.append(
+            f"thickness {thickness} um is below one grid interval {grid_delta} um")
+    if step["operation"] == "deposit":
+        masks = protected_material_names(project, step)
+        if masks:
+            blockers.append(
+                f"positive masked geometric deposition is unsafe (geometry masks {masks})")
+    if requested == "geometric":
+        if blockers:
+            raise RuntimeError("isotropicMethod geometric is unsafe: " + "; ".join(blockers))
+        reason = "explicit geometric SphereDistribution request"
+        if dimension == 3:
+            reason += ("; explicit 3D override: measured 3-30x slower than IsotropicProcess")
+        return "geometric", reason
+    if dimension != 2:
+        blockers.append(
+            "auto uses geometric only in 2D; measured 3D SphereDistribution is 3-30x slower "
+            "than IsotropicProcess")
+    if blockers:
+        return "levelSet", "auto selected level-set: " + "; ".join(blockers)
+    return "geometric", (
+        f"auto selected geometric: 2D uniform isotropic step with thickness {thickness} um "
+        f">= gridDelta {grid_delta} um")
+
+
+def isotropic_level_set_record(project: dict[str, Any], step: dict[str, Any],
+                               reason: str) -> dict[str, Any]:
+    grid_delta = float(project["domain"]["gridDelta"])
+    thickness = isotropic_thickness(step)
+    material_mode = (project.get("schemaVersion") in (4, 5, 6, 7)
+                     and step.get("rateMode") == "material")
+    masks = [] if material_mode else protected_material_names(project, step)
+    ratio, ratio_source = _isotropic_time_step_ratio(project, step)
+    return {
+        "requestedIsotropicMethod": step.get("isotropicMethod") or "levelSet",
+        "actualIsotropicMethod": "levelSet",
+        "nativeClass": "IsotropicProcess",
+        "nativeRadiusUm": None,
+        "thicknessUm": thickness,
+        "cells": thickness / grid_delta,
+        "gridDeltaUm": grid_delta,
+        "maskMaterials": masks,
+        "reason": reason,
+        "nativeDurationIgnored": False,
+        "timeStepRatio": ratio,
+        "timeStepRatioSource": ratio_source,
+    }
+
+
+def build_isotropic_geometric(ps: Any, domain: Any, project: dict[str, Any],
+                              step: dict[str, Any], *, reason: str,
+                              ) -> tuple[Any, dict[str, Any], dict[str, Any]]:
+    """Construct the native ``SphereDistribution`` for an isotropic offset.
+
+    The geometric strategy consumes only a signed radius; the requested
+    duration is ignored by construction.  Etches may carry geometry mask
+    materials through ``addMaskMaterial`` (the supported direction), while a
+    deposition is always constructed without masks.
+    """
+    dimension = int(project["dimension"])
+    grid_delta = float(project["domain"]["gridDelta"])
+    thickness = isotropic_thickness(step)
+    if thickness + 1e-12 < grid_delta:
+        raise RuntimeError(
+            f"geometric isotropic thickness {thickness} um is below one grid interval "
+            f"{grid_delta} um; native geometric advection is unsafe below that")
+    sign = -1.0 if step["operation"] == "etch" else 1.0
+    signed_radius = sign * thickness
+    model = ps.SphereDistribution(signed_radius)
+    applied: list[str] = []
+    omitted: list[str] = []
+    if sign < 0.0:
+        for name in protected_material_names(project, step):
+            handle = material_handle(ps, name)
+            material_level_set = domain.getMaterialLevelSet(handle)
+            if material_level_set is None or int(material_level_set.getNumberOfPoints()) == 0:
+                # The geometry declared the material but the domain does not
+                # carry it; passing it would make the native strategy log
+                # "not found" and silently stay maskless.
+                omitted.append(name)
+                continue
+            model.addMaskMaterial(handle)
+            applied.append(name)
+    before = surface_state(domain, dimension)
+    record = {
+        "requestedIsotropicMethod": step.get("isotropicMethod") or "levelSet",
+        "actualIsotropicMethod": "geometric",
+        "nativeClass": "SphereDistribution",
+        "nativeConstructor": f"viennaps.d{dimension}.SphereDistribution(radius)",
+        "nativeRadiusUm": signed_radius,
+        "thicknessUm": thickness,
+        "cells": thickness / grid_delta,
+        "gridDeltaUm": grid_delta,
+        "maskMaterials": applied,
+        "omittedMaskMaterials": omitted,
+        "reason": reason,
+        "nativeDurationIgnored": float(step["duration"]),
+        "timeStepRatio": "ignored: geometric advection integrates no PDE",
+        "dimension": dimension,
+        "nativeProcessBackend": "CPU_DISK pinned; geometric distribution has no stochastic flux engine",
+    }
+    return model, record, before
 
 
 def build_multi_particle_model(ps: Any, step: dict[str, Any]) -> tuple[Any, dict[str, Any], dict[str, Any]]:
@@ -4824,6 +5059,23 @@ def execute(input_path: Path, run_dir: Path) -> None:
                         "maskMaterialIds":records[0]["maskMaterialIds"] if records else [],
                         "maskSource":records[0]["maskSource"] if records else None,
                         "nativeProcess":"viennaps.DirectionalProcess (not called: every rate is zero)"}
+                elif directional_material_mode(step):
+                    material_record=directional_material_rate_records(step)
+                    raw_direction=[float(value) for value in (step.get("direction") or [0.0,0.0,0.0])]
+                    length=math.sqrt(sum(value*value for value in raw_direction))
+                    no_op_parameters={"mode":"materialRates","rateMode":"material",
+                        "nativeClass":"DirectionalProcess","nativeOverload":DIRECTIONAL_MATERIAL_OVERLOAD,
+                        "direction":raw_direction,
+                        "nativeUnitDirection":([value/length for value in raw_direction] if length>1e-12 else None),
+                        "materialRates":material_record["rows"],
+                        "defaultMaterialRate":material_record["requestedDefault"],
+                        "defaultMaterialRateOmitted":material_record["defaultOmitted"],
+                        "nativeDefaultDirectionalRate":material_record["nativeDefault"][0],
+                        "nativeDefaultIsotropicRate":material_record["nativeDefault"][1],
+                        "directionalSign":material_record["directionalSign"],
+                        "isotropicSign":material_record["isotropicSign"],
+                        "calculateVisibility":"not-applicable: no rate is active",
+                        "nativeProcess":"viennaps.DirectionalProcess (not called: every rate is zero)"}
                 else:
                     native_directional,native_isotropic=signed_directional_rates(step)
                     raw_direction=[float(value) for value in step["direction"]]
@@ -4910,6 +5162,7 @@ def execute(input_path: Path, run_dir: Path) -> None:
             signed_material_rates: dict[str,float] = {}
             multi_actual: dict[str,Any] | None = None
             callback_state: dict[str,Any] | None = None
+            material_mode = project["schemaVersion"] in (4,5,6,7) and step.get("rateMode")=="material"
             if deposition:
                 if specialized and step.get("nativeModel") == "selectiveEpitaxy":
                     # The installed SelectiveEpitaxy binding checks the native
@@ -4925,7 +5178,6 @@ def execute(input_path: Path, run_dir: Path) -> None:
                 debug_domain["levelSetCount"] = int(domain.getNumberOfLevelSets())
                 atomic_json(run_dir / f"native-debug-pre-process-{step['id']}.json", debug_domain)
             particle = uses_flux(step)
-            material_mode = project["schemaVersion"] in (4,5,6,7) and step.get("rateMode")=="material"
             directional_parameters: dict[str,Any] | None = None
             if directional:
                 if step.get("rateSets") is not None:
@@ -4939,6 +5191,58 @@ def execute(input_path: Path, run_dir: Path) -> None:
                         "rateSets":set_records,
                         "maskMaterials":set_records[0]["maskMaterials"] if set_records else [],
                         "maskMaterialIds":set_records[0]["maskMaterialIds"] if set_records else [],
+                        "nativeProcessBackend":"CPU_DISK pinned; directional model has no stochastic flux engine",
+                        "raysPerPoint":"not-applicable",
+                        "randomSeed":"not-applicable",
+                    }
+                elif directional_material_mode(step):
+                    # Defense in depth: a hand-edited worker input must never
+                    # combine the material map with the scalar/rate-set modes.
+                    conflicting=sorted({name for name,active in (
+                        ("rateSets",step.get("rateSets") is not None),
+                        ("directionalRateMagnitude",step.get("directionalRateMagnitude") is not None),
+                        ("isotropicRateMagnitude",step.get("isotropicRateMagnitude") is not None)) if active})
+                    if conflicting:
+                        raise RuntimeError(
+                            "directional materialRates is mutually exclusive with " + ", ".join(conflicting))
+                    if step.get("calculateVisibility") is False:
+                        raise RuntimeError(
+                            "directional materialRates has no native visibility control; "
+                            "calculateVisibility must be omitted or true")
+                    raw_direction=[float(value) for value in (step.get("direction") or [])]
+                    if len(raw_direction) != 3:
+                        raise RuntimeError("directional materialRates requires a 3-component direction")
+                    length=math.sqrt(sum(value*value for value in raw_direction))
+                    if not math.isfinite(length) or length <= 1e-12:
+                        raise RuntimeError("direction must be a finite nonzero vector")
+                    native_direction=[value/length for value in raw_direction]
+                    material_record=directional_material_rate_records(step)
+                    native_rate_map={material_handle(ps,name):pair
+                                     for name,pair in material_record["native"].items()}
+                    model=ps.DirectionalProcess(native_direction,native_rate_map,
+                                                material_record["nativeDefault"][0],
+                                                material_record["nativeDefault"][1])
+                    directional_parameters={
+                        "mode":"materialRates",
+                        "rateMode":"material",
+                        "nativeClass":"DirectionalProcess",
+                        "nativeOverload":DIRECTIONAL_MATERIAL_OVERLOAD,
+                        "requestedDirection":raw_direction,
+                        "nativeUnitDirection":native_direction,
+                        "directionCoordinateMap":"2D [x,h,0] -> native [x,h,0]; 3D [x,y,z] -> native [x,y,z] (z vertical)",
+                        "materialRates":material_record["rows"],
+                        "nativeMaterialRatesByName":{name:list(pair)
+                                                     for name,pair in material_record["native"].items()},
+                        "nativeMaterialRatesById":{str(row["id"]):[row["nativeDirectionalRate"],row["nativeIsotropicRate"]]
+                                                   for row in material_record["rows"]},
+                        "defaultMaterialRate":material_record["requestedDefault"],
+                        "defaultMaterialRateOmitted":material_record["defaultOmitted"],
+                        "nativeDefaultDirectionalRate":material_record["nativeDefault"][0],
+                        "nativeDefaultIsotropicRate":material_record["nativeDefault"][1],
+                        "directionalSign":material_record["directionalSign"],
+                        "isotropicSign":material_record["isotropicSign"],
+                        "masks":"material rate map only; unlisted materials use the default rate",
+                        "calculateVisibility":"not-applicable: native material map has no visibility control",
                         "nativeProcessBackend":"CPU_DISK pinned; directional model has no stochastic flux engine",
                         "raysPerPoint":"not-applicable",
                         "randomSeed":"not-applicable",
@@ -4997,6 +5301,13 @@ def execute(input_path: Path, run_dir: Path) -> None:
             if multi_strategy == GPU_MULTIPARTICLE_NATIVE_STRATEGY and not native_engine_fingerprint:
                 raise RuntimeError("native multi-ion GPU execution requires a pinned engine build fingerprint")
             gpu_multi_split = gpu_multi_ion and multi_strategy == GPU_MULTIPARTICLE_SPLIT_STRATEGY
+            isotropic_dispatch: dict[str,Any] | None = None
+            geometric_isotropic = False
+            isotropic_geometric_before: dict[str,Any] | None = None
+            isotropic_fields_present = (step.get("model") == "isotropic"
+                                        and project["schemaVersion"] in (4,5,6,7)
+                                        and (step.get("isotropicMethod") is not None
+                                             or step.get("isotropicTimeStepRatio") is not None))
             if directional:
                 pass
             elif specialized:
@@ -5024,16 +5335,37 @@ def execute(input_path: Path, run_dir: Path) -> None:
                 else:
                     model = ps.SingleParticleProcess(rate=rate,stickingProbability=float(step["stickingProbability"]),sourceExponent=float(step["sourceExponent"]),maskMaterial=ps.Material.Mask)
             else:
-                if material_mode:
+                if isotropic_fields_present:
+                    actual_method, dispatch_reason = resolve_isotropic_method(project, step)
+                elif step.get("model") == "isotropic" and (
+                        step.get("isotropicMethod") is not None
+                        or step.get("isotropicTimeStepRatio") is not None):
+                    # Schema-3 projects cannot carry the new fields; a
+                    # hand-edited input must not silently ignore them.
+                    raise RuntimeError("isotropicMethod and isotropicTimeStepRatio require a schema-4+ project")
+                else:
+                    actual_method, dispatch_reason = "levelSet", "legacy level-set PDE path"
+                if actual_method == "geometric":
+                    model, isotropic_dispatch, isotropic_geometric_before = build_isotropic_geometric(
+                        ps, domain, project, step, reason=dispatch_reason)
+                    geometric_isotropic = True
+                elif material_mode:
+                    isotropic_dispatch = (isotropic_level_set_record(project, step, dispatch_reason)
+                                          if isotropic_fields_present else None)
                     model=ps.IsotropicProcess(rate=rate,maskMaterials=[])
                     for name, material_rate in signed_material_rates.items():
                         model.setMaterialRate(material_handle(ps,name),material_rate)
                 elif project["schemaVersion"]>=3:
+                    isotropic_dispatch = (isotropic_level_set_record(project, step, dispatch_reason)
+                                          if isotropic_fields_present else None)
                     model=ps.IsotropicProcess(rate=rate,maskMaterials=[material_handle(ps,name) for name in protected_material_names(project,step)])
                 else:
                     model = ps.IsotropicProcess(rate=rate, maskMaterial=ps.Material.Mask)
+            native_duration = (process_duration if (specialized or csv_process)
+                               else 0.0 if geometric_isotropic
+                               else float(step.get("duration", 0.0)))
             process = (None if gpu_multi_split else
-                       ps.Process(domain, model, process_duration if (specialized or csv_process) else float(step["duration"])))
+                       ps.Process(domain, model, native_duration))
             # The 4.6.2 Process default attempts CUDA initialization even for
             # isotropic models. Pin a concrete, verified backend before apply.
             engine = "not-applicable"
@@ -5058,7 +5390,20 @@ def execute(input_path: Path, run_dir: Path) -> None:
             else:
                 # Isotropic Process never consumes a ray flux engine.
                 process.setFluxEngineType(ps.FluxEngineType.CPU_DISK)
-            advection, advection_actual = configure_advection(ps, project)
+                if geometric_isotropic:
+                    selection_reason = ("CPU_DISK pinned; geometric SphereDistribution has no "
+                                        "stochastic flux engine")
+            advection, advection_actual = configure_advection(
+                ps, project,
+                time_step_ratio=(None if geometric_isotropic or isotropic_dispatch is None
+                                 else step.get("isotropicTimeStepRatio")))
+            if isotropic_dispatch is not None:
+                if geometric_isotropic:
+                    isotropic_dispatch["timeStepRatio"] = "ignored: geometric advection integrates no PDE"
+                else:
+                    isotropic_dispatch["timeStepRatio"] = float(advection.timeStepRatio)
+                    isotropic_dispatch["timeStepRatioSource"] = advection_actual.get(
+                        "timeStepRatioSource", "solver.timeStepRatio")
             if specialized and step["nativeModel"] == "oxideRegrowth":
                 advection.ignoreVoids = True
                 advection_actual["ignoreVoids"] = True
@@ -5068,11 +5413,23 @@ def execute(input_path: Path, run_dir: Path) -> None:
                 for process_parameters in special_process_parameters:
                     process.setParameters(process_parameters)
             actual_parameters: dict[str, Any] = {**advection_actual, "duration": process_duration if (specialized or csv_process) else float(step["duration"]), "rate": rate}
+            if geometric_isotropic:
+                # The native geometric strategy ignores the requested duration.
+                actual_parameters["duration"] = 0.0
             if project["schemaVersion"] in (4,5,6,7) and not directional and not specialized and not csv_process and step.get("model") != "multiParticle":
                 actual_parameters.update({"rateMode":step["rateMode"],"actualDefaultRate":rate,
                     "actualMaterialRatesByName":signed_material_rates,
                     "actualMaterialRatesById":{str(MATERIAL_IDS[name]):value for name,value in signed_material_rates.items()},
                     "nativeRateTable":[{"name":name,"id":MATERIAL_IDS[name],"rate":value} for name,value in sorted(signed_material_rates.items())]})
+                if material_mode:
+                    # Record both sides: the requested nonnegative table and
+                    # the signed values that reached the native process.
+                    actual_parameters["requestedDefaultRate"] = float(step.get("rateMagnitude", 0.0))
+                    actual_parameters["requestedMaterialRatesByName"] = {
+                        name: float(value) for name, value in (step.get("materialRates") or {}).items()}
+                    actual_parameters["operationSign"] = -1.0 if step["operation"] == "etch" else 1.0
+            if isotropic_dispatch is not None:
+                actual_parameters.update(isotropic_dispatch)
             if particle:
                 ray_parameters, ray_actual = configure_rays(ps, project, int(step_seed))
                 if process is not None:
@@ -5122,7 +5479,10 @@ def execute(input_path: Path, run_dir: Path) -> None:
             event(run_dir, {"type": "step-configured", "stepId": step["id"], "operation": step["operation"], "model": step["model"],
                             "noOp": False, "actualEngine": engine, "engineSelectionReason": selection_reason,
                             "requestedEnginePreference": engine_preference, "actualSeed": step_seed, "actualRate": rate,
-                            "duration": process_duration if (specialized or csv_process) else step["duration"], "actualParameters": actual_parameters})
+                            **({"isotropicMethod": isotropic_dispatch["actualIsotropicMethod"],
+                                "nativeClass": isotropic_dispatch["nativeClass"]}
+                               if isotropic_dispatch is not None else {}),
+                            "duration": native_duration, "actualParameters": actual_parameters})
             intermediate_dir = run_dir / "intermediate" / step["id"]
             intermediate_dir.mkdir(parents=True, exist_ok=True)
             split_result = None
@@ -5152,6 +5512,20 @@ def execute(input_path: Path, run_dir: Path) -> None:
                     process_apply_seconds = time.perf_counter() - process_started
                 finally:
                     os.chdir(previous_cwd)
+            if geometric_isotropic:
+                geometric_after = surface_state(domain, int(project["dimension"]))
+                assert isotropic_geometric_before is not None
+                actual_parameters["surfaceSignatureBefore"] = isotropic_geometric_before["digest"]
+                actual_parameters["surfaceSignatureAfter"] = geometric_after["digest"]
+                actual_parameters["surfaceBoundsBeforeUm"] = isotropic_geometric_before["bounds"]
+                actual_parameters["surfaceBoundsAfterUm"] = geometric_after["bounds"]
+                if isotropic_geometric_before["digest"] == geometric_after["digest"]:
+                    masks = isotropic_dispatch.get("maskMaterials") if isotropic_dispatch else []
+                    raise RuntimeError(
+                        "geometric isotropic SphereDistribution left the surface unchanged; refusing "
+                        "to record a silent no-op (thickness must exceed the grid resolution"
+                        + (f", and the mask {masks} must not cover the whole exposed surface"
+                           if masks else "") + ")")
             next_gpu_step_pending = any(
                 uses_flux(future)
                 and str(step_engines.get(

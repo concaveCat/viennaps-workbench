@@ -827,6 +827,13 @@ class StepV4(StrictModel):
     rateMode: Literal["uniform", "material"] = "uniform"
     materialRates: dict[str, Annotated[Number, Field(ge=0, le=2)]] | None = None
     selectivityReference: Annotated[str, Field(min_length=1, max_length=80)] | None = None
+    # Isotropic dispatch. ``None`` rather than a default keeps both fields out of
+    # ``model_dump(exclude_none=True)`` (the canonical request hash input) for
+    # every existing step, which keeps historical request hashes unchanged.
+    # ``auto`` is resolved by the worker from the project dimension and the
+    # geometric safety rules; validation only has to admit it.
+    isotropicMethod: Literal["auto", "levelSet", "geometric"] | None = None
+    isotropicTimeStepRatio: Annotated[Number, Field(ge=0.05, le=0.5)] | None = None
 
     @model_validator(mode="after")
     def validate_rate_and_model_fields(self):
@@ -838,11 +845,15 @@ class StepV4(StrictModel):
             raise ValueError("singleParticle requires stickingProbability and sourceExponent")
         if self.model == "isotropic" and ({"stickingProbability", "sourceExponent"} & self.model_fields_set):
             raise ValueError("particle parameters apply only to singleParticle")
+        if self.model != "isotropic" and ({"isotropicMethod", "isotropicTimeStepRatio"} & self.model_fields_set):
+            raise ValueError("isotropicMethod and isotropicTimeStepRatio apply only to isotropic steps")
+        if self.isotropicMethod == "geometric" and self.rateMode == "material":
+            # A geometric advection cannot carry a per-material rate table: it
+            # offsets the whole exposed surface by one uniform radius.
+            raise ValueError("isotropicMethod geometric is not supported with rateMode material")
         if self.rateMode == "uniform" and "materialRates" in self.model_fields_set:
             raise ValueError("uniform rateMode forbids materialRates")
         if self.rateMode == "material":
-            if self.operation != "etch":
-                raise ValueError("material rateMode is supported only for etch")
             if "materialRates" not in self.model_fields_set or self.materialRates is None:
                 raise ValueError("material rateMode requires materialRates, which may be empty")
         return self
@@ -935,6 +946,18 @@ class DirectionalRateSetV5(StrictModel):
         return self
 
 
+class DirectionalMaterialRate(StrictModel):
+    """One native ``RateMap`` entry: non-negative directional/isotropic rates.
+
+    The step ``operation`` supplies the native sign (etch negative, deposit
+    positive), exactly like the scalar fields. A material that is absent from
+    the table falls back to ``DirectionalStepV5.defaultMaterialRate``.
+    """
+
+    directional: Annotated[Number, Field(ge=0, le=2)] = 0.0
+    isotropic: Annotated[Number, Field(ge=0, le=2)] = 0.0
+
+
 class DirectionalStepV5(StrictModel):
     id: Annotated[str, Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")]
     name: Annotated[str, Field(min_length=1, max_length=80)]
@@ -951,13 +974,46 @@ class DirectionalStepV5(StrictModel):
     # Native DirectionalProcess(rateSets: Sequence[RateSet]). Bounded because
     # every set with a directed component costs one native visibility pass.
     rateSets: Annotated[list[DirectionalRateSetV5], Field(min_length=1, max_length=8)] | None = None
+    # Native DirectionalProcess(direction, RateMap, default directional rate,
+    # default isotropic rate) overload. Both fields default to ``None`` so an
+    # absent table never enters the canonical request hash.
+    materialRates: dict[str, DirectionalMaterialRate] | None = None
+    defaultMaterialRate: DirectionalMaterialRate | None = None
     duration: Annotated[Number, Field(ge=0.01, le=600)]
     depositMaterial: str | None = None
 
     @model_validator(mode="after")
     def validate_directional_fields(self):
         scalar_fields = ("direction", "directionalRateMagnitude", "isotropicRateMagnitude")
-        if self.rateSets is None:
+        # A material table is the mode switch; an explicit JSON null is treated
+        # like an omitted field so clients that always serialize the key keep
+        # the historical scalar/rateSets behaviour.
+        material_mode = self.materialRates is not None or self.defaultMaterialRate is not None
+        if material_mode:
+            table = self.materialRates or {}
+            if "directionalRateMagnitude" in self.model_fields_set or "isotropicRateMagnitude" in self.model_fields_set:
+                raise ValueError(
+                    "materialRates is mutually exclusive with directionalRateMagnitude and "
+                    "isotropicRateMagnitude: omit both scalar fields in material mode")
+            if self.rateSets is not None:
+                raise ValueError("materialRates is mutually exclusive with rateSets")
+            if self.direction is None:
+                raise ValueError("material rate mode requires direction")
+            if math.sqrt(sum(float(value) ** 2 for value in self.direction)) <= 1e-12:
+                raise ValueError("direction must be a nonzero 3-component vector")
+            if self.calculateVisibility is not True:
+                raise ValueError(
+                    "material rate mode has no native visibility control; omit calculateVisibility "
+                    "instead of materializing it (or leave it true)")
+            default = self.defaultMaterialRate
+            effective = any(
+                float(row.directional) > 0.0 or float(row.isotropic) > 0.0 for row in table.values()
+            ) or (default is not None
+                  and (float(default.directional) > 0.0 or float(default.isotropic) > 0.0))
+            if not effective:
+                raise ValueError(
+                    "material rate mode requires at least one nonzero directional or isotropic rate")
+        elif self.rateSets is None:
             if any(getattr(self, name) is None for name in scalar_fields):
                 raise ValueError(
                     "directional steps require direction, directionalRateMagnitude and "

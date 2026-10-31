@@ -31,6 +31,22 @@ def has_motion(step: Any) -> bool:
             float(rate) > 0.0 for row in overrides.values() for rate in row.values()
         )
     if value(step, "model") == "directional":
+        material_rates = value(step, "materialRates")
+        default_material_rate = value(step, "defaultMaterialRate")
+        if material_rates is not None or default_material_rate is not None:
+            # Native RateMap mode: an unlisted material falls back to the
+            # default row, so both the table and the default contribute motion.
+            table = material_rates or {}
+            if any(
+                float(value(row, "directional", 0.0)) > 0.0
+                or float(value(row, "isotropic", 0.0)) > 0.0
+                for row in table.values()
+            ):
+                return True
+            return (
+                float(value(default_material_rate, "directional", 0.0)) > 0.0
+                or float(value(default_material_rate, "isotropic", 0.0)) > 0.0
+            )
         rate_sets = value(step, "rateSets")
         if rate_sets is not None:
             return any(

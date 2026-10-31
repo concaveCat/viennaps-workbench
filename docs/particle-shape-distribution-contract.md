@@ -415,3 +415,11 @@ no-op。`actualEngine` 固定为 `not-applicable`，`actualSeed` 为 `null`。
   “没有变化”的快照。
 - 这是形态学几何偏移，不是物理沉积/刻蚀：没有通量、黏附概率、角度分布、
   材料选择比或时间演化；位移是参数值，不是 `rate × duration`。
+
+## 11. 与 isotropic 分流的关系
+
+`model: "isotropic"` 的 2D `auto` 复用同一原生 `SphereDistribution`（无掩膜沉积 /
+带掩膜刻蚀）做一次均匀半径的几何偏移；3D `auto` 始终走 level-set
+`IsotropicProcess`，因为本仓库测得的 3D 几何路径更慢。`particleShape` 仍是显式的
+几何步骤，不参与 `auto` 分流，也没有速度/材料速率表；两者的字段、安全边界和记录
+不要混用。分流规则见 [`isotropic-dispatch-contract.md`](./isotropic-dispatch-contract.md)。

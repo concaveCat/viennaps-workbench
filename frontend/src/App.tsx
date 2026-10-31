@@ -44,11 +44,15 @@ type SpecializedField = { key: string; label: string; kind: 'number' | 'boolean'
 type SpecializedModel = { id: string; label: string; nativeClass: string; operation: 'etch' | 'deposit' | 'native'; usesFlux: boolean; dimensions?: number[]; depositMaterial?: string; depositMaterialSelectable?: boolean; fields: SpecializedField[] };
 type SpecializedCatalog = { schemaVersion: number; engineVersion: string; unitsNote: string; models: SpecializedModel[] };
 type CsvRateAsset = { assetId: string; fileName: string; dimension: 2 | 3; columns: string[]; rowCount: number; x: { min: number; max: number; count: number }; y?: { min: number; max: number; count: number }; rate: { min: number; max: number; sign: string }; linearCompatible: boolean; sizeBytes: number };
+type DirectionalMaterialRate = { directional: number; isotropic: number };
 type Step = {
   id: string; name: string; enabled: boolean; operation?: 'etch' | 'deposit' | 'native'; model: 'isotropic' | 'singleParticle' | 'multiParticle' | 'directional' | 'specialized' | 'csvProcess' | 'removeMaterial' | 'planarize' | 'boolean' | 'gdsBoolean';
   rateMagnitude?: number; directionalRateMagnitude?: number; isotropicRateMagnitude?: number; direction?: [number, number, number]; calculateVisibility?: boolean;
+  isotropicMethod?: 'auto' | 'levelSet' | 'geometric'; isotropicTimeStepRatio?: number;
   duration?: number; depositMaterial?: string; stickingProbability?: number; sourceExponent?: number;
-  rateMode?: 'uniform' | 'material'; materialRates?: Record<string, number>; selectivityReference?: string;
+  // `materialRates` is shared by two schemas: isotropic steps store a scalar rate per
+  // material, directional steps store a {directional, isotropic} pair per material.
+  rateMode?: 'uniform' | 'material'; materialRates?: Record<string, number> | Record<string, DirectionalMaterialRate>; defaultMaterialRate?: DirectionalMaterialRate; selectivityReference?: string;
   species?: ParticleSpecies[]; rateCoefficients?: MultiParticleRateCoefficients;
   nativeModel?: string; nativeParameters?: Record<string, unknown>;
   assetId?: string; fileName?: string; offset?: [number, number]; isotropicComponent?: number; directionalComponent?: number; interpolationMode?: 'LINEAR' | 'IDW'; idwNeighbors?: number;
@@ -209,17 +213,52 @@ const NATIVE_MAKEFIN_SIGSEGV_MODELS = new Set(['sf6o2', 'hbro2', 'sf6c4f8', 'neu
 // per lateral axis, so the UI floor follows gridDelta.
 const MIN_DOMAIN_EXTENT_3D = 0.1;
 const minThreeDExtent = (gridDelta: number) => Math.max(MIN_DOMAIN_EXTENT_3D, 2 * gridDelta);
+// Isotropic steps hold one scalar rate per material; directional steps hold a
+// directional/isotropic pair. Both live in `materialRates`, so read them through
+// these helpers instead of casting at each use site.
+function scalarMaterialRates(step: Step): Record<string, number> {
+  const table = step.materialRates ?? {};
+  return Object.fromEntries(Object.entries(table).filter(entry => typeof entry[1] === 'number')) as Record<string, number>;
+}
+function directionalMaterialRates(step: Step): Record<string, DirectionalMaterialRate> {
+  const table = step.materialRates ?? {};
+  return Object.fromEntries(Object.entries(table).filter(entry => typeof entry[1] === 'object' && entry[1] !== null)) as Record<string, DirectionalMaterialRate>;
+}
+function isDirectionalMaterialMode(step: Step): boolean {
+  return step.model === 'directional' && (step.materialRates !== undefined || step.defaultMaterialRate !== undefined);
+}
+function materialRateModeAvailable(step: Step): boolean { return step.model === 'isotropic' || step.operation === 'etch'; }
+function materialRateModeActive(step: Step): boolean { return materialRateModeAvailable(step) && step.rateMode === 'material'; }
+function stripIsotropicMethod(step: Step): Step {
+  const next = { ...step }; delete next.isotropicMethod; delete next.isotropicTimeStepRatio; return next;
+}
+function stripDirectionalRateTable(step: Step): Step {
+  const next: Step & { rateSets?: unknown } = { ...step };
+  delete next.materialRates; delete next.defaultMaterialRate; delete next.rateSets;
+  return next;
+}
+function stripDirectionalScalarRates(step: Step): Step {
+  const next: Step & { rateSets?: unknown } = { ...step };
+  delete next.directionalRateMagnitude; delete next.isotropicRateMagnitude; delete next.calculateVisibility; delete next.rateSets;
+  return next;
+}
 function hasMotion(step: Step): boolean {
   if (isGeometryStep(step)) return false;
   if (step.model === 'specialized' || step.model === 'csvProcess') return true;
-  if (step.model === 'directional') return (step.directionalRateMagnitude ?? 0) > 0 || (step.isotropicRateMagnitude ?? 0) > 0;
+  if (step.model === 'directional') {
+    if (isDirectionalMaterialMode(step)) {
+      return Object.values(directionalMaterialRates(step)).some(row => (row.directional ?? 0) > 0 || (row.isotropic ?? 0) > 0)
+        || (step.defaultMaterialRate?.directional ?? 0) > 0 || (step.defaultMaterialRate?.isotropic ?? 0) > 0;
+    }
+    return (step.directionalRateMagnitude ?? 0) > 0 || (step.isotropicRateMagnitude ?? 0) > 0;
+  }
   if (step.model === 'multiParticle') {
     const table = step.rateCoefficients;
     return Object.values(table?.defaultBySpecies ?? {}).some(rate => rate > 0)
       || Object.values(table?.byMaterial ?? {}).some(row => Object.values(row).some(rate => rate > 0));
   }
   if (step.rateMode !== 'material') return (step.rateMagnitude ?? 0) > 0;
-  return (step.rateMagnitude ?? 0) > 0 || Object.values(step.materialRates ?? {}).some(rate => rate > 0);
+  return (step.rateMagnitude ?? 0) > 0 || Object.values(scalarMaterialRates(step)).some(rate => rate > 0);
 }
 function usesFlux(step: Step): boolean { return step.enabled && ((step.model === 'specialized' && SPECIALIZED_FLUX_MODELS.has(step.nativeModel ?? '')) || (step.model === 'singleParticle' || step.model === 'multiParticle') && hasMotion(step)); }
 function isGeometryStep(step: Step): boolean { return step.model === 'removeMaterial' || step.model === 'planarize' || step.model === 'boolean' || step.model === 'gdsBoolean'; }
@@ -237,7 +276,8 @@ function stepKindLabel(step: Step): string {
   if (step.model === 'gdsBoolean') return `GDS 布尔 · layer ${step.gdsMask?.layer ?? '—'}/${step.gdsMask?.datatype ?? 0} · ${{ union: '并集', intersection: '交集', difference: '差集' }[step.booleanOperation ?? 'difference']}`;
   if (step.model === 'specialized') return `ViennaPS 专用模型 · ${step.nativeModel ?? '未选择'}`;
   if (step.model === 'csvProcess') return `CSV 速率表 · ${step.fileName ?? '未选择文件'} · ${step.interpolationMode ?? '未设置插值'}`;
-  return `${step.operation === 'etch' ? '刻蚀' : '沉积'} · ${step.model === 'isotropic' ? '各向同性' : step.model === 'singleParticle' ? '单粒子' : step.model === 'multiParticle' ? '多粒子' : '定向过程'}${hasMotion(step) ? '' : ' · 零速率'}`;
+  const directionalTableCount = step.model === 'directional' ? Object.keys(directionalMaterialRates(step)).length : 0;
+  return `${step.operation === 'etch' ? '刻蚀' : '沉积'} · ${step.model === 'isotropic' ? '各向同性' : step.model === 'singleParticle' ? '单粒子' : step.model === 'multiParticle' ? '多粒子' : '定向过程'}${hasMotion(step) ? '' : ' · 零速率'}${directionalTableCount ? ` · 材料速率表 ${directionalTableCount} 项` : ''}`;
 }
 function geometryMaterialNames(geometry: Geometry): string[] {
   const names = new Set<string>();
@@ -763,6 +803,7 @@ export default function App() {
   const [gdsImportError, setGdsImportError] = useState('');
   const [slicePosition, setSlicePosition] = useState(0);
   const [rateRowMaterial, setRateRowMaterial] = useState('');
+  const [directionalRateRowMaterial, setDirectionalRateRowMaterial] = useState('');
   const [multiRateMaterial, setMultiRateMaterial] = useState('');
   const [multiStickingMaterial, setMultiStickingMaterial] = useState('');
   const [health, setHealth] = useState<'checking' | 'ready' | 'offline'>('checking');
@@ -1626,6 +1667,7 @@ export default function App() {
     }
     const step: Step = { id, name: `步骤 ${project.steps.length + 1}`, enabled: true, operation: 'etch', model, rateMagnitude: 0.2, duration: 0.2,
       ...(project.schemaVersion >= 4 ? { rateMode: 'uniform' as const } : {}),
+      ...(project.schemaVersion >= 4 && model === 'isotropic' ? { isotropicMethod: 'auto' as const } : {}),
       ...(model === 'singleParticle' ? { stickingProbability: 0.5, sourceExponent: 1 } : {}) };
     updateProject(previous => ({ ...previous, steps: [...previous.steps, step] })); setSelectedStep(id);
   };
@@ -1780,8 +1822,8 @@ export default function App() {
         if (step.id !== stepId) return step;
         const rate = Math.min(2, Object.values(step.rateCoefficients?.defaultBySpecies ?? {}).reduce((sum, value) => sum + value, 0));
         const { species: _species, rateCoefficients: _rateCoefficients, ...common } = step;
-        if (model === 'directional') return { ...common, model, direction: defaultDirection(previous.dimension), directionalRateMagnitude: rate, isotropicRateMagnitude: 0, calculateVisibility: true };
-        const converted: Step = { ...common, model, rateMagnitude: Math.max(rate, 0.2), rateMode: 'uniform' };
+        if (model === 'directional') return { ...stripIsotropicMethod(stripDirectionalRateTable(common)), model, direction: defaultDirection(previous.dimension), directionalRateMagnitude: rate, isotropicRateMagnitude: 0, calculateVisibility: true };
+        const converted: Step = { ...stripIsotropicMethod(stripDirectionalRateTable(common)), model, rateMagnitude: Math.max(rate, 0.2), rateMode: 'uniform' };
         if (model === 'singleParticle') { converted.stickingProbability = 0.5; converted.sourceExponent = 1; }
         else { delete converted.stickingProbability; delete converted.sourceExponent; }
         return converted;
@@ -1793,6 +1835,7 @@ export default function App() {
         const { rateMagnitude: _rate, rateMode: _mode, materialRates: _materials, selectivityReference: _reference,
           stickingProbability: _sticking, sourceExponent: _exponent, direction: _direction,
           directionalRateMagnitude: _directional, isotropicRateMagnitude: _isotropic,
+          isotropicMethod: _isotropicMethod, isotropicTimeStepRatio: _isotropicTimeStepRatio, defaultMaterialRate: _defaultMaterialRate,
           calculateVisibility: _visibility, ...common } = step;
         return { ...common, model, ...defaultMultiParticleFields() };
       }) };
@@ -1801,11 +1844,12 @@ export default function App() {
       const promoted = promoteProjectToV5(previous);
       return { ...promoted, steps: promoted.steps.map(step => {
         if (step.id !== stepId) return step;
-        const availableRates = [step.rateMagnitude ?? 0, ...Object.values(step.materialRates ?? {})];
+        const availableRates = [step.rateMagnitude ?? 0, ...Object.values(scalarMaterialRates(step))];
         const rate = Math.max(...availableRates);
         const { rateMagnitude: _rateMagnitude, rateMode: _rateMode, materialRates: _materialRates, selectivityReference: _selectivityReference,
-          stickingProbability: _stickingProbability, sourceExponent: _sourceExponent, ...common } = step;
-        return { ...common, model: 'directional', direction: defaultDirection(previous.dimension), directionalRateMagnitude: rate,
+          stickingProbability: _stickingProbability, sourceExponent: _sourceExponent,
+          isotropicMethod: _isotropicMethod, isotropicTimeStepRatio: _isotropicTimeStepRatio, ...common } = step;
+        return { ...stripDirectionalRateTable(common), model: 'directional', direction: defaultDirection(previous.dimension), directionalRateMagnitude: rate,
           isotropicRateMagnitude: 0, calculateVisibility: true };
       }) };
     }
@@ -1816,7 +1860,7 @@ export default function App() {
         const combinedRate = Math.min(2, (step.directionalRateMagnitude ?? 0) + (step.isotropicRateMagnitude ?? 0));
         const { direction: _direction, directionalRateMagnitude: _directionalRate, isotropicRateMagnitude: _isotropicRate,
           calculateVisibility: _visibility, ...common } = step;
-        const converted: Step = { ...common, model, rateMagnitude: combinedRate, rateMode: 'uniform' };
+        const converted: Step = { ...stripDirectionalRateTable(common), model, rateMagnitude: combinedRate, rateMode: 'uniform' };
         if (model === 'singleParticle') { converted.stickingProbability = 0.5; converted.sourceExponent = 1; }
         else { delete converted.stickingProbability; delete converted.sourceExponent; }
         return converted;
@@ -1824,7 +1868,7 @@ export default function App() {
     }
     return { ...previous, steps: previous.steps.map(step => {
       if (step.id !== stepId) return step;
-      if (model === 'singleParticle') return { ...step, model, rateMagnitude: step.rateMagnitude ?? 0.2, stickingProbability: 0.5, sourceExponent: 1 };
+      if (model === 'singleParticle') return { ...stripIsotropicMethod(step), model, rateMagnitude: step.rateMagnitude ?? 0.2, stickingProbability: 0.5, sourceExponent: 1 };
       const converted: Step = { ...step, model, rateMagnitude: step.rateMagnitude ?? 0.2 };
       delete converted.stickingProbability; delete converted.sourceExponent;
       return converted;
@@ -1848,28 +1892,64 @@ export default function App() {
     setSelectedStep(duplicate.id);
   };
   const setRateMode = (stepId: string, mode: 'uniform' | 'material') => editRateProfile(stepId, (step, source) => {
-    if (mode === 'material' && step.operation === 'etch') return {
+    if (mode === 'material' && step.model !== 'directional' && step.model !== 'specialized' && materialRateModeAvailable(step)) return {
       ...step, rateMode: 'material',
-      materialRates: step.rateMode === 'material' ? { ...(step.materialRates ?? {}) } : configuredMaterialRates(source, step.rateMagnitude ?? 0.2),
+      materialRates: step.rateMode === 'material' ? { ...scalarMaterialRates(step) } : configuredMaterialRates(source, step.rateMagnitude ?? 0.2),
     };
     const next = { ...step, rateMode: 'uniform' as const };
     delete next.materialRates; delete next.selectivityReference;
     return next;
   });
-  const setMaterialRate = (stepId: string, name: string, rate: number) => editRateProfile(stepId, step => ({ ...step, rateMode: 'material', materialRates: { ...(step.materialRates ?? {}), [name]: rate } }));
+  const setMaterialRate = (stepId: string, name: string, rate: number) => editRateProfile(stepId, step => ({ ...step, rateMode: 'material', materialRates: { ...scalarMaterialRates(step), [name]: rate } }));
   const removeMaterialRate = (stepId: string, name: string) => editRateProfile(stepId, step => {
-    const materialRates = { ...(step.materialRates ?? {}) }; delete materialRates[name];
+    const materialRates = { ...scalarMaterialRates(step) }; delete materialRates[name];
     return { ...step, rateMode: 'material', materialRates };
   });
   const addMaterialRate = (stepId: string, name: string) => {
     if (!name) return;
-    editRateProfile(stepId, step => ({ ...step, rateMode: 'material', materialRates: { ...(step.materialRates ?? {}), [name]: step.rateMagnitude ?? 0.2 } }));
+    editRateProfile(stepId, step => ({ ...step, rateMode: 'material', materialRates: { ...scalarMaterialRates(step), [name]: step.rateMagnitude ?? 0.2 } }));
     setRateRowMaterial('');
   };
   const setSelectivityReference = (stepId: string, name: string) => editRateProfile(stepId, step => {
     const next = { ...step, rateMode: 'material' as const };
     if (name) next.selectivityReference = name; else delete next.selectivityReference;
     return next;
+  });
+  // Directional material-rate table. Scalar rates and the visibility flag stay
+  // out of the object while this mode is active (the native RateMap has no
+  // visibility control and the schema rejects mixed scalar/material steps).
+  const setDirectionalMaterialRate = (stepId: string, name: string, patch: Partial<DirectionalMaterialRate>) => editStep(stepId, step => {
+    const table = directionalMaterialRates(step);
+    return { ...step, materialRates: { ...table, [name]: { ...(table[name] ?? { directional: 0, isotropic: 0 }), ...patch } } };
+  });
+  const removeDirectionalMaterialRate = (stepId: string, name: string) => editStep(stepId, step => {
+    const table = directionalMaterialRates(step); delete table[name];
+    return { ...step, materialRates: table };
+  });
+  const addDirectionalMaterialRate = (stepId: string, name: string) => {
+    if (!name) return;
+    editStep(stepId, step => ({ ...step, materialRates: { ...directionalMaterialRates(step), [name]: { ...(step.defaultMaterialRate ?? { directional: 0, isotropic: 0 }) } } }));
+    setDirectionalRateRowMaterial('');
+  };
+  const setDirectionalDefaultMaterialRate = (stepId: string, patch: Partial<DirectionalMaterialRate>) => editStep(stepId, step => ({
+    ...step, defaultMaterialRate: { ...(step.defaultMaterialRate ?? { directional: 0, isotropic: 0 }), ...patch },
+  }));
+  const setDirectionalRateMode = (stepId: string, mode: 'scalar' | 'material') => editStep(stepId, step => {
+    if (mode === 'material') {
+      if (isDirectionalMaterialMode(step)) return step;
+      return {
+        ...stripDirectionalScalarRates(step),
+        materialRates: {},
+        defaultMaterialRate: { directional: step.directionalRateMagnitude ?? 0.2, isotropic: step.isotropicRateMagnitude ?? 0 },
+      };
+    }
+    if (!isDirectionalMaterialMode(step)) return step;
+    return {
+      ...stripDirectionalRateTable(step),
+      directionalRateMagnitude: step.defaultMaterialRate?.directional ?? 0.2,
+      isotropicRateMagnitude: step.defaultMaterialRate?.isotropic ?? 0,
+      calculateVisibility: true,
+    };
   });
   const updatePattern = (part: Partial<Exclude<StackGeometry['pattern'], { kind: 'none' }>>) => updateProject(previous => {
     if (previous.geometry.kind !== 'stack' || previous.geometry.pattern.kind === 'none') return previous;
@@ -2897,8 +2977,11 @@ export default function App() {
               {selectedStepObject.model !== 'specialized' && selectedStepObject.model !== 'csvProcess' && <SelectField label="工艺操作" value={selectedStepObject.operation ?? 'etch'} options={[{ value: 'etch', label: '刻蚀' }, { value: 'deposit', label: '沉积' }]} onChange={value => editStep(selectedStepObject.id, step => {
                 const next = { ...step, operation: value as Step['operation'] };
                 if (next.operation === 'deposit') next.depositMaterial = materials.find(m => m.name === 'SiO2')?.name ?? 'SiO2'; else delete next.depositMaterial;
-                delete next.materialRates; delete next.selectivityReference;
-                if (next.model !== 'directional' && next.model !== 'multiParticle' && project.schemaVersion >= 4) next.rateMode = 'uniform'; else delete next.rateMode;
+                // Material tables are valid for both operations now: the worker applies the
+                // operation sign. Only scalar-rate steps lose the table on an operation switch.
+                const keepsMaterialTable = isDirectionalMaterialMode(step) || (step.model === 'isotropic' && step.rateMode === 'material');
+                if (!keepsMaterialTable) { delete next.materialRates; delete next.selectivityReference; }
+                if (next.model !== 'directional' && next.model !== 'multiParticle' && project.schemaVersion >= 4) next.rateMode = keepsMaterialTable && step.model === 'isotropic' ? 'material' : 'uniform'; else delete next.rateMode;
                 return next;
               })} />}
               {selectedStepObject.model !== 'specialized' && selectedStepObject.model !== 'csvProcess' && <SelectField label="过程模型" value={selectedStepObject.model} options={[{ value: 'isotropic', label: '各向同性过程' }, { value: 'singleParticle', label: '单粒子过程' }, { value: 'multiParticle', label: '多粒子过程' }, { value: 'directional', label: '定向过程' }]} onChange={value => changeStepModel(selectedStepObject.id, value as Step['model'])} />}
@@ -2993,13 +3076,40 @@ export default function App() {
                     })} />;
                   })}
                 </div>
-                <NumericField label="定向速率大小" unit="µm/s" value={selectedStepObject.directionalRateMagnitude ?? 0} min={0} max={2} step="0.01" hint="刻蚀/沉积操作自动应用原生符号" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, directionalRateMagnitude: value }))} />
-                <NumericField label="各向同性速率分量" unit="µm/s" value={selectedStepObject.isotropicRateMagnitude ?? 0} min={0} max={2} step="0.01" hint="与定向分量叠加；0 表示不添加该分量" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, isotropicRateMagnitude: value }))} />
-                <label className={`visibility-option ${(selectedStepObject.directionalRateMagnitude ?? 0) === 0 ? 'disabled' : ''}`}>
-                  <input type="checkbox" aria-label="计算方向可见性" checked={selectedStepObject.calculateVisibility ?? true} disabled={(selectedStepObject.directionalRateMagnitude ?? 0) === 0}
-                    onChange={event => editStep(selectedStepObject.id, step => ({ ...step, calculateVisibility: event.target.checked }))} />
-                  <span><strong>计算遮挡可见性</strong><small>仅定向速率非零时适用；关闭后不计算遮挡</small></span>
-                </label>
+                {(() => {
+                  const materialMode = isDirectionalMaterialMode(selectedStepObject);
+                  const table = directionalMaterialRates(selectedStepObject);
+                  const defaultRate = selectedStepObject.defaultMaterialRate ?? { directional: 0, isotropic: 0 };
+                  return <>
+                    <SelectField label="速率输入模式" value={materialMode ? 'material' : 'scalar'} options={[{ value: 'scalar', label: '标量速率' }, { value: 'material', label: '材料速率表' }]} onChange={value => setDirectionalRateMode(selectedStepObject.id, value as 'scalar' | 'material')} hint="材料速率表与标量速率、遮挡可见性互斥" />
+                    {materialMode ? <>
+                      <div className="rate-profile-note">每种材料分别给出定向与各向同性分量（µm/s，0–2）。未列出的材料使用默认速率，0 表示不动。原生 RateMap 没有遮挡可见性开关，因此材料模式不写 calculateVisibility。</div>
+                      <NumericField label="默认定向速率" unit="µm/s" value={defaultRate.directional} min={0} max={2} step="0.01" hint="未列出材料的定向分量；0 表示保护" onChange={value => setDirectionalDefaultMaterialRate(selectedStepObject.id, { directional: value })} />
+                      <NumericField label="默认各向同性速率" unit="µm/s" value={defaultRate.isotropic} min={0} max={2} step="0.01" hint="未列出材料的各向同性分量；0 表示不添加" onChange={value => setDirectionalDefaultMaterialRate(selectedStepObject.id, { isotropic: value })} />
+                      <div className="rate-table" role="table" aria-label="定向材料速率表">
+                        <div className="rate-table-head" role="row"><span>材料 / 定向 / 各向同性</span><span>µm/s</span><span /></div>
+                        {Object.entries(table).sort(([a], [b]) => a.localeCompare(b)).map(([materialName, row]) => <div className="rate-row" role="row" key={materialName}>
+                          <div>
+                            <strong>{materialName}</strong>
+                            <NumericField label={`${materialName} 定向速率`} unit="µm/s" value={row.directional ?? 0} min={0} max={2} step="0.01" onChange={value => setDirectionalMaterialRate(selectedStepObject.id, materialName, { directional: value })} />
+                            <NumericField label={`${materialName} 各向同性速率`} unit="µm/s" value={row.isotropic ?? 0} min={0} max={2} step="0.01" onChange={value => setDirectionalMaterialRate(selectedStepObject.id, materialName, { isotropic: value })} />
+                          </div>
+                          <span className="rate-ratio">{(row.directional ?? 0) === 0 && (row.isotropic ?? 0) === 0 ? '0 · 不动' : `${row.directional ?? 0} / ${row.isotropic ?? 0}`}</span>
+                          <button className="icon-button" type="button" aria-label={`移除 ${materialName} 定向速率行`} title="移除材料行" onClick={() => removeDirectionalMaterialRate(selectedStepObject.id, materialName)}>×</button>
+                        </div>)}
+                        <div className="rate-add"><select aria-label="新增定向材料速率行" value={directionalRateRowMaterial} onChange={event => setDirectionalRateRowMaterial(event.target.value)}><option value="">选择材料…</option>{materials.filter(m => !Object.hasOwn(table, m.name)).map(m => <option key={m.name} value={m.name}>{m.name}</option>)}</select><button className="button" disabled={!directionalRateRowMaterial} onClick={() => addDirectionalMaterialRate(selectedStepObject.id, directionalRateRowMaterial)}>＋ 添加材料行</button></div>
+                      </div>
+                    </> : <>
+                      <NumericField label="定向速率大小" unit="µm/s" value={selectedStepObject.directionalRateMagnitude ?? 0} min={0} max={2} step="0.01" hint="刻蚀/沉积操作自动应用原生符号" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, directionalRateMagnitude: value }))} />
+                      <NumericField label="各向同性速率分量" unit="µm/s" value={selectedStepObject.isotropicRateMagnitude ?? 0} min={0} max={2} step="0.01" hint="与定向分量叠加；0 表示不添加该分量" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, isotropicRateMagnitude: value }))} />
+                      <label className={`visibility-option ${(selectedStepObject.directionalRateMagnitude ?? 0) === 0 ? 'disabled' : ''}`}>
+                        <input type="checkbox" aria-label="计算方向可见性" checked={selectedStepObject.calculateVisibility ?? true} disabled={(selectedStepObject.directionalRateMagnitude ?? 0) === 0}
+                          onChange={event => editStep(selectedStepObject.id, step => ({ ...step, calculateVisibility: event.target.checked }))} />
+                        <span><strong>计算遮挡可见性</strong><small>仅定向速率非零时适用；关闭后不计算遮挡</small></span>
+                      </label>
+                    </>}
+                  </>;
+                })()}
               </div> : selectedStepObject.model === 'multiParticle' ? <>
                 <div className="step-tab-panel" data-step-tab-panel="native">
                 <div className="inline-note">参数直接传给 ViennaPS 4.6.2 MultiParticleProcess。安装版绑定没有声明离子角度与能量单位，工作台不换算单位。速率关系是受控表格：按材料选择各粒子通量系数，刻蚀返回负速度、沉积返回正速度；原生通量单位未声明，系数负责换算到工作台使用的 µm/s。</div>
@@ -3070,23 +3180,48 @@ export default function App() {
                 </div>
               </> : <>
               <div className="step-tab-panel" data-step-tab-panel="physics">
-              {selectedStepObject.operation === 'etch' && <SelectField label="速率模式" value={selectedStepObject.rateMode ?? 'uniform'} options={[{ value: 'uniform', label: '统一速率' }, { value: 'material', label: '按材料设置' }]} onChange={value => setRateMode(selectedStepObject.id, value as 'uniform' | 'material')} hint="可为每种材料分别指定刻蚀速率" />}
-              <NumericField label={selectedStepObject.operation === 'etch' && selectedStepObject.rateMode === 'material' ? '未列出材料默认速率' : '速率大小'} unit="µm/s" value={selectedStepObject.rateMagnitude ?? 0} min={0} max={2} step="0.01" hint={selectedStepObject.operation === 'etch' && selectedStepObject.rateMode === 'material' ? '材料表中的显式值优先；未列出的材料使用此值' : "刻蚀传入负速率，沉积传入正速率"} onChange={value => selectedStepObject.operation === 'etch' && selectedStepObject.rateMode === 'material' ? editRateProfile(selectedStepObject.id, step => ({ ...step, rateMagnitude: value, rateMode: 'material' })) : editStep(selectedStepObject.id, step => ({ ...step, rateMagnitude: value }))} />
-              {selectedStepObject.operation === 'etch' && selectedStepObject.rateMode === 'material' && <>
+              {selectedStepObject.model === 'isotropic' && <SelectField label="各向同性算法" value={selectedStepObject.isotropicMethod ?? ''} options={[
+                { value: '', label: 'Level-set · 旧项目默认（不写字段）' },
+                { value: 'auto', label: '自动（2D 几何 / 3D level-set）' },
+                { value: 'levelSet', label: 'Level-set' },
+                { value: 'geometric', label: '几何偏移' },
+              ]} onChange={value => editStep(selectedStepObject.id, step => {
+                const next = { ...step };
+                if (value) next.isotropicMethod = value as NonNullable<Step['isotropicMethod']>; else delete next.isotropicMethod;
+                if (value === 'geometric') delete next.isotropicTimeStepRatio;
+                return next;
+              })} hint="自动只在 2D、统一速率且几何安全时改用几何偏移；3D 自动始终走 level-set" />}
+              {selectedStepObject.model === 'isotropic' && selectedStepObject.isotropicMethod === 'geometric' && <div className="inline-note warning">几何偏移只支持统一速率{materialRateModeActive(selectedStepObject) ? '（当前是按材料速率，请切回统一速率）' : ''}，并且厚度必须 ≥ 一个网格；3D 显式几何通常比 level-set 慢 3–30 倍，只适合作为对照。</div>}
+              {selectedStepObject.model === 'isotropic' && selectedStepObject.isotropicMethod !== 'geometric' && <>
+                <label className="visibility-option">
+                  <input type="checkbox" aria-label="覆盖 level-set 时间步比例" checked={selectedStepObject.isotropicTimeStepRatio !== undefined}
+                    onChange={event => editStep(selectedStepObject.id, step => {
+                      const next = { ...step };
+                      if (event.target.checked) next.isotropicTimeStepRatio = step.isotropicTimeStepRatio ?? project.solver.timeStepRatio;
+                      else delete next.isotropicTimeStepRatio;
+                      return next;
+                    })} />
+                  <span><strong>覆盖 level-set 时间步比例</strong><small>仅影响 level-set 路径；关闭时沿用求解器值 {project.solver.timeStepRatio}</small></span>
+                </label>
+                {selectedStepObject.isotropicTimeStepRatio !== undefined && <NumericField label="level-set 时间步比例" value={selectedStepObject.isotropicTimeStepRatio} min={0.05} max={0.5} step="0.01" hint="范围 0.05–0.5；0.5 更快，但需要自行验证稳定性" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, isotropicTimeStepRatio: value }))} />}
+              </>}
+              {materialRateModeAvailable(selectedStepObject) && <SelectField label="速率模式" value={selectedStepObject.rateMode ?? 'uniform'} options={[{ value: 'uniform', label: '统一速率' }, { value: 'material', label: '按材料设置' }]} onChange={value => setRateMode(selectedStepObject.id, value as 'uniform' | 'material')} hint={selectedStepObject.operation === 'deposit' ? '沉积与刻蚀都可用材料表；未列出的材料使用“速率大小”' : '可为每种材料分别指定刻蚀速率'} />}
+              <NumericField label={materialRateModeActive(selectedStepObject) ? '未列出材料默认速率' : '速率大小'} unit="µm/s" value={selectedStepObject.rateMagnitude ?? 0} min={0} max={2} step="0.01" hint={materialRateModeActive(selectedStepObject) ? '材料表中的显式值优先；未列出的材料使用此值，0 表示保护' : "刻蚀传入负速率，沉积传入正速率"} onChange={value => materialRateModeActive(selectedStepObject) ? editRateProfile(selectedStepObject.id, step => ({ ...step, rateMagnitude: value, rateMode: 'material' })) : editStep(selectedStepObject.id, step => ({ ...step, rateMagnitude: value }))} />
+              {materialRateModeActive(selectedStepObject) && <>
                 <div className="rate-profile-note">表格中的速率优先；未列出的材料使用默认速率。0 µm/s 表示保护。掩膜也按此表执行，同一种材料的所有区域共用速率。</div>
                 <SelectField label="选择性参考材料" value={selectedStepObject.selectivityReference ?? ''} options={[{ value: '', label: '不显示参考比值' }, ...materials.map(m => ({ value: m.name, label: m.name }))]} onChange={value => setSelectivityReference(selectedStepObject.id, value)} hint="仅显示参考比值，不改变仿真" />
-                <div className="rate-table" role="table" aria-label="材料相关刻蚀速率">
+                <div className="rate-table" role="table" aria-label={selectedStepObject.operation === 'etch' ? '材料相关刻蚀速率' : '材料相关沉积速率'}>
                   <div className="rate-table-head" role="row"><span>材料 / 速率</span><span>参考速率 ÷ 本材料</span><span /></div>
-                  {Object.entries(selectedStepObject.materialRates ?? {}).sort(([a], [b]) => a.localeCompare(b)).map(([materialName, rate]) => {
-                    const referenceRate = selectedStepObject.materialRates?.[selectedStepObject.selectivityReference ?? ''] ?? selectedStepObject.rateMagnitude ?? 0;
+                  {Object.entries(scalarMaterialRates(selectedStepObject)).sort(([a], [b]) => a.localeCompare(b)).map(([materialName, rate]) => {
+                    const referenceRate = scalarMaterialRates(selectedStepObject)[selectedStepObject.selectivityReference ?? ''] ?? selectedStepObject.rateMagnitude ?? 0;
                     const ratio = rate === 0 ? referenceRate === 0 ? '— · 0/0 未定义' : '∞ · 保护' : `${(referenceRate / rate).toPrecision(4)}×`;
                     return <div className="rate-row" role="row" key={materialName}>
-                      <div><strong>{materialName}</strong>{rate === 0 && <small className="protected-mark">0 · 保护</small>}<NumericField label="刻蚀速率" unit="µm/s" value={rate} min={0} max={2} step=".01" onChange={value => setMaterialRate(selectedStepObject.id, materialName, value)} /></div>
+                      <div><strong>{materialName}</strong>{rate === 0 && <small className="protected-mark">0 · 保护</small>}<NumericField label={selectedStepObject.operation === 'etch' ? '刻蚀速率' : '沉积速率'} unit="µm/s" value={rate} min={0} max={2} step=".01" onChange={value => setMaterialRate(selectedStepObject.id, materialName, value)} /></div>
                       <span className="rate-ratio">{selectedStepObject.selectivityReference ? ratio : '—'}</span>
                       <button className="icon-button" type="button" aria-label={`移除 ${materialName} 速率覆盖`} title="移除覆盖" onClick={() => removeMaterialRate(selectedStepObject.id, materialName)}>×</button>
                     </div>;
                   })}
-                  <div className="rate-add"><select aria-label="新增材料速率行" value={rateRowMaterial} onChange={event => setRateRowMaterial(event.target.value)}><option value="">选择材料…</option>{materials.filter(m => !Object.hasOwn(selectedStepObject.materialRates ?? {}, m.name)).map(m => <option key={m.name} value={m.name}>{m.name}</option>)}</select><button className="button" disabled={!rateRowMaterial} onClick={() => addMaterialRate(selectedStepObject.id, rateRowMaterial)}>＋ 添加材料行</button></div>
+                  <div className="rate-add"><select aria-label="新增材料速率行" value={rateRowMaterial} onChange={event => setRateRowMaterial(event.target.value)}><option value="">选择材料…</option>{materials.filter(m => !Object.hasOwn(scalarMaterialRates(selectedStepObject), m.name)).map(m => <option key={m.name} value={m.name}>{m.name}</option>)}</select><button className="button" disabled={!rateRowMaterial} onClick={() => addMaterialRate(selectedStepObject.id, rateRowMaterial)}>＋ 添加材料行</button></div>
                 </div>
               </>}
               </div></>}
