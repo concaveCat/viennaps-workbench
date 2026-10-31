@@ -112,6 +112,25 @@ export async function createVtkScene(container: HTMLElement): Promise<VtkScene> 
   });
   win.setContainer(container);
   win.resize();
+  // vtk.js defaults to `powerPreference: 'high-performance'`, but the default is
+  // implicit and easy to lose across upgrades. Pin it before vtk's first
+  // render creates the context, so laptops with iGPU + dGPU ask for the
+  // discrete GPU (Windows may still hand Edge the iGPU unless the browser is
+  // listed as "high performance" in the OS graphics settings).
+  try {
+    const apiWindow = win.getApiSpecificRenderWindow();
+    // `get3DContext` exists on the OpenGL backend; WebGPU has no such knob.
+    if ('get3DContext' in apiWindow) {
+      (apiWindow as { get3DContext: (options: Record<string, unknown>) => unknown }).get3DContext({
+        preserveDrawingBuffer: false,
+        depth: true,
+        alpha: true,
+        powerPreference: 'high-performance',
+      });
+    }
+  } catch {
+    // The render pass creates the context with vtk's own defaults if this fails.
+  }
   const renderer = win.getRenderer();
   const renderWindow = win.getRenderWindow();
   const interactor = win.getInteractor();

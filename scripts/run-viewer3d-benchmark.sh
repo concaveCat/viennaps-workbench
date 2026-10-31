@@ -7,6 +7,9 @@
 #   VIEWER3D_PORT      preferred port (default 8811, auto-increments when busy)
 #   VIEWER3D_BENCH_OUT build directory (default $TMPDIR/viewer3d-bench-dist)
 #   VIEWER3D_BENCH_JSON report path (default docs/viewer3d-benchmark.json)
+#   VIEWER3D_CDP_URL   attach to a running browser over CDP (e.g. Windows Edge
+#                      with the RTX GPU: http://127.0.0.1:9222) instead of
+#                      launching headless SwiftShader Chromium
 #   KEEP_BUILD=1       keep the built harness after the run
 set -euo pipefail
 
@@ -71,5 +74,21 @@ for _ in $(seq 1 60); do
 done
 
 echo "==> 运行 benchmark"
-VIEWER3D_BASE_URL="http://127.0.0.1:$chosen" VIEWER3D_BENCH_JSON="$REPORT" \
-  node tests/viewer3d-benchmark.mjs
+if [ -n "${VIEWER3D_CDP_URL:-}" ]; then
+  echo "==> CDP 浏览器：$VIEWER3D_CDP_URL（不启动本地 headless）"
+else
+  echo "==> 本地 headless Chromium + SwiftShader（软件回退）"
+fi
+status=0
+VIEWER3D_BASE_URL="http://127.0.0.1:$chosen" \
+  VIEWER3D_CDP_URL="${VIEWER3D_CDP_URL:-}" \
+  VIEWER3D_BENCH_JSON="$REPORT" \
+  node tests/viewer3d-benchmark.mjs || status=$?
+if [ -f "$REPORT" ]; then
+  node -e '
+    const report = require(process.argv[1]);
+    console.log(`==> renderer: ${report.webglRenderer ?? "unknown"}`);
+    console.log(`==> environment: ${report.environment ?? "unknown"}`);
+  ' "$REPORT" || true
+fi
+exit "$status"

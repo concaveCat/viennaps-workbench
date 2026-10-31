@@ -16,6 +16,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Viewer2D from './Viewer2D';
 import { loadMesh, loadRunStepIds, prefetch, SnapshotUnavailableError } from './snapshotCache';
 import { createVtkScene, type StandardView, type VtkScene } from './vtkScene';
+import { readWebglRenderer, shortRendererName, type WebglRendererInfo } from './webglRenderer';
 import type {
   ClipState,
   DisplayMode,
@@ -37,6 +38,9 @@ const AXIS_ORDER: Array<'x' | 'y' | 'z'> = ['x', 'y', 'z'];
 /** `?debug=1` exposes the frame-rate counter without opening 性能. */
 const DEBUG_FPS = typeof window !== 'undefined'
   && new URLSearchParams(window.location.search).get('debug') === '1';
+
+/** Remember a dismissed software-rendering warning per renderer string. */
+const RENDERER_WARNING_KEY = 'wb.viewer3d.dismissedRenderer';
 
 const numberFormat = new Intl.NumberFormat('en-US');
 
@@ -104,6 +108,16 @@ export default function WorkflowViewer3D({
   const [fps, setFps] = useState(0);
   const [sceneVersion, setSceneVersion] = useState(0);
   const [sceneError, setSceneError] = useState<string | null>(null);
+  /** WebGL backend of this browser; null when WebGL is unavailable. */
+  const [rendererInfo, setRendererInfo] = useState<WebglRendererInfo | null>(null);
+  /** Dismissal is remembered per renderer, so a GPU switch shows the hint again. */
+  const [dismissedRenderer, setDismissedRenderer] = useState<string>(() => {
+    try {
+      return window.localStorage.getItem(RENDERER_WARNING_KEY) ?? '';
+    } catch {
+      return '';
+    }
+  });
 
   const containerRef = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<VtkScene | null>(null);
@@ -131,6 +145,27 @@ export default function WorkflowViewer3D({
     setState({ status: 'unavailable', reason });
     callbacks.current.onStepUnavailable?.(reason);
   }, []);
+
+  // ------------------------------------------------------------ WebGL backend
+  // Read once per mount: the renderer string never changes without a browser
+  // restart, and creating a probe context per render would be wasteful.
+  useEffect(() => {
+    if (dimension !== 3) return;
+    setRendererInfo(readWebglRenderer());
+  }, [dimension]);
+
+  const dismissRendererWarning = (): void => {
+    if (!rendererInfo) return;
+    setDismissedRenderer(rendererInfo.renderer);
+    try {
+      window.localStorage.setItem(RENDERER_WARNING_KEY, rendererInfo.renderer);
+    } catch {
+      /* private mode: the warning just reappears next time */
+    }
+  };
+  const showRendererWarning = dimension === 3 && !!rendererInfo?.software
+    && dismissedRenderer !== rendererInfo.renderer;
+  const showRendererDebug = DEBUG_FPS || showStats;
 
   // ---------------------------------------------------------------- loading
   useEffect(() => {
@@ -482,6 +517,23 @@ export default function WorkflowViewer3D({
           性能
         </label>
       </div>
+
+      {showRendererWarning && rendererInfo && (
+        <div className="wb-viewer3d__renderer-warn" role="alert" aria-label="软件渲染提示">
+          <span>
+            当前浏览器使用软件渲染（<code title={rendererInfo.renderer}>{shortRendererName(rendererInfo.renderer)}</code>），
+            3D 可能卡顿；请在支持 GPU 的桌面浏览器打开或开启硬件加速。
+          </span>
+          <button type="button" className="wb-viewer3d__button" aria-label="关闭软件渲染提示"
+            onClick={dismissRendererWarning}>关闭</button>
+        </div>
+      )}
+
+      {showRendererDebug && rendererInfo && (
+        <div className="wb-viewer3d__renderer" aria-label="WebGL 渲染器" title={rendererInfo.renderer}>
+          WebGL：{rendererInfo.renderer}
+        </div>
+      )}
 
       <div className="wb-viewer3d__stage">
         {dimension === 3 && <div className="wb-viewer3d__canvas" ref={containerRef} aria-label="三维工艺结构视图" />}

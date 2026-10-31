@@ -153,9 +153,12 @@ onSceneReady?: (handle: {
 
 ## 已知限制
 
-- 无头 Chromium 只有 SwiftShader 软件光栅化，20 万三角形在 1254×594 下约 165 ms/帧；
-  同机同分辨率的裸 WebGL2 基线是 70 ms/帧，见 `docs/viewer3d-benchmark.md`。真实 GPU
-  上是毫秒级。
+- 无头 Chromium 只有 SwiftShader 软件光栅化，20 万三角形在 1254×594 下约 148 ms/帧；
+  同机同分辨率的裸 WebGL2 基线是 50 ms/帧，见 `docs/viewer3d-benchmark.md`。真实 GPU
+  （RTX 3060 Laptop，Windows Edge）上同一场景是 **16.67 ms/帧（60 FPS）**。
+- 面板会读取 `WEBGL_debug_renderer_info`：软件后端（SwiftShader / llvmpipe / Microsoft
+  Basic Render）显示可关闭的“软件渲染”提示，但不禁用 3D；`?debug=1` 或勾选“性能”才显示
+  完整 renderer 字符串。创建 render window 时显式要求 `powerPreference: 'high-performance'`。
 - 背面剔除没有默认打开：开放曲面从背面看会消失，正确性优先。需要时可作为性能开关。
 - 2D 只画原生界面线（快照里没有填充多边形），不做体素化。
 - 截面控件是**裁剪面**（真实裁剪几何），不是等值面切片；没有截面数据时不会显示假控件。

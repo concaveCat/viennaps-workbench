@@ -7,8 +7,11 @@
  * analysis.
  *
  * Usage: node tests/viewer3d-benchmark.mjs
- * Env:   VIEWER3D_BASE_URL (default http://127.0.0.1:8811)
- *        VIEWER3D_BENCH_JSON (default ../../docs/viewer3d-benchmark.json)
+ * Env:   VIEWER3D_BASE_URL   harness URL (default http://127.0.0.1:8811)
+ *        VIEWER3D_BENCH_JSON report path (default ../../docs/viewer3d-benchmark.json)
+ *        VIEWER3D_CDP_URL    attach to an already running browser over CDP
+ *                            (for example Windows Edge with the RTX GPU) instead
+ *                            of launching headless Chromium + SwiftShader
  */
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -20,6 +23,8 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '../..');
 const baseUrl = (process.env.VIEWER3D_BASE_URL ?? 'http://127.0.0.1:8811').replace(/\/$/, '');
 const jsonPath = process.env.VIEWER3D_BENCH_JSON ?? path.join(root, 'docs/viewer3d-benchmark.json');
+const cdpUrl = (process.env.VIEWER3D_CDP_URL ?? '').trim();
+const SOFTWARE_RENDERER = /swiftshader|llvmpipe|softpipe|software|microsoft basic render|basic render driver/i;
 
 const FRAME_BUDGET_MS = 33;
 const FIRST_SWITCH_BUDGET_MS = 800;
@@ -29,7 +34,10 @@ const report = {
   status: 'running',
   generatedAt: new Date().toISOString(),
   baseUrl,
-  browser: 'chromium headless (swiftshader)',
+  browser: cdpUrl ? `chromium via CDP (${cdpUrl})` : 'chromium headless (swiftshader)',
+  environment: cdpUrl ? 'hardware-or-remote' : 'software',
+  webglRenderer: null,
+  webglVendor: null,
   triangles: 0,
   avgFrameMs: null,
   p50FrameMs: null,
@@ -44,19 +52,41 @@ const report = {
   limitations: [],
 };
 
+// Keep the separate manual hardware run (RTX 3060 Laptop) across software runs.
+let previousReport = {};
+try {
+  previousReport = JSON.parse(await fs.readFile(jsonPath, 'utf8'));
+} catch {
+  previousReport = {};
+}
+if (previousReport.hardware) report.hardware = previousReport.hardware;
+
 const check = (name, data = {}) => {
   report.checks.push({ name, ...data });
   console.log(`PASS ${name}${Object.keys(data).length ? ` ${JSON.stringify(data)}` : ''}`);
 };
 
 let browser;
+let launchedHere = false;
 try {
-  browser = await chromium.launch({
-    headless: true,
-    args: ['--no-sandbox', '--use-angle=swiftshader', '--enable-unsafe-swiftshader'],
-  });
-  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  if (cdpUrl) {
+    // A real desktop browser (Windows Edge on the RTX GPU) already exists; do
+    // not launch a second, software-only browser. Reuse its default context so
+    // the benchmark measures the same GPU the user sees.
+    browser = await chromium.connectOverCDP(cdpUrl);
+    report.browser = `chromium via CDP (${cdpUrl})`;
+  } else {
+    browser = await chromium.launch({
+      headless: true,
+      args: ['--no-sandbox', '--use-angle=swiftshader', '--enable-unsafe-swiftshader'],
+    });
+    launchedHere = true;
+  }
+  const context = cdpUrl
+    ? (browser.contexts()[0] ?? await browser.newContext({ viewport: { width: 1280, height: 800 } }))
+    : await browser.newContext({ viewport: { width: 1280, height: 800 } });
   const page = await context.newPage();
+  if (cdpUrl) await page.setViewportSize({ width: 1280, height: 800 });
   page.on('console', (message) => {
     if (message.type() === 'error') report.consoleErrors.push(message.text());
   });
@@ -66,6 +96,23 @@ try {
   await page.waitForFunction(() => window.__viewer3dHarness?.getState().ready === true, null, { timeout: 60000 });
   const initial = await page.evaluate(() => window.__viewer3dHarness.getState());
   report.triangles = initial.stats.triangles;
+  // Read the real backend from the vtk canvas (no extra context is created).
+  const rendererInfo = await page.evaluate(() => {
+    const canvas = document.querySelector('.wb-viewer3d__canvas canvas') ?? document.createElement('canvas');
+    const gl = canvas.getContext('webgl2') ?? canvas.getContext('webgl');
+    if (!gl) return null;
+    const debug = gl.getExtension('WEBGL_debug_renderer_info');
+    return {
+      renderer: String(debug ? gl.getParameter(debug.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER) ?? ''),
+      vendor: String(debug ? gl.getParameter(debug.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR) ?? ''),
+    };
+  });
+  if (rendererInfo) {
+    report.webglRenderer = rendererInfo.renderer;
+    report.webglVendor = rendererInfo.vendor;
+    report.environment = SOFTWARE_RENDERER.test(`${rendererInfo.vendor} ${rendererInfo.renderer}`) ? 'software' : 'hardware';
+    console.log(`WEBGL_RENDERER ${rendererInfo.renderer} (${report.environment})`);
+  }
   assert.ok(report.triangles >= 200_000, `harness must render at least 200k triangles, got ${report.triangles}`);
   check('harness ready', { triangles: report.triangles, parseMs: initial.stats.parseMs });
 
@@ -119,6 +166,11 @@ try {
   // --- heavy step: vertex-clustering simplification -------------------------
   const heavy = await page.evaluate(() => window.__viewer3dHarness.switchStep('step-3'));
   report.switchMs.heavy = Number(heavy.ms.toFixed(1));
+  report.simplification = {
+    from: heavy.stats.sourceTriangles,
+    to: heavy.stats.triangles,
+    ms: report.switchMs.heavy,
+  };
   assert.equal(heavy.stats.simplified, true, 'the 700k triangle step must be simplified');
   assert.ok(heavy.stats.triangles <= 300_000, `simplified mesh still has ${heavy.stats.triangles} triangles`);
   assert.ok(heavy.stats.sourceTriangles >= 700_000, `unexpected source triangle count ${heavy.stats.sourceTriangles}`);
@@ -251,6 +303,34 @@ try {
   await apiPage.close();
   check('worker fetch path + idle prefetch of the next step', report.apiMode);
 
+  // --- renderer line is opt-in (性能) and the software hint is honest ------
+  assert.equal(await page.locator('.wb-viewer3d__renderer').count(), 0, 'the renderer string is hidden by default');
+  await page.locator('.wb-viewer3d__toggle--end input').check();
+  const rendererLine = page.locator('.wb-viewer3d__renderer');
+  await rendererLine.waitFor();
+  const uiRenderer = await rendererLine.innerText();
+  assert.match(uiRenderer, /WebGL：/);
+  assert.ok(uiRenderer.includes(String(report.webglRenderer ?? '').slice(0, 12)),
+    `panel renderer ${uiRenderer} does not match ${report.webglRenderer}`);
+  await page.locator('.wb-viewer3d__toggle--end input').uncheck();
+  assert.equal(await page.locator('.wb-viewer3d__renderer').count(), 0, 'closing 性能 hides the renderer string');
+  if (report.environment === 'software') {
+    const warning = page.locator('[aria-label="软件渲染提示"]');
+    assert.equal(await warning.count(), 1, 'software rendering must be announced in the panel');
+    assert.match(await warning.innerText(), /软件渲染/);
+  } else {
+    assert.equal(await page.locator('[aria-label="软件渲染提示"]').count(), 0, 'a hardware GPU must not warn');
+  }
+  check('renderer string is opt-in and software rendering is announced', { environment: report.environment });
+
+  const debugPage = await context.newPage();
+  await debugPage.goto(`${baseUrl}/viewer3d-harness.html?debug=1`, { waitUntil: 'domcontentloaded' });
+  await debugPage.waitForFunction(() => window.__viewer3dHarness?.getState().ready === true, null, { timeout: 60000 });
+  await debugPage.locator('.wb-viewer3d__renderer').waitFor({ timeout: 30000 });
+  assert.match(await debugPage.locator('.wb-viewer3d__renderer').innerText(), /WebGL：/);
+  await debugPage.close();
+  check('?debug=1 shows the renderer string without opening 性能');
+
   // --- raw WebGL2 floor on the same canvas ---------------------------------
   const baseline = await page.evaluate(
     ([width, height, triangles]) => window.__viewer3dHarness.webglBaseline(width, height, triangles),
@@ -262,9 +342,12 @@ try {
   // --- frame budget ---------------------------------------------------------
   if (report.avgFrameMs > FRAME_BUDGET_MS) {
     report.limitations.push(
-      `平均帧时间 ${report.avgFrameMs} ms 超过 ${FRAME_BUDGET_MS} ms：无头 Chromium 只能用 SwiftShader 软件光栅化。` +
+      `平均帧时间 ${report.avgFrameMs} ms 超过 ${FRAME_BUDGET_MS} ms（渲染后端 ${report.webglRenderer ?? 'unknown'}）。` +
       `同机同分辨率的裸 WebGL2 基线（单 draw call、最简着色器、同样 ${report.triangles} 个三角形）为 ${report.webglBaselineMs} ms/帧，` +
-      `因此瓶颈是 SwiftShader 软件光栅化而不是查看器的 draw call 数量；查看器相对基线的开销约为 ${(report.avgFrameMs / Math.max(report.webglBaselineMs, 0.01)).toFixed(1)}x。`,
+      `查看器相对基线的开销约为 ${(report.avgFrameMs / Math.max(report.webglBaselineMs, 0.01)).toFixed(1)}x。` +
+      (report.environment === 'software'
+        ? '无头 Chromium 只能用 SwiftShader 软件光栅化，这个数字不代表真机 GPU；请用 VIEWER3D_CDP_URL 连到硬件浏览器复测。'
+        : '这是硬件 GPU 上的结果，瓶颈需要结合基线判断。'),
     );
   } else {
     check('interaction frame time within budget', { avgMs: report.avgFrameMs, budgetMs: FRAME_BUDGET_MS });
@@ -280,7 +363,34 @@ try {
   console.error(`FAIL ${report.error}`);
   process.exitCode = 1;
 } finally {
-  await browser?.close();
+  if (launchedHere) {
+    await browser?.close();
+  } else if (browser) {
+    // CDP: closing the connection must not close the user's Edge window.
+    for (const context of browser.contexts()) {
+      for (const page of context.pages()) {
+        if (page.url().startsWith(baseUrl)) await page.close().catch(() => undefined);
+      }
+    }
+    await browser.close().catch(() => undefined);
+  }
+  if (report.environment === 'hardware' && report.webglRenderer) {
+    // A CDP run against a real GPU refreshes the hardware section itself.
+    report.hardware = {
+      measuredAt: report.generatedAt,
+      source: `CDP ${cdpUrl}`,
+      browser: report.browser,
+      environment: 'hardware',
+      webglRenderer: report.webglRenderer,
+      webglVendor: report.webglVendor,
+      triangles: report.triangles,
+      avgFrameMs: report.avgFrameMs,
+      p95FrameMs: report.p95FrameMs,
+      staticFullDetailMs: report.staticFullDetailMs,
+      switchMs: report.switchMs,
+      simplification: report.simplification,
+    };
+  }
   await fs.mkdir(path.dirname(jsonPath), { recursive: true });
   await fs.writeFile(jsonPath, `${JSON.stringify(report, null, 2)}\n`);
   console.log(JSON.stringify(report, null, 2));

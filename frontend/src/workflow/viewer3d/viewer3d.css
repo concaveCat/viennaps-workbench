@@ -80,6 +80,42 @@
   margin-left: auto;
 }
 
+/* Software-rendering warning and the opt-in renderer line (debug/性能). */
+.wb-viewer3d__renderer-warn {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 7px 10px;
+  border-bottom: 1px solid #6b4a12;
+  background: #2a2007;
+  color: #f4d799;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.wb-viewer3d__renderer-warn code {
+  color: #ffe3a8;
+  font: 11px "IBM Plex Mono", ui-monospace, monospace;
+}
+
+.wb-viewer3d__renderer-warn .wb-viewer3d__button {
+  margin-left: auto;
+  flex: none;
+  padding: 2px 8px;
+  font-size: 11px;
+}
+
+.wb-viewer3d__renderer {
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--wf-line, #213a53);
+  background: #0d1b2b;
+  color: var(--wf-muted, #8da6bd);
+  font: 10px/1.5 "IBM Plex Mono", ui-monospace, monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .wb-viewer3d__toggle input {
   accent-color: var(--wf-teal, #35d6c2);
 }

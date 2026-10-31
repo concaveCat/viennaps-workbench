@@ -325,6 +325,19 @@ try {
   await page.waitForFunction(id => document.querySelector('.wf-step-chip.active')?.getAttribute('data-step-id') === id, stepChipId);
   assert.match(await page.locator('.wf-summary.success').filter({ hasText: 'Route 已创建' }).innerText(), /结构：/);
 
+  // ---- software renderer hint (03 hides the viewer's 性能 toggle) --------
+  // Headless CI is SwiftShader: the panel must say so, stay usable, and the
+  // warning must be dismissible. On a hardware browser the warning is absent.
+  const rendererWarning = page.locator('[aria-label="软件渲染提示"]');
+  assert.equal(await page.locator('.wb-viewer3d__renderer').count(), 0, 'the renderer string is hidden by default');
+  if (await rendererWarning.count() > 0) {
+    assert.match(await rendererWarning.innerText(), /软件渲染/);
+    await rendererWarning.getByRole('button', { name: '关闭软件渲染提示' }).click();
+    await rendererWarning.waitFor({ state: 'detached' });
+    // 3D keeps working after dismissing the hint.
+    assert.equal(await page.locator('.wb-viewer3d canvas').count(), 1);
+  }
+
   await page.screenshot({ path: screenshot, fullPage: true });
   const benign = /favicon|Download the React DevTools/i;
   const consoleProblems = consoleErrors.filter(message => !benign.test(message));
