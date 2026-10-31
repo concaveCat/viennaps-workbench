@@ -105,6 +105,14 @@ export default function WorkflowViewer3D({
   // as a defect instead of a measurement. Triangles / points / parse time stay
   // visible; `?debug=1` forces the FPS counter on.
   const [showStats, setShowStats] = useState(false);
+  /** Skip the 500k-triangle preview budget and keep the raw simulation mesh. */
+  const [fullResolution, setFullResolution] = useState(() => {
+    try {
+      return window.localStorage.getItem('wb.viewer3d.fullResolution') === '1';
+    } catch {
+      return false;
+    }
+  });
   const [fps, setFps] = useState(0);
   const [sceneVersion, setSceneVersion] = useState(0);
   const [sceneError, setSceneError] = useState<string | null>(null);
@@ -172,7 +180,9 @@ export default function WorkflowViewer3D({
     const token = ++requestToken.current;
     setState({ status: 'loading' });
     const request = snapshot ? { runId, stepId, snapshot } : { runId, stepId };
-    loadMesh(request)
+    // Full resolution is a 3D-only concept: 2D snapshots are already raw lines.
+    const options = dimension === 3 && fullResolution ? { maxTriangles: Number.MAX_SAFE_INTEGER } : undefined;
+    loadMesh({ ...request, options })
       .then((mesh) => {
         if (token !== requestToken.current) return;
         if (dimension === 3 && mesh.triangleCount === 0) {
@@ -200,7 +210,7 @@ export default function WorkflowViewer3D({
       requestToken.current += 1;
     };
     // `snapshot` must be referentially stable; memoise it in the parent.
-  }, [runId, stepId, snapshot, dimension, retryToken, markUnavailable, stepIds, reportStats]);
+  }, [runId, stepId, snapshot, dimension, retryToken, markUnavailable, stepIds, reportStats, fullResolution]);
 
   // ------------------------------------------------------------- prefetching
   useEffect(() => {
@@ -447,6 +457,20 @@ export default function WorkflowViewer3D({
                 <option value="parallel">正交</option>
                 <option value="perspective">透视</option>
               </select>
+            </label>
+            <label className="wb-viewer3d__toggle"
+              title="不简化三角形，显示原始仿真网格；百万面级别可能明显变慢">
+              <input
+                type="checkbox"
+                checked={fullResolution}
+                disabled={busy}
+                onChange={(event) => {
+                  const value = event.target.checked;
+                  setFullResolution(value);
+                  try { window.localStorage.setItem('wb.viewer3d.fullResolution', value ? '1' : '0'); } catch { /* storage may be full */ }
+                }}
+              />
+              完整分辨率
             </label>
             <label className="wb-viewer3d__toggle">
               <input

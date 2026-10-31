@@ -22,7 +22,8 @@ export class SnapshotUnavailableError extends Error {
   }
 }
 
-export const cacheKey = (runId: string, stepId: string): string => `${runId}:${stepId}`;
+export const cacheKey = (runId: string, stepId: string, options?: ParseOptions): string =>
+  `${runId}:${stepId}:${options?.maxTriangles ?? 'default'}`;
 
 export const snapshotUrl = (runId: string, stepId: string): string =>
   `/api/runs/${encodeURIComponent(runId)}/snapshots/${encodeURIComponent(stepId)}`;
@@ -100,7 +101,7 @@ function remember(key: string, mesh: ParsedMesh): void {
 
 /** Parse (or reuse) the geometry for one step. */
 export function loadMesh(request: LoadRequest): Promise<ParsedMesh> {
-  const key = cacheKey(request.runId, request.stepId);
+  const key = cacheKey(request.runId, request.stepId, request.options);
   const cached = cache.get(key);
   if (cached) {
     // Refresh LRU order.
@@ -121,8 +122,8 @@ export function loadMesh(request: LoadRequest): Promise<ParsedMesh> {
   return promise;
 }
 
-export function getCached(runId: string, stepId: string): ParsedMesh | undefined {
-  return cache.get(cacheKey(runId, stepId));
+export function getCached(runId: string, stepId: string, options?: ParseOptions): ParsedMesh | undefined {
+  return cache.get(cacheKey(runId, stepId, options));
 }
 
 const runSteps = new Map<string, Promise<string[]>>();
