@@ -754,6 +754,56 @@ function candidateKey(row: { runId: string; stepId: string }): string {
   return `${row.runId}:${row.stepId}`;
 }
 
+/**
+ * Execution fingerprint of a project: only the fields that change what a
+ * Compile/Run actually does. Labels (name/view/timestamps) are ignored, null
+ * defaults are dropped, and a compiled envelope's generated step ids are
+ * mapped back to their authored ids through the source map. A fresh Compile of
+ * the same project therefore compares equal, while an edited duration does not.
+ */
+function executionProjectFingerprint(
+  document: ProjectDoc | CompiledEnvelope['project'] | null | undefined,
+  sourceMap?: Array<{ stepId: string; authoredStepId: string }>,
+): string {
+  if (!document) return '';
+  const authoredByCompiled = new Map((sourceMap ?? []).map(entry => [entry.stepId, entry.authoredStepId]));
+  const normalize = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(normalize);
+    if (value && typeof value === 'object') {
+      const result: Record<string, unknown> = {};
+      for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+        const item = (value as Record<string, unknown>)[key];
+        if (item === null || item === undefined) continue;
+        result[key] = normalize(item);
+      }
+      return result;
+    }
+    return value;
+  };
+  const raw = document as Record<string, unknown>;
+  const steps = Array.isArray(raw.steps) ? raw.steps as Array<Record<string, unknown>> : [];
+  const normalizedSteps = steps.map(step => {
+    const copy: Record<string, unknown> = { ...step };
+    if (typeof copy.id === 'string') copy.id = authoredByCompiled.get(copy.id) ?? copy.id;
+    delete copy.name;
+    return normalize(copy);
+  });
+  return JSON.stringify(normalize({
+    dimension: raw.dimension,
+    domain: raw.domain,
+    geometry: raw.geometry,
+    steps: normalizedSteps,
+    solver: raw.solver,
+  }));
+}
+
+/** True when a restored Compile still describes exactly what the project will run. */
+function compileMatchesProject(document: ProjectDoc | null | undefined, compile: CompileInfo | null): boolean {
+  if (!document || !compile) return false;
+  return executionProjectFingerprint(document)
+    === executionProjectFingerprint(compile.compile.project as ProjectDoc, compile.compile.sourceMap);
+}
+
 function metricMethodLabel(method: string): string {
   return METRIC_METHOD_LABELS[method] ?? method;
 }
@@ -1809,7 +1859,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
    * own: one 404 clears only that pointer and adds a closable notice, so a
    * collected compile never blanks the whole page.
    */
-  const restoreWorkflowState = async (id: string) => {
+  const restoreWorkflowState = async (id: string, document?: ProjectDoc) => {
     let stored: ProjectWorkflowState;
     try {
       stored = await api<ProjectWorkflowState>(`/api/v1/workflow/projects/${id}/state`);
@@ -1830,7 +1880,16 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       try {
         const envelope = await api<CompiledEnvelope>(`/api/v1/workflow/compiles/${next.compileId}`);
         setCompile(compileInfoFromEnvelope(envelope));
-        setCompileStale(false);
+        // The saved Compile only describes the project as it was compiled. If
+        // 01/02 changed afterwards (and was saved), restoring it as "fresh"
+        // would route and execute the stale durations. Compare the execution
+        // fields before trusting the envelope.
+        const currentDocument = document ?? project;
+        const matches = !!currentDocument
+          && executionProjectFingerprint(currentDocument)
+            === executionProjectFingerprint(envelope.project, envelope.sourceMap);
+        setCompileStale(!matches);
+        if (!matches) notices.push('工程在编译后有修改，需重新编译。');
       } catch (exc) {
         if ((exc as { status?: number }).status === 404) {
           next.compileId = null;
@@ -2027,6 +2086,15 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     await refreshProjects();
   };
 
+  /**
+   * A saved edit must invalidate the Compile immediately: otherwise 02 keeps
+   * offering "去 03" and the old Compile silently runs the previous durations.
+   */
+  const refreshCompileStaleness = (document: ProjectDoc) => {
+    if (!compile) return;
+    setCompileStale(!compileMatchesProject(document, compile));
+  };
+
   /** The document that actually goes to the server: geometry follows the 01 source tab. */
   const projectDocumentForSave = (): ProjectDoc => {
     if (!project) throw new Error('没有可保存的工程');
@@ -2052,6 +2120,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         : await projectRequest('/api/v1/workflow/projects', 'POST', document);
       setProject(document);
       await applySavedRecord(record, document);
+      refreshCompileStaleness(document);
       // A new projectId (or a just-created draft) still needs its state PUT.
       lastStateJson.current = '';
       setProjectState(previous => ({ ...previous }));
@@ -2076,6 +2145,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setOverwriteArmed(null);
     setProject(document);
     await applySavedRecord(record, document);
+    refreshCompileStaleness(document);
     lastStateJson.current = '';
     setProjectState(previous => ({ ...previous }));
   });
@@ -2085,7 +2155,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     applyLoadedProject(document, record);
     await activateClipBinding(await resolveClipBinding(document));
     window.localStorage.setItem(PROJECT_STORAGE_KEY, record.projectId);
-    await restoreWorkflowState(record.projectId);
+    await restoreWorkflowState(record.projectId, document);
     await restoreLatestReport(record.projectId);
   });
 
@@ -2201,7 +2271,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         });
         await activateClipBinding(await resolveClipBinding(document));
         window.localStorage.setItem(PROJECT_STORAGE_KEY, stored);
-        await restoreWorkflowState(stored);
+        await restoreWorkflowState(stored, document);
         await restoreLatestReport(stored);
       } catch {
         window.localStorage.removeItem(PROJECT_STORAGE_KEY);
@@ -2383,8 +2453,16 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const authoredSteps = useMemo(() => project?.steps ?? [], [project]);
   const selectedFlowStep = authoredSteps.find(step => step.id === selectedFlowStepId) ?? null;
   const canCompile = !!project && authoredSteps.length > 0 && !busy;
+  /**
+   * A Route is stale when none of its attempts was built from the current
+   * Compile. Branch attempts legitimately use derived Compiles, so any matching
+   * attempt keeps the Route runnable; a Route created before a recompile has no
+   * match and is blocked.
+   */
+  const routeStale = !!route && !!compile
+    && !route.attempts.some(attempt => attempt.compileId === compile.compileId);
   const canRoute = !!compile && !compileStale && !busy;
-  const canRun = !!segment && segment.status === 'planned' && !busy;
+  const canRun = !!segment && segment.status === 'planned' && !busy && !compileStale && !routeStale;
   /** A continued Segment can only start from a successful predecessor checkpoint. */
   const attemptSegments = segment && route
     ? route.segments.filter(item => item.attemptId === segment.attemptId)
@@ -2405,12 +2483,17 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     const limit = project?.dimension === 3 && Number.isFinite(yExtent) && yExtent > 0
       ? Math.min(xExtent, yExtent)
       : xExtent;
-    return Number.isFinite(limit) && limit > 0 ? { min: 0, max: limit } : null;
+    if (!Number.isFinite(limit) || limit <= 0) return null;
+    // The computational domain is centred on the origin: [-extent/2, +extent/2].
+    const radius = limit / 2;
+    return { min: -radius, max: radius };
   }, [project?.dimension, project?.domain]);
   const recipeXValue = Number(recipeX);
   const recipeXOutOfDomain = recipeMethod === 'etch_depth'
     && (!Number.isFinite(recipeXValue) || (!!recipeDomain && (recipeXValue < recipeDomain.min || recipeXValue > recipeDomain.max)));
-  const recipeDomainText = recipeDomain ? `0–${formatNumber(recipeDomain.max)} µm` : '计算域未知';
+  const recipeDomainText = recipeDomain
+    ? `${formatNumber(recipeDomain.min)}–${formatNumber(recipeDomain.max)} µm`
+    : '计算域未知';
   const activeRecipeXOutOfDomain = !!activeRecipeSummary
     && activeRecipeSummary.method === 'etch_depth'
     && activeRecipeSummary.x !== null
@@ -2454,7 +2537,6 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     return duplicates;
   }, [experimentRows]);
   const variantDurationConflict = duplicateVariantDurations.size > 0;
-  const routeStale = !!route && !!compile && route.attempts.some(attempt => attempt.compileId !== compile.compileId);
   /** A rebuilt Route or re-run Segment drops its measurement; say so in 03. */
   const needsRemeasure = !!route && !measurement && (measurementInvalidated || route.segments.some(item => item.status === 'succeeded'));
   /** Left tree and the right property panel must describe the measurement the same way. */
@@ -2859,7 +2941,13 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         timeStepRatio: 0.25,
         raysPerPoint: Math.max(1, Number(draft.raysPerPoint) || 16),
         cpuThreads: Math.max(1, Number(draft.cpuThreads) || 1),
-        random: { mode: 'fixed', seed: Number(draft.seed) || 7 },
+        // 0 is a legal seed: only an empty/invalid value falls back to 7.
+        random: {
+          mode: 'fixed',
+          seed: String(draft.seed ?? '').trim() !== '' && Number.isFinite(Number(draft.seed))
+            ? Number(draft.seed)
+            : 7,
+        },
         enginePreference: draft.engine,
         timeoutSeconds: Math.max(5, Number(draft.timeout) || 60),
       },
@@ -2902,6 +2990,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     if (compile) setPreviousCompile(compile);
     setCompile(result);
     setCompileStale(false);
+    setRestoreNotice('');
     recordCompile(result.compileId);
     setProject(previous => previous
       ? { ...previous, steps: (result.authoredSteps ?? previous.steps ?? []) as ProjectStep[] }
@@ -3014,6 +3103,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
 
   const execute = () => run('execute', async () => {
     if (!segment) throw new Error('先创建 Route');
+    if (compileStale || routeStale) throw new Error('编译已过期，先重新编译并重建 Route');
     clearMeasurementsFrom(segment.segmentId);
     const result = await postJson<{ segment: RoutePlan['segments'][number]; runId: string }>(
       `/api/v1/workflow/segments/${segment.segmentId}/execute`, {},
@@ -3032,6 +3122,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
    */
   const executeThroughCurrent = () => run('execute', async () => {
     if (!segment || !route) throw new Error('先创建 Route');
+    if (compileStale || routeStale) throw new Error('编译已过期，先重新编译并重建 Route');
     const attemptSegments = route.segments.filter(item => item.attemptId === segment.attemptId);
     const index = attemptSegments.findIndex(item => item.segmentId === segment.segmentId);
     if (index < 0) throw new Error('当前 Segment 不在 Route 中');
@@ -3174,6 +3265,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
 
   const executeAll = () => run('execute', async () => {
     if (!route) throw new Error('先创建 Route');
+    if (compileStale || routeStale) throw new Error('编译已过期，先重新编译并重建 Route');
     let working = route;
     for (const item of route.segments.filter(segmentItem => segmentItem.status === 'planned')) {
       clearMeasurementsFrom(item.segmentId);
@@ -4305,14 +4397,14 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     }).filter(row => row.runId && row.stepId);
   };
 
-  const loadAnalysis = async (rows: Array<{ runId: string; stepId: string; label: string }>) => {
+  const loadAnalysis = async (rows: Array<{ runId: string; stepId: string; label: string }>, picks: string[] = comparePick) => {
     const candidates = rows.filter(item => item.runId && item.stepId);
     if (!candidates.length) throw new Error('实验还没有可分析的 Run');
     const total = candidates.length;
-    // Only the first COMPARE_CANDIDATE_LIMIT candidates go to the pairwise
-    // comparison; every candidate still gets its own structure view.
-    const picked = comparePick.length
-      ? candidates.filter(item => comparePick.includes(candidateKey(item)))
+    // Only the selected (≤ COMPARE_CANDIDATE_LIMIT) candidates go to the
+    // pairwise comparison; every candidate still gets its own structure view.
+    const picked = picks.length
+      ? candidates.filter(item => picks.includes(candidateKey(item)))
       : [];
     const compareRows = (picked.length ? picked : candidates).slice(0, COMPARE_CANDIDATE_LIMIT);
     const prefix = compareRows.every((row, index) => candidateKey(row) === candidateKey(candidates[index]));
@@ -4324,7 +4416,11 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     } else {
       setComparison(null);
     }
-    setCompareCoverage({ compared: compareRows.map(candidateKey), total, prefix });
+    const comparedKeys = compareRows.map(candidateKey);
+    setCompareCoverage({ compared: comparedKeys, total, prefix });
+    // The compare table is the truth for the checkboxes: keep the picks in sync
+    // with what the backend actually compared.
+    setComparePick(comparedKeys);
     const outcomes = await Promise.allSettled(candidates.map(item => api<CandidateView>(
       `/api/v1/workflow/analysis/candidates/${item.runId}/${item.stepId}/view`,
     )));
@@ -4361,7 +4457,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     if (!rows.length) return;
     setComparePick([]);
     setCompareCandidates(rows);
-    void run('compare', () => loadAnalysis(rows)).catch(() => undefined);
+    void run('compare', () => loadAnalysis(rows, rows.slice(0, COMPARE_CANDIDATE_LIMIT).map(candidateKey))).catch(() => undefined);
   };
 
   const addCurrentCandidate = () => {
@@ -4379,15 +4475,35 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     await loadAnalysis(candidates);
   });
 
-  /** Checked candidates in the compare table: the last run's choice, else the first 4. */
-  const comparedCandidateKeys = compareCoverage?.compared
-    ?? compareCandidates.slice(0, COMPARE_CANDIDATE_LIMIT).map(candidateKey);
+  /**
+   * The checked candidates in the compare table. `comparePick` is the single
+   * source of truth: it is seeded with the first 4 candidates whenever the
+   * candidate list changes, toggled directly by the checkboxes, and synced to
+   * the actually compared keys after a comparison finishes.
+   */
+  useEffect(() => {
+    setComparePick(compareCandidates.slice(0, COMPARE_CANDIDATE_LIMIT).map(candidateKey));
+  }, [compareCandidates]);
+
+  const comparedCandidateKeys = useMemo(() => {
+    const known = new Set(compareCandidates.map(candidateKey));
+    return comparePick.filter(key => known.has(key));
+  }, [comparePick, compareCandidates]);
+  /** Checkboxes changed after the last comparison: the table is one click behind. */
+  const comparePickPending = !!compareCoverage && (
+    comparedCandidateKeys.length !== compareCoverage.compared.length
+    || comparedCandidateKeys.some((key, index) => key !== compareCoverage.compared[index])
+  );
 
   /** Pick which ≤4 candidates the compare table covers; views are unaffected. */
   const toggleCompareCandidate = (key: string) => {
-    const current = comparedCandidateKeys;
-    if (current.includes(key)) setComparePick(current.filter(item => item !== key));
-    else if (current.length < COMPARE_CANDIDATE_LIMIT) setComparePick([...current, key]);
+    setComparePick(current => {
+      const known = new Set(compareCandidates.map(candidateKey));
+      const base = current.filter(item => known.has(item));
+      if (base.includes(key)) return base.filter(item => item !== key);
+      if (base.length >= COMPARE_CANDIDATE_LIMIT) return base;
+      return [...base, key];
+    });
   };
 
   // 04 → 05 hand-off: once the experiment has results, 05 presents them without
@@ -4402,7 +4518,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setAutoAnalysisId(experimentDoc.experimentId);
     setComparePick([]);
     setCompareCandidates(rows);
-    void run('compare', () => loadAnalysis(rows)).catch(() => undefined);
+    void run('compare', () => loadAnalysis(rows, rows.slice(0, COMPARE_CANDIDATE_LIMIT).map(candidateKey))).catch(() => undefined);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [zone, experimentDoc, analysisStepId]);
 
@@ -4790,12 +4906,17 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         <button className="wf-button primary" disabled={!canCompile}
           title={authoredSteps.length === 0 ? '流程为空：先插入或添加步骤' : '编译当前步骤，生成 Compile 与绑定 (binding)'}
           onClick={() => void compileFlow()}>{busy === 'compile-flow' ? '编译中…' : compile ? '重新编译' : '编译流程'}</button>
-        {route
+        {route && !compileStale
           ? <button className="wf-button" onClick={goToRun}>去 03</button>
           : compile && !compileStale
             ? <button className="wf-button" disabled={!canRoute} onClick={() => void createRoute()}>{busy === 'route' ? '创建中…' : '创建 Route'}</button>
             : null}
-        {route && <button className="wf-button ghost" onClick={() => setRebuildRouteArmed(true)}>重建 Route…</button>}
+        {route && <button className="wf-button ghost" disabled={compileStale || !!busy}
+          title={compileStale ? '编译已过期：先重新编译，再重建 Route' : '基于当前 Compile 重建 Route'}
+          onClick={() => setRebuildRouteArmed(true)}>重建 Route…</button>}
+        {route && compileStale && <span className="wf-block-reason" role="alert" aria-label="Route 需重建">
+          工程在编译后有修改，需重新编译；旧 Route 需重建。
+        </span>}
       </div>
     </div>
   );
@@ -5307,7 +5428,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 <button role="menuitem" disabled={!canRun} onClick={() => { setOpenMenu(null); void (needsPredecessors ? executeThroughCurrent() : execute()); }}>
                   {needsPredecessors ? '执行前序并运行' : '执行当前 Segment'}
                 </button>
-                <button role="menuitem" disabled={!route} onClick={() => { setOpenMenu(null); void executeAll(); }}>执行全部 Segment</button>
+                <button role="menuitem" disabled={!route || compileStale || routeStale} onClick={() => { setOpenMenu(null); void executeAll(); }}>执行全部 Segment</button>
                 <button role="menuitem" disabled={!canMeasure} onClick={() => { setOpenMenu(null); void measure(); }}>测量并绑定来源证据</button>
                 <button role="menuitem" disabled={!route || !decisionPrefixId} onClick={() => { setOpenMenu(null); void decideMeasurementBranch(); }}>测量驱动分支</button>
               </>}
@@ -6222,6 +6343,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             {routeStale && <span className="wf-rerun">流程已变更，现有 Segment 待重跑</span>}
             {needsRemeasure && <span className="wf-rerun">测量已失效，需重新测量</span>}
           </div>}
+          {(compileStale || routeStale) && <div className="wf-block-reason" role="alert" aria-label="执行禁用原因">
+            {compileStale ? '编译已过期，先重新编译并重建 Route。' : 'Route 基于旧 Compile，先重新编译并重建 Route。'}
+          </div>}
 
           <div className="wf-structure-panel" aria-label="当前 Run 结构">
             <div className="wf-structure-head">
@@ -6387,7 +6511,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                 onClick={() => void (needsPredecessors ? executeThroughCurrent() : execute())}>
                 {busy === 'execute' ? '启动中…' : needsPredecessors ? '执行前序并运行' : '执行当前 Segment'}
               </button>
-              <button className="wf-button" disabled={!route || !!busy} onClick={() => void executeAll()}>执行全部 Segment</button>
+              <button className="wf-button" disabled={!route || !!busy || compileStale || routeStale} onClick={() => void executeAll()}>执行全部 Segment</button>
               {segment?.status === 'planned' && needsPredecessors && <span className="wf-muted" aria-label="前序 Segment 提示">
                 前序 {blockingPredecessors.length} 个 Segment 尚未成功：会按顺序执行到当前 Segment，失败即停止。
               </span>}
@@ -6856,8 +6980,9 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
             </table>}
 
             {compareCoverage && compareCoverage.total > COMPARE_CANDIDATE_LIMIT && <div className="wf-block-reason" aria-label="对比候选说明">
-              对比{compareCoverage.prefix ? '前' : '所选'} {compareCoverage.compared.length}/{compareCoverage.total} 个候选；
-              其余候选的结构视图仍全部加载与显示。
+              {comparePickPending
+                ? `已选择 ${comparedCandidateKeys.length}/${compareCoverage.total} 个候选；点击“比较并加载视图”更新对比表。`
+                : `对比${compareCoverage.prefix ? '前' : '所选'} ${compareCoverage.compared.length}/${compareCoverage.total} 个候选；其余候选的结构视图仍全部加载与显示。`}
               <button type="button" className="wf-link" onClick={() => document.getElementById('wf-candidate-table')?.scrollIntoView({ block: 'center' })}>选择对比候选</button>
               <button type="button" className="wf-link" disabled={!!busy}
                 onClick={() => void run('compare', () => loadAnalysis(compareCandidates)).catch(() => undefined)}>显示全部视图</button>

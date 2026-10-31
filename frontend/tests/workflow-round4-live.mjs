@@ -167,7 +167,9 @@ for (const variant of finished.variants) {
   }
 }
 
-const projectA = await postJson('/api/v1/workflow/projects', { ...fixture, geometry: gdsGeometry });
+const projectA = await postJson('/api/v1/workflow/projects', {
+  ...fixture, geometry: gdsGeometry, domain: compiled.compile.project.domain,
+});
 await putJson(`/api/v1/workflow/projects/${projectA.projectId}/state`, {
   schemaVersion: 1,
   compileId: compiled.compileId,
@@ -182,7 +184,9 @@ await putJson(`/api/v1/workflow/projects/${projectA.projectId}/state`, {
 const routeB = await postJson('/api/v1/workflow/routes/from-compile', {
   compileId: compiled.compileId, name: `${fixtureName} · 无前序`, splitAfterStepId,
 });
-const projectB = await postJson('/api/v1/workflow/projects', { ...fixture, name: `${fixtureName} · 无前序`, geometry: gdsGeometry });
+const projectB = await postJson('/api/v1/workflow/projects', {
+  ...fixture, name: `${fixtureName} · 无前序`, geometry: gdsGeometry, domain: compiled.compile.project.domain,
+});
 await putJson(`/api/v1/workflow/projects/${projectB.projectId}/state`, {
   schemaVersion: 1, compileId: compiled.compileId, routeId: routeB.plan.route.routeId,
   segmentRuns: [], measurementIds: [], experimentIds: [],
