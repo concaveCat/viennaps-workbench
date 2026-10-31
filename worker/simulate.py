@@ -3437,6 +3437,46 @@ def _field_surface_bounds(domain: Any, *, is3d: bool) -> tuple[float, float]:
     return _surface_vertical_bounds(mesh.getNodes(), is3d=is3d)
 
 
+def _cell_grid_from_native(cell_set: Any, *, dimension: int, delta: float) -> Any:
+    """Describe a native ``DenseCellSet`` as a bounding lattice + active map.
+
+    A GDS / multi-material geometry can omit cells from the bounding lattice
+    (cover/void regions), so ``getNumberOfCells()`` is smaller than
+    ``nx * ny * nz``. Dense grids keep the cheap identity layout; sparse grids
+    get one ``getCellCenter`` call per native cell to derive the absolute
+    ``(ix, iy, iz)`` key. The native cell order is recorded, not assumed.
+    """
+    from backend.field_remap import CellGrid
+
+    grid = CellGrid.from_points(cell_set.getNodes(), dimension=int(dimension),
+                                delta=float(delta), allow_gaps=True)
+    cells = int(cell_set.getNumberOfCells())
+    if cells == grid.cell_count:
+        return grid
+    origin = grid.origin
+    nx, ny, nz = grid.shape
+    keys = array("q")
+    seen = bytearray(grid.cell_count)
+    for index in range(cells):
+        center = cell_set.getCellCenter(index)
+        i = int(round((float(center[0]) - origin[0]) / delta - 0.5))
+        j = int(round((float(center[1]) - origin[1]) / delta - 0.5))
+        k = (int(round((float(center[2]) - origin[2]) / delta - 0.5))
+             if int(dimension) == 3 else 0)
+        if not (0 <= i < nx and 0 <= j < ny and 0 <= k < nz):
+            raise RuntimeError(
+                f"native cell {index} center {center} lies outside the cell-set bounding "
+                f"lattice {grid.shape}; the native grid is not lattice aligned")
+        key = i + nx * (j + ny * k)
+        if seen[key]:
+            raise RuntimeError(
+                f"native cell {index} repeats lattice key {(i, j, k)}; the native cell "
+                "order is not a one-to-one lattice map")
+        seen[key] = 1
+        keys.append(key)
+    return grid.with_active(keys)
+
+
 def _field_grid_cell_bound(requested: dict[str, Any], *, top: float, bottom: float,
                            delta: float) -> int:
     """Conservative cell count for a field grid spanning ``[bottom, top]``.
@@ -3478,8 +3518,6 @@ def _generate_field_cell_set(ps: Any, source_domain: Any, project: dict[str, Any
     construction limit and a ``height`` below the current surface is refused
     instead of letting the native generator walk the whole band.
     """
-    from backend.field_remap import CellGrid
-
     delta = float(source_domain.getGridDelta())
     is3d = project["dimension"] == 3
     if height + 1e-12 < delta:
@@ -3537,14 +3575,18 @@ def _generate_field_cell_set(ps: Any, source_domain: Any, project: dict[str, Any
     cell_set.buildNeighborhood()
     cell_set.setPeriodicBoundary([bool(periodic), bool(periodic), False] if is3d
                                  else [bool(periodic), False])
-    grid = CellGrid.from_points(cell_set.getNodes(), dimension=int(project["dimension"]),
-                                delta=delta)
-    if grid.cell_count != cells:
+    grid = _cell_grid_from_native(cell_set, dimension=int(project["dimension"]),
+                                  delta=delta)
+    if grid.active_count != cells:
         raise RuntimeError(
-            f"native cell set reports {cells} cells but its grid is {grid.cell_count} cells; "
-            "the generated grid is not a single regular box")
+            f"native cell set reports {cells} cells but its active map has "
+            f"{grid.active_count}; the native grid is not a one-to-one lattice map")
     info = {
         "numberOfCells": cells,
+        "activeCellCount": int(grid.active_count),
+        "fullCellCount": int(grid.cell_count),
+        "missingCellCount": int(grid.missing_count),
+        "sparse": bool(grid.is_sparse),
         "cellsUpperBound": max(bound, cells),
         "preAllocationBound": bound,
         "constructionGuardBound": guard_bound,
@@ -3575,6 +3617,10 @@ def _field_setup_record(step: dict[str, Any], state: dict[str, Any],
         "currentGrid": (state.get("currentGrid") or captured).signature(),
         "gridCapturedAtStepId": state.get("gridStepId"),
         "numberOfCells": int(info["numberOfCells"]),
+        "activeCellCount": int(info.get("activeCellCount", info["numberOfCells"])),
+        "fullCellCount": int(info.get("fullCellCount", info["numberOfCells"])),
+        "missingCellCount": int(info.get("missingCellCount", 0)),
+        "sparse": bool(info.get("sparse", False)),
         "cellsUpperBound": int(info["cellsUpperBound"]),
         "surfaceTop": float(info["surfaceTop"]),
         "surfaceBottom": float(info["surfaceBottom"]),
@@ -3656,20 +3702,28 @@ def remap_field_cell_set(ps: Any, domain: Any, project: dict[str, Any],
         cover=cover, periodic=bool(state["settings"].get("periodic", False)),
         surface_bounds=(surface_top, surface_bottom))
     for _attempt in range(4):
-        if (abs(float(grid.bottom) - required_bottom) <= 1e-9
-                and abs(float(grid.top) - required_top) <= 1e-9):
+        # Structured/GDS level sets can carry a band wider than the analytic
+        # extent, so the native bounding lattice may exceed the captured grid.
+        # Growing beyond it is conservative: the remap copies by lattice key
+        # and starts the extra cells at zero. Only a grid that does not *cover*
+        # the captured extent needs another native call.
+        covers = (float(grid.top) + 1e-9 >= required_top
+                  and float(grid.bottom) - 1e-9 <= required_bottom)
+        if covers:
             break
-        band_cells = max(2, band_cells + 2 * int(
-            round((float(grid.bottom) - required_bottom) / delta)))
-        height += float(required_top) - float(grid.top)
+        if float(grid.top) + 1e-9 < required_top:
+            height += float(required_top) - float(grid.top)
+        if float(grid.bottom) - 1e-9 > required_bottom:
+            band_cells = max(2, band_cells + 2 * int(
+                round((float(grid.bottom) - required_bottom) / delta)))
         field_domain, cell_set, grid, info = _generate_field_cell_set(
             ps, domain, project, height=height, band_cells=band_cells,
             cover=cover, periodic=bool(state["settings"].get("periodic", False)),
             surface_bounds=(surface_top, surface_bottom))
     else:
         raise GridRemapError(
-            "conservative grid remap not implemented: the regenerated cell grid could not be "
-            f"aligned to the captured grid (bottom {required_bottom:g}/{grid.bottom:g} um, "
+            "conservative grid remap not implemented: the regenerated cell grid does not "
+            f"cover the captured extent (bottom {required_bottom:g}/{grid.bottom:g} um, "
             f"top {required_top:g}/{grid.top:g} um)")
 
     check_captured_grid(captured, grid)

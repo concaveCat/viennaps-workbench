@@ -261,10 +261,23 @@ gives `8 um^-1`), and the 3D value is dimensionless (the summary omits
 ### 3.1 Cell-set regeneration and conservative remap
 
 The first enabled field step captures an absolute grid: origin, top/bottom,
-cell counts, `gridDelta`, `coverMaterial`/id, `periodic`, the native material
-map and the `substrateDepth`-derived band width (`cellSet.grid` /
+bounding cell counts, `gridDelta`, `coverMaterial`/id, `periodic`, the native
+material map and the `substrateDepth`-derived band width (`cellSet.grid` /
 `gridCapturedAtStepId`). The grid lives on the domain lattice, so every later
 regeneration is described by whole-cell offsets.
+
+A GDS / multi-material / structured geometry does **not** produce a full box:
+the native `DenseCellSet` omits cover/void cells from the bounding lattice
+(measured 1,608,870 active cells inside a 1,860,000-cell FinFET bounding
+lattice). The grid is therefore stored as
+
+* the bounding lattice (`origin`, `shape`, `gridDelta`), and
+* an **active map**: the absolute integer key `i + nx·(j + ny·k)` of every
+  native cell, in native cell order (`CellGrid.active`).
+
+Plane/trench geometries are dense (`active = None`, position == key). Sparse
+geometries build the map once from `getCellCenter()`; `nx·ny·nz` is **not**
+required to equal `getNumberOfCells()`.
 
 After every surface-moving step that is followed by another enabled field step
 (and lazily if one is ever skipped) the worker:
@@ -275,15 +288,19 @@ After every surface-moving step that is followed by another enabled field step
    (a band of `2` points is the native minimum);
 2. if the surface grew above the captured top it grows the grid upwards, and if
    an etch went below the captured bottom it grows the grid downwards (band
-   minimum); both are integer cell extensions, never a rescale;
+   minimum); both are integer cell extensions, never a rescale. A native
+   bounding lattice that is *larger* than the captured extent is accepted as a
+   conservative superset (the extra active cells start at `0`);
 3. reads the native `Material`/`FillingFraction` (and therefore the material IDs
    and native filling) unchanged from the regenerated grid;
-4. remaps every non-system scalar label cell-for-cell by absolute position
+4. remaps every non-system scalar label **by lattice key**
    (`backend/field_remap.py`):
-   * **same grid** -> ordered index copy, `O(N)`;
-   * **integer shift / grow** -> axis-aligned overlap copy with `cellOffset`
-     `{x,y,z}` in cells; overlap cells keep their exact value, every new cell is
-     `0`;
+   * **identical active layout** -> ordered index copy, `O(N)`;
+   * **integer shift / grow / shrink** -> key overlap copy with `cellOffset`
+     `{x,y,z}` in cells; matching active cells keep their exact value, every
+     new active cell is `0`, and an old active cell with no new key is removed
+     (`removedByGrid`, mass recorded);
+   * new cells that were inactive before (a void becoming solid) start at `0`;
    * a lateral change, a spacing change or a non-integer offset raises
      `conservative grid remap not implemented` (HTTP 422 semantics: the worker
      fails before a native process call, no silent interpolation);
@@ -294,19 +311,19 @@ After every surface-moving step that is followed by another enabled field step
 
 Each remap appends one record to `cellSet.remaps` (also emitted as a
 `cell-set-remap` event) with: `sourceStepId`, `remapOfStepId`,
-`oldGrid`/`newGrid`/`capturedGrid` signatures, `method`, `exact`,
-`oldCellCount`, `newCellCount`, `remappedCells`, `newCells`, `removedCells`
-(`removedByGrid` + `removedByMaterial`), `reactivatedCells`, `cellOffset`,
-`cellVolume`, `labels`, per-label `mass.before/after/lost` (native
-`sum · gridDelta^D` units), `fieldDigests` and the current `materialMap`. The
-record is deterministic: replaying a project reproduces the same record and
-digests.
+`oldGrid`/`newGrid`/`capturedGrid` signatures, `method`, `exact`, `sparse`,
+active/full/missing counts (`oldCellCount`, `oldFullCellCount`,
+`oldMissingCellCount`, likewise `new*`), `remappedCells`, `newCells`,
+`removedCells` (`removedByGrid` + `removedByMaterial`), `reactivatedCells`,
+`cellOffset`, `cellVolume`, `labels`, per-label `mass.before/after/lost`
+(native `sum · gridDelta^D` units), `fieldDigests` and the current
+`materialMap`. The record is deterministic: replaying a project reproduces the
+same record and digests.
 
 Conservation rule: `mass.after = mass.before - mass.lost`, exactly. `lost` is
-the sum over cells that became cover (plus, for a shrunk grid, cells outside the
-new grid); new cells contribute `0`. The per-label `lost` is therefore the
-amount physically removed by the etch (`removedCells`) and not a numerical
-residual.
+the sum over active cells that became cover or have no new key; new cells
+contribute `0`. The per-label `lost` is therefore the amount physically removed
+by the etch (`removedCells`) and not a numerical residual.
 
 ### 3.2 Pre-allocation bounds
 
@@ -319,12 +336,13 @@ captured grid:
 top_node       = ceil(highest_surface / delta) * delta
 bottom_node    = floor(lowest_surface / delta) * delta
 required_top   = max(captured.top, top_node)
-stored_half    = ceil(widest_stored_level_set_width / 2)
+stored_half    = floor(widest_stored_level_set_width / 2)
 band_half      = max(requested_band_cells // 2, stored_half)
 planned_bottom = bottom_node - band_half * delta
 rows           = ceil((required_top - planned_bottom) / delta) + 4
 lateral        = (ceil(xExtent/delta) + 2) * (ceil(yExtent/delta) + 2)   # +2 is 2D
 bound          = lateral * max(rows, 2)
+construction   = ceil(bound * 2.5)        # GDS/multi-level-set band guard
 ```
 
 `viennals.Expand(width)` only grows a band: a level set that already carries a
@@ -333,10 +351,12 @@ it. The bound therefore uses `getLevelSetWidth()` across **all** level sets;
 with a 202-point stored band, a requested 18-point Expand still allocates the
 2220-cell `[-5.05, 0.5]` grid and the bound is 2552 instead of 506.
 
-`bound` is checked against `MAX_CELL_SET_CELLS` (2,000,000) before
+`construction` is checked against `MAX_CELL_SET_CELLS` (2,000,000) before
 `generateCellSet`; the bound carries two lateral cells of slack per axis and
 four spare rows, which covers the measured native extent for plane, trench,
-fin, stack, Boolean-grown surfaces and pre-expanded bands. If a stored band
+fin, stack, Boolean-grown surfaces and pre-expanded bands. The hard cap is
+enforced again on the measured **active** native cell count after generation
+(the storage is active-cell based). If a stored band
 forces the bottom below the captured grid, the remap accepts the downward
 growth as an integer-offset overlap (new cells `0`) instead of failing.
 
@@ -422,6 +442,15 @@ project-level vertical extent.
 * The remap is exact on the lattice, not a volume/area-weighted
   re-projection. A future grid with a different `gridDelta` or lateral extent
   would need a genuine conservative intersection algorithm and is refused today.
+* A sparse native grid stores one active-map entry per cell. `getCellCenter()`
+  is called once per native cell when the map is built (~1.5 M calls/s on this
+  host; 1.6 M cells take about one second). The map is kept for the run and
+  reused by every remap, and the dense plane/trench case stores no map at all.
+* The hard commitment is on **active** cells (`MAX_CELL_SET_CELLS`); the
+  bounding lattice may be larger for a sparse geometry. The pre-allocation
+  guard uses the analytic dense bound with a 2.5x band margin, so a geometry
+  whose full bounding lattice is much larger than the bound can still be
+  refused before allocation even when its active count would fit.
 
 ## 6. Tests
 
@@ -451,7 +480,7 @@ project-level vertical extent.
 * `_field_integral` unit regression: `C=2 um^-3`, `delta=2 um` gives
   `8 um^-1` in 2D and the exported 2D `integralUnit` is `1/um` (3D omits it).
 
-`tests/test_field_remap.py` (30 tests):
+`tests/test_field_remap.py` (37 tests):
 
 * pure-Python mapping: `CellGrid` round-trip from native node points, ordered
   same-grid copy (`O(N)`, exact digests), integer-shift overlap, grid growth
@@ -459,10 +488,18 @@ project-level vertical extent.
   redistribution, cover→solid reactivation, deterministic record, the
   pre-allocation bound formula, and refusals for a non-integer offset, a
   lateral/spacing change and a gapped lattice;
+* sparse mapping: same-layout key copy, new active cells `0`, removed active
+  cells (`removedByGrid`) with mass loss, and an integer shift over a sparse
+  active map;
+* native sparse reproduction: a fin (`finHeight=0.3`, `maskHeight=0.2`)
+  produces a 20x33 / 12x12x33 bounding lattice with 517 / 3794 active cells
+  instead of being rejected as "not a single regular box";
 * real runs: 2D and 3D `implant → etch → anneal → analysis` (same-grid remap,
   recorded `sourceStepId`, per-label mass balance, labels preserved, Rsh still
   computed), `implant → deposit → anneal` (grid unchanged, `mass.lost = 0`),
-  a deep etch that grows the grid downwards conservatively, a Boolean union
+  sparse `implant → deposit → anneal` (2D) and `implant → etch → anneal` (3D)
+  on the fin geometry, a deep etch that grows the grid downwards
+  conservatively, a Boolean union
   that lifts the surface from 0 to 2 um (380 → 980 cells inside the
   pre-allocation bound), `plane(2) → planarize(0) → implant → anneal →
   analysis` in 2D (380 cells) and 3D (18,400 cells), replay reproducing the
