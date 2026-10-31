@@ -606,6 +606,25 @@ class SpecializedValidationNegatives(unittest.TestCase):
         for false_claim in ("no etch", "no-op", "unchanged surface"):
             self.assertNotIn(false_claim, text)
 
+    def test_ibe_energy_values_reject_strings_bools_and_non_finite(self):
+        # ProjectV7.nativeParameters is dict[str, Any], so strings survive
+        # model_validate; the shared rule must still reject them instead of
+        # letting the worker coerce "200" with float().
+        for dimension in (2, 3):
+            for key, value in (("thresholdEnergy", "200"), ("meanEnergy", "100"),
+                               ("thresholdEnergy", True), ("meanEnergy", False),
+                               ("thresholdEnergy", float("nan")),
+                               ("meanEnergy", float("inf"))):
+                with self.subTest(dimension=dimension, key=key, value=value):
+                    project = faraday_project(dimension)
+                    project["steps"][0]["nativeParameters"][key] = value
+                    with self.assertRaises(ProjectInputError) as ctx:
+                        validate_project(project, kind="simulate")
+                    self.assertTrue(any(issue.path == f"steps[0].nativeParameters.{key}"
+                                        for issue in ctx.exception.issues),
+                                    [(issue.path, issue.message)
+                                     for issue in ctx.exception.issues])
+
     def test_ibe_energy_order_rejects_threshold_at_or_above_mean(self):
         # Native normalization reverses the flux sign at threshold >= mean, so
         # the same rule must reject 2D and 3D before the worker.
@@ -743,6 +762,36 @@ class WorkerSafetyPreflight(unittest.TestCase):
         normalized, step = self.normalized(ion_beam)
         with self.assertRaises(RuntimeError) as ctx:
             build_specialized_model(ps, None, normalized, step, material_handle, {})
+        self.assertIn("thresholdEnergy", str(ctx.exception))
+
+    def test_direct_worker_rejects_string_energy_before_native(self):
+        # ProjectV7 accepts these strings; the worker must reject them before
+        # float() would coerce "200" and reach the native constructor.
+        for dimension in (2, 3):
+            for key, value in (("thresholdEnergy", "200"), ("meanEnergy", "100")):
+                with self.subTest(dimension=dimension, key=key):
+                    project = faraday_project(dimension)
+                    project["steps"][0]["nativeParameters"].update({
+                        "meanEnergy": 100.0, "thresholdEnergy": 20.0,
+                        "sigmaEnergy": 500.0})
+                    project["steps"][0]["nativeParameters"][key] = value
+                    normalized, step = self.normalized(project)
+                    self.assertEqual(step["nativeParameters"][key], value)
+                    with self.assertRaises(RuntimeError) as ctx:
+                        build_specialized_model(ps, None, normalized, step,
+                                                material_handle, {},
+                                                flux_engine="CPU_DISK")
+                    message = str(ctx.exception)
+                    self.assertIn("FaradayCageEtching rejected", message)
+                    self.assertIn(key, message)
+                    self.assertIn("numeric strings are not coerced", message)
+        # IonBeamEtching shares the helper and the native struct.
+        ion_beam = make_project("ionBeam", 3)
+        ion_beam["steps"][0]["nativeParameters"]["thresholdEnergy"] = "200"
+        normalized, step = self.normalized(ion_beam)
+        with self.assertRaises(RuntimeError) as ctx:
+            build_specialized_model(ps, None, normalized, step, material_handle, {})
+        self.assertIn("numeric strings are not coerced", str(ctx.exception))
         self.assertIn("thresholdEnergy", str(ctx.exception))
 
 
@@ -1294,6 +1343,21 @@ class FaradayCpuReplay(unittest.IsolatedAsyncioTestCase):
         detail = json_body(response)["detail"]
         self.assertTrue(any(issue.get("path") == "steps[0].nativeParameters.thresholdEnergy"
                             and "less than meanEnergy" in issue.get("message", "")
+                            for issue in detail), detail)
+
+    async def test_faraday_string_energy_is_rejected_before_the_worker(self):
+        # ProjectV7.nativeParameters is dict[str, Any]; a numeric string must be
+        # a 422 instead of being coerced by the worker's float().
+        project = faraday_project(2)
+        project["steps"][0]["nativeParameters"].update({
+            "meanEnergy": 100.0, "thresholdEnergy": "200", "sigmaEnergy": 500.0})
+        project["solver"]["enginePreference"] = "cpu"
+        response = await asgi_request("/api/runs", method="POST",
+                                      payload={"kind": "simulate", "project": project})
+        self.assertEqual(response[0], 422, response[2])
+        detail = json_body(response)["detail"]
+        self.assertTrue(any(issue.get("path") == "steps[0].nativeParameters.thresholdEnergy"
+                            and "finite JSON number" in issue.get("message", "")
                             for issue in detail), detail)
 
     async def test_explicit_coverage_tolerance_cpu_run_replays(self):

@@ -326,27 +326,47 @@ def ibe_energy_issues(parameters: Any) -> list[tuple[str, str]]:
       (0.8 um unchanged) instead of etching.
 
     Every probed combination with ``thresholdEnergy < meanEnergy``, including
-    sigmaEnergy up to the catalog maximum, etched normally. Both API
-    validation and ``build_specialized_model`` call this function, so a direct
-    worker input cannot reach the native constructor with a reversed yield.
+    sigmaEnergy up to the catalog maximum, etched normally.
+
+    The values must already be JSON numbers. They are deliberately not passed
+    through ``float()``: ``ProjectV7.nativeParameters`` is a ``dict[str, Any]``
+    and accepts ``"200"``, but the worker later calls ``float(p[key])``, so a
+    numeric string would otherwise reach the native constructor and grow the
+    surface. Booleans, numeric strings, missing keys, and non-finite values are
+    rejected here so the worker can stop before any native object exists. Both
+    API validation and ``build_specialized_model`` call this function.
     """
     if not isinstance(parameters, dict):
-        return []
-    mean = parameters.get("meanEnergy")
-    threshold = parameters.get("thresholdEnergy")
-    for value in (mean, threshold):
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            # Type/range validation owns malformed values; stay silent here.
-            return []
+        return [("nativeParameters", "must be a JSON object")]
+    issues: list[tuple[str, str]] = []
+    values: dict[str, float] = {}
+    for key in ("meanEnergy", "thresholdEnergy"):
+        if key not in parameters:
+            issues.append((f"nativeParameters.{key}",
+                           "is required for the IBE energy-order check"))
+            continue
+        value = parameters[key]
+        if isinstance(value, bool):
+            issues.append((f"nativeParameters.{key}",
+                           "must be a JSON number; booleans are not accepted"))
+            continue
+        if not isinstance(value, (int, float)):
+            issues.append((f"nativeParameters.{key}",
+                           "must be a finite JSON number; numeric strings are not coerced"))
+            continue
         if not math.isfinite(float(value)):
-            return []
-    if float(threshold) < float(mean):
+            issues.append((f"nativeParameters.{key}", "must be a finite JSON number"))
+            continue
+        values[key] = float(value)
+    if issues:
+        return issues
+    if values["thresholdEnergy"] < values["meanEnergy"]:
         return []
     return [(
         "nativeParameters.thresholdEnergy",
-        f"must be less than meanEnergy ({float(mean):g}); ViennaPS {engine_version()} compares the sampled "
-        f"energy with thresholdEnergy when it normalizes the IonBeamEtching/FaradayCageEtching yield, and "
-        f"thresholdEnergy >= meanEnergy reverses the native flux sign. An etch step then grows the surface "
+        f"must be less than meanEnergy ({values['meanEnergy']:g}); ViennaPS {engine_version()} compares the "
+        f"sampled energy with thresholdEnergy when it normalizes the IonBeamEtching/FaradayCageEtching yield, "
+        f"and thresholdEnergy >= meanEnergy reverses the native flux sign. An etch step then grows the surface "
         f"(threshold 200 with mean 100 and sigmaEnergy 500 grew 0.8 um to 0.969595 um), aborts the ray trace "
         f"when thresholdEnergy equals meanEnergy with sigmaEnergy > 0, or empties the top level set when "
         f"sigmaEnergy is 0. Keep thresholdEnergy below meanEnergy.")]
