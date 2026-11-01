@@ -11,17 +11,30 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import viennaps as ps
+from pydantic import BaseModel
 
 from plugins.isotropic import IsotropicParams
 from process_models.plugins import load_registry
-from process_models.v2.contract import ProcessContext
-from process_models.v2.engine import EngineCapabilities, StaticEngine, StaticEngineProvider
+from process_models.v2.contract import (
+    ProcessContext,
+    ProcessSpec,
+    VariantCapabilities,
+    VariantRegistration,
+)
+from process_models.v2.engine import (
+    EngineCapabilities,
+    EngineRequirement,
+    StaticEngine,
+    StaticEngineProvider,
+)
 from process_models.v2.executor import FlowExecutor, FlowRun, FlowStep
+from process_models.v2.registry import ProcessRegistry
 from process_models.v2.resolver import ExecutionResolutionError
 from process_models.v2.state import (
     CellSetState,
@@ -33,6 +46,8 @@ from process_models.v2.state import (
     MaterialState,
     OutputSet,
     ProcessState,
+    StateDelta,
+    StepResult,
 )
 from process_models.v2.storage import StateStore
 
@@ -123,7 +138,6 @@ def _state(domain: Any) -> ProcessState:
             handle=domain,
             dimension=2,
             grid_delta=GRID_DELTA,
-            material_order=order,
         ),
         materials=MaterialState(order=order, names={SI: "Si"}),
         layers=_layers(),
@@ -192,6 +206,136 @@ class _HandleProxy:
         return getattr(self._module, name)
 
 
+# -- fake engine/variant pair for lease-release accounting ------------------
+
+
+class _FakeParams(BaseModel):
+    """Minimal parameter model for the fake mutating process."""
+
+    label: str = "fake"
+
+
+class _FakeDomain:
+    """Native-handle stub whose ``Domain`` copy constructor records copies."""
+
+    def __init__(self, copies: list["_FakeDomain"]) -> None:
+        self._copies = copies
+
+    def Domain(self, other: "_FakeDomain") -> "_FakeDomain":  # noqa: N802 - ViennaPS spelling
+        self._copies.append(other)
+        return _FakeDomain(self._copies)
+
+
+class _FakeLease:
+    """Lease stub that counts ``release`` calls."""
+
+    def __init__(self, handle: Any, events: list[str], name: str) -> None:
+        self.engine_id = "fake"
+        self.engine_version = "1.0.0"
+        self.kind = "native"
+        self.backend = "cpu"
+        self.fingerprint = name
+        self.handle = handle
+        self.released = 0
+        self._events = events
+
+    def release(self) -> None:
+        self.released += 1
+        self._events.append(f"release:{self.fingerprint}")
+
+    def __enter__(self) -> "_FakeLease":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.release()
+
+
+class _FakeProvider:
+    """Provider that hands out :class:`_FakeLease` objects and records order."""
+
+    def __init__(self, handle: Any) -> None:
+        self._handle = handle
+        self.events: list[str] = []
+        self.leases: list[_FakeLease] = []
+
+    def engines(self) -> list[EngineCapabilities]:
+        return [
+            EngineCapabilities(engine_id="fake", version="1.0.0", kind="native", backends=("cpu",)),
+        ]
+
+    def acquire(self, requirement: EngineRequirement) -> _FakeLease:
+        name = f"lease{len(self.leases)}"
+        lease = _FakeLease(self._handle, self.events, name)
+        self.leases.append(lease)
+        self.events.append(f"acquire:{name}")
+        return lease
+
+
+class _FakeMutatingVariant:
+    """In-place geometry step: returns the executed handle as its delta."""
+
+    variant_id = "fake"
+    version = "1.0.0"
+    capabilities = VariantCapabilities(
+        dimensions=(2,),
+        reads=frozenset({"geometry"}),
+        writes=frozenset({"geometry"}),
+        mutates_input=True,
+    )
+    engine = EngineRequirement(kind="native", engine_id="fake", min_version="1.0.0")
+    implementation_hash = None
+
+    def __init__(self) -> None:
+        self.executed_handles: list[Any] = []
+
+    def validate(self, ctx: ProcessContext, params: BaseModel) -> list[Any]:
+        return []
+
+    def execute(self, state: ProcessState, params: BaseModel, ctx: ProcessContext, engine: Any) -> StepResult:
+        self.executed_handles.append(state.geometry.handle)
+        return StepResult(delta=StateDelta(geometry=state.geometry))
+
+
+class _ExplodingVariant(_FakeMutatingVariant):
+    """Mutating variant whose execution always fails."""
+
+    def execute(self, state: ProcessState, params: BaseModel, ctx: ProcessContext, engine: Any) -> StepResult:
+        raise RuntimeError("boom")
+
+
+def _fake_registry(variant: Any) -> ProcessRegistry:
+    registry = ProcessRegistry()
+    registry.register_process(
+        ProcessSpec(
+            id="fake",
+            version="1.0.0",
+            label="Fake",
+            params_model=_FakeParams,
+            dimensions=(2,),
+            operations=("fake",),
+        )
+    )
+    registry.register_variant(VariantRegistration(process_id="fake", variant=variant))
+    return registry
+
+
+def _fake_state(handle: _FakeDomain) -> ProcessState:
+    return ProcessState(
+        geometry=LevelSetState(handle=handle, dimension=2, grid_delta=GRID_DELTA),
+        materials=MaterialState(()),
+    )
+
+
+def _fake_step() -> FlowStep:
+    return FlowStep(
+        step_id="fake",
+        process_id="fake",
+        variant_id="fake",
+        params=_FakeParams(),
+        context=ProcessContext(dimension=2, grid_delta=GRID_DELTA),
+    )
+
+
 class FlowExecutorTest(unittest.TestCase):
     def setUp(self) -> None:
         ps.setNumThreads(1)
@@ -237,8 +381,14 @@ class FlowExecutorTest(unittest.TestCase):
 
         # deposit +0.3 then uniform etch -0.2 leaves the surface at +0.1.
         self.assertAlmostEqual(_top(run.state.geometry.handle) - initial_top, 0.1, delta=1e-6)
-        self.assertEqual(run.state.geometry.material_order, (SI, SIO2))
         self.assertEqual(run.state.materials.order, (SI, SIO2))
+        self.assertEqual(run.state.materials.names, {SI: "Si"})
+
+        # The deposit's materials delta is threaded into the next step.
+        self.assertEqual(first.delta.materials.order, (SI, SIO2))
+        self.assertIsNot(second.plan.request.state.materials, initial_state.materials)
+        self.assertEqual(second.plan.request.state.materials.order, (SI, SIO2))
+        self.assertEqual(second.result.delta.materials.order, (SI, SIO2))
 
         # Layers and fields survive across steps even though isotropic only writes geometry.
         self.assertIsNotNone(run.state.layers)
@@ -252,7 +402,7 @@ class FlowExecutorTest(unittest.TestCase):
         flow = json.loads(flow_path.read_text(encoding="utf-8"))
         self.assertEqual(flow["schemaVersion"], 1)
         self.assertEqual(flow["runDir"], str(self.root))
-        self.assertEqual(flow["steps"], [outcome.plan.identity() for outcome in run.outcomes])
+        self.assertEqual(flow["steps"], [outcome.plan.identity_json() for outcome in run.outcomes])
         self.assertEqual(flow["versions"], {"viennaps": VIENNAPS_VERSION})
 
     def _assert_step_files(self, step_id: str) -> None:
@@ -271,11 +421,11 @@ class FlowExecutorTest(unittest.TestCase):
         self.assertEqual(payload["geometry"]["gridDelta"], GRID_DELTA)
 
         plan = json.loads((directory / "plan.json").read_text(encoding="utf-8"))
-        self.assertEqual(plan["process_id"], "isotropic")
-        self.assertEqual(plan["variant_id"], "native")
-        self.assertEqual(plan["engine_id"], "viennaps")
-        self.assertEqual(plan["engine_version"], VIENNAPS_VERSION)
-        self.assertEqual(plan["engine_fingerprint"], FINGERPRINT)
+        self.assertEqual(plan["processId"], "isotropic")
+        self.assertEqual(plan["variantId"], "native")
+        self.assertEqual(plan["engineId"], "viennaps")
+        self.assertEqual(plan["engineVersion"], VIENNAPS_VERSION)
+        self.assertEqual(plan["engineFingerprint"], FINGERPRINT)
 
     def test_state_json_metadata_and_outputs_round_trip(self) -> None:
         _domain, _state_input, run = self._run_two_step_flow()
@@ -283,7 +433,8 @@ class FlowExecutorTest(unittest.TestCase):
         payload = json.loads((self.store.step_dir("etch") / "state.json").read_text(encoding="utf-8"))
         self.assertEqual(payload["materials"]["order"], [SI, SIO2])
         self.assertEqual(payload["materials"]["names"], {str(SI): "Si"})
-        self.assertEqual(payload["geometry"]["materialOrder"], [SI, SIO2])
+        # Material order lives only in the canonical materials block.
+        self.assertNotIn("materialOrder", payload["geometry"])
         self.assertEqual(
             payload["layers"],
             {
@@ -325,7 +476,7 @@ class FlowExecutorTest(unittest.TestCase):
         self.assertIsNotNone(loaded.geometry)
         self.assertEqual(loaded.geometry.dimension, 2)
         self.assertEqual(loaded.geometry.grid_delta, GRID_DELTA)
-        self.assertEqual(loaded.geometry.material_order, final.geometry.material_order)
+        self.assertEqual(loaded.materials.order, final.materials.order)
         self.assertAlmostEqual(_top(loaded.geometry.handle), _top(final.geometry.handle), delta=1e-6)
 
         self.assertEqual(loaded.materials, final.materials)
@@ -364,9 +515,86 @@ class FlowExecutorTest(unittest.TestCase):
         self.assertEqual(second_run.state.materials.order, (SI, SIO2))
 
         flow = json.loads((second_root / "flow.json").read_text(encoding="utf-8"))
-        self.assertEqual(flow["steps"], [second_run.outcomes[0].plan.identity()])
+        self.assertEqual(flow["steps"], [second_run.outcomes[0].plan.identity_json()])
         self.assertEqual(flow["versions"], {"viennaps": VIENNAPS_VERSION})
         self.assertTrue((second_store.step_dir("etch") / "state.json").is_file())
+
+    # -- version pins ------------------------------------------------------
+
+    def test_flow_step_version_pins_are_forwarded_to_the_plan(self) -> None:
+        resolved = self.registry.get_variant("isotropic", "native")
+        pinned = replace(
+            _deposit_step(),
+            expected_process_version=resolved.process_version,
+            expected_variant_version=resolved.variant_version,
+        )
+
+        run = self.executor.run(_state(_plane()), [pinned])
+
+        plan = run.outcomes[0].plan
+        self.assertEqual(plan.request.expected_process_version, resolved.process_version)
+        self.assertEqual(plan.request.expected_variant_version, resolved.variant_version)
+        self.assertEqual(plan.process_version, resolved.process_version)
+        self.assertEqual(plan.variant_version, resolved.variant_version)
+
+        stored = json.loads((self.store.step_dir("deposit") / "plan.json").read_text(encoding="utf-8"))
+        self.assertEqual(stored["processVersion"], resolved.process_version)
+        self.assertEqual(stored["variantVersion"], resolved.variant_version)
+
+    def test_flow_step_wrong_version_pin_aborts_before_any_write(self) -> None:
+        root = Path(self._temporary.name) / "pinned-miss"
+        store = StateStore(root)
+        executor = FlowExecutor(self.registry, self.provider, store)
+
+        for pin in ("expected_process_version", "expected_variant_version"):
+            with self.subTest(pin=pin):
+                step = replace(_deposit_step(), **{pin: "9.9.9"})
+                with self.assertRaises(KeyError) as raised:
+                    executor.run(_state(_plane()), [step])
+                self.assertIn("9.9.9", str(raised.exception))
+
+        self.assertFalse((root / "flow.json").exists())
+        self.assertFalse(store.step_dir("deposit").exists())
+
+    # -- engine lease release ---------------------------------------------
+
+    def test_mutates_input_releases_the_first_lease_before_re_resolving(self) -> None:
+        copies: list[_FakeDomain] = []
+        variant = _FakeMutatingVariant()
+        provider = _FakeProvider(_FakeDomain(copies))
+        root = Path(self._temporary.name) / "leases"
+        store = StateStore(root)
+        executor = FlowExecutor(_fake_registry(variant), provider, store)
+
+        run = executor.run(_fake_state(_FakeDomain(copies)), [_fake_step()])
+
+        self.assertEqual(
+            provider.events,
+            ["acquire:lease0", "release:lease0", "acquire:lease1", "release:lease1"],
+        )
+        self.assertEqual([lease.released for lease in provider.leases], [1, 1])
+        self.assertEqual(len(copies), 1)  # one checkpoint copy, unchanged behaviour
+        # A released lease's identity stays readable on the returned outcome.
+        self.assertEqual(run.outcomes[0].plan.engine.fingerprint, "lease1")
+        self.assertEqual(run.outcomes[0].plan.identity()["engine_id"], "fake")
+        self.assertTrue((store.step_dir("fake") / "plan.json").is_file())
+
+    def test_failed_execution_still_releases_the_lease(self) -> None:
+        copies: list[_FakeDomain] = []
+        provider = _FakeProvider(_FakeDomain(copies))
+        root = Path(self._temporary.name) / "failed"
+        store = StateStore(root)
+        executor = FlowExecutor(_fake_registry(_ExplodingVariant()), provider, store)
+
+        with self.assertRaises(RuntimeError):
+            executor.run(_fake_state(_FakeDomain(copies)), [_fake_step()])
+
+        self.assertEqual(
+            provider.events,
+            ["acquire:lease0", "release:lease0", "acquire:lease1", "release:lease1"],
+        )
+        self.assertFalse((root / "flow.json").exists())
+        self.assertFalse(store.step_dir("fake").exists())
 
     # -- engines without checkpoint/writer support ------------------------
 

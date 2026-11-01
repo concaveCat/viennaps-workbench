@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from backend.csv_assets import RateCsvError, canonicalize_rate_csv
-from worker.mask_materials import protected_material_names
+from process_models.v2.engines.viennaps import protected_material_names
 
 
 def _sha256(path: Path) -> str:

@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import math
-
 from typing import Any
 
+from process_models.v2.engines.viennaps import signed_rates as signed_rates
 
 GEOMETRY_MODELS = {"removeMaterial", "planarize", "boolean", "gdsBoolean", "particleShape"}
 
@@ -72,14 +72,6 @@ def uses_flux(step: Any) -> bool:
         spec = model_spec(str(value(step, "nativeModel", "")))
         return bool(spec and spec["usesFlux"])
     return has_motion(step) and value(step, "model") in {"singleParticle", "multiParticle"}
-
-
-def signed_rates(step: Any) -> tuple[float, dict[str, float]]:
-    """Return native default and explicit material rates, signed for etch."""
-    sign = -1.0 if value(step, "operation") == "etch" else 1.0
-    fallback = float(value(step, "rateMagnitude", 0.0)) * sign
-    rates = {name: float(rate) * sign for name, rate in (value(step, "materialRates", {}) or {}).items()}
-    return fallback, rates
 
 
 def signed_directional_rates(step: Any) -> tuple[float, float]:

@@ -1,22 +1,21 @@
-"""Shadow/apply hook tests for the v2 isotropic bridge.
+"""Shadow/apply hook tests for the generic v2 plugin hook.
 
 Both hooks are default-off. These tests pin every side:
 
 * with both env flags unset, ``run_process_step`` behaves exactly as before
   (no copy, no shadow event, no v2 metadata, same domain object);
-* with ``VIENNAPS_WORKBENCH_V2_ISOTROPIC_SHADOW=1``, an eligible uniform
-  level-set step runs the bridge on a deep copy and records a
-  ``v2-isotropic-shadow`` event whose digests and material map match the
-  worker path, while the returned metadata and the worker domain do not
-  change;
-* with ``VIENNAPS_WORKBENCH_V2_ISOTROPIC_APPLY=1`` that validated v2 domain
+* with ``VIENNAPS_WORKBENCH_V2_PLUGIN_SHADOW=1``, a step claimed by a
+  registered plugin runs the v2 path on a deep copy and records a
+  ``v2-plugin-shadow`` event whose digests and material map match the worker
+  path, while the returned metadata and the worker domain do not change;
+* with ``VIENNAPS_WORKBENCH_V2_PLUGIN_APPLY=1`` that validated v2 domain
   becomes ``ctx.domain`` (snapshots/native state/replay then describe the v2
-  result) and a ``v2-isotropic-applied`` event records the digests, plan and
+  result) and a ``v2-plugin-applied`` event records the digests, plan and
   metadata. Apply implies shadow; an unvalidated apply does not exist.
 
-Ineligible steps (material rates, geometric/auto-geometric) must record a
-``v2-isotropic-shadow-skipped`` event and never call the bridge, with or
-without the apply flag.
+Steps no plugin claims (material rates, geometric/auto-geometric, or a model
+without a plugin) must record a ``v2-plugin-shadow-skipped`` event and never
+call the bridge, with or without the apply flag.
 """
 
 from __future__ import annotations
@@ -25,6 +24,8 @@ import contextlib
 import json
 import os
 import shutil
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 from typing import Any
@@ -34,24 +35,24 @@ import viennals
 import viennaps as ps
 
 import worker.simulate as simulate
+from process_models.plugins import load_registry
 from tests.test_worker_v2_isotropic import (
     GRID_DELTA,
+    TEST_ROOT,
     _old_reference,
+    bridge_ctx,
     isotropic_step,
     plane_domain,
     plane_project,
 )
-from worker.process_models_v2 import run_isotropic_v2
+from worker.process_models_v2 import run_v2_step
 from worker.steps.context import RunContext
 from worker.steps.process import (
-    V2_ISOTROPIC_APPLY_ENV,
-    V2_ISOTROPIC_SHADOW_ENV,
-    _v2_isotropic_shadow_eligible,
+    V2_PLUGIN_APPLY_ENV,
+    V2_PLUGIN_SHADOW_ENV,
+    _v2_plugin_skip_reason,
     run_process_step,
 )
-
-ROOT = Path(__file__).resolve().parents[1]
-TEST_ROOT = ROOT / "var" / "test-worker-v2-shadow"
 
 
 def _worker_project() -> dict[str, Any]:
@@ -88,12 +89,12 @@ def _events_of(run_dir: Path, event_type: str) -> list[dict[str, Any]]:
 def _v2_flags(*, shadow: bool = False, apply: bool = False):
     """Set or clear *both* hooks' env flags for the duration of a call."""
     with mock.patch.dict(os.environ, {}, clear=False):
-        for name in (V2_ISOTROPIC_SHADOW_ENV, V2_ISOTROPIC_APPLY_ENV):
+        for name in (V2_PLUGIN_SHADOW_ENV, V2_PLUGIN_APPLY_ENV):
             os.environ.pop(name, None)
         if shadow:
-            os.environ[V2_ISOTROPIC_SHADOW_ENV] = "1"
+            os.environ[V2_PLUGIN_SHADOW_ENV] = "1"
         if apply:
-            os.environ[V2_ISOTROPIC_APPLY_ENV] = "1"
+            os.environ[V2_PLUGIN_APPLY_ENV] = "1"
         yield
 
 
@@ -151,7 +152,7 @@ class _V2WorkerStepTestBase(unittest.TestCase):
         self.assertEqual([key for key in metadata if "v2" in key.lower()], [])
 
     def _assert_shadow_matches(self, run_dir: Path) -> dict[str, Any]:
-        records = _events_of(run_dir, "v2-isotropic-shadow")
+        records = _events_of(run_dir, "v2-plugin-shadow")
         self.assertEqual(len(records), 1, records)
         shadow = records[0]
         self.assertIs(shadow["matched"], True, shadow["reasons"])
@@ -167,12 +168,13 @@ class _V2WorkerStepTestBase(unittest.TestCase):
         self.assertEqual(plan["variant_id"], "native")
         self.assertEqual(plan["engine_id"], "viennaps")
         self.assertEqual(plan["engine_version"], str(ps.__version__))
+        self.assertEqual(plan["engine_fingerprint"], "worker-v2-plugin")
         return shadow
 
     def _assert_applied_event_matches(self, run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
         """The apply record must carry the validated shadow's digests/plan/metadata."""
         shadow = self._assert_shadow_matches(run_dir)
-        applied = _events_of(run_dir, "v2-isotropic-applied")
+        applied = _events_of(run_dir, "v2-plugin-applied")
         self.assertEqual(len(applied), 1, applied)
         record = applied[0]
         self.assertEqual(record["stepId"], shadow["stepId"])
@@ -184,7 +186,7 @@ class _V2WorkerStepTestBase(unittest.TestCase):
         return shadow, record
 
 
-class V2IsotropicShadowTests(_V2WorkerStepTestBase):
+class V2PluginShadowTests(_V2WorkerStepTestBase):
     def test_flag_off_keeps_the_default_path(self) -> None:
         step = isotropic_step("etch", rate=0.3, duration=1.0)
         ctx = self._context("flag-off", step)
@@ -197,10 +199,12 @@ class V2IsotropicShadowTests(_V2WorkerStepTestBase):
         self.assertIs(ctx.domain, original_domain)
         self.assertAlmostEqual(_top(ctx.domain) - before, -0.3, delta=1e-6)
         self._assert_no_v2_metadata(result.metadata)
-        self.assertEqual(_events_of(ctx.run_dir, "v2-isotropic-shadow"), [])
-        self.assertEqual(_events_of(ctx.run_dir, "v2-isotropic-shadow-skipped"), [])
-        self.assertEqual(_events_of(ctx.run_dir, "v2-isotropic-applied"), [])
+        self.assertEqual(_events_of(ctx.run_dir, "v2-plugin-shadow"), [])
+        self.assertEqual(_events_of(ctx.run_dir, "v2-plugin-shadow-skipped"), [])
+        self.assertEqual(_events_of(ctx.run_dir, "v2-plugin-applied"), [])
         self.assertEqual(len(_events_of(ctx.run_dir, "step-configured")), 1)
+        # Default off: the bridge is not imported by the step module at all.
+        self.assertFalse((ctx.run_dir / "v2").exists())
 
     def test_flag_on_etch_shadows_a_copy_and_matches_the_worker(self) -> None:
         step = isotropic_step("etch", rate=0.3, duration=1.0, ratio=0.25)
@@ -218,9 +222,9 @@ class V2IsotropicShadowTests(_V2WorkerStepTestBase):
         self.assertEqual(simulate.surface_state(ctx.domain, 2)["digest"], shadow["oldDigest"])
         self.assertEqual(shadow["v2Metadata"]["operation"], "etch")
         self._assert_no_v2_metadata(result.metadata)
-        self.assertEqual(_events_of(ctx.run_dir, "v2-isotropic-shadow-skipped"), [])
+        self.assertEqual(_events_of(ctx.run_dir, "v2-plugin-shadow-skipped"), [])
         # Shadow alone never applies.
-        self.assertEqual(_events_of(ctx.run_dir, "v2-isotropic-applied"), [])
+        self.assertEqual(_events_of(ctx.run_dir, "v2-plugin-applied"), [])
 
     def test_flag_on_deposit_shadows_a_copy_and_matches_the_worker(self) -> None:
         step = isotropic_step("deposit", rate=0.3, duration=1.0)
@@ -238,7 +242,7 @@ class V2IsotropicShadowTests(_V2WorkerStepTestBase):
         self.assertIn(int(ps.Material.SiO2), shadow["newMaterialMap"])
         self.assertEqual(shadow["v2Metadata"]["depositMaterial"], "SiO2")
         self._assert_no_v2_metadata(result.metadata)
-        self.assertEqual(_events_of(ctx.run_dir, "v2-isotropic-applied"), [])
+        self.assertEqual(_events_of(ctx.run_dir, "v2-plugin-applied"), [])
 
     def test_snapshot_geometry_matches_the_worker_path(self) -> None:
         """The v2 domain must produce the same snapshot JSON geometry as the old path."""
@@ -248,13 +252,12 @@ class V2IsotropicShadowTests(_V2WorkerStepTestBase):
                 old_domain = plane_domain(2)
                 new_domain = plane_domain(2)
                 _old_reference(ps, self.project, step, old_domain)
-                run_isotropic_v2(
-                    ps,
-                    self.project,
+                outcome = run_v2_step(
+                    bridge_ctx(self.project, self.work_dir / f"v2-snapshot-{operation}"),
                     step,
                     new_domain,
-                    ps_version=str(ps.__version__),
                 )
+                new_domain = outcome.state.geometry.handle
 
                 old_dir = self.work_dir / f"old-snapshot-{operation}"
                 new_dir = self.work_dir / f"new-snapshot-{operation}"
@@ -292,13 +295,12 @@ class V2IsotropicShadowTests(_V2WorkerStepTestBase):
                 old_domain = plane_domain(2)
                 new_domain = plane_domain(2)
                 _old_reference(ps, self.project, step, old_domain)
-                run_isotropic_v2(
-                    ps,
-                    self.project,
+                outcome = run_v2_step(
+                    bridge_ctx(self.project, self.work_dir / f"v2-state-{operation}"),
                     step,
                     new_domain,
-                    ps_version=str(ps.__version__),
                 )
+                new_domain = outcome.state.geometry.handle
 
                 old_dir = self.work_dir / f"old-state-{operation}"
                 new_dir = self.work_dir / f"new-state-{operation}"
@@ -326,6 +328,21 @@ class V2IsotropicShadowTests(_V2WorkerStepTestBase):
                 )
                 self.assertEqual(old_state["stateId"], new_state["stateId"])
 
+    def test_registry_is_loaded_once_per_step_and_shared_with_the_bridge(self) -> None:
+        step = isotropic_step("etch", rate=0.3, duration=1.0)
+        ctx = self._context("flag-on-load-once", step)
+        calls: list[tuple[Any, ...]] = []
+
+        def counting_loader(*args: Any, **kwargs: Any):
+            calls.append((args, kwargs))
+            return load_registry(*args, **kwargs)
+
+        with _shadow_flag(True), mock.patch("process_models.plugins.load_registry", side_effect=counting_loader):
+            run_process_step(ctx, 1, step)
+
+        self.assertEqual(len(calls), 1, calls)
+        self.assertEqual(_events_of(ctx.run_dir, "v2-plugin-shadow-skipped"), [])
+
     def test_material_rate_mode_is_skipped_without_a_bridge_call(self) -> None:
         step = isotropic_step("etch", rate=0.0, duration=1.0)
         step["rateMode"] = "material"
@@ -333,17 +350,16 @@ class V2IsotropicShadowTests(_V2WorkerStepTestBase):
         ctx = self._context("flag-on-material", step)
         before = _top(ctx.domain)
 
-        with _shadow_flag(True), mock.patch("worker.process_models_v2.run_isotropic_v2") as bridge:
+        with _shadow_flag(True), mock.patch("worker.process_models_v2.run_v2_step") as bridge:
             run_process_step(ctx, 1, step)
 
         bridge.assert_not_called()
         self.assertAlmostEqual(_top(ctx.domain) - before, -0.2, delta=1e-6)
-        skipped = _events_of(ctx.run_dir, "v2-isotropic-shadow-skipped")
+        skipped = _events_of(ctx.run_dir, "v2-plugin-shadow-skipped")
         self.assertEqual(len(skipped), 1, skipped)
         self.assertEqual(skipped[0]["stepId"], step["id"])
         self.assertIn("material", skipped[0]["reason"].lower())
-        self.assertIn("uniform", skipped[0]["reason"].lower())
-        self.assertEqual(_events_of(ctx.run_dir, "v2-isotropic-shadow"), [])
+        self.assertEqual(_events_of(ctx.run_dir, "v2-plugin-shadow"), [])
 
     def test_geometric_mode_is_skipped_without_a_bridge_call(self) -> None:
         # Thickness 0.3 um is >= gridDelta 0.2 um, so the explicit geometric
@@ -354,18 +370,36 @@ class V2IsotropicShadowTests(_V2WorkerStepTestBase):
         ctx = self._context("flag-on-geometric", step)
         before = _top(ctx.domain)
 
-        with _shadow_flag(True), mock.patch("worker.process_models_v2.run_isotropic_v2") as bridge:
+        with _shadow_flag(True), mock.patch("worker.process_models_v2.run_v2_step") as bridge:
             run_process_step(ctx, 1, step)
 
         bridge.assert_not_called()
         self.assertLess(_top(ctx.domain) - before, -0.1)
-        skipped = _events_of(ctx.run_dir, "v2-isotropic-shadow-skipped")
+        skipped = _events_of(ctx.run_dir, "v2-plugin-shadow-skipped")
         self.assertEqual(len(skipped), 1, skipped)
         self.assertIn("geometric", skipped[0]["reason"].lower())
-        self.assertEqual(_events_of(ctx.run_dir, "v2-isotropic-shadow"), [])
+        self.assertEqual(_events_of(ctx.run_dir, "v2-plugin-shadow"), [])
+
+    def test_model_without_a_plugin_is_skipped(self) -> None:
+        step = isotropic_step("etch", rate=0.0, duration=1.0)
+        step["model"] = "directional"
+        step["direction"] = [0.0, -1.0, 0.0]
+        step["directionalRateMagnitude"] = 0.0
+        step["isotropicRateMagnitude"] = 0.0
+        step["calculateVisibility"] = False
+        ctx = self._context("flag-on-unclaimed", step)
+
+        with _shadow_flag(True), mock.patch("worker.process_models_v2.run_v2_step") as bridge:
+            run_process_step(ctx, 1, step)
+
+        bridge.assert_not_called()
+        skipped = _events_of(ctx.run_dir, "v2-plugin-shadow-skipped")
+        self.assertEqual(len(skipped), 1, skipped)
+        self.assertIn("directional", skipped[0]["reason"])
+        self.assertEqual(_events_of(ctx.run_dir, "v2-plugin-shadow"), [])
 
 
-class V2IsotropicApplyTests(_V2WorkerStepTestBase):
+class V2PluginApplyTests(_V2WorkerStepTestBase):
     """Validation-only apply: an eligible, matched v2 domain replaces ctx.domain."""
 
     def test_apply_etch_replaces_the_domain_with_the_v2_domain(self) -> None:
@@ -386,7 +420,7 @@ class V2IsotropicApplyTests(_V2WorkerStepTestBase):
         self.assertEqual(simulate.surface_state(ctx.domain, 2)["digest"], applied["newDigest"])
         # The returned metadata still comes from the old save_snapshot call.
         self._assert_no_v2_metadata(result.metadata)
-        self.assertEqual(_events_of(ctx.run_dir, "v2-isotropic-shadow-skipped"), [])
+        self.assertEqual(_events_of(ctx.run_dir, "v2-plugin-shadow-skipped"), [])
 
     def test_apply_deposit_keeps_the_deposited_material(self) -> None:
         step = isotropic_step("deposit", rate=0.3, duration=1.0)
@@ -413,18 +447,18 @@ class V2IsotropicApplyTests(_V2WorkerStepTestBase):
         original_domain = ctx.domain
         before = _top(ctx.domain)
 
-        with _v2_flags(apply=True), mock.patch("worker.process_models_v2.run_isotropic_v2") as bridge:
+        with _v2_flags(apply=True), mock.patch("worker.process_models_v2.run_v2_step") as bridge:
             run_process_step(ctx, 1, step)
 
         bridge.assert_not_called()
         # The old path mutated its own domain in place; nothing was applied.
         self.assertIs(ctx.domain, original_domain)
         self.assertAlmostEqual(_top(ctx.domain) - before, -0.2, delta=1e-6)
-        skipped = _events_of(ctx.run_dir, "v2-isotropic-shadow-skipped")
+        skipped = _events_of(ctx.run_dir, "v2-plugin-shadow-skipped")
         self.assertEqual(len(skipped), 1, skipped)
         self.assertIn("material", skipped[0]["reason"].lower())
-        self.assertEqual(_events_of(ctx.run_dir, "v2-isotropic-shadow"), [])
-        self.assertEqual(_events_of(ctx.run_dir, "v2-isotropic-applied"), [])
+        self.assertEqual(_events_of(ctx.run_dir, "v2-plugin-shadow"), [])
+        self.assertEqual(_events_of(ctx.run_dir, "v2-plugin-applied"), [])
 
     def test_apply_is_refused_for_geometric_mode(self) -> None:
         self.assertGreaterEqual(0.3, GRID_DELTA)
@@ -434,75 +468,60 @@ class V2IsotropicApplyTests(_V2WorkerStepTestBase):
         original_domain = ctx.domain
         before = _top(ctx.domain)
 
-        with _v2_flags(apply=True), mock.patch("worker.process_models_v2.run_isotropic_v2") as bridge:
+        with _v2_flags(apply=True), mock.patch("worker.process_models_v2.run_v2_step") as bridge:
             run_process_step(ctx, 1, step)
 
         bridge.assert_not_called()
         self.assertIs(ctx.domain, original_domain)
         self.assertLess(_top(ctx.domain) - before, -0.1)
-        skipped = _events_of(ctx.run_dir, "v2-isotropic-shadow-skipped")
+        skipped = _events_of(ctx.run_dir, "v2-plugin-shadow-skipped")
         self.assertEqual(len(skipped), 1, skipped)
         self.assertIn("geometric", skipped[0]["reason"].lower())
-        self.assertEqual(_events_of(ctx.run_dir, "v2-isotropic-shadow"), [])
-        self.assertEqual(_events_of(ctx.run_dir, "v2-isotropic-applied"), [])
+        self.assertEqual(_events_of(ctx.run_dir, "v2-plugin-shadow"), [])
+        self.assertEqual(_events_of(ctx.run_dir, "v2-plugin-applied"), [])
 
 
-class V2IsotropicShadowEligibilityTests(unittest.TestCase):
-    def setUp(self) -> None:
-        ps.setNumThreads(1)
-        ps.Length.setUnit("um")
-        ps.setDimension(2)
-        self.project = plane_project(2)
+class V2PluginImportSafetyTests(unittest.TestCase):
+    def test_importing_the_step_module_does_not_import_the_bridge(self) -> None:
+        """Default off must stay import-free, not just event-free."""
+        code = (
+            "import sys\n"
+            "import worker.steps.process\n"
+            "loaded = sorted(name for name in sys.modules if name in "
+            "{'worker.process_models_v2', 'plugins', 'plugins.isotropic'})\n"
+            "assert not loaded, loaded\n"
+        )
+        completed = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
-    def test_uniform_level_set_is_eligible(self) -> None:
-        step = isotropic_step("etch", rate=0.3, duration=1.0)
-        step["isotropicMethod"] = "levelSet"
 
-        eligible, reason = _v2_isotropic_shadow_eligible(simulate, self.project, step)
+class V2PluginSkipReasonTests(unittest.TestCase):
+    """The skip reason names the dispatch fields without assuming a model."""
 
-        self.assertTrue(eligible, reason)
-        self.assertIn("uniform", reason)
-
-    def test_material_rate_mode_is_not_eligible(self) -> None:
-        step = isotropic_step("etch", rate=0.0, duration=1.0)
+    def test_material_rate_mode_reason(self) -> None:
+        step = isotropic_step("etch", rate=0.0)
         step["rateMode"] = "material"
         step["materialRates"] = {"Si": 0.2}
 
-        eligible, reason = _v2_isotropic_shadow_eligible(simulate, self.project, step)
+        reason = _v2_plugin_skip_reason(step)
 
-        self.assertFalse(eligible)
         self.assertIn("material", reason.lower())
-        self.assertIn("uniform", reason.lower())
+        self.assertIn("model='isotropic'", reason)
 
-    def test_geometric_method_is_not_eligible(self) -> None:
-        step = isotropic_step("etch", rate=0.3, duration=1.0)
+    def test_geometric_method_reason(self) -> None:
+        step = isotropic_step("etch", rate=0.3)
         step["isotropicMethod"] = "geometric"
 
-        eligible, reason = _v2_isotropic_shadow_eligible(simulate, self.project, step)
+        reason = _v2_plugin_skip_reason(step)
 
-        self.assertFalse(eligible)
         self.assertIn("geometric", reason.lower())
 
-    def test_auto_that_resolves_geometric_is_not_eligible(self) -> None:
-        step = isotropic_step("etch", rate=0.3, duration=1.0)
-        step["isotropicMethod"] = "auto"
-        method, _dispatch_reason = simulate.resolve_isotropic_method(self.project, step)
-        self.assertEqual(method, "geometric")
+    def test_non_plugin_model_reason(self) -> None:
+        step = {"id": "s", "model": "specialized", "operation": "deposit"}
 
-        eligible, reason = _v2_isotropic_shadow_eligible(simulate, self.project, step)
+        reason = _v2_plugin_skip_reason(step)
 
-        self.assertFalse(eligible)
-        self.assertIn("geometric", reason.lower())
-
-    def test_schema_three_is_not_eligible(self) -> None:
-        project = plane_project(2)
-        project["schemaVersion"] = 3
-        step = isotropic_step("etch", rate=0.3, duration=1.0)
-
-        eligible, reason = _v2_isotropic_shadow_eligible(simulate, project, step)
-
-        self.assertFalse(eligible)
-        self.assertIn("schema", reason.lower())
+        self.assertIn("model='specialized'", reason)
 
 
 if __name__ == "__main__":

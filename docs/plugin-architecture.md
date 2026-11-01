@@ -1,8 +1,10 @@
 # 插件组织与数据流
 
-> 状态：v2.2 契约 + 生命周期 + 第一个真实插件（isotropic）+ runtime/storage/conformance
+> 状态：v2.4 契约 + 生命周期 + 第一个真实插件（isotropic）+ runtime/storage/conformance
 > 基础已落地。本文描述**插件应该如何组织、数据如何流动**；这一片是运行时基础，
-> 不是生产 backend 接入，也没有 API/UI，文中明确标出。
+> 不是生产 backend 接入，也没有 API/UI，文中明确标出。v2.4 在 v2.2 结构化输出之上
+> 完成了 3C 清理：单步 dispatch 走 `ProcessSpec.parse_step`、插件包拆出 `step.py`、
+> 引擎 helper 移到 `process_models/v2/engines/`。
 
 ## 1. 分层
 
@@ -10,10 +12,10 @@
 | --- | --- | --- |
 | Runtime / executor | `worker/`、`process_models/v2/executor.py`、`storage.py` | 跨步骤 flow state、checkpoint、on-disk state/outputs、plan identity、引擎策略；v2 runner 尚未接入 backend |
 | Conformance | `process_models/v2/conformance.py`、`output_schema.py` | 变体一致性检查、可序列化的输出契约描述 |
-| Engine | `process_models/v2/engine.py` | `EngineRequirement` / `EngineLease` / provider；严格版本与后端匹配 |
-| Service | `process_models/plugins/`、`registry.py`、`resolver.py` | manifest、发现、lock、版本解析、准入、`ExecutionPlan` |
+| Engine | `process_models/v2/engine.py`、`engines/viennaps.py` | `EngineRequirement` / `EngineLease` / provider；ViennaPS 纯 Python helper（材料、速率、advection），不 import backend/worker |
+| Service | `process_models/plugins/`、`registry.py`、`resolver.py` | manifest、发现、lock、版本解析、`resolve_step` / `default_variant_id`、准入、`ExecutionPlan` |
 | State | `process_models/v2/state.py`、`adapters.py` | `ProcessState`、`StateDelta`、`StepResult`、`OutputSet`、表示转换 |
-| Plugin | `plugins/<id>/` | 工艺参数、spec、variant 实现、物理模型 |
+| Plugin | `plugins/<id>/` | 工艺参数、`parse_step`、spec、variant 实现、物理模型 |
 
 原则：**plugin 只描述和执行工艺；runtime、持久化、快照、replay、UI 属于平台。**
 
@@ -26,7 +28,8 @@ plugins/isotropic/
   plugin.toml              # api / id / version / entrypoint
   __init__.py              # 公开导出；外部包也可是顶层模块
   params.py                # canonical Pydantic params
-  spec.py                  # ProcessSpec
+  step.py                  # parse_step(project, step) -> params | None
+  spec.py                  # ProcessSpec（default_variant + parse_step）
   variants/
     __init__.py
     native.py              # EngineVariant(kind=native)
@@ -41,6 +44,7 @@ plugins/my_process/
   my_process/
     __init__.py
     params.py
+    step.py
     spec.py
     variants.py
     register.py
@@ -62,10 +66,17 @@ loader 会把插件目录的父目录加入 `sys.path`，因此 manifest 里只�
 # params.py
 class MyParams(BaseModel): ...
 
+# step.py
+def parse_step(project, step):
+    if step.get("model") != "my_process":
+        return None
+    return MyParams(...)          # 缺字段时抛 ValueError
+
 # spec.py
 MySpec = ProcessSpec(
     id="my_process", version="1.0.0", label="...",
     params_model=MyParams, dimensions=(2, 3), operations=("etch",),
+    default_variant="native", parse_step=parse_step,
 )
 
 # variants/native.py
@@ -113,13 +124,13 @@ variant.execute(S_i', params, ctx, engine_lease)
         │
         ▼
 StepResult {
-  state: StateDelta { geometry, layers, fields, voxels },
+  delta: StateDelta { geometry, materials, layers, fields, voxels },
   outputs: OutputSet { metrology, artifacts },
   metadata, warnings
 }
         │
         ▼
-adapter.commit(S_i', result.state, variant.writes)
+adapter.commit(S_i', result.delta, variant.writes)
         │
         ▼
 ProcessState S_{i+1}
@@ -150,7 +161,9 @@ commit -> S_{i+1} -> store`。`FlowExecutor` 负责串起这条链；单步调�
 
 ### 3.2 不可变性
 
-- `ProcessState` 是 frozen；插件只返回 `StateDelta`。
+- `ProcessState` 是 frozen；插件只返回 `StepResult.delta`（一个 `StateDelta`）。
+- `MaterialState` 是材料顺序的唯一来源（`LevelSetState` 只有句柄和网格元数据）；
+  `ProcessState.materials` 总是存在，`state.has("materials")` 恒为 true。
 - `adapter.prepare/commit` 用 `dataclasses.replace` 生成新状态，不原地改输入。
 - `mutates_input=True` 的 native 变体（如 isotropic）会原地改 native geometry handle；
   `FlowExecutor` 在调用前用 `engine.handle.Domain(state.geometry.handle)` 复制一份
@@ -162,12 +175,13 @@ commit -> S_{i+1} -> store`。`FlowExecutor` 负责串起这条链；单步调�
 | 组件 | 模块 | 职责 |
 | --- | --- | --- |
 | `StateStore` | `process_models/v2/storage.py` | 逐步骤保存/读取 `ProcessState`、`OutputSet`、plan identity 与 `flow.json`；原子 JSON 写（`tmp` + `os.replace`） |
-| `FlowExecutor` | `process_models/v2/executor.py` | 消费 `FlowStep` 列表，执行 `S_i -> resolve -> checkpoint -> prepare -> execute -> commit -> S_{i+1}`，逐步骤落盘并返回 `FlowRun` |
+| `FlowExecutor` | `process_models/v2/executor.py` | 消费 `FlowStep` 列表，执行 `S_i -> resolve -> checkpoint -> prepare -> execute -> commit -> S_{i+1}`，逐步骤落盘并返回 `FlowRun`；支持 `expected_process_version` / `expected_variant_version` 严格 pin，并在每步结束（含异常）释放 engine lease |
 | `check_variant` / `ConformanceReport` | `process_models/v2/conformance.py` | 对单个变体做契约级一致性检查（解析、校验、`StepResult` 形状、输入不可变、strict determinism） |
 | `output_contract_schema` | `process_models/v2/output_schema.py` | 返回 `StepResult`/`StateDelta`/`OutputSet` 等类型的 JSON 可序列化契约描述；是给未来 API/UI 的 schema，不是完整 JSON Schema 校验器 |
 
 `FlowExecutor.run()` 的输入是 frozen 的 `FlowStep`（`step_id`、`process_id`、
-`variant_id`、`params`、`context`）和初始 `ProcessState`；输出是 `FlowRun`：
+`variant_id`、`params`、`context`，可选两个版本 pin）和初始 `ProcessState`；输出是
+`FlowRun`：
 
 ```python
 @dataclass(frozen=True)
@@ -186,7 +200,7 @@ class FlowRun:
     state.json                 # schemaVersion 1：materials / geometry / layers / fields 元数据
     fields.npz                 # 仅在有 fields/cell-set 时写；field_000, field_001, ... 按 JSON 顺序（可选 material_ids）
     outputs.json               # OutputSet：metrology + artifacts
-    plan.json                  # plan.identity()
+    plan.json                  # plan.identity_json()（camelCase）
     geometry.vpsd              # 可选；引擎暴露 Writer 时由 FlowExecutor 写
 ```
 
@@ -196,9 +210,13 @@ class FlowRun:
   handle 直接报 `StateStoreError`。
 - `outputs.json` 拒绝 NaN/Inf 和不可序列化值，报 `StateStoreError`。
 - `voxels` 是逐步骤 scratch，**不落盘**；下一步需要时由 adapter 从 geometry 重新派生。
-- `geometry` 只记录 `geometryRef`（通常是 `geometry.vpsd`）和维度/`gridDelta`/材料顺序。
-  `StateStore.load_state()` 不内置原生几何 replay loader：有 ref 但没有调用方传入的
-  `geometry_loader` 时直接报错，不做静默降级。
+- `state.json` 的 geometry 只记录 `geometry.ref`（通常是 `geometry.vpsd`）和维度/
+  `gridDelta`；材料顺序在顶层 `materials`。`StateStore.load_state()` 不内置原生几何
+  replay loader：有 ref 但没有调用方传入的 `geometry_loader` 时直接报错，不做静默降级。
+- `state.json` 由 `STATE_SCHEMA_VERSION` 管，`outputs.json` 由 `OUTPUTS_SCHEMA_VERSION`
+  管；两者独立，升一个不会让另一个失效。
+- `plan.json` / `flow.json` 里的 plan identity 用 `identity_json()` 的 camelCase 键；
+  `identity()` 是内部 snake_case 形式，不直接落盘。
 
 ### 3.5 Conformance 与输出契约
 
@@ -258,59 +276,71 @@ stable input package (mesh/voxel/field files or arrays)
 S_0 → step_1 → S_1 → step_2 → S_2 → ... → S_n
 ```
 
-- 每个 step 的 `ExecutionPlan.identity()` + 输入状态 hash + params hash + 输出 artifact
-  hash 进入 run record。`FlowExecutor` 至少把 plan identity 写进 `steps/<step_id>/plan.json`，
-  并在 `flow.json` 里记录本次 run 的步骤顺序与版本；`StateStore` 固定
-  `state.json` / `fields.npz` / `outputs.json` 的 schema。
-- replay 必须钉住：process/variant 版本、implementation hash、engine version/fingerprint、
-  plugin lock、输入状态和输出 artifact。
-- 原生几何 replay 还缺 loader：`state.json` 只有 `geometryRef`，重载需要调用方提供能把
+- 已实现：`FlowExecutor` 把每个 step 的 `plan.identity_json()` 写进
+  `steps/<step_id>/plan.json`，并在 `flow.json` 里记录本次 run 的步骤顺序与版本；
+  `StateStore` 固定 `state.json` / `fields.npz` / `outputs.json` 的 schema。
+- 已实现：`ExecutionRequest` 与 `FlowStep` 的 `expected_process_version` /
+  `expected_variant_version` 是当前唯一可执行的 replay/版本 pin；pin 到未安装版本直接
+  报错，不会回退到最新版本。
+- **未实现**：输入状态 hash、params hash、输出 artifact hash 都没有进入 run record；
+  `implementation_hash` 与 engine fingerprint 只被记录，不能作为 pin 重新校验；
+  `plugins.lock` 也不写进 plan identity。当前 replay 只能保证“同 process/variant 版本”，
+  不能声称字节级可复现。
+- 原生几何 replay 还缺 loader：`state.json` 只有 `geometry.ref`，重载需要调用方提供能把
   ref 变回引擎 handle 的 `geometry_loader`；store 本身不生成/解析 `.vpsd`。
 - 插件升级 = 新 variant 版本或新 process 版本；旧 lock 仍可加载旧版本（如果安装）。
 
 ## 6. 当前实现状态
 
-> 这一片的具体测试项按实际运行单独报告；本文只描述职责与边界，不写死数量。
-
 | 项 | 状态 |
 | --- | --- |
 | manifest / discovery / lock | ✅ |
-| `ProcessSpec` / `VariantRegistration` / resolver / `ExecutionPlan` | ✅ |
-| `ProcessState` / `StateDelta` / `StepResult` / `OutputSet` | ✅ 类型与校验 |
-| native isotropic 插件（StepResult） | ✅ |
-| voxel proof surrogate（StepResult） | ✅ |
-| 标准插件包布局（isotropic 已在 `plugins/isotropic/`） | ✅ |
+| `ProcessSpec`（含 `parse_step` / `default_variant`）/ `VariantRegistration` / resolver / `ExecutionPlan` | ✅ |
+| `ProcessRegistry.resolve_step` / `default_variant_id` | ✅ 单步 dispatch 只走 spec 的 `parse_step` |
+| `ProcessState` / `StateDelta` / `StepResult` / `OutputSet` | ✅ 类型与校验；`StepResult.delta` |
+| native isotropic 插件（`StepResult.delta`） | ✅ |
+| voxel proof surrogate（`StepResult.delta`） | ✅ |
+| 标准插件包布局（isotropic 含 `step.py` / `parse_step`） | ✅ |
+| 可复制脚手架 `docs/plugin-template/` | ✅ 不在 `plugins/*` 扫描范围 |
 | field/layer store + persistence | ✅ `StateStore`：`state.json` + `fields.npz`，原子写，geometry 只存 ref |
 | 通用 executor 消费 `StepResult`/`OutputSet` | ✅ `FlowExecutor`：多步状态转移、`mutates_input` checkpoint、逐 step 落盘；**尚未接入 backend** |
 | `OutputSet` 落盘 | ✅ `outputs.json`（metrology/artifacts，拒绝 NaN/Inf） |
 | `OutputSet` API / UI | ❌ 只有 Python 契约和 `output_contract_schema()` |
 | conformance harness | ✅ `check_variant()`：解析、校验、`StepResult` 形状、输入不可变、strict determinism |
-| output contract schema | ✅ `output_contract_schema()`，JSON 可序列化，`schemaVersion: 1` |
+| output contract schema | ✅ `output_contract_schema()`，JSON 可序列化，`schemaVersion: 1`；不是完整 JSON Schema 校验器 |
+| generic worker plugin hook | ✅ 默认关闭的 shadow/apply；事件 `v2-plugin-shadow` / `v2-plugin-applied` / `v2-plugin-shadow-skipped`；生产默认路径不变 |
 | external engine adapter | ❌ |
-| 原生 geometry replay loader | ❌ `geometryRef` 已记录；重载需调用方提供 loader |
+| 原生 geometry replay loader | ❌ `geometry.ref` 已记录；重载需调用方提供 loader |
 | v2 run 接入 backend/API/UI | ❌ |
+| 定向测试 | 275 项通过 + 默认 isotropic dispatch 12 项通过（具体见 v2 文档 §9.2） |
 
-### 6.1 本切片仍未完成
+### 6.1 当前仍未完成
 
 - **没有 API/UI**：`output_contract_schema()` 只是契约描述，项目 JSON、HTTP API 和前端
   都还不会引用 v2 run。
-- **没有原生几何 replay loader**：`StateStore` 记录 `geometryRef`（以及可选的
+- **没有原生几何 replay loader**：`StateStore` 记录 `geometry.ref`（以及可选的
   `geometry.vpsd`），但把 ref 重新加载成引擎 handle 的 loader 由调用方提供；
   缺失时 `load_state()` 直接报错。
 - **没有外部引擎 adapter**：`external` 仍只是枚举值，registry/provider 只支持 ViennaPS
   原生路径。
-- **没有 backend 集成**：`FlowExecutor` 是独立运行时组件；worker/正式服务仍走旧路径，
-  v2 只有默认关闭的影子/apply 开关（v2 文档 §7.5），没有生产 cutover。
+- **没有 backend 集成**：`FlowExecutor` 是独立运行时组件；worker/正式服务仍走旧路径。
+  worker 侧只有一个通用的、默认关闭的 plugin shadow/apply hook（按
+  `ProcessSpec.parse_step` 分派，v2 文档 §7.5），没有 isotropic 专用 bridge，也没有生产
+  cutover。
 
 ## 7. 新增插件的清单
 
-1. 建 `plugins/<id>/`，写 `plugin.toml`。
-2. `params.py`：canonical Pydantic 参数，`extra="forbid"`。
-3. `spec.py`：`ProcessSpec`；版本只随 schema/语义变。
-4. `variants/`：每个实现一个 `EngineVariant`，声明 `reads/writes`、engine requirement、
-   `mutates_input`、`output_kinds`。
-5. `register.py`：只注册 spec + `VariantRegistration(process_id, variant)`。
-6. 写 parity/conformance 测试；至少跑一次 `check_variant(...)`，native 变体还必须与
+1. 复制 `docs/plugin-template/` 到 `plugins/<id>/`（模板不在 `plugins/*` 扫描范围）。
+2. 改 `plugin.toml`：`api` / `id` / `version` / `entrypoint`。
+3. `params.py`：canonical Pydantic 参数，`extra="forbid"`。
+4. `step.py`：`parse_step(project, step) -> BaseModel | None`；不属于本工艺返回 `None`，
+   声称属于但字段缺失抛 `ValueError`。
+5. `spec.py`：`ProcessSpec`，显式写 `default_variant="..."` 和 `parse_step=parse_step`；
+   版本只随 schema/语义变。
+6. `variants/`：每个实现一个 `EngineVariant`，声明 `reads/writes`、engine requirement、
+   `mutates_input`、`output_kinds`；`execute()` 返回 `StepResult(delta=...)`。
+7. `register.py`：只注册 spec + `VariantRegistration(process_id, variant)`。
+8. 写 parity/conformance 测试；至少跑一次 `check_variant(...)`，native 变体还必须与
    worker 路径对照。
-7. 运行 `python scripts/lock-plugins.py` 生成 lock，`--check` 通过。
-8. 不要在插件里做快照、文件路径、seed、engine policy 或全局状态。
+9. 运行 `python scripts/lock-plugins.py` 生成 lock，`--check` 通过。
+10. 不要在插件里做快照、文件路径、seed、engine policy 或全局状态。

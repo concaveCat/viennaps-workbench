@@ -43,6 +43,12 @@ from backend.validation import (GPU_MULTIPARTICLE_FLUX_STRATEGY,
 from backend.engine import multi_ion_gpu_error
 from backend.gpu_devices import cuda_devices, resolve_gpu_device
 from backend.gds import MAX_GDS_BLUR_CELLS, blur_exposure_cell_count
+from process_models.v2.engines.viennaps import (
+    configure_advection,
+    material_handle,
+    material_map,
+    protected_material_names,
+)
 from worker.gds_mask import CONSTRUCTION as GDS_MASK_CONSTRUCTION
 from worker.gds_mask import (NATIVE_CONSTRUCTION, NATIVE_REGRID_CONSTRUCTION,
                              apply_gds_blur, build_aligned_gds_layer,
@@ -50,7 +56,6 @@ from worker.gds_mask import (NATIVE_CONSTRUCTION, NATIVE_REGRID_CONSTRUCTION,
                              planar_point_count, resolve_blur)
 from worker.specialized import build_specialized_model
 from worker.csv_process import build_csv_process
-from worker.mask_materials import protected_material_names
 from worker.artifacts import (artifact_bytes_used, atomic_json, check_artifact_budget,
                               file_sha256, output_artifact)
 from worker.engine_policy import (multi_ion_gpu_step, native_slice_position,
@@ -562,41 +567,6 @@ def native_mesh_report(mesh: Any) -> dict[str, Any]:
             "meshIdentity": mesh_identity, "fields": fields}
 
 
-def configure_advection(ps: Any, project: dict[str, Any],
-                        time_step_ratio: float | None = None) -> tuple[Any, dict[str, Any]]:
-    """Build the step's native AdvectionParameters.
-
-    ``time_step_ratio`` is the step-level ``isotropicTimeStepRatio`` override.
-    It is applied to a freshly configured parameter object (never to the
-    saved project's solver defaults) and recorded under ``timeStepRatio`` so a
-    run remains auditable.
-    """
-    params = ps.AdvectionParameters()
-    params.timeStepRatio = float(project["solver"]["timeStepRatio"])
-    actual: dict[str, Any] = {"timeStepRatio": float(params.timeStepRatio)}
-    if time_step_ratio is not None:
-        params.timeStepRatio = float(time_step_ratio)
-        actual["timeStepRatio"] = float(params.timeStepRatio)
-        actual["solverTimeStepRatio"] = float(project["solver"]["timeStepRatio"])
-        actual["timeStepRatioSource"] = "step.isotropicTimeStepRatio"
-    if project["schemaVersion"] >= 7:
-        requested = project["solver"]["advection"]
-        params.spatialScheme = getattr(ps.ls.SpatialSchemeEnum, requested["spatialScheme"])
-        params.temporalScheme = getattr(ps.ls.TemporalSchemeEnum, requested["temporalScheme"])
-        for name in ("adaptiveTimeStepping", "adaptiveTimeStepSubdivisions", "calculateIntermediateVelocities",
-                     "checkDissipation", "dissipationAlpha", "ignoreVoids", "velocityOutput"):
-            setattr(params, name, requested[name])
-        actual.update({name: getattr(params, name) for name in (
-            "adaptiveTimeStepping", "adaptiveTimeStepSubdivisions",
-            "calculateIntermediateVelocities", "checkDissipation", "dissipationAlpha", "ignoreVoids", "velocityOutput")})
-        actual["spatialScheme"] = params.spatialScheme.name
-        actual["spatialSchemeValue"] = int(params.spatialScheme)
-        actual["temporalScheme"] = params.temporalScheme.name
-        actual["temporalSchemeValue"] = int(params.temporalScheme)
-        actual["nativeAdvectionMetadata"] = params.toMetaData()
-    return params, actual
-
-
 def configure_rays(ps: Any, project: dict[str, Any], seed: int) -> tuple[Any, dict[str, Any]]:
     params = ps.RayTracingParameters()
     params.raysPerPoint = int(project["solver"]["raysPerPoint"])
@@ -950,11 +920,6 @@ def measure_step_change(step: dict[str, Any], previous_tops: dict[str, Any] | No
     return {key: record}
 
 
-def material_map(domain: Any) -> list[int]:
-    mapping = domain.getMaterialMap()
-    return [int(mapping.getMaterialIdAtIdx(index)) for index in range(mapping.size())]
-
-
 def _levelset_index(path: Path) -> int:
     match = re.search(r"_layer(\d+)\.(?:lvst|vtp)$", path.name)
     if not match:
@@ -990,14 +955,6 @@ def save_native_state(ps: Any, domain: Any, run_dir: Path, *, project: dict[str,
     }
     check_artifact_budget(run_dir)
     return {"fileName": path.name, **ref}
-
-
-def material_handle(ps: Any, name: str):
-    registry = ps.MaterialRegistry.instance()
-    material = registry.findMaterial(name)
-    if material is None:
-        raise RuntimeError(f"material {name!r} is absent from the native MaterialRegistry")
-    return registry.getMaterial(name)
 
 
 RATE_SET_OVERLOAD = "DirectionalProcess(rateSets: Sequence[RateSet])"

@@ -24,8 +24,9 @@ Representations
 * ``voxels`` is the dense height-field grid from :mod:`process_models.voxel`.
   Conversions in and out of voxels live in
   :class:`process_models.v2.adapters.DefaultStateAdapter`, never in a variant.
-* ``materials`` describes the native material IDs in level-set order. It may
-  be empty for field-only steps.
+* ``materials`` is the single canonical description of the native material
+  IDs in level-set order. It is always present (possibly with an empty
+  ``order``) and is never duplicated on the level-set handle.
 
 No backend, worker, or project-schema types appear here. ``ProcessState`` and
 every nested value object are frozen; adapters build new states with
@@ -455,12 +456,14 @@ class LevelSetState:
     ``handle`` is opaque to this package. For native variants it is the
     ViennaPS ``Domain``; the :class:`process_models.v2.engine.EngineLease`
     handed to the variant provides the module/handle needed to operate on it.
+
+    Material order is *not* stored here: :class:`MaterialState` on
+    :class:`ProcessState` is the single canonical source.
     """
 
     handle: Any
     dimension: int
     grid_delta: float
-    material_order: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if int(self.dimension) not in (2, 3):
@@ -468,12 +471,8 @@ class LevelSetState:
         grid_delta = float(self.grid_delta)
         if not math.isfinite(grid_delta) or grid_delta <= 0.0:
             raise ValueError(f"grid_delta must be a positive finite number, got {self.grid_delta!r}")
-        order = tuple(int(material_id) for material_id in self.material_order)
-        if any(material_id < 0 for material_id in order):
-            raise ValueError(f"material_order must contain ids >= 0, got {order}")
         object.__setattr__(self, "dimension", int(self.dimension))
         object.__setattr__(self, "grid_delta", grid_delta)
-        object.__setattr__(self, "material_order", order)
 
 
 @dataclass(frozen=True)
@@ -501,13 +500,14 @@ class ProcessState:
     def has(self, kind: StateKind) -> bool:
         """Return whether ``kind`` is populated.
 
-        ``materials`` counts as present only when at least one material id is
-        declared; an empty material map is valid for field-only steps.
+        ``materials`` is always present: :class:`ProcessState` carries a
+        :class:`MaterialState` even when its ``order`` is empty (field-only
+        steps).
         """
         if kind == "geometry":
             return self.geometry is not None
         if kind == "materials":
-            return bool(self.materials.order)
+            return True
         if kind == "layers":
             return self.layers is not None
         if kind == "fields":
@@ -541,24 +541,31 @@ class StateDelta:
     """
 
     geometry: LevelSetState | None = None
+    materials: MaterialState | None = None
     layers: LayerState | None = None
     fields: CellSetState | None = None
     voxels: VoxelState | None = None
 
     def is_empty(self) -> bool:
         """Return ``True`` when no state representation changes."""
-        return self.geometry is None and self.layers is None and self.fields is None and self.voxels is None
+        return (
+            self.geometry is None
+            and self.materials is None
+            and self.layers is None
+            and self.fields is None
+            and self.voxels is None
+        )
 
 
 @dataclass
 class StepResult:
     """One step's state change plus its report data.
 
-    ``state`` is committed by the adapter; ``outputs``, ``metadata``, and
+    ``delta`` is committed by the adapter; ``outputs``, ``metadata``, and
     ``warnings`` are recorded by the executor and never touch the state.
     """
 
-    state: StateDelta
+    delta: StateDelta
     outputs: OutputSet = field(default_factory=OutputSet)
     metadata: dict[str, Any] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)

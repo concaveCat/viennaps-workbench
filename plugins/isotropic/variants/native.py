@@ -1,20 +1,25 @@
 """Native isotropic etch/deposit variant.
 
-The variant is a parity-first wrapper around the existing worker path
-(:mod:`worker.steps.process` and the helpers in :mod:`worker.simulate`). It
-builds the same synthetic step dictionary the worker would see, calls the same
-rate/advection helpers, and constructs the same ``ps.IsotropicProcess``.
+The variant builds the same synthetic step dictionary the worker would see,
+calls the same rate/advection helpers from
+:mod:`process_models.v2.engines.viennaps`, and constructs the same
+``ps.IsotropicProcess``. It never imports the worker.
 
 The variant mutates the caller's level-set handle in place
 (``mutates_input=True``), exactly like the worker path. The executor is
 responsible for checkpointing before calling it. The engine lease is passed
 explicitly to :meth:`IsotropicNativeVariant.execute`; it is never stored in the
 process state.
+
+The variant requires a complete project (``schemaVersion``, ``geometry``, and
+``solver``): the shared helpers read all three, so a partially filled context
+fails loudly instead of falling back to defaults that would not describe the
+run. :class:`~process_models.v2.state.MaterialState` is the single canonical
+material order; the variant returns it as a delta next to the geometry.
 """
 
 from __future__ import annotations
 
-import math
 from typing import Any
 
 from pydantic import BaseModel
@@ -26,51 +31,58 @@ from process_models.v2.contract import (
     VariantCapabilities,
 )
 from process_models.v2.engine import EngineLease, EngineRequirement
-from process_models.v2.state import LevelSetState, ProcessState, StateDelta, StepResult
+from process_models.v2.engines import viennaps as _engine_helpers
+from process_models.v2.engines.viennaps import (
+    configure_advection,
+    material_handle,
+    material_map,
+    protected_material_names,
+    signed_rates,
+)
+from process_models.v2.state import (
+    LevelSetState,
+    MaterialState,
+    ProcessState,
+    StateDelta,
+    StepResult,
+)
 
 __all__ = ["IsotropicNativeVariant"]
 
-
-_DEFAULT_PROJECT: dict[str, Any] = {
-    "schemaVersion": 3,
-    "geometry": {"kind": "plane", "substrateMaterial": "Si"},
-    "solver": {"timeStepRatio": 0.25},
-}
+_REQUIRED_PROJECT_KEYS = ("schemaVersion", "geometry", "solver")
 
 
 class IsotropicNativeVariant(EngineVariant):
-    """Run a native ``ps.IsotropicProcess`` step through the worker helpers.
+    """Run a native ``ps.IsotropicProcess`` step through the shared engine helpers.
 
-    The variant reads and writes only native geometry and declares
-    ``mutates_input=True`` because the process advects the caller's domain in
-    place.
+    The variant reads native geometry and writes both the mutated geometry and
+    the canonical material order. It declares ``mutates_input=True`` because the
+    process advects the caller's domain in place.
     """
 
     variant_id = "native"
     version = "1.0.0"
     capabilities = VariantCapabilities(
         dimensions=(2, 3),
-        reads=frozenset({"geometry"}),
-        writes=frozenset({"geometry"}),
+        reads=frozenset({"geometry", "materials"}),
+        writes=frozenset({"geometry", "materials"}),
         supports_masks=True,
         mutates_input=True,
         determinism="strict",
     )
     engine = EngineRequirement(kind="native", engine_id="viennaps", min_version="4.6.2")
     implementation_hash: str | None = None
+    implementation_files = (getattr(_engine_helpers, "__file__", ""),)
 
     def validate(self, ctx: ProcessContext, params: BaseModel) -> list[Issue]:
-        """Return cheap, deterministic issues for ``params`` in ``ctx``."""
+        """Return the semantic issues Pydantic and the resolver cannot express.
+
+        Parameter ranges (dimension, positive finite rates/duration, finite
+        non-negative material rates) are already enforced by the parameter model
+        and the resolver, so only mode-specific rules and the deposit material
+        are checked here.
+        """
         issues: list[Issue] = []
-        if ctx.dimension not in self.capabilities.dimensions:
-            issues.append(
-                Issue(
-                    path="dimension",
-                    message=(
-                        f"isotropic supports dimensions {list(self.capabilities.dimensions)}, not {ctx.dimension}"
-                    ),
-                )
-            )
 
         rate_mode = str(getattr(params, "rateMode", "uniform"))
         operation = str(getattr(params, "operation", "etch"))
@@ -116,38 +128,6 @@ class IsotropicNativeVariant(EngineVariant):
                     )
                 )
 
-        rate_magnitude = float(getattr(params, "rateMagnitude", 0.0))
-        if not math.isfinite(rate_magnitude) or rate_magnitude <= 0.0:
-            issues.append(
-                Issue(
-                    path="rateMagnitude",
-                    message=f"rateMagnitude must be a finite positive number, got {rate_magnitude!r}",
-                )
-            )
-        duration = float(getattr(params, "duration", 0.0))
-        if not math.isfinite(duration) or duration <= 0.0:
-            issues.append(
-                Issue(
-                    path="duration",
-                    message=f"duration must be a finite positive number, got {duration!r}",
-                )
-            )
-
-        for name, rate in material_rates.items():
-            if not math.isfinite(rate) or rate < 0.0:
-                issues.append(
-                    Issue(
-                        path=f"materialRates.{name}",
-                        message=f"materialRates[{name!r}] must be finite and non-negative, got {rate!r}",
-                    )
-                )
-
-        for name in mask_materials:
-            if not str(name).strip():
-                issues.append(
-                    Issue(path="maskMaterials", message="maskMaterials entries must be non-empty material names")
-                )
-
         return issues
 
     def execute(
@@ -159,14 +139,14 @@ class IsotropicNativeVariant(EngineVariant):
     ) -> StepResult:
         """Apply one isotropic step and return the committed state change.
 
-        ``result.state`` carries the mutated native geometry; ``metadata`` and
-        ``warnings`` are report data and never count as a state change. The
-        worker module is imported lazily so that registering the plugin
-        never imports the worker or native libraries. ``engine.handle`` is the
-        installed ``viennaps`` module supplied by the executor's lease.
+        ``result.delta`` carries the mutated native geometry and the canonical
+        material order; ``metadata`` and ``warnings`` are report data and never
+        count as a state change. The helpers come from
+        :mod:`process_models.v2.engines.viennaps`, so the plugin never imports
+        the worker or native libraries. ``engine.handle`` is the installed
+        ``viennaps`` module supplied by the executor's lease.
         """
-        import worker.simulate as simulate
-
+        project = _require_project(ctx)
         geometry = state.require("geometry")
         ps = engine.handle
         domain = geometry.handle
@@ -178,7 +158,6 @@ class IsotropicNativeVariant(EngineVariant):
         deposit_material = str(getattr(params, "depositMaterial", "SiO2"))
         time_step_ratio = getattr(params, "isotropicTimeStepRatio", None)
 
-        project = _worker_project(ctx)
         step = {
             "model": "isotropic",
             "operation": operation,
@@ -191,9 +170,9 @@ class IsotropicNativeVariant(EngineVariant):
         }
 
         if operation == "deposit":
-            domain.duplicateTopLevelSet(simulate.material_handle(ps, deposit_material))
+            domain.duplicateTopLevelSet(material_handle(ps, deposit_material))
 
-        rate, signed_material_rates = simulate.signed_rates(step)
+        rate, signed_material_rates = signed_rates(step)
         warnings: list[str] = []
 
         if rate_mode == "material":
@@ -206,19 +185,19 @@ class IsotropicNativeVariant(EngineVariant):
                 warnings.append("rateMode 'material' ignores maskMaterials; the material rate table is authoritative")
             model = ps.IsotropicProcess(rate=native_default_rate, maskMaterials=[])
             for name, signed_rate in signed_material_rates.items():
-                model.setMaterialRate(simulate.material_handle(ps, name), signed_rate)
+                model.setMaterialRate(material_handle(ps, name), signed_rate)
         else:
             native_default_rate = rate
             explicit_masks = list(getattr(params, "maskMaterials", None) or [])
-            mask_names = explicit_masks or simulate.protected_material_names(project, step)
+            mask_names = explicit_masks or protected_material_names(project, step)
             model = ps.IsotropicProcess(
                 rate=rate,
-                maskMaterials=[simulate.material_handle(ps, name) for name in mask_names],
+                maskMaterials=[material_handle(ps, name) for name in mask_names],
             )
 
         process = ps.Process(domain, model, duration)
         process.setFluxEngineType(ps.FluxEngineType.CPU_DISK)
-        advection, advection_actual = simulate.configure_advection(
+        advection, advection_actual = configure_advection(
             ps,
             project,
             time_step_ratio=time_step_ratio,
@@ -226,12 +205,19 @@ class IsotropicNativeVariant(EngineVariant):
         process.setParameters(advection)
         process.apply()
 
-        material_order = tuple(int(material_id) for material_id in simulate.material_map(domain))
+        material_order = tuple(int(material_id) for material_id in material_map(domain))
         delta_geometry = LevelSetState(
             handle=domain,
             dimension=geometry.dimension,
             grid_delta=geometry.grid_delta,
-            material_order=material_order,
+        )
+        delta_materials = MaterialState(
+            order=material_order,
+            names={
+                material_id: name
+                for material_id, name in state.materials.names.items()
+                if material_id in material_order
+            },
         )
 
         metadata: dict[str, Any] = {
@@ -260,24 +246,26 @@ class IsotropicNativeVariant(EngineVariant):
         }
 
         return StepResult(
-            state=StateDelta(geometry=delta_geometry),
+            delta=StateDelta(geometry=delta_geometry, materials=delta_materials),
             metadata=metadata,
             warnings=warnings,
         )
 
 
-def _worker_project(ctx: ProcessContext) -> dict[str, Any]:
-    """Return a worker-shaped project mapping for the shared helpers.
+def _require_project(ctx: ProcessContext) -> Any:
+    """Return ``ctx.project`` or raise when a required key is missing.
 
-    ``ProcessContext.project`` may be empty when a caller resolves a step
-    outside a saved project. The helpers only need ``schemaVersion``,
-    ``geometry`` (mask derivation), and ``solver.timeStepRatio``, so missing
-    values fall back to :data:`_DEFAULT_PROJECT` without mutating the context.
+    The shared helpers always read the project schema version, the geometry
+    masks, and the solver time-step ratio. Callers (tests included) must pass a
+    complete project; silently substituting defaults would make the run record
+    describe a project that was never used.
     """
-    project = dict(ctx.project or {})
-    project.setdefault("schemaVersion", _DEFAULT_PROJECT["schemaVersion"])
-    project.setdefault("geometry", dict(_DEFAULT_PROJECT["geometry"]))
-    solver = dict(project.get("solver") or {})
-    solver.setdefault("timeStepRatio", _DEFAULT_PROJECT["solver"]["timeStepRatio"])
-    project["solver"] = solver
+    project = ctx.project
+    missing = [name for name in _REQUIRED_PROJECT_KEYS if not project.get(name)]
+    if missing:
+        raise RuntimeError(
+            "isotropic native variant requires a complete project with "
+            + ", ".join(_REQUIRED_PROJECT_KEYS)
+            + f"; missing {', '.join(missing)}"
+        )
     return project

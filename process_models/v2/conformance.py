@@ -9,7 +9,7 @@ deliberately mechanical:
 * ``variant.validate`` returns :class:`~process_models.v2.contract.Issue`
   values, and any ``error`` severity fails conformance;
 * ``execute_plan`` returns a :class:`~process_models.v2.state.StepResult` whose
-  ``state`` is a :class:`~process_models.v2.state.StateDelta` and whose
+  ``delta`` is a :class:`~process_models.v2.state.StateDelta` and whose
   ``outputs`` is an :class:`~process_models.v2.state.OutputSet`;
 * a variant that does not declare ``mutates_input=True`` leaves the input
   state's geometry/layers/fields handles unchanged (identity plus a best-effort
@@ -53,6 +53,7 @@ from .state import (
     CellSetState,
     LayerState,
     LevelSetState,
+    MaterialState,
     OutputSet,
     ProcessState,
     StateDelta,
@@ -209,8 +210,8 @@ def check_variant(
         if not isinstance(result, StepResult):
             issues.append(f"{label}: variant returned {type(result).__name__}, expected StepResult")
             break
-        if not isinstance(result.state, StateDelta):
-            issues.append(f"{label}: StepResult.state must be a StateDelta, got {type(result.state).__name__}")
+        if not isinstance(result.delta, StateDelta):
+            issues.append(f"{label}: StepResult.delta must be a StateDelta, got {type(result.delta).__name__}")
             break
         if not isinstance(result.outputs, OutputSet):
             issues.append(f"{label}: StepResult.outputs must be an OutputSet, got {type(result.outputs).__name__}")
@@ -233,7 +234,7 @@ def check_variant(
                 "artifacts": len(result.outputs.artifacts),
             }
             details["state"] = _state_summary(outcome.state)
-            details["delta"] = _delta_shape(result.state)
+            details["delta"] = _delta_shape(result.delta)
             warnings.extend(result.warnings)
 
     details["determinism"] = _determinism_details(outcomes, variant, digest, issues)
@@ -292,7 +293,7 @@ def _compare_structurally(first: ExecutionOutcome, second: ExecutionOutcome) -> 
         differences.append("OutputSet differs between runs")
     if not _values_equal(first.result.metadata, second.result.metadata):
         differences.append("StepResult.metadata differs between runs")
-    if not _values_equal(_delta_shape(first.result.state), _delta_shape(second.result.state)):
+    if not _values_equal(_delta_shape(first.result.delta), _delta_shape(second.result.delta)):
         differences.append("state delta shape differs between runs")
     return differences
 
@@ -365,6 +366,8 @@ def _delta_shape(delta: StateDelta) -> dict[str, Any]:
     shape: dict[str, Any] = {}
     if delta.geometry is not None:
         shape["geometry"] = _geometry_shape(delta.geometry)
+    if delta.materials is not None:
+        shape["materials"] = _materials_shape(delta.materials)
     if delta.layers is not None:
         shape["layers"] = _layers_shape(delta.layers)
     if delta.fields is not None:
@@ -378,7 +381,13 @@ def _geometry_shape(geometry: LevelSetState) -> dict[str, Any]:
     return {
         "dimension": geometry.dimension,
         "grid_delta": geometry.grid_delta,
-        "material_order": list(geometry.material_order),
+    }
+
+
+def _materials_shape(materials: MaterialState) -> dict[str, Any]:
+    return {
+        "order": list(materials.order),
+        "names": {str(material_id): name for material_id, name in materials.names.items()},
     }
 
 
@@ -457,10 +466,7 @@ def _state_summary(state: ProcessState) -> dict[str, Any]:
     voxels = state.voxels
     return {
         "geometry": None if geometry is None else _geometry_shape(geometry),
-        "materials": {
-            "order": list(state.materials.order),
-            "names": {str(material_id): name for material_id, name in state.materials.names.items()},
-        },
+        "materials": _materials_shape(state.materials),
         "layers": None if layers is None else [layer.layer_id for layer in layers.layers],
         "fields": None if cells is None else _cellset_shape(cells),
         "voxels": None if voxels is None else _voxels_shape(voxels),

@@ -17,115 +17,64 @@ from typing import Any
 
 from worker.steps.context import RunContext, simulate_module
 
-V2_ISOTROPIC_SHADOW_ENV = "VIENNAPS_WORKBENCH_V2_ISOTROPIC_SHADOW"
-V2_ISOTROPIC_APPLY_ENV = "VIENNAPS_WORKBENCH_V2_ISOTROPIC_APPLY"
+V2_PLUGIN_SHADOW_ENV = "VIENNAPS_WORKBENCH_V2_PLUGIN_SHADOW"
+V2_PLUGIN_APPLY_ENV = "VIENNAPS_WORKBENCH_V2_PLUGIN_APPLY"
 
 
-def _v2_isotropic_shadow_enabled() -> bool:
-    """The shadow hook is strictly opt-in; the default run must not change."""
-    return os.environ.get(V2_ISOTROPIC_SHADOW_ENV) == "1"
+def _v2_plugin_shadow_enabled() -> bool:
+    """The plugin shadow hook is strictly opt-in; the default run must not change."""
+    return os.environ.get(V2_PLUGIN_SHADOW_ENV) == "1"
 
 
-def _v2_isotropic_apply_enabled() -> bool:
+def _v2_plugin_apply_enabled() -> bool:
     """Validation-only apply mode: also strictly opt-in.
 
-    With this flag the v2 domain replaces ``ctx.domain`` after the shadow
-    comparison, so snapshots, native state and replay can be validated against
-    the v2 result. It is *not* a production cutover: the default path is
+    With this flag the matched v2 domain replaces ``ctx.domain`` after the
+    shadow comparison, so snapshots, native state and replay can be validated
+    against the v2 result. It is *not* a production cutover: the default path is
     untouched and an apply always implies the shadow comparison.
     """
-    return os.environ.get(V2_ISOTROPIC_APPLY_ENV) == "1"
+    return os.environ.get(V2_PLUGIN_APPLY_ENV) == "1"
 
 
-def _v2_isotropic_shadow_eligible(simulate: Any, project: dict[str, Any], step: dict[str, Any]) -> tuple[bool, str]:
-    """Decide whether the v2 isotropic bridge covers this worker step.
+def _v2_plugin_skip_reason(step: dict[str, Any]) -> str:
+    """Return the audit reason for a step no registered plugin claims.
 
-    The bridge only implements uniform level-set isotropic steps. Every
-    exclusion returns the reason that is written to the run record, so a
-    skipped step is auditable instead of silently unvalidated.
+    The hook runs for every step while a flag is set, not only for the models
+    that have a plugin today, so the reason names the dispatch fields the
+    registered ``parse_step`` hooks inspect instead of assuming one model.
+    A skipped step is auditable; a step is never silently unvalidated.
     """
-    if step.get("model") != "isotropic":
-        return False, f"model={step.get('model')!r} is not isotropic"
-    operation = step.get("operation")
-    if operation not in ("etch", "deposit"):
-        return False, f"operation={operation!r} is not an isotropic etch or deposit"
-    try:
-        schema_version = int(project.get("schemaVersion", 0))
-    except (TypeError, ValueError):
-        schema_version = 0
-    if schema_version < 4:
-        return False, f"schemaVersion={project.get('schemaVersion')!r} is older than 4"
-    rate_mode = str(step.get("rateMode", "uniform"))
-    if rate_mode != "uniform":
-        return False, (
-            f"rateMode={rate_mode!r} needs the native material rate table; the v2 bridge only covers uniform"
-        )
-    if step.get("isotropicMethod") == "geometric":
-        return False, "isotropicMethod=geometric is not bridged to v2"
-    try:
-        method, method_reason = simulate.resolve_isotropic_method(project, step)
-    except Exception as error:  # eligibility must never fail the run
-        return False, f"resolve_isotropic_method failed: {error}"
-    if method != "levelSet":
-        return False, f"actual isotropic method {method!r} is not levelSet: {method_reason}"
-    try:
-        rate_magnitude = float(step.get("rateMagnitude", 0.0))
-        duration = float(step.get("duration", 0.0))
-        dimension = int(project.get("dimension", 0))
-    except (TypeError, ValueError):
-        return False, "rateMagnitude, duration and dimension must be numeric"
-    if not rate_magnitude > 0:
-        return False, f"rateMagnitude={rate_magnitude} is not positive"
-    if not duration > 0:
-        return False, f"duration={duration} is not positive"
-    if dimension not in (2, 3):
-        return False, f"dimension={dimension} is not 2 or 3"
-    return True, f"uniform level-set isotropic {operation} is bridgeable"
+    fields = ", ".join(f"{name}={step.get(name)!r}" for name in ("model", "operation", "rateMode", "isotropicMethod"))
+    return f"no registered v2 plugin process matches this step ({fields})"
 
 
-@dataclass(frozen=True)
-class _V2IsotropicShadowResult:
-    """Everything the caller needs from a *successful* shadow comparison.
+def _run_v2_plugin_shadow(
+    ctx: RunContext,
+    step: dict[str, Any],
+    shadow_domain: Any,
+    registry: Any,
+) -> None:
+    """Run the v2 path on ``shadow_domain``, compare, and optionally apply.
 
-    ``geometry_handle`` is the v2 domain itself; the plan/metadata are the same
-    values written to the ``v2-isotropic-shadow`` event and let the apply mode
-    record them without re-running (or reaching into) the bridge.
+    The comparison event is written before a mismatch is raised so the failed
+    run keeps the digests, material maps and plan identity that explain the
+    divergence. Only a matched domain is ever assigned to ``ctx.domain``. The
+    caller passes the registry it already loaded for dispatch, so the bridge
+    resolves the step without loading and verifying the lock a second time.
     """
+    from worker.process_models_v2 import compare_domains, run_v2_step
 
-    geometry_handle: Any
-    comparison: dict[str, Any]
-    plan_identity: dict[str, Any]
-    metadata: dict[str, Any]
-
-
-def _run_v2_isotropic_shadow(
-    ctx: RunContext, step: dict[str, Any], shadow_domain: Any, simulate: Any
-) -> _V2IsotropicShadowResult:
-    """Run the v2 bridge on a copy and compare it with the worker result.
-
-    The event is written before any mismatch is raised so the failed run keeps
-    the digests, material maps and plan identity that explain the divergence.
-    The v2 geometry handle is returned only after a match, so the caller can
-    never apply an unvalidated domain.
-    """
-    from worker.process_models_v2 import compare_isotropic_surfaces, run_isotropic_v2
-
-    outcome = run_isotropic_v2(
-        ctx.ps,
-        ctx.project,
-        step,
-        shadow_domain,
-        ps_version=ctx.ps_version,
-        engine_fingerprint=ctx.native_engine_fingerprint or "",
-    )
+    outcome = run_v2_step(ctx, step, shadow_domain, registry=registry)
     shadow_geometry = getattr(outcome.state, "geometry", None)
-    if shadow_geometry is None or getattr(shadow_geometry, "handle", None) is None:
-        raise RuntimeError(f"v2 isotropic shadow for step {step['id']!r} returned no geometry state")
-    comparison = compare_isotropic_surfaces(ctx.domain, shadow_geometry.handle, int(ctx.project["dimension"]))
+    shadow_handle = getattr(shadow_geometry, "handle", None)
+    if shadow_handle is None:
+        raise RuntimeError(f"v2 plugin shadow for step {step['id']!r} returned no geometry state")
+    comparison = compare_domains(ctx.domain, shadow_handle, int(ctx.project["dimension"]))
     plan_identity = outcome.plan.identity()
     ctx.event(
         {
-            "type": "v2-isotropic-shadow",
+            "type": "v2-plugin-shadow",
             "stepId": step["id"],
             **comparison,
             "v2Plan": plan_identity,
@@ -135,14 +84,25 @@ def _run_v2_isotropic_shadow(
     )
     if not comparison["matched"]:
         raise RuntimeError(
-            f"v2 isotropic shadow for step {step['id']!r} did not match the worker path: "
+            f"v2 plugin shadow for step {step['id']!r} did not match the worker path: "
             + "; ".join(comparison["reasons"])
         )
-    return _V2IsotropicShadowResult(
-        geometry_handle=shadow_geometry.handle,
-        comparison=comparison,
-        plan_identity=plan_identity,
-        metadata=outcome.metadata,
+    if not _v2_plugin_apply_enabled():
+        return
+    # Validation-only apply: from here on the snapshots, native state and
+    # replay records describe the v2 domain. The old process/model handles stay
+    # referenced by ProcessStepResult; plugin steps are CPU-only, so there is no
+    # GPU teardown to worry about.
+    ctx.domain = shadow_handle
+    ctx.event(
+        {
+            "type": "v2-plugin-applied",
+            "stepId": step["id"],
+            "oldDigest": comparison["oldDigest"],
+            "newDigest": comparison["newDigest"],
+            "v2Plan": plan_identity,
+            "v2Metadata": outcome.metadata,
+        }
     )
 
 
@@ -156,23 +116,25 @@ class ProcessStepResult:
 def run_process_step(ctx: RunContext, index: int, step: dict[str, Any]) -> ProcessStepResult:
     simulate = simulate_module()
     shadow_domain = None
-    shadow_skip_reason = None
-    shadow_enabled = _v2_isotropic_shadow_enabled() or _v2_isotropic_apply_enabled()
-    if shadow_enabled:
-        eligible, shadow_skip_reason = _v2_isotropic_shadow_eligible(simulate, ctx.project, step)
-        if eligible:
+    v2_registry = None
+    if _v2_plugin_shadow_enabled() or _v2_plugin_apply_enabled():
+        from process_models.plugins import load_registry
+        from worker.process_models_v2 import find_v2_process
+
+        # One discovery/verification pass per step, shared by dispatch and the
+        # bridge instead of being repeated for each lookup.
+        v2_registry = load_registry()
+        spec = find_v2_process(ctx.project, step, registry=v2_registry)
+        if spec is not None:
             # Deep-copy before the worker path mutates ctx.domain so both
             # branches start from the identical geometry.
             shadow_domain = ctx.ps.Domain(ctx.domain)
-        elif step.get("model") == "isotropic":
-            # Only log isotropic skips. A full flow also contains directional,
-            # particle and specialized steps; recording a skip for every one of
-            # them would drown the useful validation records.
+        else:
             ctx.event(
                 {
-                    "type": "v2-isotropic-shadow-skipped",
+                    "type": "v2-plugin-shadow-skipped",
                     "stepId": step["id"],
-                    "reason": shadow_skip_reason,
+                    "reason": _v2_plugin_skip_reason(step),
                 }
             )
     deposition = step["operation"] == "deposit"
@@ -698,25 +660,8 @@ def run_process_step(ctx: RunContext, index: int, step: dict[str, Any]) -> Proce
                 + (f", and the mask {masks} must not cover the whole exposed surface" if masks else "")
                 + ")"
             )
-    shadow_result = None
     if shadow_domain is not None:
-        shadow_result = _run_v2_isotropic_shadow(ctx, step, shadow_domain, simulate)
-    if _v2_isotropic_apply_enabled() and shadow_result is not None:
-        # Validation-only apply: from here on the snapshots, native state and
-        # replay records describe the v2 domain. The old process/model handles
-        # stay referenced by ProcessStepResult; isotropic is CPU-only, so there
-        # is no GPU teardown to worry about.
-        ctx.domain = shadow_result.geometry_handle
-        ctx.event(
-            {
-                "type": "v2-isotropic-applied",
-                "stepId": step["id"],
-                "oldDigest": shadow_result.comparison["oldDigest"],
-                "newDigest": shadow_result.comparison["newDigest"],
-                "v2Plan": shadow_result.plan_identity,
-                "v2Metadata": shadow_result.metadata,
-            }
-        )
+        _run_v2_plugin_shadow(ctx, step, shadow_domain, v2_registry)
     next_gpu_step_pending = any(
         simulate.uses_flux(future)
         and str(

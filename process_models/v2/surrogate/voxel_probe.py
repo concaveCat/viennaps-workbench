@@ -8,7 +8,7 @@ back, and the variant itself only edits a :class:`~process_models.voxel.VoxelGri
 Ownership of the conversion stays in the adapter. The variant never calls
 :func:`process_models.voxel.read_voxels` or
 :func:`process_models.voxel.write_voxels` and never mutates the input state; it
-returns a :class:`StepResult` whose ``state`` carries the new ``voxels`` entry
+returns a :class:`StepResult` whose ``delta`` carries the new ``voxels`` entry
 the adapter commits.
 
 Only height-field geometries are supported: the erosion model removes one
@@ -76,7 +76,7 @@ class VoxelProbeVariant(EngineVariant):
 
     The variant reads ``state.voxels`` (materialised by the state adapter) and
     writes a new ``VoxelState`` into the returned :class:`StepResult`'s
-    ``state`` delta. Witness metadata records the effective operation, grid
+    ``delta``. Witness metadata records the effective operation, grid
     shape, material order, and how many cells the erosion removed.
     """
 
@@ -152,7 +152,7 @@ class VoxelProbeVariant(EngineVariant):
             warnings.append("identity operation: surface is round-tripped through the voxel grid unchanged")
 
         return StepResult(
-            state=StateDelta(voxels=VoxelState(grid=new_grid, source=ADAPTER)),
+            delta=StateDelta(voxels=VoxelState(grid=new_grid, source=ADAPTER)),
             metadata={
                 "operation": operation,
                 "layers": layers,

@@ -78,7 +78,6 @@ def _state(domain: ps.Domain, dimension: int = 2) -> ProcessState:
             handle=domain,
             dimension=dimension,
             grid_delta=GRID_DELTA,
-            material_order=order,
         ),
         materials=MaterialState(order=order, names={order[0]: "Si"}),
     )
@@ -397,9 +396,8 @@ class VoxelProbeV2Test(unittest.TestCase):
 
         np.testing.assert_array_equal(_sorted_surface_points(domain), before)
         self.assertEqual(len(domain.getLevelSets()), level_sets_before)
-        self.assertEqual(committed.geometry.material_order, state.geometry.material_order)
-        self.assertEqual(committed.materials.order, state.materials.order)
-        self.assertEqual(outcome.delta.voxels.grid.material_order, state.geometry.material_order)
+        self.assertEqual(committed.materials, state.materials)
+        self.assertEqual(outcome.delta.voxels.grid.material_order, state.materials.order)
 
     # -- resolver rejections ----------------------------------------------
     def test_resolver_rejects_missing_state_and_wrong_dimension(self) -> None:
@@ -443,17 +441,17 @@ class VoxelProbeV2Test(unittest.TestCase):
 
         result = outcome.result
         self.assertIsInstance(result, StepResult)
-        self.assertIsInstance(result.state, StateDelta)
+        self.assertIsInstance(result.delta, StateDelta)
         self.assertIsInstance(result.outputs, OutputSet)
         self.assertEqual(result.outputs, OutputSet())
         self.assertEqual(result.outputs.metrology, ())
         self.assertEqual(result.outputs.artifacts, ())
 
-        # The voxel delta lives on ``result.state``; report data does not.
-        self.assertIsNotNone(result.state.voxels)
-        self.assertIsNone(result.state.geometry)
-        self.assertFalse(result.state.is_empty())
-        self.assertIs(outcome.delta, result.state)
+        # The voxel delta lives on ``result.delta``; report data does not.
+        self.assertIsNotNone(result.delta.voxels)
+        self.assertIsNone(result.delta.geometry)
+        self.assertFalse(result.delta.is_empty())
+        self.assertIs(outcome.delta, result.delta)
         self.assertIs(outcome.outputs, result.outputs)
         self.assertIs(outcome.metadata, result.metadata)
         self.assertIs(outcome.warnings, result.warnings)
@@ -505,7 +503,7 @@ ps.MakeFin(
 material_map = domain.getMaterialMap()
 order = tuple(int(material_map.getMaterialIdAtIdx(i)) for i in range(material_map.size()))
 state = ProcessState(
-    geometry=LevelSetState(handle=domain, dimension=2, grid_delta=0.1, material_order=order),
+    geometry=LevelSetState(handle=domain, dimension=2, grid_delta=0.1),
     materials=MaterialState(order=order),
 )
 

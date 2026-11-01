@@ -23,6 +23,9 @@ import inspect
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Mapping
+
+from pydantic import BaseModel
 
 from .contract import ModelDescriptor, ProcessSpec, VariantDescriptor, VariantRegistration
 
@@ -116,6 +119,54 @@ class ProcessRegistry:
                 raise KeyError(f"unknown version {expected_version!r} for process {process_id!r}")
             return versions[expected_version]
         return versions[_latest_version(list(versions))]
+
+    def resolve_step(
+        self,
+        project: Mapping[str, Any],
+        step: Mapping[str, Any],
+    ) -> tuple[ProcessSpec, BaseModel] | None:
+        """Return the single process that parses ``step``, plus its parameters.
+
+        Each process calls its ``parse_step`` hook exactly once. Only the
+        newest registered version of each process id is consulted, so adding a
+        newer version never leaves the older one claiming steps. No match
+        returns ``None``; more than one match raises ``ValueError`` because the
+        step would be ambiguous.
+        """
+        matches: list[tuple[ProcessSpec, BaseModel]] = []
+        for versions in self._processes.values():
+            spec = versions[_latest_version(list(versions))]
+            if spec.parse_step is None:
+                continue
+            params = spec.parse_step(project, step)
+            if params is not None:
+                matches.append((spec, params))
+        if not matches:
+            return None
+        if len(matches) > 1:
+            candidates = ", ".join(sorted(f"{spec.id}@{spec.version}" for spec, _ in matches))
+            raise ValueError(f"step matches more than one registered process: {candidates}")
+        return matches[0]
+
+    def default_variant_id(self, process_id: str) -> str:
+        """Return the variant a step should use when it pins none.
+
+        The process's explicit ``default_variant`` wins. Otherwise the process
+        must have exactly one registered variant id. Raises ``KeyError`` for an
+        unknown process, no variants, or an ambiguous set of variants.
+        """
+        spec = self.get_process(process_id)
+        if spec.default_variant is not None:
+            return spec.default_variant
+        by_variant = self._variants.get(process_id)
+        if not by_variant:
+            raise KeyError(f"process {process_id!r} has no registered variants")
+        if len(by_variant) != 1:
+            raise KeyError(
+                f"process {process_id!r} has no default variant and {len(by_variant)} variants are registered: "
+                f"{', '.join(sorted(by_variant))}"
+            )
+        return next(iter(by_variant))
 
     def get_variant(
         self,
@@ -226,10 +277,17 @@ def _source_file(cls: type) -> str | None:
 
 
 def compute_implementation_hash(variant: object) -> str:
-    """Hash the variant's source file bytes plus its qualified class name.
+    """Hash the variant implementation, not just its class body.
 
-    Hashing the whole file (not just the class source) means module-level
-    helpers used by the implementation are part of the identity. Fallbacks:
+    For a plugin package (a directory below ``plugins/`` with a
+    ``plugin.toml``), every ``.py`` file in that package is hashed, sorted by
+    relative path. This covers ``step.py``, ``params.py``, ``spec.py``,
+    ``register.py`` and module-level helpers that the variant calls. Any
+    explicit ``implementation_files`` declared on the variant are hashed as
+    well (the isotropic variant uses this for the ViennaPS engine helpers).
+
+    For non-package variants (for example the in-tree voxel probe), the
+    variant source file plus its qualified class name is used. Fallbacks:
 
     1. class source, when the file cannot be read;
     2. the qualified class name, when source is unavailable entirely.
@@ -242,8 +300,19 @@ def compute_implementation_hash(variant: object) -> str:
 
     source_file = _source_file(cls)
     if source_file:
+        source_path = Path(source_file).resolve()
+        plugin_root = _plugin_root(source_path)
+        if plugin_root is not None:
+            digest = hashlib.sha256()
+            for path in sorted(plugin_root.rglob("*.py")):
+                relative = path.relative_to(plugin_root).as_posix().encode("utf-8")
+                digest.update(relative + b"\x00" + path.read_bytes() + b"\x00")
+            for extra in _implementation_files(variant):
+                digest.update(str(extra).encode("utf-8") + b"\x00" + Path(extra).read_bytes() + b"\x00")
+            digest.update(suffix)
+            return digest.hexdigest()
         try:
-            file_bytes = Path(source_file).read_bytes()
+            file_bytes = source_path.read_bytes()
         except OSError:
             file_bytes = None
         if file_bytes is not None:
@@ -254,3 +323,27 @@ def compute_implementation_hash(variant: object) -> str:
     except (OSError, TypeError):
         return hashlib.sha256(suffix).hexdigest()
     return hashlib.sha256(source.encode("utf-8") + b"\x00" + suffix).hexdigest()
+
+
+def _plugin_root(source_path: Path) -> Path | None:
+    """Return the plugin package root for a variant source file, if any."""
+    parts = source_path.parts
+    try:
+        index = parts.index("plugins")
+    except ValueError:
+        return None
+    if index + 1 >= len(parts):
+        return None
+    root = Path(*parts[: index + 2])
+    return root if (root / "plugin.toml").is_file() else None
+
+
+def _implementation_files(variant: object) -> tuple[Path, ...]:
+    """Return explicit extra implementation files declared by the variant."""
+    values = getattr(variant, "implementation_files", ()) or ()
+    files: list[Path] = []
+    for value in values:
+        path = Path(value).expanduser().resolve()
+        if path.is_file():
+            files.append(path)
+    return tuple(files)

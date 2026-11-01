@@ -1,27 +1,40 @@
-"""Direct parity tests for the worker-side v2 isotropic bridge.
+"""Direct parity tests for the generic worker-side v2 bridge.
 
 Each test builds two identical level-set domains with the installed
 ``viennaps`` module, runs the historical worker level-set path on one and
-:func:`worker.process_models_v2.run_isotropic_v2` on the other, and compares
-them through :func:`worker.process_models_v2.compare_isotropic_surfaces`.
-No server, worker subprocess, or data directory is involved.
+:func:`worker.process_models_v2.run_v2_step` on the other, and compares the v2
+result through :func:`worker.process_models_v2.compare_domains`. The params come
+from the plugin's own :func:`plugins.isotropic.parse_step` hook, so the bridge is
+exercised exactly the way the shadow hook uses it.
+
+No server, worker subprocess, or data directory is involved; the bridge's own
+state store writes into a per-test directory under ``var/``.
 """
 
 from __future__ import annotations
 
+import json
+import shutil
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
 import viennaps as ps
 
 import worker.simulate as simulate
+from plugins.isotropic import parse_step
+from process_models.plugins import load_registry
 from worker.process_models_v2 import (
-    build_isotropic_params,
-    compare_isotropic_surfaces,
+    compare_domains,
+    find_v2_process,
     material_order,
-    run_isotropic_v2,
+    run_v2_step,
 )
 
+ROOT = Path(__file__).resolve().parents[1]
+TEST_ROOT = ROOT / "var" / "test-worker-v2-bridge"
 GRID_DELTA = 0.2
 X_EXTENT = 4.0
 VIENNAPS_VERSION = str(ps.__version__)
@@ -87,6 +100,22 @@ def isotropic_step(
     return step
 
 
+def bridge_ctx(
+    project: dict[str, Any],
+    run_dir: Path,
+    *,
+    engine_fingerprint: str | None = None,
+) -> SimpleNamespace:
+    """Minimal stand-in for the fields ``run_v2_step`` reads from a RunContext."""
+    return SimpleNamespace(
+        project=project,
+        ps=ps,
+        run_dir=Path(run_dir),
+        ps_version=VIENNAPS_VERSION,
+        native_engine_fingerprint=engine_fingerprint,
+    )
+
+
 def plane_domain(dimension: int = 2) -> Any:
     ps.setDimension(dimension)
     if dimension == 2:
@@ -147,11 +176,21 @@ def _top(domain: Any, dimension: int) -> float:
     return max(float(node[axis]) for node in mesh.getNodes())
 
 
-class MaterialOrderTests(unittest.TestCase):
+class _BridgeTestBase(unittest.TestCase):
+    """Per-test work directory; no tests live here so it is not collected."""
+
     def setUp(self) -> None:
         ps.setNumThreads(1)
         ps.Length.setUnit("um")
+        self.work_dir = TEST_ROOT / self._testMethodName
+        shutil.rmtree(self.work_dir, ignore_errors=True)
+        self.work_dir.mkdir(parents=True)
 
+    def tearDown(self) -> None:
+        shutil.rmtree(self.work_dir, ignore_errors=True)
+
+
+class MaterialOrderTests(_BridgeTestBase):
     def test_material_order_matches_simulate_material_map(self) -> None:
         for label, domain in (
             ("plane", plane_domain(2)),
@@ -167,10 +206,55 @@ class MaterialOrderTests(unittest.TestCase):
         self.assertEqual(material_order(deposited), (int(ps.Material.Si), int(ps.Material.SiO2)))
 
 
-class BuildParamsTests(unittest.TestCase):
+class FindProcessTests(_BridgeTestBase):
+    def test_isotropic_uniform_step_matches_one_process(self) -> None:
+        spec = find_v2_process(plane_project(2), isotropic_step("etch"))
+
+        self.assertIsNotNone(spec)
+        assert spec is not None
+        self.assertEqual(spec.id, "isotropic")
+        self.assertEqual(spec.default_variant, "native")
+        self.assertIs(spec.parse_step, parse_step)
+
+    def test_non_plugin_step_has_no_process(self) -> None:
+        step = {
+            "id": "step_directional",
+            "name": "directional",
+            "operation": "etch",
+            "model": "directional",
+            "direction": [0.0, -1.0, 0.0],
+            "directionalRateMagnitude": 0.1,
+            "isotropicRateMagnitude": 0.0,
+            "duration": 1.0,
+            "rateMode": "uniform",
+        }
+
+        self.assertIsNone(find_v2_process(plane_project(2), step))
+
+    def test_material_rate_mode_has_no_process(self) -> None:
+        step = isotropic_step("etch", rate=0.0)
+        step["rateMode"] = "material"
+        step["materialRates"] = {"Si": 0.2}
+
+        self.assertIsNone(find_v2_process(plane_project(2), step))
+
+    def test_find_v2_process_accepts_a_caller_registry(self) -> None:
+        registry = load_registry()
+        with mock.patch("worker.process_models_v2.load_registry") as loader:
+            spec = find_v2_process(plane_project(2), isotropic_step("etch"), registry=registry)
+
+        loader.assert_not_called()
+        self.assertIsNotNone(spec)
+        assert spec is not None
+        self.assertEqual(spec.id, "isotropic")
+
+
+class ParseStepTests(_BridgeTestBase):
     def test_uniform_deposit_params(self) -> None:
         step = isotropic_step("deposit", rate=0.3, duration=1.0, ratio=0.25)
-        params = build_isotropic_params(step)
+        params = parse_step(plane_project(2), step)
+        self.assertIsNotNone(params)
+        assert params is not None
         self.assertEqual(params.operation, "deposit")
         self.assertEqual(params.rateMode, "uniform")
         self.assertEqual(params.rateMagnitude, 0.3)
@@ -180,32 +264,48 @@ class BuildParamsTests(unittest.TestCase):
         self.assertEqual(params.materialRates, {})
         self.assertEqual(params.isotropicTimeStepRatio, 0.25)
 
-        without_ratio = build_isotropic_params(isotropic_step("etch"))
+        without_ratio = parse_step(plane_project(2), isotropic_step("etch"))
+        self.assertIsNotNone(without_ratio)
+        assert without_ratio is not None
         self.assertIsNone(without_ratio.isotropicTimeStepRatio)
         self.assertEqual(without_ratio.operation, "etch")
 
-    def test_material_rate_mode_is_rejected(self) -> None:
+    def test_unsupported_steps_return_none(self) -> None:
+        material = isotropic_step("etch")
+        material["rateMode"] = "material"
+        material["materialRates"] = {"Si": 0.2}
+        geometric = isotropic_step("etch")
+        geometric["isotropicMethod"] = "geometric"
+        directional = isotropic_step("etch")
+        directional["model"] = "directional"
+        unknown_operation = isotropic_step("etch")
+        unknown_operation["operation"] = "melt"
+
+        for label, step in (
+            ("material", material),
+            ("geometric", geometric),
+            ("directional", directional),
+            ("operation", unknown_operation),
+        ):
+            with self.subTest(step=label):
+                self.assertIsNone(parse_step(plane_project(2), step))
+
+    def test_missing_rate_fields_raise(self) -> None:
         step = isotropic_step("etch")
-        step["rateMode"] = "material"
-        step["materialRates"] = {"Si": 0.2}
+        del step["rateMagnitude"]
         with self.assertRaises(ValueError) as raised:
-            build_isotropic_params(step)
-        self.assertIn("rateMode", str(raised.exception))
-        self.assertIn("material", str(raised.exception))
+            parse_step(plane_project(2), step)
+        self.assertIn("rateMagnitude", str(raised.exception))
 
 
-class IsotropicParityTests(unittest.TestCase):
-    def setUp(self) -> None:
-        ps.setNumThreads(1)
-        ps.Length.setUnit("um")
-
+class IsotropicParityTests(_BridgeTestBase):
     def _assert_parity(
         self,
         reference: Any,
         candidate: Any,
         dimension: int,
     ) -> dict[str, Any]:
-        result = compare_isotropic_surfaces(reference, candidate, dimension)
+        result = compare_domains(reference, candidate, dimension)
         self.assertTrue(result["matched"], result["reasons"])
         self.assertEqual(result["reasons"], [])
         self.assertEqual(result["oldDigest"], result["newDigest"])
@@ -217,100 +317,148 @@ class IsotropicParityTests(unittest.TestCase):
         self.assertEqual(result["oldCellCount"], result["newCellCount"])
         return result
 
+    def _run(self, project: dict[str, Any], step: dict[str, Any], domain: Any, **kwargs: Any):
+        ctx = bridge_ctx(project, self.work_dir / f"run-{step['id']}", **kwargs)
+        before = _top(domain, int(project["dimension"]))
+        outcome = run_v2_step(ctx, step, domain)
+        new_domain = outcome.state.geometry.handle
+        self.assertIsNot(new_domain, domain)
+        return outcome, new_domain, before
+
     def test_etch_matches_the_worker_level_set_path(self) -> None:
         project = plane_project(2)
         step = isotropic_step("etch", rate=0.3, duration=1.0, ratio=0.25)
         reference = plane_domain(2)
         candidate = plane_domain(2)
-        before = _top(candidate, 2)
 
         _old_reference(ps, project, step, reference)
-        outcome = run_isotropic_v2(ps, project, step, candidate, ps_version=VIENNAPS_VERSION)
+        outcome, new_domain, before = self._run(project, step, candidate)
 
-        self._assert_parity(reference, candidate, 2)
-        self.assertAlmostEqual(_top(candidate, 2) - before, -0.3, delta=1e-6)
+        self._assert_parity(reference, new_domain, 2)
+        self.assertAlmostEqual(_top(new_domain, 2) - before, -0.3, delta=1e-6)
+        # The bridge checkpoints before the mutating variant runs.
+        self.assertAlmostEqual(_top(candidate, 2) - before, 0.0, delta=1e-12)
 
-        self.assertIs(outcome.delta.geometry.handle, candidate)
-        self.assertIs(outcome.state.geometry.handle, candidate)
+        self.assertIs(outcome.delta.geometry.handle, outcome.state.geometry.handle)
         self.assertEqual(outcome.delta.geometry.dimension, 2)
-        self.assertEqual(outcome.delta.geometry.material_order, material_order(candidate))
+        self.assertEqual(outcome.delta.materials.order, material_order(new_domain))
+        self.assertEqual(outcome.state.materials, outcome.delta.materials)
         self.assertEqual(outcome.metadata["nativeClass"], "ps.IsotropicProcess")
         self.assertEqual(outcome.metadata["operation"], "etch")
         self.assertEqual(outcome.metadata["timeStepRatio"], 0.25)
 
-        identity = outcome.plan.identity()
-        self.assertEqual(identity["process_id"], "isotropic")
-        self.assertEqual(identity["variant_id"], "native")
-        self.assertEqual(identity["engine_id"], "viennaps")
-        self.assertEqual(identity["engine_version"], VIENNAPS_VERSION)
-        self.assertEqual(identity["engine_fingerprint"], "worker-v2-isotropic")
+        identity = outcome.plan.identity_json()
+        self.assertEqual(identity["processId"], "isotropic")
+        self.assertEqual(identity["variantId"], "native")
+        self.assertEqual(identity["engineId"], "viennaps")
+        self.assertEqual(identity["engineVersion"], VIENNAPS_VERSION)
+        self.assertEqual(identity["engineFingerprint"], "worker-v2-plugin")
 
     def test_deposit_matches_the_worker_level_set_path(self) -> None:
         project = plane_project(2)
         step = isotropic_step("deposit", rate=0.3, duration=1.0)
         reference = plane_domain(2)
-        candidate = plane_domain(2)
-        before = _top(candidate, 2)
 
         _old_reference(ps, project, step, reference)
-        outcome = run_isotropic_v2(
-            ps,
-            project,
-            step,
-            candidate,
-            ps_version=VIENNAPS_VERSION,
-            engine_fingerprint="worker-v2-test",
-        )
+        outcome, new_domain, before = self._run(project, step, plane_domain(2), engine_fingerprint="worker-v2-test")
 
-        self._assert_parity(reference, candidate, 2)
-        self.assertAlmostEqual(_top(candidate, 2) - before, 0.3, delta=1e-6)
-        self.assertIn(int(ps.Material.SiO2), simulate.material_map(candidate))
+        self._assert_parity(reference, new_domain, 2)
+        self.assertAlmostEqual(_top(new_domain, 2) - before, 0.3, delta=1e-6)
+        self.assertIn(int(ps.Material.SiO2), simulate.material_map(new_domain))
         self.assertEqual(outcome.metadata["depositMaterial"], "SiO2")
-        self.assertEqual(outcome.plan.identity()["engine_fingerprint"], "worker-v2-test")
+        self.assertEqual(outcome.plan.identity_json()["engineFingerprint"], "worker-v2-test")
 
     def test_masked_trench_matches_the_worker_level_set_path(self) -> None:
         project = trench_project()
         step = isotropic_step("etch", rate=0.2, duration=0.5)
         reference = trench_domain()
-        candidate = trench_domain()
         self.assertEqual(simulate.protected_material_names(project, step), ["Mask"])
 
         _old_reference(ps, project, step, reference)
-        outcome = run_isotropic_v2(ps, project, step, candidate, ps_version=VIENNAPS_VERSION)
+        outcome, new_domain, _before = self._run(project, step, trench_domain())
 
-        self._assert_parity(reference, candidate, 2)
+        self._assert_parity(reference, new_domain, 2)
         self.assertEqual(outcome.metadata["maskMaterials"], ["Mask"])
-        self.assertIn(int(ps.Material.Mask), simulate.material_map(candidate))
+        self.assertIn(int(ps.Material.Mask), simulate.material_map(new_domain))
 
     def test_three_dimensional_plane_smoke(self) -> None:
         project = plane_project(3)
         step = isotropic_step("etch", rate=0.2, duration=0.5)
-        candidate = plane_domain(3)
-        before = _top(candidate, 3)
 
-        outcome = run_isotropic_v2(ps, project, step, candidate, ps_version=VIENNAPS_VERSION)
+        outcome, new_domain, before = self._run(project, step, plane_domain(3))
 
-        self.assertAlmostEqual(_top(candidate, 3) - before, -0.1, delta=1e-6)
+        self.assertAlmostEqual(_top(new_domain, 3) - before, -0.1, delta=1e-6)
         self.assertEqual(outcome.delta.geometry.dimension, 3)
-        self.assertEqual(outcome.delta.geometry.material_order, material_order(candidate))
+        self.assertEqual(outcome.delta.materials.order, material_order(new_domain))
         self.assertEqual(outcome.state.geometry.dimension, 3)
         self.assertEqual(outcome.metadata["dimension"], 3)
-        surface = simulate.surface_state(candidate, 3)
+        surface = simulate.surface_state(new_domain, 3)
         self.assertGreater(surface["pointCount"], 0)
-        self.assertEqual(material_order(candidate), (int(ps.Material.Si),))
+        self.assertEqual(material_order(new_domain), (int(ps.Material.Si),))
 
 
-class CompareMismatchTests(unittest.TestCase):
-    def setUp(self) -> None:
-        ps.setNumThreads(1)
-        ps.Length.setUnit("um")
+class RunArtifactsTests(_BridgeTestBase):
+    def test_run_v2_step_writes_state_outputs_and_plan(self) -> None:
+        project = plane_project(2)
+        step = isotropic_step("etch", rate=0.2, duration=0.5)
+        ctx = bridge_ctx(project, self.work_dir / "run")
 
+        outcome = run_v2_step(ctx, step, plane_domain(2))
+
+        # The store root is <run_dir>/v2/<step>; StateStore keeps its usual
+        # ``steps/<step_id>/`` layout below it.
+        root = ctx.run_dir / "v2" / step["id"]
+        step_dir = root / "steps" / step["id"]
+        for name in ("state.json", "outputs.json", "plan.json"):
+            with self.subTest(file=name):
+                self.assertTrue((step_dir / name).is_file(), sorted(path.name for path in root.rglob("*")))
+        self.assertTrue((root / "flow.json").is_file())
+        self.assertTrue((step_dir / "geometry.vpsd").is_file())
+
+        state = json.loads((step_dir / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["schemaVersion"], 1)
+        self.assertEqual(state["stepId"], step["id"])
+        self.assertEqual(state["geometry"]["ref"], "geometry.vpsd")
+        self.assertEqual(state["geometry"]["dimension"], 2)
+        self.assertEqual(state["materials"]["order"], list(material_order(outcome.state.geometry.handle)))
+
+        plan = json.loads((step_dir / "plan.json").read_text(encoding="utf-8"))
+        self.assertEqual(plan, outcome.plan.identity_json())
+
+        outputs = json.loads((step_dir / "outputs.json").read_text(encoding="utf-8"))
+        self.assertIsInstance(outputs, dict)
+
+        flow = json.loads((root / "flow.json").read_text(encoding="utf-8"))
+        self.assertEqual(flow["schemaVersion"], 1)
+        self.assertEqual(flow["versions"], {"viennaps": VIENNAPS_VERSION})
+
+    def test_run_v2_step_resolves_the_step_once_with_the_given_registry(self) -> None:
+        project = plane_project(2)
+        step = isotropic_step("etch", rate=0.2, duration=0.5)
+        registry = load_registry()
+        calls: list[str] = []
+        original = registry.resolve_step
+
+        def counting_resolve(project: dict[str, Any], step: dict[str, Any]):
+            calls.append(step["id"])
+            return original(project, step)
+
+        registry.resolve_step = counting_resolve  # type: ignore[method-assign]
+        ctx = bridge_ctx(project, self.work_dir / "run-once")
+
+        outcome = run_v2_step(ctx, step, plane_domain(2), registry=registry)
+
+        self.assertEqual(calls, [step["id"]])
+        self.assertEqual(outcome.plan.process.id, "isotropic")
+
+
+class CompareMismatchTests(_BridgeTestBase):
     def test_compare_reports_mismatch_without_raising(self) -> None:
         etched = plane_domain(2)
         untouched = plane_domain(2)
         _old_reference(ps, plane_project(2), isotropic_step("etch", rate=0.3, duration=1.0), etched)
 
-        result = compare_isotropic_surfaces(etched, untouched, 2)
+        result = compare_domains(etched, untouched, 2)
 
         self.assertFalse(result["matched"])
         self.assertNotEqual(result["oldDigest"], result["newDigest"])

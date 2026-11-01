@@ -1,146 +1,119 @@
-"""Worker-side bridge to the v2 process-model contract.
+"""Worker-side bridge to the generic v2 ``FlowExecutor``.
 
-The v2 native ``isotropic`` plugin is parity-first: it rebuilds the same
-worker step dictionary and calls the same helpers in :mod:`worker.simulate`.
-This module is the worker-side seam that turns the worker's live
-``viennaps`` module, project dict, step dict, and ``ps.Domain`` into a v2
-:class:`~process_models.v2.resolver.ExecutionRequest` and back into an
-:class:`~process_models.v2.resolver.ExecutionOutcome`.
+A v2 plugin declares one optional :class:`~process_models.v2.contract.ProcessSpec`
+hook: ``parse_step(project, step)``. It is the only plugin knowledge this
+module has: nothing here names a concrete process, and adding a process never
+touches the worker.
 
-It is deliberately a *bridge*, not the dispatch switch: ``worker/steps/process.py``
-still owns the worker path; a later shadow hook may call
-:func:`run_isotropic_v2` next to it and compare both results with
-:func:`compare_isotropic_surfaces`.
+:func:`find_v2_process` asks the plugin registry which process claims a raw
+worker step; :func:`run_v2_step` turns the worker's live ``viennaps`` module,
+project dict, step dict, and ``ps.Domain`` into a one-step v2 flow and returns
+the committed :class:`~process_models.v2.resolver.ExecutionOutcome`.
+:func:`compare_domains` is the generic digest/material-map comparison the
+shadow hook uses to check the two paths agree.
 
 Import safety
 -------------
-``process_models.v2`` and the isotropic plugin are imported at module top (the
-plugin itself only imports the worker lazily inside ``execute``). The worker's
-``simulate`` module is resolved lazily through
-:func:`worker.steps.context.simulate_module`, which returns the already-loaded
-copy even when the bounded child runs ``simulate.py`` as ``__main__``. That
-keeps this module importable from ``worker.steps.process`` without creating a
-circular import or a second copy of the worker's module-level native state.
+``process_models.v2`` is imported at module top; it never imports the worker.
+The worker's ``simulate`` module is resolved lazily inside
+:func:`compare_domains` through :func:`worker.steps.context.simulate_module`,
+which returns the already-loaded copy even when the bounded child runs
+``simulate.py`` as ``__main__``. That keeps this module importable from
+``worker.steps.process`` without creating a circular import or a second copy of
+the worker's module-level native state.
 
-Scope
------
-Only ``rateMode="uniform"`` is bridged here. ``rateMode="material"`` needs the
-worker's material-rate table conventions, which the shadow hook excludes for
-now; :func:`build_isotropic_params` raises a clear ``ValueError`` instead of
-silently running a different process.
+Persistence
+-----------
+Every call writes the executor's artifacts below
+``<run_dir>/v2/<step_id>/`` (``steps/<step_id>/{state,outputs,plan}.json``,
+optionally ``geometry.vpsd``, plus ``flow.json``). The flow runs on a
+checkpointed copy of the handle because the native variant declares
+``mutates_input``; the caller's domain is left untouched.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from pathlib import Path
+from typing import Any, Mapping
 
-from plugins.isotropic import IsotropicParams
 from process_models.plugins import load_registry
-from process_models.v2.contract import ProcessContext
+from process_models.v2.contract import ProcessContext, ProcessSpec
 from process_models.v2.engine import (
     EngineCapabilities,
     StaticEngine,
     StaticEngineProvider,
 )
-from process_models.v2.resolver import (
-    ExecutionOutcome,
-    ExecutionRequest,
-    resolve_execution,
-)
+from process_models.v2.engines.viennaps import material_map
+from process_models.v2.executor import FlowExecutor, FlowStep
+from process_models.v2.registry import ProcessRegistry
+from process_models.v2.resolver import ExecutionOutcome
 from process_models.v2.state import LevelSetState, MaterialState, ProcessState
+from process_models.v2.storage import StateStore
 
 __all__ = [
-    "build_isotropic_params",
-    "compare_isotropic_surfaces",
+    "compare_domains",
+    "find_v2_process",
     "material_order",
-    "run_isotropic_v2",
+    "run_v2_step",
 ]
 
-PROCESS_ID = "isotropic"
-VARIANT_ID = "native"
-DEFAULT_ENGINE_FINGERPRINT = "worker-v2-isotropic"
+DEFAULT_ENGINE_FINGERPRINT = "worker-v2-plugin"
 
 
 def material_order(domain: Any) -> tuple[int, ...]:
-    """Return the native material IDs in level-set order.
+    """Return the native material IDs in level-set order."""
+    return tuple(int(material_id) for material_id in material_map(domain))
 
-    This mirrors :func:`worker.simulate.material_map` without importing the
-    worker module, so it is safe to call during import-sensitive bootstrap.
+
+def find_v2_process(
+    project: Mapping[str, Any], step: Mapping[str, Any], *, registry: ProcessRegistry | None = None
+) -> ProcessSpec | None:
+    """Return the single registered process whose ``parse_step`` accepts ``step``.
+
+    ``None`` means no plugin claims the step. An ambiguous match raises
+    ``ValueError`` from the registry rather than guessing. Pass an existing
+    ``registry`` to avoid rebuilding and re-verifying the lock twice. The
+    returned spec is the one whose ``parse_step`` produced the parameters;
+    :func:`run_v2_step` resolves the step again (one parse per call) because it
+    needs the parameters, not just the identity.
     """
-    mapping = domain.getMaterialMap()
-    return tuple(int(mapping.getMaterialIdAtIdx(index)) for index in range(mapping.size()))
+    if registry is None:
+        registry = load_registry()
+    resolved = registry.resolve_step(project, step)
+    return None if resolved is None else resolved[0]
 
 
-def build_isotropic_params(step: dict[str, Any]) -> IsotropicParams:
-    """Build validated v2 parameters from one worker isotropic step.
-
-    Only the uniform rate mode is supported by this bridge. The material rate
-    table is a worker convention (signed rates per material, zero default);
-    bridging it is a separate change, so it fails loudly here rather than
-    running a subtly different process.
-    """
-    rate_mode = str(step.get("rateMode", "uniform"))
-    if rate_mode != "uniform":
-        raise ValueError(
-            f"worker.process_models_v2 only bridges rateMode='uniform' isotropic steps; got rateMode={rate_mode!r}"
-        )
-
-    operation = str(step["operation"])
-    values: dict[str, Any] = {
-        "operation": operation,
-        "rateMagnitude": float(step["rateMagnitude"]),
-        "duration": float(step["duration"]),
-        "rateMode": rate_mode,
-        # The worker derives geometry masks through the plugin; an explicit
-        # list here would diverge from the worker path.
-        "maskMaterials": [],
-    }
-    if operation == "deposit":
-        values["depositMaterial"] = str(step.get("depositMaterial", "SiO2"))
-    ratio = step.get("isotropicTimeStepRatio")
-    if ratio is not None:
-        values["isotropicTimeStepRatio"] = float(ratio)
-    return IsotropicParams(**values)
-
-
-def run_isotropic_v2(
-    ps: Any,
-    project: dict[str, Any],
-    step: dict[str, Any],
-    domain: Any,
-    *,
-    ps_version: str,
-    engine_fingerprint: str = "",
+def run_v2_step(
+    ctx: Any, step: dict[str, Any], domain: Any, *, registry: ProcessRegistry | None = None
 ) -> ExecutionOutcome:
-    """Run one isotropic step through the v2 registry and return its outcome.
+    """Run one worker step through the v2 registry and return its outcome.
 
-    A fresh registry/provider is built per call: the bridge owns no global
-    state and must not depend on another caller's registrations. The plugin
-    mutates ``domain`` in place, exactly like the worker path; callers that
-    need the old geometry must checkpoint (or duplicate) it first.
+    ``ctx`` is a :class:`worker.steps.context.RunContext` (or any object with
+    ``project``, ``ps``, ``ps_version``, ``native_engine_fingerprint``, and
+    ``run_dir``). The registry is loaded once per call unless the caller passes
+    one (the worker hook does); the provider and state store are built per
+    call, so the bridge owns no global state and cannot inherit another
+    caller's registrations. The step is parsed exactly once through
+    ``registry.resolve_step``. Only the last step of the one-step flow is
+    returned.
+
+    The native variant mutates its input handle, so the executor checkpoints a
+    copy through ``ps.Domain`` first: ``domain`` is never modified and
+    ``outcome.state.geometry.handle`` is the processed copy.
     """
-    params = build_isotropic_params(step)
+    if registry is None:
+        registry = load_registry()
+    resolved = registry.resolve_step(ctx.project, step)
+    if resolved is None:
+        raise RuntimeError(f"no registered v2 process matches step {step['id']!r}")
+    spec, params = resolved
 
-    registry = load_registry()
-    provider = StaticEngineProvider(
-        [
-            StaticEngine(
-                capabilities=EngineCapabilities(
-                    engine_id="viennaps",
-                    version=ps_version,
-                    kind="native",
-                    backends=("cpu",),
-                ),
-                handle=ps,
-                fingerprint=engine_fingerprint or DEFAULT_ENGINE_FINGERPRINT,
-            )
-        ]
-    )
+    variant_id = registry.default_variant_id(spec.id)
 
     context = ProcessContext(
-        dimension=int(project["dimension"]),
-        grid_delta=float(project["domain"]["gridDelta"]),
-        project=project,
+        dimension=int(ctx.project["dimension"]),
+        grid_delta=float(ctx.project["domain"]["gridDelta"]),
+        project=ctx.project,
         step=step,
     )
     order = material_order(domain)
@@ -149,28 +122,47 @@ def run_isotropic_v2(
             handle=domain,
             dimension=context.dimension,
             grid_delta=context.grid_delta,
-            material_order=order,
         ),
         materials=MaterialState(order=order),
     )
-    request = ExecutionRequest(
-        process_id=PROCESS_ID,
-        variant_id=VARIANT_ID,
-        params=params,
-        context=context,
-        state=state,
+    provider = StaticEngineProvider(
+        [
+            StaticEngine(
+                capabilities=EngineCapabilities(
+                    engine_id="viennaps",
+                    version=ctx.ps_version,
+                    kind="native",
+                    backends=("cpu",),
+                ),
+                handle=ctx.ps,
+                fingerprint=ctx.native_engine_fingerprint or DEFAULT_ENGINE_FINGERPRINT,
+            )
+        ]
     )
-    plan = resolve_execution(request, registry, provider)
-    return plan.run()
+    store = StateStore(Path(ctx.run_dir) / "v2" / step["id"])
+    flow = FlowExecutor(registry, provider, store).run(
+        state,
+        [
+            FlowStep(
+                step_id=step["id"],
+                process_id=spec.id,
+                variant_id=variant_id,
+                params=params,
+                context=context,
+            )
+        ],
+    )
+    return flow.outcomes[-1]
 
 
-def compare_isotropic_surfaces(old_domain: Any, new_domain: Any, dimension: int) -> dict[str, Any]:
+def compare_domains(old_domain: Any, new_domain: Any, dimension: int) -> dict[str, Any]:
     """Compare two domains by exposed-surface digest and material map.
 
-    The result is a plain JSON-safe dict for run records. A mismatch is data,
-    not an exception: the caller decides whether to warn, fail, or accept the
-    difference. Point/cell counts are reported for diagnosis; the digest
-    already covers them, so they do not add separate mismatch reasons.
+    The result is a plain JSON-safe dict for run records and applies to any
+    native level-set geometry. A mismatch is data, not an exception: the caller
+    decides whether to warn, fail, or accept the difference. Point/cell counts
+    are reported for diagnosis; the digest already covers them, so they do not
+    add separate mismatch reasons.
     """
     from worker.steps.context import simulate_module
 

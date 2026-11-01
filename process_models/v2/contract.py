@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Literal, Mapping, Protocol
+from typing import Any, Callable, Literal, Mapping, Protocol
 
 from pydantic import BaseModel
 
@@ -158,6 +158,13 @@ class ProcessSpec:
 
     Multiple versions of the same ``id`` may be registered at once. Variants
     are registered separately and are not tied to a single process version.
+
+    The optional ``parse_step`` hook is the single runtime dispatch helper for
+    worker steps: it returns the canonical parameter model when a raw step
+    belongs to this process, or ``None`` when it does not. Malformed fields may
+    raise ``ValueError``. It is a callable, so it is deliberately excluded from
+    :class:`ModelDescriptor` (the serializable description).
+    ``default_variant`` names the variant to use when a step does not pin one.
     """
 
     id: str
@@ -167,6 +174,8 @@ class ProcessSpec:
     dimensions: tuple[int, ...]
     operations: tuple[str, ...]
     description: str = ""
+    default_variant: str | None = None
+    parse_step: Callable[[Mapping[str, Any], Mapping[str, Any]], BaseModel | None] | None = None
 
     def __post_init__(self) -> None:
         for name in ("id", "version", "label"):
@@ -181,6 +190,12 @@ class ProcessSpec:
         operations = tuple(str(operation) for operation in self.operations)
         if not operations:
             raise ValueError("operations must not be empty")
+        if self.default_variant is not None and (
+            not isinstance(self.default_variant, str) or not self.default_variant.strip()
+        ):
+            raise ValueError("default_variant must be a non-empty string or None")
+        if self.parse_step is not None and not callable(self.parse_step):
+            raise TypeError("parse_step must be callable or None")
         object.__setattr__(self, "dimensions", dimensions)
         object.__setattr__(self, "operations", operations)
 
@@ -208,6 +223,9 @@ class VariantRegistration:
             raise TypeError("variant capabilities must be a VariantCapabilities")
         if not isinstance(getattr(self.variant, "engine", None), EngineRequirement):
             raise TypeError("variant engine must be an EngineRequirement")
+        for name in ("validate", "execute"):
+            if not callable(getattr(self.variant, name, None)):
+                raise TypeError(f"variant {name} must be callable")
         implementation_hash = getattr(self.variant, "implementation_hash", None)
         if implementation_hash is not None and not isinstance(implementation_hash, str):
             raise TypeError("variant implementation_hash must be a string or None")

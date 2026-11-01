@@ -7,9 +7,10 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationError
 
+from process_models.v2.engines import viennaps
+
 from . import storage
 from .engine import ENGINE_REGISTRY_VERSION, SUPPORTED_ENGINE_VERSIONS, engine_version
-
 
 BUILTIN_CATALOG = storage.ROOT / "docs" / "materials-catalog.json"
 NATIVE_IDS = storage.ROOT / "docs" / "native-material-ids-4.6.2.json"  # historical inventory; IDs re-verified identical on 4.7.0
@@ -210,34 +211,8 @@ def delete_material(name: str, current_project: Any = None) -> dict[str, Any]:
     return {**rows[index], "isCustom": True}
 
 
-GEO_MASK_MATERIAL_DEFAULT = "Mask"
-
-
-def geometry_mask_material_names(geometry: Any) -> list[str]:
-    """Material names exposed as masks by the project geometry alone.
-
-    This is the single derivation shared by the scalar particle/directional
-    paths, the CSV rate-grid path and the per-rate-set mask default. It covers
-    the built-in trench/hole/fin mask, stack mask layers and the legacy stack
-    ``gdsMask`` overlay (only when it protects etch), plus GDS geometry layers
-    explicitly marked as masks.
-    """
-    if not isinstance(geometry, dict):
-        return []
-    kind = geometry.get("kind")
-    if kind in ("trench", "hole", "fin") and float(geometry.get("maskHeight", 0) or 0) > 0:
-        return [str(geometry.get("maskMaterial", GEO_MASK_MATERIAL_DEFAULT))]
-    if kind == "stack":
-        values = [str(layer["material"]) for layer in geometry.get("layers", []) if layer.get("role") == "mask"]
-        gds_mask = geometry.get("gdsMask") or {}
-        if gds_mask.get("protectsEtch") and gds_mask.get("material"):
-            values.append(str(gds_mask["material"]))
-        return list(dict.fromkeys(values))
-    if kind == "gds":
-        return list(dict.fromkeys(
-            str(layer["material"]) for layer in geometry.get("layers", []) if layer.get("mask", False)
-        ))
-    return []
+GEO_MASK_MATERIAL_DEFAULT = viennaps.GEO_MASK_MATERIAL_DEFAULT
+geometry_mask_material_names = viennaps.geometry_mask_material_names
 
 
 def referenced_material_names(project: Any) -> set[str]:

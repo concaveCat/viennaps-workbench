@@ -3,7 +3,7 @@
 These tests are hermetic: the in-tree plugin is exercised read-only, and every
 mutating case builds a temporary plugin directory. No server or data directory
 is involved. The worker bridge test runs one tiny native plane step to prove
-that ``run_isotropic_v2`` resolves the isotropic process through
+that ``run_v2_step`` resolves the isotropic process through
 ``process_models.plugins.load_registry`` instead of hardcoded registration.
 """
 
@@ -20,10 +20,12 @@ import uuid
 from dataclasses import fields
 from pathlib import Path
 from string import Template
+from types import SimpleNamespace
 from unittest import mock
 
 import viennaps as ps
 
+from plugins.isotropic import IsotropicProcessSpec, parse_step
 from process_models.plugins import (
     PLUGIN_API_VERSION,
     PluginLifecycleError,
@@ -39,7 +41,7 @@ from process_models.plugins import (
 from process_models.v2.contract import ProcessSpec
 from process_models.v2.registry import ProcessRegistry, compute_implementation_hash
 from tests.test_worker_v2_isotropic import VIENNAPS_VERSION, isotropic_step, plane_domain, plane_project
-from worker.process_models_v2 import run_isotropic_v2
+from worker.process_models_v2 import run_v2_step
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_DIRS_ENV = "VIENNAPS_WORKBENCH_PLUGIN_DIRS"
@@ -255,6 +257,28 @@ class InTreePluginTests(unittest.TestCase):
             with self.assertRaises(PluginLifecycleError):
                 verify_lock(lock_path=missing)
 
+    def test_process_spec_declares_default_variant_and_one_parse_hook(self) -> None:
+        self.assertEqual(IsotropicProcessSpec.default_variant, "native")
+        self.assertIs(IsotropicProcessSpec.parse_step, parse_step)
+        self.assertFalse(hasattr(IsotropicProcessSpec, "matches_step"))
+        self.assertFalse(hasattr(IsotropicProcessSpec, "params_from_step"))
+
+        registry = load_registry()
+        step = isotropic_step("etch", rate=0.2, duration=0.5)
+        resolved = registry.resolve_step(plane_project(2), step)
+        self.assertIsNotNone(resolved)
+        assert resolved is not None
+        spec, params = resolved
+        self.assertIs(spec, IsotropicProcessSpec)
+        self.assertEqual(params.operation, "etch")
+        self.assertEqual(params.rateMagnitude, 0.2)
+
+        unsupported = isotropic_step("etch", rate=0.2, duration=0.5)
+        unsupported["rateMode"] = "material"
+        unsupported["materialRates"] = {"Si": 0.2}
+        self.assertIsNone(parse_step(plane_project(2), unsupported))
+        self.assertIsNone(registry.resolve_step(plane_project(2), unsupported))
+
     def test_project_api_has_no_module_path_or_callable_field(self) -> None:
         process_fields = {item.name for item in fields(ProcessSpec)}
         self.assertFalse({"entrypoint", "module", "callable", "path", "import"} & process_fields)
@@ -423,6 +447,18 @@ class ManifestAndLockTamperTests(_TempPluginCase):
 
 
 class TempPluginRoundTripTests(_TempPluginCase):
+    def test_changing_any_plugin_package_file_invalidates_lock(self) -> None:
+        base = self.temp_dir()
+        plugin_root = base / "plugins"
+        plugin_root.mkdir()
+        plugin_dir, _ = self.make_plugin(plugin_root)
+        lock_path = base / "plugins.lock"
+        write_lock([plugin_root], lock_path)
+        verify_lock([plugin_root], lock_path)
+        (plugin_dir / "step.py").write_text("VALUE = 1\n", encoding="utf-8")
+        with self.assertRaises(PluginLifecycleError):
+            verify_lock([plugin_root], lock_path)
+
     def test_write_lock_and_load_registry_round_trip(self) -> None:
         base = self.temp_dir()
         plugin_dir, _ = self.make_plugin(base / "plugins", plugin_id="temp_plugin", version="0.1.0")
@@ -513,29 +549,52 @@ class WorkerBridgeLifecycleTests(unittest.TestCase):
     def test_bridge_resolves_isotropic_from_the_discovered_registry(self) -> None:
         discovered = load_registry()
         with mock.patch("worker.process_models_v2.load_registry", return_value=discovered) as loader:
-            outcome = run_isotropic_v2(
-                ps,
-                plane_project(2),
-                isotropic_step("etch", rate=0.1, duration=0.5),
-                plane_domain(2),
-                ps_version=VIENNAPS_VERSION,
-            )
+            with tempfile.TemporaryDirectory() as tmp:
+                ctx = SimpleNamespace(
+                    project=plane_project(2),
+                    ps=ps,
+                    run_dir=Path(tmp),
+                    ps_version=VIENNAPS_VERSION,
+                    native_engine_fingerprint=None,
+                )
+                outcome = run_v2_step(ctx, isotropic_step("etch", rate=0.1, duration=0.5), plane_domain(2))
         loader.assert_called_once_with()
         self.assertEqual(outcome.plan.process.id, "isotropic")
         self.assertEqual(outcome.plan.variant.variant_id, "native")
         self.assertEqual(outcome.metadata["operation"], "etch")
 
+    def test_bridge_accepts_a_caller_supplied_registry(self) -> None:
+        discovered = load_registry()
+        with mock.patch("worker.process_models_v2.load_registry") as loader:
+            with tempfile.TemporaryDirectory() as tmp:
+                ctx = SimpleNamespace(
+                    project=plane_project(2),
+                    ps=ps,
+                    run_dir=Path(tmp),
+                    ps_version=VIENNAPS_VERSION,
+                    native_engine_fingerprint=None,
+                )
+                outcome = run_v2_step(
+                    ctx,
+                    isotropic_step("etch", rate=0.1, duration=0.5),
+                    plane_domain(2),
+                    registry=discovered,
+                )
+        loader.assert_not_called()
+        self.assertEqual(outcome.plan.process.id, "isotropic")
+
     def test_bridge_has_no_hardcoded_fallback_registration(self) -> None:
         empty = ProcessRegistry()
         with mock.patch("worker.process_models_v2.load_registry", return_value=empty):
-            with self.assertRaises(KeyError):
-                run_isotropic_v2(
-                    ps,
-                    plane_project(2),
-                    isotropic_step("etch", rate=0.1, duration=0.5),
-                    plane_domain(2),
+            with self.assertRaises(RuntimeError):
+                ctx = SimpleNamespace(
+                    project=plane_project(2),
+                    ps=ps,
+                    run_dir=Path(tempfile.mkdtemp()),
                     ps_version=VIENNAPS_VERSION,
+                    native_engine_fingerprint=None,
                 )
+                run_v2_step(ctx, isotropic_step("etch", rate=0.1, duration=0.5), plane_domain(2))
 
 
 if __name__ == "__main__":

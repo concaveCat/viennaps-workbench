@@ -39,6 +39,34 @@ last step one ``flow.json`` records the run::
 Per-step process/variant versions already live in the plan identity, so the
 flow-level ``versions`` map only summarises which engine builds the run used.
 
+Version pins
+------------
+A :class:`FlowStep` may pin ``expected_process_version`` and
+``expected_variant_version``. Both are forwarded verbatim into the
+:class:`ExecutionRequest`, so a pin that is not registered fails admission
+with the registry's ``KeyError`` instead of silently running the newest
+version.
+
+Engine leases
+-------------
+Every :func:`resolve_execution` acquires an engine lease. A ``mutates_input``
+step resolves twice (once before checkpointing, once against the copy), so the
+first, abandoned plan's lease is released before the second resolution, and
+the final lease is released in a ``finally`` after the step has executed and
+been persisted. Callers therefore never have to close the leases behind a
+returned :class:`ExecutionOutcome`; its plan identity stays readable because
+release only drops the acquisition, not the dataclass fields.
+
+Costs
+-----
+A ``mutates_input`` step copies the native geometry handle before executing.
+From the second step on the incoming state is already executor-private (the
+previous step committed it), so that is a redundant second copy. It is kept as
+an accepted validation cost for now: re-resolution must validate the exact
+state the variant will execute on, and reusing an earlier handle would let a
+wrong copy/alias corrupt an upstream state instead of failing admission. Do
+not "optimise" this away without covering that failure mode.
+
 This module does not snapshot, preview, call an API, or acquire external
 engines; it is the runtime foundation only.
 """
@@ -74,13 +102,21 @@ GEOMETRY_FILE = "geometry.vpsd"
 
 @dataclass(frozen=True)
 class FlowStep:
-    """One step in a flow: a process variant plus its parameters and context."""
+    """One step in a flow: a process variant plus its parameters and context.
+
+    ``expected_process_version`` and ``expected_variant_version`` are optional
+    strict pins. When set, resolution must return exactly that registered
+    version; a pin that is not registered aborts the flow before anything is
+    written to disk.
+    """
 
     step_id: str
     process_id: str
     variant_id: str
     params: BaseModel
     context: ProcessContext
+    expected_process_version: str | None = None
+    expected_variant_version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -132,15 +168,20 @@ class FlowExecutor:
 
         for step in ordered:
             plan = self._resolve(step, state)
-            outcome = execute_plan(plan)
+            try:
+                outcome = execute_plan(plan)
 
-            geometry_ref = self._write_geometry(step, plan, outcome.state)
-            self._store.save_state(step.step_id, outcome.state, geometry_ref=geometry_ref)
-            self._store.save_outputs(step.step_id, outcome.outputs)
-            identities.append(self._store.save_plan(step.step_id, plan))
+                geometry_ref = self._write_geometry(step, plan, outcome.state)
+                self._store.save_state(step.step_id, outcome.state, geometry_ref=geometry_ref)
+                self._store.save_outputs(step.step_id, outcome.outputs)
+                identities.append(self._store.save_plan(step.step_id, plan))
+                versions.setdefault(plan.engine.engine_id, plan.engine_version)
+            finally:
+                # Release even when execution or persistence raises: the flow
+                # is over for this plan either way.
+                plan.engine.release()
 
             outcomes.append(outcome)
-            versions.setdefault(plan.engine.engine_id, plan.engine_version)
             state = outcome.state
 
         self._store.save_flow(
@@ -154,14 +195,26 @@ class FlowExecutor:
         return FlowRun(run_dir=self._store.root, outcomes=tuple(outcomes), state=state)
 
     def _resolve(self, step: FlowStep, state: ProcessState) -> ExecutionPlan:
-        """Resolve ``step`` against ``state``, checkpointing native geometry first."""
+        """Resolve ``step`` against ``state``, checkpointing native geometry first.
+
+        A ``mutates_input`` step resolves twice: once against the caller's
+        state (admission), then against a copied handle (execution). The first
+        plan is abandoned, so its engine lease is released before the second
+        resolution acquires another one.
+        """
         plan = resolve_execution(self._request(step, state), self._registry, self._provider, adapter=self._adapter)
         if not plan.variant.capabilities.mutates_input:
             return plan
 
-        checkpointed = self._checkpoint(plan, state)
+        try:
+            checkpointed = self._checkpoint(plan, state)
+        except BaseException:
+            plan.engine.release()
+            raise
         if checkpointed is state:
             return plan
+
+        plan.engine.release()
         return resolve_execution(
             self._request(step, checkpointed),
             self._registry,
@@ -177,6 +230,8 @@ class FlowExecutor:
             params=step.params,
             context=step.context,
             state=state,
+            expected_process_version=step.expected_process_version,
+            expected_variant_version=step.expected_variant_version,
         )
 
     @staticmethod

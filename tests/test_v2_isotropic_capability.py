@@ -1,14 +1,14 @@
-"""End-to-end capability validation for the validation-only v2 isotropic apply.
+"""End-to-end capability validation for the validation-only v2 plugin apply.
 
-``VIENNAPS_WORKBENCH_V2_ISOTROPIC_APPLY=1`` makes the worker use the v2
-isotropic domain as the result of an eligible uniform level-set step after the
-shadow comparison matched. Unlike the unit-level tests in
+``VIENNAPS_WORKBENCH_V2_PLUGIN_APPLY=1`` makes the worker use the v2 plugin
+domain as the result of an eligible uniform level-set step after the shadow
+comparison matched. Unlike the unit-level tests in
 ``tests/test_worker_v2_isotropic_shadow.py`` these tests drive the real API:
 
 * a 2D three-step flow (deposit / etch / deposit) is run once with both v2
   flags unset and once with the apply flag set; every step snapshot, every
   native state ID and the run history must be identical, and the apply run
-  must record one ``v2-isotropic-applied`` event per eligible step;
+  must record one ``v2-plugin-applied`` event per eligible step;
 * that apply run is replayed through ``/api/runs/{id}/replay-project`` +
   ``/api/runs/replay`` with the apply flag still set, so the replay exercises
   the same v2 path. Its final snapshot and native state must match both the
@@ -40,8 +40,8 @@ from backend.main import app
 from tests.test_api_integration import asgi_request, json_body
 from tests.test_isotropic_dispatch import iso_step, project
 
-SHADOW_ENV = "VIENNAPS_WORKBENCH_V2_ISOTROPIC_SHADOW"
-APPLY_ENV = "VIENNAPS_WORKBENCH_V2_ISOTROPIC_APPLY"
+SHADOW_ENV = "VIENNAPS_WORKBENCH_V2_PLUGIN_SHADOW"
+APPLY_ENV = "VIENNAPS_WORKBENCH_V2_PLUGIN_APPLY"
 
 # ``outputs`` are run-directory-relative artifacts and ``runId`` names the
 # run; everything else is the geometry/readback contract the apply mode must
@@ -238,9 +238,9 @@ class V2IsotropicApplyCapabilityTests(unittest.IsolatedAsyncioTestCase):
 
         # The default path stays v2-free; the apply run must validate and apply
         # every eligible step exactly once.
-        self.assertEqual(v2_events(storage.run_path(baseline_id), "v2-isotropic-applied"), [])
-        self.assertEqual(v2_events(storage.run_path(baseline_id), "v2-isotropic-shadow"), [])
-        applied = v2_events(storage.run_path(apply_id), "v2-isotropic-applied")
+        self.assertEqual(v2_events(storage.run_path(baseline_id), "v2-plugin-applied"), [])
+        self.assertEqual(v2_events(storage.run_path(baseline_id), "v2-plugin-shadow"), [])
+        applied = v2_events(storage.run_path(apply_id), "v2-plugin-applied")
         self.assertEqual([record["stepId"] for record in applied], step_ids, applied)
         for record in applied:
             # Apply implies the shadow comparison, and only a matched v2 domain
@@ -248,7 +248,7 @@ class V2IsotropicApplyCapabilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(record["oldDigest"], record["newDigest"], record["stepId"])
             self.assertEqual(record["v2Plan"]["process_id"], "isotropic")
             self.assertEqual(record["v2Plan"]["engine_id"], "viennaps")
-        shadows = v2_events(storage.run_path(apply_id), "v2-isotropic-shadow")
+        shadows = v2_events(storage.run_path(apply_id), "v2-plugin-shadow")
         self.assertEqual([record["stepId"] for record in shadows], step_ids, shadows)
         for record in shadows:
             self.assertIs(record["matched"], True, record["reasons"])
@@ -269,7 +269,7 @@ class V2IsotropicApplyCapabilityTests(unittest.IsolatedAsyncioTestCase):
             self._created_runs.append(replay_id)
             replay_info = await self.wait(replay_id)
 
-        replay_applied = v2_events(storage.run_path(replay_id), "v2-isotropic-applied")
+        replay_applied = v2_events(storage.run_path(replay_id), "v2-plugin-applied")
         self.assertEqual([record["stepId"] for record in replay_applied], step_ids, replay_applied)
 
         final_step = step_ids[-1]
@@ -304,10 +304,10 @@ class V2IsotropicApplyCapabilityTests(unittest.IsolatedAsyncioTestCase):
 
         step_ids = [step["id"] for step in value["steps"]]
         self.assertEqual(
-            [record["stepId"] for record in v2_events(storage.run_path(apply_id), "v2-isotropic-applied")],
+            [record["stepId"] for record in v2_events(storage.run_path(apply_id), "v2-plugin-applied")],
             step_ids,
         )
-        self.assertEqual(v2_events(storage.run_path(baseline_id), "v2-isotropic-applied"), [])
+        self.assertEqual(v2_events(storage.run_path(baseline_id), "v2-plugin-applied"), [])
 
         self.assert_snapshots_match(baseline_id, baseline_info, apply_id, apply_info, value["steps"])
         self.assert_native_states_match(baseline_info, apply_info, value["steps"])

@@ -11,9 +11,11 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import numpy as np
 
+from process_models.v2 import storage
 from process_models.v2.output_schema import output_contract_schema
 from process_models.v2.state import (
     Artifact,
@@ -29,7 +31,12 @@ from process_models.v2.state import (
     ProcessState,
     VoxelState,
 )
-from process_models.v2.storage import StateStore, StateStoreError
+from process_models.v2.storage import (
+    OUTPUTS_SCHEMA_VERSION,
+    STATE_SCHEMA_VERSION,
+    StateStore,
+    StateStoreError,
+)
 
 GRID = GridSpec(dimension=2, origin=(-1.0, -1.0), spacing=0.1, shape=(4, 5))
 
@@ -85,12 +92,12 @@ def _state() -> ProcessState:
 
 
 class _PlanStub:
-    """Stand-in for ``ExecutionPlan``; ``save_plan`` only calls ``identity``."""
+    """Stand-in for ``ExecutionPlan``; ``save_plan`` only calls ``identity_json``."""
 
     def __init__(self, identity: dict[str, str]) -> None:
         self._identity = identity
 
-    def identity(self) -> dict[str, str]:
+    def identity_json(self) -> dict[str, str]:
         return dict(self._identity)
 
 
@@ -185,15 +192,17 @@ class StateStoreTest(unittest.TestCase):
     def test_geometry_ref_round_trip_with_loader(self) -> None:
         handle = object()
         state = ProcessState(
-            geometry=LevelSetState(handle=object(), dimension=2, grid_delta=0.2, material_order=(10, 30)),
+            geometry=LevelSetState(handle=object(), dimension=2, grid_delta=0.2),
             materials=_materials(),
             layers=_layers(),
         )
         payload = self.store.save_state("etch", state, geometry_ref="geometry.vpsd")
         self.assertEqual(
             payload["geometry"],
-            {"ref": "geometry.vpsd", "dimension": 2, "gridDelta": 0.2, "materialOrder": [10, 30]},
+            {"ref": "geometry.vpsd", "dimension": 2, "gridDelta": 0.2},
         )
+        self.assertNotIn("materialOrder", payload["geometry"])
+        self.assertEqual(payload["materials"], {"order": [10, 30], "names": {"10": "Si", "30": "SiO2"}})
         (self.store.step_dir("etch") / "geometry.vpsd").write_bytes(b"native-domain")
 
         references: list[str] = []
@@ -206,9 +215,8 @@ class StateStoreTest(unittest.TestCase):
         self.assertEqual(references, ["geometry.vpsd"])
         assert restored.geometry is not None
         self.assertIs(restored.geometry.handle, handle)
-        self.assertEqual(
-            restored.geometry, LevelSetState(handle=handle, dimension=2, grid_delta=0.2, material_order=(10, 30))
-        )
+        self.assertEqual(restored.geometry, LevelSetState(handle=handle, dimension=2, grid_delta=0.2))
+        self.assertFalse(hasattr(restored.geometry, "material_order"))
         self.assertEqual(restored.materials, state.materials)
         self.assertEqual(restored.layers, state.layers)
 
@@ -269,14 +277,14 @@ class StateStoreTest(unittest.TestCase):
 
     def test_plan_identity_round_trip(self) -> None:
         identity = {
-            "process_id": "isotropic",
-            "process_version": "1.0.0",
-            "variant_id": "native",
-            "variant_version": "1.0.0",
-            "implementation_hash": "sha256:abc",
-            "engine_id": "viennaps",
-            "engine_version": "4.7.0",
-            "engine_fingerprint": "viennaps@4.7.0",
+            "processId": "isotropic",
+            "processVersion": "1.0.0",
+            "variantId": "native",
+            "variantVersion": "1.0.0",
+            "implementationHash": "sha256:abc",
+            "engineId": "viennaps",
+            "engineVersion": "4.7.0",
+            "engineFingerprint": "viennaps@4.7.0",
             "adapter": "default",
         }
         returned = self.store.save_plan("deposit", _PlanStub(identity))
@@ -330,13 +338,93 @@ class StateStoreTest(unittest.TestCase):
             self.store.load_state("bad")
         self.assertIn("schemaVersion", str(raised.exception))
 
+    def test_state_and_outputs_schema_versions_are_independent(self) -> None:
+        outputs = OutputSet(
+            metrology=(MetrologyRecord(metric="thickness", value=0.05, unit="um"),),
+            artifacts=(Artifact(kind="json", name="summary", metadata={"tags": ["a"]}),),
+        )
+        self.assertEqual(STATE_SCHEMA_VERSION, 1)
+        self.assertEqual(OUTPUTS_SCHEMA_VERSION, 1)
+
+        # Bumping the state schema must not touch what outputs.json writes.
+        with mock.patch.object(storage, "STATE_SCHEMA_VERSION", 7):
+            state_payload = self.store.save_state("coupled", _state())
+            outputs_payload = self.store.save_outputs("coupled", outputs)
+
+            self.assertEqual(state_payload["schemaVersion"], 7)
+            self.assertEqual(outputs_payload["schemaVersion"], OUTPUTS_SCHEMA_VERSION)
+            self.assertEqual(
+                self._read_json("steps", "coupled", "outputs.json")["schemaVersion"],
+                OUTPUTS_SCHEMA_VERSION,
+            )
+            self.assertIsNotNone(self.store.load_state("coupled"))
+            self.assertEqual(self.store.load_outputs("coupled"), outputs)
+
+        # And bumping the outputs schema must not touch state.json.
+        with mock.patch.object(storage, "OUTPUTS_SCHEMA_VERSION", 2):
+            outputs_payload = self.store.save_outputs("decoupled", outputs)
+            state_payload = self.store.save_state("decoupled", _state())
+
+            self.assertEqual(outputs_payload["schemaVersion"], 2)
+            self.assertEqual(state_payload["schemaVersion"], STATE_SCHEMA_VERSION)
+            restored = self.store.load_outputs("decoupled")
+            self.assertEqual(restored.schema_version, 2)
+            self.assertEqual(restored.metrology, outputs.metrology)
+            self.assertEqual(restored.artifacts, outputs.artifacts)
+
+    def test_legacy_outputs_schema_v1_file_stays_readable(self) -> None:
+        directory = self.store.step_dir("legacy")
+        directory.mkdir(parents=True)
+        (directory / "outputs.json").write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "metrology": [
+                        {
+                            "metric": "thickness",
+                            "value": 0.05,
+                            "unit": "um",
+                            "region": None,
+                            "method": "plugin",
+                            "uncertainty": None,
+                        }
+                    ],
+                    "artifacts": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        restored = self.store.load_outputs("legacy")
+        self.assertEqual(restored.schema_version, 1)
+        self.assertEqual(restored.metrology[0].metric, "thickness")
+
+    def test_unsupported_outputs_schema_version_raises(self) -> None:
+        directory = self.store.step_dir("bad-outputs")
+        directory.mkdir(parents=True)
+        (directory / "outputs.json").write_text(
+            json.dumps({"schemaVersion": OUTPUTS_SCHEMA_VERSION + 1, "metrology": [], "artifacts": []}),
+            encoding="utf-8",
+        )
+        with self.assertRaises(StateStoreError) as raised:
+            self.store.load_outputs("bad-outputs")
+        message = str(raised.exception)
+        self.assertIn("outputs schemaVersion", message)
+        self.assertIn(str(OUTPUTS_SCHEMA_VERSION + 1), message)
+
+        # A state schema version must never be accepted as an outputs version.
+        with mock.patch.object(storage, "STATE_SCHEMA_VERSION", OUTPUTS_SCHEMA_VERSION + 1):
+            with self.assertRaises(StateStoreError):
+                self.store.load_outputs("bad-outputs")
+
     def test_output_contract_schema_is_json_serializable(self) -> None:
         schema = output_contract_schema()
         self.assertEqual(schema["schemaVersion"], 1)
         self.assertEqual(json.loads(json.dumps(schema, allow_nan=False)), schema)
-        self.assertEqual(
-            set(schema["types"]),
+        # The contract may grow (new state types); storage only needs the
+        # value-carrying types it persists to stay described.
+        self.assertLessEqual(
             {"StepResult", "StateDelta", "OutputSet", "MetrologyRecord", "Artifact", "CellSetState", "Field", "Layer"},
+            set(schema["types"]),
         )
         for name, description in schema["types"].items():
             self.assertTrue(description["fields"], name)

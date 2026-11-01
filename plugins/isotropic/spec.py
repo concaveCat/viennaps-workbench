@@ -5,8 +5,9 @@ from __future__ import annotations
 from process_models.v2.contract import ProcessSpec
 
 from .params import IsotropicParams
+from .step import parse_step
 
-__all__ = ["IsotropicProcessSpec", "IsotropicSpec"]
+__all__ = ["IsotropicProcessSpec"]
 
 IsotropicProcessSpec = ProcessSpec(
     id="isotropic",
@@ -19,7 +20,6 @@ IsotropicProcessSpec = ProcessSpec(
         "Native ViennaPS IsotropicProcess driven through the worker rate and "
         "advection helpers; parity with worker/steps/process.py."
     ),
+    default_variant="native",
+    parse_step=parse_step,
 )
-
-#: Alias matching the short name used in the v2 spec.
-IsotropicSpec = IsotropicProcessSpec

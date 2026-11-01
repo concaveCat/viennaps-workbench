@@ -25,7 +25,6 @@ from typing import Any, Protocol, runtime_checkable
 from .contract import VariantCapabilities
 from .state import (
     LevelSetState,
-    MaterialState,
     ProcessState,
     StateDelta,
     StateKind,
@@ -101,8 +100,10 @@ class DefaultStateAdapter:
         Geometry wins over voxels when a variant returns both: a variant that
         produced a new native geometry has already superseded any voxel view.
         A committed geometry also drops a stale voxel snapshot so the next
-        voxel reader re-derives it. ``layers`` and ``fields`` are independent
-        of geometry/voxels and of each other.
+        voxel reader re-derives it. ``materials`` is independent of geometry: a
+        geometry delta never changes it, and a materials delta replaces it.
+        ``layers`` and ``fields`` are independent of geometry/voxels and of
+        each other.
         """
         prepared = state
 
@@ -115,7 +116,6 @@ class DefaultStateAdapter:
                 prepared,
                 geometry=delta.geometry,
                 voxels=None,
-                materials=_merge_materials(delta.geometry.material_order, prepared.materials),
             )
         elif delta.voxels is not None:
             if "voxels" not in capabilities.writes:
@@ -126,21 +126,23 @@ class DefaultStateAdapter:
                 raise StateMissingError("committing voxels requires the original geometry")
 
             new_handle = _write_voxels(state.geometry.handle, delta.voxels.grid)
-            order = tuple(int(material_id) for material_id in getattr(delta.voxels.grid, "material_order", ()))
-            if not order:
-                order = state.geometry.material_order
             geometry = LevelSetState(
                 handle=new_handle,
                 dimension=state.geometry.dimension,
                 grid_delta=state.geometry.grid_delta,
-                material_order=order,
             )
             prepared = replace(
                 prepared,
                 geometry=geometry,
                 voxels=None,
-                materials=_merge_materials(order, prepared.materials),
             )
+
+        if delta.materials is not None:
+            if "materials" not in capabilities.writes:
+                raise _resolution_error(
+                    "variant returned a materials delta but does not declare 'materials' in capabilities.writes"
+                )
+            prepared = replace(prepared, materials=delta.materials)
 
         if delta.layers is not None:
             if "layers" not in capabilities.writes:
@@ -166,14 +168,6 @@ def _resolution_error(message: str) -> Exception:
     from .resolver import ExecutionResolutionError
 
     return ExecutionResolutionError(message)
-
-
-def _merge_materials(order: tuple[int, ...], current: MaterialState) -> MaterialState:
-    """Keep names that still exist when the material order changes."""
-    if not order or tuple(order) == tuple(current.order):
-        return current
-    kept = {material_id: name for material_id, name in current.names.items() if material_id in order}
-    return MaterialState(order=tuple(order), names=kept)
 
 
 def _read_voxels(handle: Any) -> Any:

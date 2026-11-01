@@ -1,12 +1,12 @@
 # 插件生命周期：manifest、发现与锁
 
 > 范围：`process_models/plugins/`、`plugins/`、`plugins.lock`、`scripts/lock-plugins.py`。
-> 本文描述 v2.1 插件生命周期的**目标契约**：把一个插件从“代码里的一个类”变成
-> **可安装、可校验、可 pin 的单元**。落地由同一分支的生命周期改动负责（相关文件可能
-> 已部分或全部出现在工作区）；本文不把未合入的能力写成已完成状态。是否可用以仓库
-> 文件、以及 `scripts/lock-plugins.py --check` 的退出码为准，不以本文为准。
+> 本文描述当前 v2.4 插件生命周期：把一个插件从“代码里的一个类”变成
+> **可安装、可校验、可 pin 的单元**。manifest、发现、lock、loader 均已落地；
+> 是否可用以仓库文件、以及 `scripts/lock-plugins.py --check` 的退出码为准。
 >
-> 精确的测试结果（用例数、通过/失败）**另行报告**，本文不写数字。
+> 精确的定向测试结果见 [`process-model-plugins-v2.md`](process-model-plugins-v2.md) §9.2；
+> 本文不重复数字。
 >
 > 契约、分层与执行语义见 [`process-model-plugins-v2.md`](process-model-plugins-v2.md)；
 > 本文只讲“插件作为安装单元”这一层。
@@ -25,7 +25,7 @@
 
 - **项目 JSON 永远不出现模块路径或 callable。** JSON 里只有 `process_id`、
   `variant_id` 和参数；选择“跑哪份代码”的是运维控制的 manifest + lock，不是用户输入。
-- 插件作者仍然写 Python（`ProcessSpec` + `EngineVariant` + `register_<name>`），
+- 插件作者仍然写 Python（`ProcessSpec` + `parse_step` + `EngineVariant` + `register`），
   manifest 只是让这份代码**可安装、可校验**，不改变 v2 的注册方式。
 - 发现与加载只读 manifest。loader 不会从项目 JSON、请求体或任意用户字段里
   import 模块。
@@ -37,6 +37,11 @@ process_models/plugins/     # 生命周期库：manifest / lock / loader / error
 plugins/
   isotropic/
     plugin.toml             # 树内唯一注册插件的 manifest
+    params.py
+    step.py                 # parse_step(project, step)
+    spec.py
+    register.py
+    variants/native.py
 plugins.lock                # 由脚本生成，随部署一起发布
 scripts/lock-plugins.py     # 生成 / 校验
 ```
@@ -141,7 +146,7 @@ lock 是**运维签字**：它把“这次部署实际装的是哪份代码”�
 | 字段 | 覆盖范围 | 能发现什么 |
 | --- | --- | --- |
 | `manifestSha256` | `plugin.toml` 的**原始字节**（不是解析后的值） | 改注释、改顺序、改空白也会变；身份字段被改必然变 |
-| `variants.<id>.implementationHash` | `compute_implementation_hash()`：变体类所在模块的 `.py` 文件字节 + `模块.qualname` | 版本号没升但实现改了；模块级 helper/常量变化 |
+| `variants.<id>.implementationHash` | `compute_implementation_hash()`：如果变体在 `plugins/<id>/` 包内，覆盖该包**全部 `.py` 字节**（含 `step.py`/`params.py`/`spec.py`/`register.py`），再加变体声明的 `implementation_files`（isotropic 用它覆盖 `process_models/v2/engines/viennaps.py`），最后混入 `模块.qualname` | 版本号没升但实现改了；包内任一模块或共享引擎 helper 变化 |
 
 lock **不保存代码副本**，只保存哈希。因此字节级复现依赖“同一份代码 + 同一份
 lock”。第三方行为（`viennaps`/`numpy` 版本）由 `requirements*.lock` 与
@@ -182,9 +187,13 @@ lock”。第三方行为（`viennaps`/`numpy` 版本）由 `requirements*.lock`
   下载或自动回滚。
 - replay 需要某个**未安装**的版本时，是**硬错误**：既不降级到邻近版本，也不改用
   “最新版本”。要 replay 旧 run，就必须同时保留旧代码目录与它的 lock 条目。
-- 与执行身份的关系：run 记录仍保存 `ExecutionPlan.identity()` 的九个键（见 v2
-  文档 §5）。`manifestSha256` 属于**安装面证据**，本切片不写进 plan identity；
-  需要字节级复现时，归档“代码 + lock”这一对。
+- 与执行身份的关系：run 记录保存 `ExecutionPlan.identity_json()` 的九个 camelCase 键
+  （`processId`、`processVersion`、`variantId`、`variantVersion`、`implementationHash`、
+  `engineId`、`engineVersion`、`engineFingerprint`、`adapter`；见 v2 文档 §5）。
+  `manifestSha256` 属于**安装面证据**，不写进 plan identity；需要字节级复现时，归档
+  “代码 + lock”这一对。
+- 可执行的 replay pin 目前只有 `expected_process_version` / `expected_variant_version`；
+  `implementationHash` / engine fingerprint 只被记录，不能重新 pin。
 - 本切片不做版本保留策略（留多久、删了之后旧 replay 怎么办），该问题仍挂在
   v2 文档 §10.2。
 
@@ -196,8 +205,10 @@ lock”。第三方行为（`viennaps`/`numpy` 版本）由 `requirements*.lock`
 
 1. 建 `plugins/<id>/plugin.toml`（`api`/`id`/`version`/`entrypoint` 必填，
    `description` 可选）。
-2. 实现 `register_<name>(registry)`，内部仍是 v2 的
-   `register_process(spec)` + `register_variant(VariantRegistration(...))`。
+2. 按 `docs/plugin-template/` 的布局实现 `params.py`、`step.py`（`parse_step`）、
+   `spec.py`（`default_variant` + `parse_step`）、`variants/` 和
+   `register(registry)`；注册内部仍是 v2 的 `register_process(spec)` +
+   `register_variant(VariantRegistration(...))`。
 3. 运行 `scripts/lock-plugins.py` 生成/更新 `plugins.lock`。
 4. 运行 `scripts/lock-plugins.py --check`，必须退出 0。
 5. **重启 worker / 服务**：发现与 registry 在进程启动时构建，没有热加载。
@@ -225,7 +236,7 @@ lock”。第三方行为（`viennaps`/`numpy` 版本）由 `requirements*.lock`
 
 | 能力 | 状态 | 说明 |
 | --- | --- | --- |
-| 一致性/符合性 harness | 不包含 | 没有跨插件 conformance 套件；只有本切片的 lifecycle 单测 |
+| 跨插件一致性套件 | 不包含 | `process_models/v2/conformance.py` 提供单变体 `check_variant()`；没有跨插件/跨目录的批量 conformance 套件 |
 | 运行时 warm pool / 租约池 | 不包含 | registry 每次构建，import 由 Python 缓存；`StaticEngine.release()` 仍是 no-op |
 | HTTP API / UI | 不包含 | 没有“已安装插件”端点、没有上传页 |
 | 插件市场 / 分发 / 签名 | 不包含 | 安装 = 运维把目录放进发现根并生成 lock |
@@ -251,11 +262,15 @@ lock”。第三方行为（`viennaps`/`numpy` 版本）由 `requirements*.lock`
 - [ ] manifest 只写 `api`/`id`/`version`/`entrypoint`/`description`，不加自定义键。
 - [ ] manifest 的 `id`/`version` 与 `ProcessSpec` 一致；`api` 跟随
       `PLUGIN_API_VERSION`。
-- [ ] entrypoint 是单个 `module:attr`，指向幂等的 `register_<name>`。
+- [ ] entrypoint 是单个 `module:attr`，指向幂等的 `register`。
+- [ ] `step.py` 的 `parse_step(project, step)` 只认领本工艺；不属于时返回 `None`，
+      字段缺失时抛 `ValueError`；`spec.py` 里显式写 `default_variant` 和
+      `parse_step=parse_step`。
 - [ ] 改实现就升变体版本，并重新生成 lock；不手改 `plugins.lock`。
 - [ ] 项目 JSON 里没有也不新增 module/callable 字段。
-- [ ] 跑 lifecycle 单测与 worker bridge 单测（`tests/test_plugin_lifecycle.py`、
-      `tests/test_worker_v2_isotropic.py`）——结果单独报告。
+- [ ] 跑 lifecycle 单测、dispatch 单测与 worker bridge 单测
+      （`tests/test_plugin_lifecycle.py`、`tests/test_worker_v2_isotropic.py`、
+      `tests/test_v2_conformance_native.py`）——结果见 v2 文档 §9.2。
 - [ ] 不碰 v1（`process_models/contract.py`、`registry.py`、`voxel.py`）、
       `backend/`、`frontend/`，不新增 process model。
 
@@ -278,6 +293,7 @@ lock”。第三方行为（`viennaps`/`numpy` 版本）由 `requirements*.lock`
 | `id` @ `version` | `isotropic` @ `1.0.0` |
 | `entrypoint` | `plugins.isotropic:register` |
 | 变体 | `native` @ `1.0.0`（2D/3D，etch/deposit） |
+| 单步 dispatch | `spec.py` 绑定 `step.py::parse_step`；`default_variant="native"` |
 | lock 条目 | `plugins` 数组中唯一一条 `("isotropic", "1.0.0")` |
 | `manifestSha256` | 由 `scripts/lock-plugins.py` 生成，以仓库内 `plugins.lock` 为准 |
 | `variants.native.implementationHash` | 同上（`compute_implementation_hash` 结果） |
@@ -289,4 +305,5 @@ lock”。第三方行为（`viennaps`/`numpy` 版本）由 `requirements*.lock`
 | --- | --- | --- |
 | `voxel_probe` @ `1.0.0` | `process_models/v2/surrogate/voxel_probe.py` | surrogate **proof** 插件，仅用于验证 level-set ↔ voxel 适配器；没有 manifest，不是安装单元 |
 
-第二个真实工艺（`sf6o2` 等）落地时按 §6 新增目录与 lock 条目即可，不需要改契约。
+第二个真实工艺（`sf6o2` 等）落地时复制 `docs/plugin-template/`、按 §6 新增目录与 lock
+条目即可，不需要改契约。

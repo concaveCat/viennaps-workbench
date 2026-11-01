@@ -9,7 +9,7 @@ from process_models.v2.contract import VariantRegistration
 from .spec import IsotropicProcessSpec
 from .variants import IsotropicNativeVariant
 
-__all__ = ["register", "register_isotropic"]
+__all__ = ["register"]
 
 
 def register(registry: Any) -> VariantRegistration:
@@ -25,7 +25,3 @@ def register(registry: Any) -> VariantRegistration:
     registry.register_process(IsotropicProcessSpec)
     registry.register_variant(registration)
     return registration
-
-
-#: Backwards-compatible name for callers that used the pre-package entrypoint.
-register_isotropic = register

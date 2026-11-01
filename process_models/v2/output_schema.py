@@ -67,6 +67,11 @@ def _state_delta() -> dict[str, Any]:
                 persisted=False,
                 note="Persisted through a per-step geometry reference, not inline.",
             ),
+            "materials": _value(
+                "MaterialState",
+                f"Native material IDs in level-set order; {null_note}",
+                nullable=True,
+            ),
             "layers": _value("LayerState", f"Ordered layer stack; {null_note}", nullable=True),
             "fields": _value("CellSetState", f"Regular cell grid with named fields; {null_note}", nullable=True),
             "voxels": _value(
@@ -78,6 +83,58 @@ def _state_delta() -> dict[str, Any]:
             ),
         },
         required=(),
+    )
+
+
+def _material_state() -> dict[str, Any]:
+    return _record(
+        "Native material IDs in level-set order plus optional names.",
+        {
+            "order": _value(
+                "array",
+                "One native material ID per level-set index; IDs may repeat or be empty.",
+                items={"type": "integer", "minimum": 0},
+            ),
+            "names": _value(
+                "object",
+                "Display name per material ID (unique names; keys cover order).",
+                additionalProperties={"type": "string"},
+            ),
+        },
+        required=("order",),
+    )
+
+
+def _level_set_state() -> dict[str, Any]:
+    return _record(
+        "An engine-specific level-set handle plus the grid it carries.",
+        {
+            "handle": _value(
+                "LevelSetHandle",
+                "Opaque engine handle (for native variants the ViennaPS Domain).",
+                persisted=False,
+                note="Never serialized; only usable inside the owning engine lease.",
+            ),
+            "dimension": _value("integer", "Spatial dimension.", enum=[2, 3]),
+            "gridDelta": _value("number", "Grid spacing in project units.", exclusiveMinimum=0),
+        },
+        required=("handle", "dimension", "gridDelta"),
+    )
+
+
+def _voxel_state() -> dict[str, Any]:
+    return _record(
+        "A dense height-field grid.",
+        {
+            "grid": _value(
+                "VoxelGrid",
+                "Dense material/height grid (process_models.voxel.VoxelGrid).",
+                persisted=False,
+                note="Per-step scratch; serialized through a dedicated artifact when available.",
+            ),
+            "source": _value("string", "Producer tag, for example 'height-field-v1'.", default="height-field-v1"),
+        },
+        required=("grid",),
     )
 
 
@@ -161,6 +218,20 @@ def _layer() -> dict[str, Any]:
     )
 
 
+def _layer_state() -> dict[str, Any]:
+    return _record(
+        "An ordered tuple of layers.",
+        {
+            "layers": _value(
+                "array",
+                "Layer entries; the producer documents top-to-bottom or bottom-to-top order.",
+                items={"type": "Layer"},
+            )
+        },
+        required=("layers",),
+    )
+
+
 def output_contract_schema() -> dict[str, Any]:
     """Return the v2 output contract description as plain JSON data.
 
@@ -175,12 +246,12 @@ def output_contract_schema() -> dict[str, Any]:
             "StepResult": _record(
                 "One step's committed state change plus its report data.",
                 {
-                    "state": _value("StateDelta", "State representations the next step consumes."),
+                    "delta": _value("StateDelta", "State representations the next step consumes."),
                     "outputs": _value("OutputSet", "Metrology records and artifacts."),
                     "metadata": _value("object", "Small per-step bookkeeping values.", additionalProperties=True),
                     "warnings": _value("array", "Human-readable warnings.", items={"type": "string"}),
                 },
-                required=("state",),
+                required=("delta",),
             ),
             "StateDelta": _state_delta(),
             "OutputSet": _output_set(),
@@ -208,7 +279,11 @@ def output_contract_schema() -> dict[str, Any]:
                 required=("kind", "name"),
             ),
             "CellSetState": _cell_set_state(),
+            "MaterialState": _material_state(),
+            "LevelSetState": _level_set_state(),
+            "VoxelState": _voxel_state(),
             "Field": _field(),
             "Layer": _layer(),
+            "LayerState": _layer_state(),
         },
     }

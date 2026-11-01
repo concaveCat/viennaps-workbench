@@ -80,10 +80,28 @@ class PassingVariant(EngineVariant):
     def execute(self, state: ProcessState, params: BaseModel, ctx: ProcessContext, engine: Any) -> StepResult:
         self.seen_states.append(state)
         return StepResult(
-            state=StateDelta(),
+            delta=StateDelta(),
             outputs=OutputSet(),
             metadata={"value": params.value, "engine": engine.engine_id},
             warnings=["passing variant warning"],
+        )
+
+
+class MaterialsWritingVariant(PassingVariant):
+    """Commits a new canonical material state."""
+
+    variant_id = "writes-materials"
+    capabilities = VariantCapabilities(
+        dimensions=(2,),
+        reads=frozenset({"geometry"}),
+        writes=frozenset({"materials"}),
+    )
+
+    def execute(self, state: ProcessState, params: BaseModel, ctx: ProcessContext, engine: Any) -> StepResult:
+        self.seen_states.append(state)
+        return StepResult(
+            delta=StateDelta(materials=MaterialState(order=(10, 20), names={10: "Si", 20: "SiO2"})),
+            outputs=OutputSet(),
         )
 
 
@@ -126,7 +144,7 @@ class CountingVariant(PassingVariant):
     def execute(self, state: ProcessState, params: BaseModel, ctx: ProcessContext, engine: Any) -> StepResult:
         self.calls += 1
         self.seen_states.append(state)
-        return StepResult(state=StateDelta(), outputs=OutputSet(), metadata={"call": self.calls})
+        return StepResult(delta=StateDelta(), outputs=OutputSet(), metadata={"call": self.calls})
 
 
 class HandleTouchingVariant(PassingVariant):
@@ -137,7 +155,7 @@ class HandleTouchingVariant(PassingVariant):
     def execute(self, state: ProcessState, params: BaseModel, ctx: ProcessContext, engine: Any) -> StepResult:
         self.seen_states.append(state)
         state.geometry.handle.touch()
-        return StepResult(state=StateDelta(), outputs=OutputSet())
+        return StepResult(delta=StateDelta(), outputs=OutputSet())
 
 
 @dataclass(frozen=True)
@@ -189,7 +207,6 @@ def _state_factory(handle: DummyHandle | None = None) -> Callable[[], ProcessSta
                 handle=handle if handle is not None else DummyHandle(),
                 dimension=2,
                 grid_delta=0.1,
-                material_order=(10,),
             ),
             materials=MaterialState(order=(10,), names={10: "Si"}),
         )
@@ -236,6 +253,8 @@ class ConformanceHarnessTest(unittest.TestCase):
 
         self.assertEqual(report.details["output_counts"], {"metrology": 0, "artifacts": 0})
         self.assertEqual(report.details["state"]["materials"]["order"], [10])
+        self.assertNotIn("material_order", report.details["state"]["geometry"])
+        self.assertNotIn("materials", report.details["delta"])
         self.assertIn("passing variant warning", report.details["warnings"])
         self.assertTrue(report.details["determinism"]["checked"])
         self.assertEqual(report.details["determinism"]["compared_with"], "structure")
@@ -243,6 +262,17 @@ class ConformanceHarnessTest(unittest.TestCase):
         # Two fresh runs were executed, as the strict-determinism check requires.
         self.assertEqual(len(variant.seen_states), 2)
         self.assertIsNot(variant.seen_states[0], variant.seen_states[1])
+
+    def test_materials_delta_is_summarized_from_canonical_state(self) -> None:
+        variant = MaterialsWritingVariant()
+        report = _check(_fixture(variant), variant.variant_id)
+
+        self.assertTrue(report.passed, report.issues)
+        self.assertEqual(report.details["state"]["materials"]["order"], [10, 20])
+        self.assertEqual(report.details["state"]["materials"]["names"], {"10": "Si", "20": "SiO2"})
+        self.assertEqual(report.details["delta"]["materials"]["order"], [10, 20])
+        self.assertNotIn("material_order", report.details["delta"]["materials"])
+        self.assertNotIn("geometry", report.details["delta"])
 
     def test_legacy_state_delta_return_fails_with_clear_issue(self) -> None:
         variant = LegacyDeltaVariant()

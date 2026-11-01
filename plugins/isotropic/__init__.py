@@ -9,15 +9,15 @@ operator package can use the same ``module:attribute`` shape.
 from __future__ import annotations
 
 from .params import IsotropicParams
-from .register import register, register_isotropic
-from .spec import IsotropicProcessSpec, IsotropicSpec
+from .register import register
+from .spec import IsotropicProcessSpec
+from .step import parse_step
 from .variants import IsotropicNativeVariant
 
 __all__ = [
     "IsotropicNativeVariant",
     "IsotropicParams",
     "IsotropicProcessSpec",
-    "IsotropicSpec",
+    "parse_step",
     "register",
-    "register_isotropic",
 ]

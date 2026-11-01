@@ -85,7 +85,7 @@ class DummyVariant(EngineVariant):
         self.last_params = params
         self.last_context = ctx
         return StepResult(
-            state=StateDelta(geometry=state.geometry),
+            delta=StateDelta(geometry=state.geometry),
             outputs=OutputSet(
                 metrology=(MetrologyRecord(metric="thickness", value=float(params.value), unit="nm"),),
                 artifacts=(Artifact(kind="json", name="dummy.json", path="dummy.json"),),
@@ -109,12 +109,36 @@ class OutputOnlyVariant(DummyVariant):
     def execute(self, state: ProcessState, params: BaseModel, ctx: ProcessContext, engine: object) -> StepResult:
         self.last_state = state
         return StepResult(
-            state=StateDelta(),
+            delta=StateDelta(),
             outputs=OutputSet(
                 metrology=(MetrologyRecord(metric="dose", value=1.5, unit="1/cm2", method="reference"),),
             ),
             metadata={"note": "outputs only"},
         )
+
+
+class MaterialsDeltaVariant(DummyVariant):
+    """Writes materials without geometry; used to check the commit gate."""
+
+    variant_id = "materials-delta"
+    capabilities = VariantCapabilities(
+        dimensions=(2,),
+        reads=frozenset({"geometry"}),
+        writes=frozenset({"materials"}),
+    )
+
+    def __init__(self, declare_write: bool = True) -> None:
+        super().__init__()
+        if not declare_write:
+            self.capabilities = VariantCapabilities(
+                dimensions=(2,),
+                reads=frozenset({"geometry"}),
+                writes=frozenset(),
+            )
+
+    def execute(self, state: ProcessState, params: BaseModel, ctx: ProcessContext, engine: object) -> StepResult:
+        self.last_state = state
+        return StepResult(delta=StateDelta(materials=MaterialState(order=(10, 20), names={10: "Si", 20: "SiO2"})))
 
 
 class VoxelReadVariant(DummyVariant):
@@ -126,7 +150,7 @@ class VoxelReadVariant(DummyVariant):
     )
 
     def execute(self, state: ProcessState, params: BaseModel, ctx: ProcessContext, engine: object) -> StepResult:
-        return StepResult(state=StateDelta(voxels=state.voxels))
+        return StepResult(delta=StateDelta(voxels=state.voxels))
 
 
 class NoVoxelAdapter:
@@ -206,7 +230,7 @@ def _fixture() -> Fixture:
         step={},
     )
     state = ProcessState(
-        geometry=LevelSetState(handle=object(), dimension=2, grid_delta=0.1, material_order=(10,)),
+        geometry=LevelSetState(handle=object(), dimension=2, grid_delta=0.1),
         materials=materials,
     )
     return Fixture(registry=registry, provider=provider, spec=spec, variant=variant, context=context, state=state)
@@ -251,7 +275,7 @@ class ExecutionEntryTest(unittest.TestCase):
         self.assertIs(fixture.variant.last_context, fixture.context)
 
         self.assertIsInstance(outcome.result, StepResult)
-        self.assertIs(outcome.delta, outcome.result.state)
+        self.assertIs(outcome.delta, outcome.result.delta)
         self.assertIs(outcome.metadata, outcome.result.metadata)
         self.assertIs(outcome.warnings, outcome.result.warnings)
         self.assertIs(outcome.outputs, outcome.result.outputs)
@@ -270,9 +294,11 @@ class ExecutionEntryTest(unittest.TestCase):
         plan = resolve_execution(_request(fixture), fixture.registry, fixture.provider)
         outcome = execute_plan(plan)
 
-        # The committed state came from ``result.state``; metadata/warnings/
+        # The committed state came from ``result.delta``; metadata/warnings/
         # outputs are not part of it.
         self.assertIs(outcome.state.geometry, fixture.state.geometry)
+        # A geometry delta never changes the canonical material state.
+        self.assertIs(outcome.state.materials, fixture.state.materials)
         for name in ("outputs", "metadata", "warnings", "artifacts"):
             self.assertFalse(hasattr(outcome.state, name))
 
@@ -400,7 +426,7 @@ class ExecutionEntryTest(unittest.TestCase):
         fixture = _fixture()
         state = dataclasses.replace(
             fixture.state,
-            geometry=LevelSetState(handle=object(), dimension=3, grid_delta=0.1, material_order=(10,)),
+            geometry=LevelSetState(handle=object(), dimension=3, grid_delta=0.1),
         )
         with self.assertRaises(ExecutionResolutionError):
             resolve_execution(_request(fixture, state=state), fixture.registry, fixture.provider)
@@ -409,7 +435,7 @@ class ExecutionEntryTest(unittest.TestCase):
         fixture = _fixture()
         state = dataclasses.replace(
             fixture.state,
-            geometry=LevelSetState(handle=object(), dimension=2, grid_delta=0.2, material_order=(10,)),
+            geometry=LevelSetState(handle=object(), dimension=2, grid_delta=0.2),
         )
         with self.assertRaises(ExecutionResolutionError):
             resolve_execution(_request(fixture, state=state), fixture.registry, fixture.provider)
@@ -456,6 +482,36 @@ class ExecutionEntryTest(unittest.TestCase):
                 StateDelta(voxels=VoxelState(grid=grid)),
                 capabilities,
             )
+
+    def test_materials_delta_is_committed_when_declared(self) -> None:
+        fixture = _fixture()
+        variant = MaterialsDeltaVariant()
+        fixture.registry.register_variant(VariantRegistration(process_id=fixture.spec.id, variant=variant))
+        outcome = run_step(
+            fixture.registry,
+            fixture.provider,
+            fixture.spec.id,
+            "materials-delta",
+            DummyParams(),
+            fixture.context,
+            fixture.state,
+        )
+        self.assertEqual(outcome.state.materials.order, (10, 20))
+        self.assertEqual(outcome.state.materials.name_for(20), "SiO2")
+        self.assertIs(outcome.state.geometry, fixture.state.geometry)
+
+    def test_materials_delta_without_write_declaration_is_rejected(self) -> None:
+        fixture = _fixture()
+        variant = MaterialsDeltaVariant(declare_write=False)
+        fixture.registry.register_variant(VariantRegistration(process_id=fixture.spec.id, variant=variant))
+        plan = resolve_execution(
+            _request(fixture, variant_id="materials-delta"),
+            fixture.registry,
+            fixture.provider,
+        )
+        with self.assertRaises(ExecutionResolutionError) as caught:
+            execute_plan(plan)
+        self.assertIn("materials", str(caught.exception))
 
 
 if __name__ == "__main__":

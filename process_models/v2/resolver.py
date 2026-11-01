@@ -65,7 +65,7 @@ class ExecutionRequest:
 class ExecutionOutcome:
     """The committed state plus the :class:`StepResult` that produced it.
 
-    ``state`` is what the adapter committed from ``result.state``; outputs,
+    ``state`` is what the adapter committed from ``result.delta``; outputs,
     metadata, and warnings stay on the result and are read through the
     delegating properties below.
     """
@@ -76,7 +76,7 @@ class ExecutionOutcome:
 
     @property
     def delta(self) -> StateDelta:
-        return self.result.state
+        return self.result.delta
 
     @property
     def metadata(self) -> dict[str, object]:
@@ -133,6 +133,25 @@ class ExecutionPlan:
             "adapter": self.state_adapter.id,
         }
 
+    def identity_json(self) -> dict[str, str]:
+        """Return the JSON-boundary identity in camelCase.
+
+        ``identity()`` stays the internal snake_case key set; storage and API
+        documents use this stable camelCase form.
+        """
+        identity = self.identity()
+        return {
+            "processId": identity["process_id"],
+            "processVersion": identity["process_version"],
+            "variantId": identity["variant_id"],
+            "variantVersion": identity["variant_version"],
+            "implementationHash": identity["implementation_hash"],
+            "engineId": identity["engine_id"],
+            "engineVersion": identity["engine_version"],
+            "engineFingerprint": identity["engine_fingerprint"],
+            "adapter": identity["adapter"],
+        }
+
     def run(self) -> ExecutionOutcome:
         """Execute this plan, equivalent to ``execute_plan(self)``."""
         return execute_plan(self)
@@ -147,9 +166,9 @@ def resolve_execution(
     """Resolve ``request`` to an :class:`ExecutionPlan` or raise.
 
     Checks, in order: registry identity, parameter type, dimension, required
-    state representations, material-order consistency, variant validation, and
-    engine availability. A failed check raises :class:`ExecutionResolutionError`
-    without retrying a different variant or engine.
+    state representations, variant validation, and engine availability. A
+    failed check raises :class:`ExecutionResolutionError` without retrying a
+    different variant or engine.
     """
     resolved = registry.get_variant(
         request.process_id,
@@ -182,8 +201,6 @@ def resolve_execution(
             f"variant {process.id!r}/{variant.variant_id!r} requires state kinds {missing}, "
             f"but the process state does not provide them"
         )
-
-    _check_materials(request.state)
 
     issues = list(variant.variant.validate(request.context, request.params))
     errors = [issue for issue in issues if issue.severity == "error"]
@@ -219,7 +236,7 @@ def execute_plan(plan: ExecutionPlan) -> ExecutionOutcome:
     This is the single execution entry point: it uses only the plan's own
     request (state, params, context), passes the acquired engine lease to the
     variant explicitly, materializes any derived representation, and commits
-    ``result.state``. It deliberately does not checkpoint or roll back;
+    ``result.delta``. It deliberately does not checkpoint or roll back;
     variants that declare ``mutates_input=True`` must be checkpointed by the
     caller before this function is invoked.
     """
@@ -237,7 +254,7 @@ def execute_plan(plan: ExecutionPlan) -> ExecutionOutcome:
             f"variant {plan.process.id!r}/{plan.variant.variant_id!r} returned "
             f"{type(result).__name__}, expected StepResult"
         )
-    committed = plan.state_adapter.commit(prepared, result.state, plan.variant.capabilities)
+    committed = plan.state_adapter.commit(prepared, result.delta, plan.variant.capabilities)
     return ExecutionOutcome(plan=plan, state=committed, result=result)
 
 
@@ -302,20 +319,6 @@ def _state_provides(state: ProcessState, kind: StateKind, adapter: StateAdapter)
     if kind != "voxels" or kind not in adapter.provides:
         return False
     return state.has("geometry")
-
-
-def _check_materials(state: ProcessState) -> None:
-    """Reject a state whose material order contradicts its geometry."""
-    geometry = state.geometry
-    if geometry is None or not geometry.material_order:
-        return
-    if not state.materials.order:
-        return
-    if tuple(geometry.material_order) != tuple(state.materials.order):
-        raise ExecutionResolutionError(
-            f"geometry material order {list(geometry.material_order)} does not match "
-            f"state material order {list(state.materials.order)}"
-        )
 
 
 def _format_issues(process_id: str, variant_id: str, issues: list[Issue]) -> str:

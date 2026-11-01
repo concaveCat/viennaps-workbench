@@ -33,6 +33,7 @@ from process_models.v2 import (
     LevelSetState,
     MaterialState,
     MetrologyRecord,
+    ModelDescriptor,
     OutputSet,
     ProcessContext,
     ProcessRegistry,
@@ -106,6 +107,12 @@ _STRUCTURED_CAPS = VariantCapabilities(
     output_kinds=("metrology", "artifact:profile"),
 )
 
+_MATERIAL_CAPS = VariantCapabilities(
+    dimensions=(2, 3),
+    reads=frozenset({"geometry"}),
+    writes=frozenset({"geometry", "materials"}),
+)
+
 
 class DummyVariant:
     variant_id = "dummy"
@@ -124,7 +131,7 @@ class DummyVariant:
     def execute(self, state: ProcessState, params: BaseModel, ctx: ProcessContext, engine: object) -> StepResult:
         self.execute_calls += 1
         self.last_engine = engine
-        return StepResult(state=StateDelta())
+        return StepResult(delta=StateDelta())
 
 
 class DummyVariantV2(DummyVariant):
@@ -184,6 +191,37 @@ def _registration(
     return VariantRegistration(process_id=process_id, variant=variant)  # type: ignore[arg-type]
 
 
+def _hook_spec(
+    *,
+    process_id: str = "dummy.match",
+    version: str = "1.0.0",
+    default_variant: str | None = None,
+    parse_step: object = None,
+) -> ProcessSpec:
+    return ProcessSpec(
+        id=process_id,
+        version=version,
+        label="Dummy matched process",
+        params_model=DummyParams,
+        dimensions=(2, 3),
+        operations=("deposit",),
+        default_variant=default_variant,
+        parse_step=parse_step,  # type: ignore[arg-type]
+    )
+
+
+def _parser(
+    result: DummyParams | None,
+    calls: list[tuple[dict, dict]] | None = None,
+):
+    def parse_step(project: dict, step: dict) -> DummyParams | None:
+        if calls is not None:
+            calls.append((project, step))
+        return result
+
+    return parse_step
+
+
 def _static_engine(
     *,
     kind: str = "native",
@@ -213,7 +251,7 @@ def _state(
     materials: MaterialState | None = None,
 ) -> ProcessState:
     return ProcessState(
-        geometry=LevelSetState(handle=object(), dimension=dimension, grid_delta=0.5, material_order=material_order),
+        geometry=LevelSetState(handle=object(), dimension=dimension, grid_delta=0.5),
         materials=materials if materials is not None else MaterialState(order=material_order, names={0: "Si"}),
     )
 
@@ -322,16 +360,15 @@ class StateTest(unittest.TestCase):
             MaterialState(order=(0, 1), names={0: "Si", 1: "Si"})
 
     def test_levelset_state_validation(self) -> None:
-        state = LevelSetState(handle=object(), dimension=3, grid_delta=0.25, material_order=(0, 1))
+        state = LevelSetState(handle=object(), dimension=3, grid_delta=0.25)
         self.assertEqual(state.dimension, 3)
+        self.assertFalse(hasattr(state, "material_order"))
         with self.assertRaises(ValueError):
             LevelSetState(handle=object(), dimension=4, grid_delta=0.5)
         with self.assertRaises(ValueError):
             LevelSetState(handle=object(), dimension=2, grid_delta=0.0)
         with self.assertRaises(ValueError):
             LevelSetState(handle=object(), dimension=2, grid_delta=float("nan"))
-        with self.assertRaises(ValueError):
-            LevelSetState(handle=object(), dimension=2, grid_delta=0.5, material_order=(-1,))
 
     def test_process_state_is_frozen_and_has_no_engine_or_meta(self) -> None:
         state = _state()
@@ -351,7 +388,10 @@ class StateTest(unittest.TestCase):
     def test_process_state_has_require_and_missing_error(self) -> None:
         empty = ProcessState()
         self.assertFalse(empty.has("geometry"))
-        self.assertFalse(empty.has("materials"))
+        # Materials are always present, even when the order is empty.
+        self.assertTrue(empty.has("materials"))
+        self.assertIs(empty.require("materials"), empty.materials)
+        self.assertEqual(empty.materials.order, ())
         self.assertFalse(empty.has("layers"))
         self.assertFalse(empty.has("fields"))
         self.assertFalse(empty.has("voxels"))
@@ -374,10 +414,11 @@ class StateTest(unittest.TestCase):
     def test_state_delta_is_empty_covers_every_flow_representation(self) -> None:
         self.assertEqual(
             {field.name for field in dataclasses.fields(StateDelta)},
-            {"geometry", "layers", "fields", "voxels"},
+            {"geometry", "materials", "layers", "fields", "voxels"},
         )
         self.assertTrue(StateDelta().is_empty())
         self.assertFalse(StateDelta(geometry=LevelSetState(handle=object(), dimension=2, grid_delta=0.5)).is_empty())
+        self.assertFalse(StateDelta(materials=MaterialState(order=(0,))).is_empty())
         self.assertFalse(StateDelta(layers=_layers()).is_empty())
         self.assertFalse(StateDelta(fields=_cellset()).is_empty())
         self.assertFalse(StateDelta(voxels=VoxelState(grid=FakeGrid())).is_empty())
@@ -639,29 +680,29 @@ class OutputSetTest(unittest.TestCase):
             OutputSet(artifacts=("not-an-artifact",))  # type: ignore[arg-type]
 
     def test_step_result_separates_state_from_report_data(self) -> None:
-        defaults = StepResult(state=StateDelta())
+        defaults = StepResult(delta=StateDelta())
         self.assertEqual(dict(defaults.metadata), {})
         self.assertEqual(defaults.warnings, [])
         self.assertEqual(defaults.outputs, OutputSet())
-        self.assertTrue(defaults.state.is_empty())
+        self.assertTrue(defaults.delta.is_empty())
 
         record = MetrologyRecord(metric="thickness", value=3.0, unit="nm")
         artifact = Artifact(kind="profile", name="depth.profile")
         result = StepResult(
-            state=StateDelta(layers=_layers()),
+            delta=StateDelta(layers=_layers()),
             outputs=OutputSet(metrology=(record,), artifacts=(artifact,)),
             metadata={"model": "dummy"},
             warnings=["clipped"],
         )
-        self.assertFalse(result.state.is_empty())
+        self.assertFalse(result.delta.is_empty())
         self.assertEqual(result.metadata["model"], "dummy")
         self.assertEqual(result.warnings, ["clipped"])
         self.assertEqual(result.outputs.metrology[0].metric, "thickness")
         self.assertEqual([item.name for item in result.outputs.artifacts], ["depth.profile"])
         # Report data never leaks into the flow delta.
-        self.assertIsNone(result.state.geometry)
-        self.assertIsNone(result.state.fields)
-        self.assertIsNone(result.state.voxels)
+        self.assertIsNone(result.delta.geometry)
+        self.assertIsNone(result.delta.fields)
+        self.assertIsNone(result.delta.voxels)
 
 
 # ---------------------------------------------------------------------------
@@ -802,6 +843,23 @@ class ContractRegistryTest(unittest.TestCase):
 
         with self.assertRaises(TypeError):
             VariantRegistration(process_id="dummy.deposit", variant=BadHashVariant())
+
+    def test_variant_registration_requires_callable_validate_and_execute(self) -> None:
+        class NoValidateVariant(DummyVariant):
+            validate = None  # type: ignore[assignment]
+
+        with self.assertRaises(TypeError):
+            VariantRegistration(process_id="dummy.deposit", variant=NoValidateVariant())
+
+        class NoExecuteVariant(DummyVariant):
+            execute = "not-callable"  # type: ignore[assignment]
+
+        with self.assertRaises(TypeError):
+            VariantRegistration(process_id="dummy.deposit", variant=NoExecuteVariant())
+
+        registration = VariantRegistration(process_id="dummy.deposit", variant=DummyVariant())
+        self.assertTrue(callable(registration.variant.validate))
+        self.assertTrue(callable(registration.variant.execute))
 
     def test_registry_multiple_process_versions_and_pins(self) -> None:
         registry = ProcessRegistry()
@@ -957,6 +1015,134 @@ class ContractRegistryTest(unittest.TestCase):
             computed.list_variants("dummy.deposit")[0].implementation_hash,
             compute_implementation_hash(DummyVariant()),
         )
+
+
+# ---------------------------------------------------------------------------
+# process spec hooks, step parsing, default variants
+# ---------------------------------------------------------------------------
+class ProcessSpecHooksTest(unittest.TestCase):
+    def test_spec_hook_defaults_and_validation(self) -> None:
+        defaults = _spec()
+        self.assertIsNone(defaults.default_variant)
+        self.assertIsNone(defaults.parse_step)
+
+        def parse_step(project: dict, step: dict) -> DummyParams:
+            return DummyParams(amount=float(step.get("amount", 1.0)))
+
+        spec = _hook_spec(default_variant="native", parse_step=parse_step)
+        self.assertEqual(spec.default_variant, "native")
+        self.assertIs(spec.parse_step, parse_step)
+        self.assertEqual(spec.parse_step({}, {"amount": 3}), DummyParams(amount=3.0))
+
+        # Hooks are runtime callables, never serializable identity.
+        descriptor_fields = {field.name for field in dataclasses.fields(ModelDescriptor)}
+        self.assertFalse({"default_variant", "parse_step"} & descriptor_fields)
+        registry = ProcessRegistry()
+        registry.register_process(spec)
+        descriptor = registry.list_processes()[0]
+        self.assertEqual(descriptor.id, "dummy.match")
+        self.assertNotIn("parse_step", json.dumps(dataclasses.asdict(descriptor)))
+
+    def test_spec_hook_validation(self) -> None:
+        for value in ("", " ", 3):
+            with self.assertRaises(ValueError):
+                _hook_spec(default_variant=value)  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            _hook_spec(parse_step="not-callable")
+
+    def test_resolve_step_returns_none_without_a_match(self) -> None:
+        registry = ProcessRegistry()
+        registry.register_process(_spec("1.0.0"))
+        registry.register_process(_hook_spec(process_id="dummy.match", parse_step=_parser(None)))
+        self.assertIsNone(registry.resolve_step({}, {"model": "isotropic"}))
+
+    def test_resolve_step_returns_the_only_match_with_parsed_params(self) -> None:
+        calls: list[tuple[dict, dict]] = []
+        registry = ProcessRegistry()
+        registry.register_process(_hook_spec(parse_step=_parser(None)))
+        registry.register_process(
+            _hook_spec(process_id="dummy.real", parse_step=_parser(DummyParams(amount=2.0), calls))
+        )
+        project = {"dimension": 2}
+        step = {"model": "isotropic", "operation": "etch"}
+
+        resolved = registry.resolve_step(project, step)
+
+        self.assertIsNotNone(resolved)
+        assert resolved is not None
+        spec, params = resolved
+        self.assertEqual(spec.id, "dummy.real")
+        self.assertEqual(params, DummyParams(amount=2.0))
+        self.assertEqual(calls, [(project, step)])
+
+    def test_resolve_step_parses_once_per_candidate(self) -> None:
+        calls: list[tuple[dict, dict]] = []
+        registry = ProcessRegistry()
+        registry.register_process(
+            _hook_spec(process_id="dummy.only", parse_step=_parser(DummyParams(amount=4.0), calls))
+        )
+
+        resolved = registry.resolve_step({"name": "p"}, {"amount": 4})
+
+        assert resolved is not None
+        self.assertEqual(resolved[1], DummyParams(amount=4.0))
+        self.assertEqual(len(calls), 1)
+
+    def test_resolve_step_checks_only_the_newest_process_version(self) -> None:
+        matched_old = ProcessRegistry()
+        matched_old.register_process(_hook_spec(version="1.0.0", parse_step=_parser(DummyParams())))
+        matched_old.register_process(_hook_spec(version="2.0.0", parse_step=_parser(None)))
+        self.assertIsNone(matched_old.resolve_step({}, {}))
+
+        matched_new = ProcessRegistry()
+        matched_new.register_process(_hook_spec(version="1.0.0", parse_step=_parser(None)))
+        matched_new.register_process(_hook_spec(version="2.0.0", parse_step=_parser(DummyParams())))
+        resolved = matched_new.resolve_step({}, {})
+        self.assertIsNotNone(resolved)
+        assert resolved is not None
+        self.assertEqual(resolved[0].version, "2.0.0")
+
+    def test_resolve_step_rejects_ambiguous_matches(self) -> None:
+        registry = ProcessRegistry()
+        registry.register_process(_hook_spec(process_id="dummy.a", parse_step=_parser(DummyParams())))
+        registry.register_process(_hook_spec(process_id="dummy.b", parse_step=_parser(DummyParams())))
+
+        with self.assertRaises(ValueError) as caught:
+            registry.resolve_step({}, {})
+        message = str(caught.exception)
+        self.assertIn("dummy.a", message)
+        self.assertIn("dummy.b", message)
+
+    def test_default_variant_id_prefers_the_explicit_default(self) -> None:
+        registry = ProcessRegistry()
+        registry.register_process(_hook_spec(process_id="dummy.deposit", default_variant="native"))
+        registry.register_variant(_registration(DummyVariant()))
+        registry.register_variant(_registration(VoxelVariant()))
+
+        self.assertEqual(registry.default_variant_id("dummy.deposit"), "native")
+
+    def test_default_variant_id_uses_the_only_registered_variant(self) -> None:
+        registry = ProcessRegistry()
+        registry.register_process(_spec())
+        registry.register_variant(_registration(DummyVariant()))
+        self.assertEqual(registry.default_variant_id("dummy.deposit"), "dummy")
+
+        # Multiple versions of the same variant id are still one choice.
+        registry.register_variant(_registration(DummyVariantV2()))
+        self.assertEqual(registry.default_variant_id("dummy.deposit"), "dummy")
+
+    def test_default_variant_id_requires_a_choice(self) -> None:
+        registry = ProcessRegistry()
+        registry.register_process(_spec())
+        with self.assertRaises(KeyError):
+            registry.default_variant_id("dummy.deposit")
+        with self.assertRaises(KeyError):
+            registry.default_variant_id("missing")
+
+        registry.register_variant(_registration(DummyVariant()))
+        registry.register_variant(_registration(VoxelVariant()))
+        with self.assertRaises(KeyError):
+            registry.default_variant_id("dummy.deposit")
 
 
 # ---------------------------------------------------------------------------
@@ -1134,22 +1320,25 @@ class ResolverTest(unittest.TestCase):
             field_provider,
         )
 
-    def test_resolver_rejects_material_order_mismatch(self) -> None:
+    def test_resolver_accepts_materials_as_the_only_material_source(self) -> None:
+        # Material order lives only on ProcessState.materials; geometry no
+        # longer carries a competing order for the resolver to check.
         registry, provider, _ = _resolver_fixture()
-        state = _state(material_order=(0, 1), materials=MaterialState(order=(0,)))
-        with self.assertRaises(ExecutionResolutionError) as caught:
-            resolve_execution(
-                ExecutionRequest(
-                    process_id="dummy.deposit",
-                    variant_id="dummy",
-                    params=DummyParams(),
-                    context=_context(),
-                    state=state,
-                ),
-                registry,
-                provider,
-            )
-        self.assertIn("material order", str(caught.exception))
+        state = _state(materials=MaterialState(order=(0,)))
+        self.assertFalse(hasattr(state.geometry, "material_order"))
+        plan = resolve_execution(
+            ExecutionRequest(
+                process_id="dummy.deposit",
+                variant_id="dummy",
+                params=DummyParams(),
+                context=_context(),
+                state=state,
+            ),
+            registry,
+            provider,
+        )
+        self.assertEqual(plan.process.id, "dummy.deposit")
+        self.assertEqual(state.require("materials").order, (0,))
 
     def test_resolver_uses_state_materials_not_context(self) -> None:
         registry, provider, _ = _resolver_fixture()
@@ -1274,18 +1463,19 @@ class AdapterTest(unittest.TestCase):
 
         write.assert_called_once_with(state.geometry.handle, grid)
         self.assertIs(committed.geometry.handle, new_handle)
-        self.assertEqual(committed.geometry.material_order, (0, 1))
         self.assertEqual(committed.geometry.dimension, state.geometry.dimension)
         self.assertEqual(committed.geometry.grid_delta, state.geometry.grid_delta)
         self.assertIsNone(committed.voxels)
-        self.assertEqual(committed.materials.order, (0, 1))
+        # A voxel write-back replaces geometry only; materials are canonical
+        # and unchanged unless the variant also sends a materials delta.
+        self.assertIs(committed.materials, state.materials)
         # Input state is untouched.
         self.assertIsNotNone(state.voxels)
         self.assertIsNot(state.geometry, committed.geometry)
 
     def test_commit_geometry_delta_wins_over_voxels_and_applies_fields(self) -> None:
         state = dataclasses.replace(_state(), voxels=VoxelState(grid=FakeGrid()))
-        new_geometry = LevelSetState(handle=object(), dimension=2, grid_delta=0.5, material_order=(0, 1))
+        new_geometry = LevelSetState(handle=object(), dimension=2, grid_delta=0.5)
         fields = _cellset()
         delta = StateDelta(geometry=new_geometry, voxels=VoxelState(grid=FakeGrid()), fields=fields)
 
@@ -1296,8 +1486,29 @@ class AdapterTest(unittest.TestCase):
         self.assertIs(committed.geometry, new_geometry)
         self.assertIs(committed.fields, fields)
         self.assertIsNone(committed.voxels)
-        self.assertEqual(committed.materials.order, (0, 1))
-        self.assertEqual(committed.materials.name_for(0), "Si")
+        self.assertIs(committed.materials, state.materials)
+
+    def test_commit_geometry_delta_does_not_silently_change_materials(self) -> None:
+        state = _state(materials=MaterialState(order=(0,), names={0: "Si"}))
+        new_geometry = LevelSetState(handle=object(), dimension=2, grid_delta=0.5)
+
+        committed = DefaultStateAdapter().commit(state, StateDelta(geometry=new_geometry), _DUMMY_CAPS)
+
+        self.assertIs(committed.geometry, new_geometry)
+        self.assertIs(committed.materials, state.materials)
+        self.assertEqual(committed.materials.order, (0,))
+
+    def test_commit_materials_delta_requires_the_write_declaration(self) -> None:
+        state = _state()
+        materials = MaterialState(order=(0, 1), names={0: "Si", 1: "SiO2"})
+
+        with self.assertRaises(ExecutionResolutionError):
+            DefaultStateAdapter().commit(state, StateDelta(materials=materials), _DUMMY_CAPS)
+
+        committed = DefaultStateAdapter().commit(state, StateDelta(materials=materials), _MATERIAL_CAPS)
+        self.assertIs(committed.materials, materials)
+        self.assertIs(committed.geometry, state.geometry)
+        self.assertNotEqual(committed.materials.order, state.materials.order)
 
     def test_commit_rejects_voxel_delta_when_write_is_not_declared(self) -> None:
         state = _state()

@@ -6,8 +6,8 @@ Layout (all paths below ``<root>``)::
     steps/<step_id>/
       state.json               # schema v1, see below
       fields.npz               # only when a CellSetState is present
-      outputs.json             # OutputSet (metrology + artifacts)
-      plan.json                # ExecutionPlan.identity()
+      outputs.json             # OutputSet (metrology + artifacts), schema v1
+      plan.json                # ExecutionPlan.identity_json() (camelCase)
       geometry.vpsd            # optional native geometry, written by the executor
 
 ``state.json`` schema v1::
@@ -17,7 +17,7 @@ Layout (all paths below ``<root>``)::
       "stepId": "...",
       "materials": {"order": [10, 30], "names": {"10": "Si", "30": "SiO2"}},
       "geometry": {"ref": "geometry.vpsd" | null, "dimension": 2,
-                   "gridDelta": 0.2, "materialOrder": [10, 30]} | null,
+                   "gridDelta": 0.2} | null,
       "layers": {"layers": [{"layerId": "...", "materialId": 30, "name": "...",
                              "sourceStep": "...", "thickness": 0.1,
                              "metadata": {}}]} | null,
@@ -33,6 +33,22 @@ Layout (all paths below ``<root>``)::
 The ``materialIds`` descriptor is only written when ``CellSetState.material_ids``
 is set; the array itself lives in ``fields.npz`` under ``material_ids``. Named
 field arrays are stored as ``field_000``, ``field_001``, ... in JSON field order.
+
+``outputs.json`` schema v1::
+
+    {
+      "schemaVersion": 1,
+      "metrology": [{"metric": "...", "value": 1.0, "unit": "nm",
+                     "region": null, "method": "plugin",
+                     "uncertainty": null}],
+      "artifacts": [{"kind": "json", "name": "...", "path": null,
+                     "schemaVersion": 1, "metadata": {}}]
+    }
+
+The two schema versions are independent: ``state.json`` is governed by
+:data:`STATE_SCHEMA_VERSION` and ``outputs.json`` by
+:data:`OUTPUTS_SCHEMA_VERSION`. Bumping one never invalidates files written by
+the other, and both are validated on load against their own constant.
 
 Rules:
 
@@ -76,6 +92,7 @@ if TYPE_CHECKING:
 __all__ = ["StateStore", "StateStoreError"]
 
 STATE_SCHEMA_VERSION = 1
+OUTPUTS_SCHEMA_VERSION = 1
 STATE_FILE = "state.json"
 FIELDS_FILE = "fields.npz"
 OUTPUTS_FILE = "outputs.json"
@@ -182,14 +199,16 @@ def _materials_from_payload(payload: Any) -> MaterialState:
 
 
 def _geometry_payload(geometry: LevelSetState | None, geometry_ref: str | None) -> dict[str, Any] | None:
-    """Serialize geometry metadata plus the optional on-disk reference."""
+    """Serialize geometry metadata plus the optional on-disk reference.
+
+    Material order lives only in ``materials``; it is never duplicated here.
+    """
     if geometry is None:
         return None
     return {
         "ref": geometry_ref,
         "dimension": int(geometry.dimension),
         "gridDelta": float(geometry.grid_delta),
-        "materialOrder": [int(material_id) for material_id in geometry.material_order],
     }
 
 
@@ -333,9 +352,14 @@ def _fields_from_payload(directory: Path, payload: Any) -> CellSetState | None:
 
 
 def _outputs_payload(outputs: OutputSet) -> dict[str, Any]:
-    """Serialize an :class:`OutputSet` (metrology records and artifacts)."""
+    """Serialize an :class:`OutputSet` (metrology records and artifacts).
+
+    ``schemaVersion`` is the *storage* format version
+    (:data:`OUTPUTS_SCHEMA_VERSION`), not ``OutputSet.schema_version``; it is
+    deliberately independent of :data:`STATE_SCHEMA_VERSION`.
+    """
     return {
-        "schemaVersion": int(outputs.schema_version),
+        "schemaVersion": int(OUTPUTS_SCHEMA_VERSION),
         "metrology": [
             {
                 "metric": record.metric,
@@ -365,8 +389,8 @@ def _outputs_from_payload(payload: Any) -> OutputSet:
     if not isinstance(payload, dict):
         raise StateStoreError(f"outputs payload must be a JSON object, got {type(payload).__name__}")
     version = payload.get("schemaVersion")
-    if version != STATE_SCHEMA_VERSION:
-        raise StateStoreError(f"unsupported outputs schemaVersion {version!r}, expected {STATE_SCHEMA_VERSION}")
+    if version != OUTPUTS_SCHEMA_VERSION:
+        raise StateStoreError(f"unsupported outputs schemaVersion {version!r}, expected {OUTPUTS_SCHEMA_VERSION}")
     try:
         return OutputSet(
             schema_version=version,
@@ -482,7 +506,11 @@ class StateStore:
         )
 
     def save_outputs(self, step_id: str, outputs: OutputSet) -> dict[str, Any]:
-        """Persist ``outputs`` for ``step_id`` and return the ``outputs.json`` payload."""
+        """Persist ``outputs`` for ``step_id`` and return the ``outputs.json`` payload.
+
+        The written ``schemaVersion`` is :data:`OUTPUTS_SCHEMA_VERSION`; see
+        :meth:`load_outputs` for the matching validation.
+        """
         step_id = _validate_step_id(step_id)
         payload = _outputs_payload(outputs)
         text = _dumps(payload, what=f"outputs for step {step_id!r}")
@@ -490,15 +518,20 @@ class StateStore:
         return payload
 
     def load_outputs(self, step_id: str) -> OutputSet:
-        """Rebuild an :class:`OutputSet` from ``outputs.json``."""
+        """Rebuild an :class:`OutputSet` from ``outputs.json``.
+
+        Rejects any file whose ``schemaVersion`` is not
+        :data:`OUTPUTS_SCHEMA_VERSION`; this is unrelated to
+        :data:`STATE_SCHEMA_VERSION`.
+        """
         step_id = _validate_step_id(step_id)
         payload = _read_json(self.step_dir(step_id) / OUTPUTS_FILE, what=f"outputs for step {step_id!r}")
         return _outputs_from_payload(payload)
 
     def save_plan(self, step_id: str, plan: ExecutionPlan) -> dict[str, str]:
-        """Persist ``plan.identity()`` as ``plan.json`` and return it."""
+        """Persist ``plan.identity_json()`` as ``plan.json`` and return it."""
         step_id = _validate_step_id(step_id)
-        identity = dict(plan.identity())
+        identity = dict(plan.identity_json())
         text = _dumps(identity, what=f"plan identity for step {step_id!r}")
         _atomic_write_text(self.step_dir(step_id) / PLAN_FILE, text)
         return identity
@@ -534,7 +567,6 @@ class StateStore:
                 handle=handle,
                 dimension=payload["dimension"],
                 grid_delta=payload["gridDelta"],
-                material_order=tuple(payload.get("materialOrder") or ()),
             )
         except (AttributeError, KeyError, TypeError, ValueError) as error:
             raise StateStoreError(f"invalid geometry payload for step {step_id!r}: {error}") from error

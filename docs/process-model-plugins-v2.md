@@ -1,4 +1,4 @@
-# 工艺模型插件 v2.2：设计/实现说明（结构化输出）
+# 工艺模型插件 v2.4：设计/实现说明（结构化输出 + 运行时基础）
 
 > 范围：`process_models/v2/`。v1（`process_models/contract.py`、`registry.py`、
 > `voxel.py`、`surrogate/voxel_probe.py`）是**冻结的 legacy**，不再演进也**不改动**；
@@ -6,16 +6,18 @@
 > **默认关闭的影子校验**形式存在，见 §7.5（由集成切片加入，不改变生产执行路径）；
 > bridge 的 registry 由 manifest + `plugins.lock` 构建（§2.2），不再在代码里点名注册。
 >
-> 本文描述 **v2.2** 的契约与边界。v2.2 只做一件事：把 **flow state**（下一步要消费的
-> 状态）与 **report outputs**（人可以看、可以比较、可以落盘的报告数据）从同一个
-> `StateDelta` 里拆开，见 §0.3。v2.1 的分层、引擎、适配器、replay 身份与插件生命周期
-> 全部保留。文中标注 “v2.1” 的段落是 v2.2 之前的历史说明；与 v2.2 不冲突的部分仍是
-> 当前基线。
+> 本文描述当前 **v2.4** 契约与边界。v2.2 引入了 **flow state**（下一步要消费的状态）
+> 与 **report outputs**（人可以看、可以比较、可以落盘的报告数据）的拆分，见 §0.3；
+> v2.4 在 runtime/storage/conformance 之上完成 3C 清理：worker 单步 dispatch 只走
+> `ProcessSpec.parse_step`，插件包拆出 `step.py`，ViennaPS helper 移到
+> `process_models/v2/engines/`。v2.1/v2.2 的分层、引擎、适配器、replay 身份与插件
+> 生命周期全部保留。文中标注 “v2.1”/“v2.2” 的段落是历史说明；与当前代码冲突时以
+> 代码为准。
 >
 > 凡是 v2 包内没有对应模块/生产者的能力，文中一律标为“未实现”，不把设计意图写成
-> 已完成状态。v2.2 这一片交付的是**契约 + 测试**，不是新的工艺模型。
+> 已完成状态。v2.4 交付的是**契约 + 运行时基础 + 测试**，不是新的工艺模型。
 >
-> 之后的 runtime/storage/conformance 切片在不改契约类型的前提下加入
+> runtime/storage/conformance 切片在不改契约类型的前提下加入
 > `storage.py` / `executor.py` / `conformance.py` / `output_schema.py`：它交付运行时
 > 基础（跨步骤 state/output 落盘、通用 executor、一致性检查、输出契约描述），
 > 仍不接 backend/API/UI。落盘布局、组件职责与剩余缺口见 §0.4 和
@@ -27,7 +29,7 @@
 > v2.1 是 v2 的**收缩**而非扩张：字段更少、依赖更显式、样板代码更少，执行语义不变。
 > v2.2 在这条线上继续加**类型**，而不是加执行路径：`StepResult` 取代裸 `StateDelta`
 > 作为 `execute()` 的返回值，但没有新增 field/cell-set 生产者、没有新工艺、
-> 没有 API/UI。
+> 没有 API/UI。v2.4 只清理实现边界（dispatch/包布局/引擎 helper），不新增工艺能力。
 
 ## 0. 一页结论
 
@@ -39,11 +41,11 @@ v1 把四件事塞进了同一层：进程身份、实现注册、原生引擎�
 | --- | --- | --- |
 | 身份 | `ProcessPlugin`（schema + 变体表 + 版本） | `ProcessSpec`（只有 schema/语义） + `VariantRegistration`（只有实现） |
 | 引擎 | 隐含在 `ProcessState.ps` | `Engine` / `EngineLease` / `EngineRequirement`，显式租约与指纹 |
-| 状态 | `ProcessState.ps/domain` + `ProcessResult.domain` | `ProcessState{geometry, materials, layers, fields, voxels}` + `StateDelta`（只有 flow state） |
+| 状态 | `ProcessState.ps/domain` + `ProcessResult.domain` | `ProcessState{geometry, materials, layers, fields, voxels}` + `StateDelta{geometry, materials, layers, fields, voxels}`（只有 flow state；`materials` 是材料顺序唯一来源） |
 | 报告输出 | 混在 `ProcessResult.metadata/outputs` | `StepResult.outputs: OutputSet`（`metrology` + `artifacts`），与 flow state 分离 |
 | 表示转换 | 变体自己调 `read_voxels`/`write_voxels` | `StateAdapter.prepare/commit`，变体只看见自己声明的表示 |
-| 解析 | `registry.resolve()` 只查表 | `resolve_execution()` 做参数/能力/引擎/适配器全链路准入并产出 `ExecutionPlan` |
-| 实现哈希 | `inspect.getsource(type(variant))` | 变体模块的**全部 .py 文件字节** + 类 qualname |
+| 解析 | `registry.resolve()` 只查表 | `resolve_execution()` 做参数/能力/引擎/适配器全链路准入并产出 `ExecutionPlan`；`ProcessRegistry.resolve_step()` 用 `ProcessSpec.parse_step` 做单步 dispatch |
+| 实现哈希 | `inspect.getsource(type(variant))` | 插件包**全部 .py 文件字节** + 显式 `implementation_files` + 类 qualname |
 
 ### 0.1 v2.1 相对 v2 的六项简化
 
@@ -75,10 +77,13 @@ state）。v2.1 只做减法：
 下面是一个可注册、可解析、可执行的最小插件。实际原生实现里 `execute` 会用
 `engine.handle` 拿 ViennaPS 句柄；这里只用 `StepResult` / `StateDelta` 说明形状。
 注意 `execute` 返回的是 `StepResult`，不是裸 `StateDelta`：flow state 放进
-`state=`，报告数据放进 `outputs=`。
+`delta=`，报告数据放进 `outputs=`。`parse_step` 是 worker 单步 dispatch 的唯一 hook；
+`default_variant` 决定未显式 pin 变体时用哪个。
 
 ```python
 from __future__ import annotations
+
+from typing import Any, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -99,6 +104,13 @@ class MyParams(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     rate: float = Field(gt=0)
 
+def parse_step(project: Mapping[str, Any], step: Mapping[str, Any]) -> MyParams | None:
+    if step.get("model") != "my_process":
+        return None
+    if step.get("rate") is None:
+        raise ValueError("my_process step requires rate")
+    return MyParams(rate=float(step["rate"]))
+
 class MyVariant:
     variant_id = "native"
     version = "1.0.0"
@@ -110,16 +122,16 @@ class MyVariant:
         determinism="strict",
     )
     engine = EngineRequirement(kind="native", engine_id="viennaps", min_version="4.6.2")
-    implementation_hash = None  # None = 由 registry 按模块字节计算
+    implementation_hash = None  # None = 由 registry 按插件包字节计算
 
     def validate(self, ctx: ProcessContext, params: MyParams) -> list:
         return []
 
     def execute(self, state: ProcessState, params: MyParams, ctx: ProcessContext, engine):
         # engine 是本步租约；原生插件用 engine.handle，surrogate 可以不用。
-        # state= 只放下一步要消费的 flow state；outputs= 只放报告数据。
+        # delta= 只放下一步要消费的 flow state；outputs= 只放报告数据。
         return StepResult(
-            state=StateDelta(),
+            delta=StateDelta(),
             metadata={"rate": params.rate},
         )
 
@@ -131,12 +143,14 @@ def register_my_process(registry: ProcessRegistry) -> None:
         params_model=MyParams,
         dimensions=(2, 3),
         operations=("etch",),
+        default_variant="native",
+        parse_step=parse_step,
     )
     registry.register_process(spec)
     # id/version/capabilities/engine/hash 都从 variant 派生，不重复传。
     registry.register_variant(VariantRegistration(process_id=spec.id, variant=MyVariant()))
 
-# 一步完成 resolve + execute；outcome.plan.identity() 可直接写进 run 记录。
+# 一步完成 resolve + execute；outcome.plan.identity_json() 可直接写进 run 记录。
 outcome = run_step(
     registry,
     provider,
@@ -151,12 +165,12 @@ outcome = run_step(
 需要分两步时用 `plan = resolve_execution(request, registry, provider)`，再
 `outcome = plan.run()`（等价于 `execute_plan(plan)`）。
 
-### 0.3 v2.2：flow state 与 report outputs 分离（本切片）
+### 0.3 v2.2 起：flow state 与 report outputs 分离
 
 v2.1 用一个 `StateDelta` 同时表达两种完全不同的东西：
 
-- **flow state**：下一步要消费的表示（`geometry` / `layers` / `fields` / `voxels`），会被
-  adapter commit 进 `ProcessState`，跨步骤存活；
+- **flow state**：下一步要消费的表示（`geometry` / `materials` / `layers` / `fields` /
+  `voxels`），会被 adapter commit 进 `ProcessState`，跨步骤存活；
 - **report data**：`artifacts` / `metadata` / `warnings`，只给本步的报告、比较、日志和
   落盘用，下一步从不读取。
 
@@ -168,7 +182,7 @@ v2.2 的拆分：
 
 | 返回面 | 类型 | 谁消费 | 生命周期 | 不应放什么 |
 | --- | --- | --- | --- | --- |
-| `StepResult.state` | `StateDelta` | adapter commit → 下一步的 `ProcessState` | 跨步骤 | 计量值、文件路径、日志 |
+| `StepResult.delta` | `StateDelta` | adapter commit → 下一步的 `ProcessState` | 跨步骤 | 计量值、文件路径、日志 |
 | `StepResult.outputs` | `OutputSet` | executor / 报告 / UI / replay 比较；**不回灌下一步执行** | 本步报告 | flow state、大数组本体 |
 | `StepResult.metadata` | `dict[str, Any]` | 本步少量 bookkeeping（实际速率、solver 配置、跳过原因码） | 本步 | 计量、警告、产物、大对象 |
 | `StepResult.warnings` | `list[str]` | 人读；不改状态、不进 identity | 本步 | 结构化数据、错误码 |
@@ -192,15 +206,16 @@ v2.2 的拆分：
 @dataclass
 class StateDelta:
     geometry: LevelSetState | None = None
+    materials: MaterialState | None = None
     layers: LayerState | None = None
     fields: CellSetState | None = None
     voxels: VoxelState | None = None
     # 没有 artifacts / metadata / warnings：delta 只描述 flow state
-    def is_empty(self) -> bool: ...   # 只看 geometry/layers/fields/voxels
+    def is_empty(self) -> bool: ...   # 只看 geometry/materials/layers/fields/voxels
 
 @dataclass
 class StepResult:
-    state: StateDelta                 # 只有 flow state
+    delta: StateDelta                 # 只有 flow state
     outputs: OutputSet = OutputSet()  # 报告输出，默认空
     metadata: dict[str, Any] = {}     # 少量 bookkeeping
     warnings: list[str] = []          # 本步警告
@@ -212,7 +227,7 @@ class OutputSet:
     artifacts: tuple[Artifact, ...] = ()
 ```
 
-`None` 仍然表示“没变”，不是“清空”。`StepResult.state` 为空是合法的：一个只产出
+`None` 仍然表示“没变”，不是“清空”。`StepResult.delta` 为空是合法的：一个只产出
 计量或只做校验的步骤可以返回空的 `StateDelta` 和非空 `OutputSet`。
 
 #### 0.3.2 新增 state 类型：`GridSpec` / `Field` / `CellSetState` / `Layer` / `LayerState`
@@ -365,7 +380,7 @@ class ExecutionOutcome:
     result: StepResult           # execute 的原始返回
 
     @property
-    def delta(self) -> StateDelta: return self.result.state
+    def delta(self) -> StateDelta: return self.result.delta
     @property
     def metadata(self) -> dict[str, Any]: return self.result.metadata
     @property
@@ -379,9 +394,9 @@ class ExecutionOutcome:
 - `execute()` 必须返回 `StepResult`；返回裸 `StateDelta` 是错误（`execute_plan` 会报
   `ExecutionResolutionError`）。
 - `output_kinds` 是**声明式**的：registry 把它抄进 `VariantDescriptor`，executor 记录
-  它，但本切片不强制“声明了就必须产出”。它让 UI/报告知道该期待什么，而不是新增
+  它，但当前不强制“声明了就必须产出”。它让 UI/报告知道该期待什么，而不是新增
   一条准入规则。
-- `ExecutionOutcome` 的 `delta` 现在是 `result.state` 的别名；调用方原来读
+- `ExecutionOutcome` 的 `delta` 现在是 `result.delta` 的别名；调用方原来读
   `outcome.delta.metadata` 的地方必须改成 `outcome.metadata` / `outcome.outputs`。
 
 `DefaultStateAdapter` 对 `layers` / `fields` 的规则：
@@ -393,15 +408,16 @@ class ExecutionOutcome:
 
 - `prepare` 时变体声明要读 `layers`/`fields`、但 state 里没有：直接
   `StateMissingError`，不会凭空构造空层表或空 cell-set。
-- `commit` 对四种可写表示分别做 write check（未在 `writes` 中声明就报错）；
-  `delta.geometry` 优先于 `delta.voxels`；`delta.layers` 与 `delta.fields` 各自独立
-  应用，互不覆盖；输入 `ProcessState` 永远不被原地修改。
+- `commit` 对 `geometry` / `materials` / `layers` / `fields` / `voxels` 分别做 write
+  check（未在 `writes` 中声明就报错）；`delta.geometry` 优先于 `delta.voxels`；
+  `delta.materials`、`delta.layers` 与 `delta.fields` 各自独立应用，互不覆盖；
+  输入 `ProcessState` 永远不被原地修改。
 - resolver 的 `_state_provides` 把 `layers`/`fields` 视为 **stored-only**：只有
   state 里已有才算满足，adapter 的 `provides` 只包含 `"voxels"`。
 
-#### 0.3.5 FinFET 输出到 v2.2 类型的映射
+#### 0.3.5 FinFET 输出到当前类型的映射
 
-| 输出 | 典型内容 | v2.2 落点 |
+| 输出 | 典型内容 | 当前落点 |
 | --- | --- | --- |
 | 表面形貌 | 表面网格、final geometry | flow state 是 `StateDelta.geometry`；网格文件额外报成 `Artifact(kind="surface_mesh")` |
 | 材料 / 层 | dummy gate、spacer、ILD 的身份与厚度 | `StateDelta.layers`（`LayerState`）；层清单表可另报 `Artifact(kind="table")` |
@@ -414,7 +430,7 @@ class ExecutionOutcome:
 这张表是**契约目标**，不是当前能力清单：本切片里没有任何插件会产出上表的
 `MetrologyRecord`、`Artifact`、`LayerState` 或 `CellSetState`（见下一节）。
 
-#### 0.3.6 本切片没有实现
+#### 0.3.6 v2.2 切片没有实现（当前仍适用）
 
 v2.2 交付的是类型、校验和测试；下表按当前基线区分 v2.2 结构化输出切片与后续
 runtime/storage/conformance 切片。标为“基础已落地”的能力属于后者，仍不等于生产接入。
@@ -424,16 +440,16 @@ runtime/storage/conformance 切片。标为“基础已落地”的能力属于�
 | field / cell-set **producer** | 未实现 | 没有插件计算掺杂、损伤、应力或任何 `Field`；类型只被构造和校验 |
 | 原生 cell-set adapter | 未实现 | `DefaultStateAdapter` 对 `fields` 只做“已有则透传/写入”，不做 level-set ↔ cell-set 转换 |
 | stress / device simulator | 未实现 | 没有力学求解器，也没有器件 I-V 仿真；`Artifact(kind="device")` 只是报告类型 |
-| UI schema / API | 未实现 | `output_contract_schema()` 只是 JSON 可序列化的契约描述，没有 HTTP API 或前端字段；项目仍不能引用 v2.2 输出 |
+| UI schema / API | 未实现 | `output_contract_schema()` 只是 JSON 可序列化的契约描述，没有 HTTP API 或前端字段；项目仍不能引用 v2.4 输出 |
 | field 持久化 | 基础已落地 | `StateStore` 写 `state.json` + `fields.npz`（`allow_pickle=False`，拒绝 opaque handle）；仍没有 field producer 或原生 cell-set adapter |
-| 原生 geometry replay | 部分 | `state.json` 记录 `geometryRef`（可选 `geometry.vpsd`）；重载需要调用方提供 `geometry_loader`，store 不内置 loader |
+| 原生 geometry replay | 部分 | `state.json` 记录 `geometry.ref`（可选 `geometry.vpsd`）；重载需要调用方提供 `geometry_loader`，store 不内置 loader |
 | 插件产出计量/产物 | 未实现 | `isotropic` 与 `voxel_probe` 移植后返回**空 `OutputSet`**（只有 `metadata`/`warnings`），不声称已有 metrology/artifact |
 | conformance harness | 基础已落地 | `check_variant()` 检查解析、校验、`StepResult` 形状、输入不可变与 strict determinism；不检查物理 parity |
 | 通用 executor | 基础已落地 | `FlowExecutor` 串联多步 `S_i -> ... -> S_{i+1}`、对 `mutates_input` 做 checkpoint、逐 step 落盘；**未接入 backend** |
 
-因此“v2.2 完成”只意味着：`execute → StepResult`、`OutputSet`、`LayerState`、
-`CellSetState`、`MetrologyRecord`、`Artifact(schema_version)` 的契约与校验成立，
-isotropic/voxel 两个既有插件随之迁移；新增测试的结果单独报告，本文不预先写数字。
+因此“v2.2 结构化输出完成”只意味着：`execute → StepResult`、`OutputSet`、
+`LayerState`、`CellSetState`、`MetrologyRecord`、`Artifact(schema_version)` 的契约与
+校验成立，isotropic/voxel 两个既有插件随之迁移。当前 v2.4 的测试结果见 §9.2。
 
 ### 0.4 Runtime / storage / conformance（运行时基础切片）
 
@@ -453,6 +469,12 @@ S_i -> resolve -> checkpoint (mutates_input) -> prepare -> execute
     -> commit -> S_{i+1} -> store
 ```
 
+`FlowStep` 可 pin `expected_process_version` / `expected_variant_version`；pin 到未注册
+版本直接报错。`FlowExecutor` 在每步结束（含异常）释放 engine lease。`mutates_input`
+步骤在第二步起会再复制一次已经私有的 native geometry；这是**可接受的验证成本**，
+因为重新 resolve 必须校验变体真正执行的副本状态，去掉它会让 copy/alias 错误污染上游
+state 而不是在准入阶段失败。
+
 落盘布局（`<root>` 由调用方指定）：
 
 ```text
@@ -462,7 +484,7 @@ S_i -> resolve -> checkpoint (mutates_input) -> prepare -> execute
     state.json      # schemaVersion 1：materials / geometry ref / layers / field 元数据
     fields.npz      # 仅在有 fields/cell-set 时；field_000, field_001, ...（可选 material_ids）
     outputs.json    # OutputSet：metrology + artifacts
-    plan.json       # plan.identity()
+    plan.json       # plan.identity_json()
     geometry.vpsd   # 可选；引擎暴露 Writer 时由 executor 写
 ```
 
@@ -470,13 +492,17 @@ S_i -> resolve -> checkpoint (mutates_input) -> prepare -> execute
 
 - **没有 API/UI**：`output_contract_schema()` 只是给未来 API/UI 的契约描述，项目 JSON
   和服务端都还没有消费它。
-- **没有原生 geometry replay loader**：`state.json` 只记 `geometryRef`；重载时调用方要
+- **没有原生 geometry replay loader**：`state.json` 只记 `geometry.ref`；重载时调用方要
   传 `geometry_loader`，否则 `load_state()` 报错。
 - **没有外部引擎 adapter**，也没有把 v2 run 接入 backend/worker 生产路径；这一片是
-  运行时基础，不是 cutover。
+  运行时基础，不是 cutover。worker 侧只有默认关闭的通用 plugin shadow/apply hook
+  （§7.5）。
+- `state.json` 由 `STATE_SCHEMA_VERSION` 管，`outputs.json` 由
+  `OUTPUTS_SCHEMA_VERSION` 管；两者独立。`plan.json` 用 `identity_json()` 的 camelCase
+  键。
 
 完整的数据流、组件职责和剩余缺口见
-[`plugin-architecture.md`](plugin-architecture.md)；测试结果按实际运行单独报告。
+[`plugin-architecture.md`](plugin-architecture.md)；测试结果见 §9.2。
 
 ## 1. v1 的结构问题
 
@@ -601,14 +627,14 @@ v1 的 `VariantCapabilities` 自己就写着：
   conformance”的运行时基础；warm pool、worker 接入、快照/预览/API 仍不在里面，
   避免在设计未定时把生产执行语义固化进契约。
 
-### 2.1 本切片明确不做
+### 2.1 明确不做
 
 下表按当前基线标注；runtime/storage/conformance 切片补上的运行时基础单列在 §0.4，
 **不代表**已经接入生产路径。
 
 | 能力 | 状态 | 原因 |
 | --- | --- | --- |
-| worker/backend 接入 | 未实现 | 生产执行路径不变；worker 侧只有默认关闭的影子校验（§7.5），以及按 lock 构建 registry 的 bridge（§2.2） |
+| worker/backend 接入 | 未实现 | 生产执行路径不变；worker 侧只有默认关闭的通用 plugin shadow/apply hook（§7.5），以及按 lock 构建 registry、按 `parse_step` 分派的 bridge（§2.2） |
 | warm pool / 引擎复用池 | 未实现 | `StaticEngine` 只包装已存在的句柄，`release()` 是 no-op |
 | 外部引擎（Sentaurus 等） | 未实现 | `EngineKind` 有 `"external"`，但没有 provider |
 | 字段 / cell-set 表示 | 类型 + 持久化已定义，producer 未实现 | `CellSetState`/`Field` 有校验，`StateStore` 可写 `fields.npz`；但**没有 producer**，adapter 对 `fields` 只做 stored-only，不做转换 |
@@ -617,13 +643,13 @@ v1 的 `VariantCapabilities` 自己就写着：
 | 跨步骤 state/output 落盘 | 基础已实现 | `StateStore`：`state.json`/`fields.npz`/`outputs.json`/`plan.json`/`flow.json`；没有 API/UI |
 | 通用多步 executor | 基础已实现 | `FlowExecutor` 串联步骤、checkpoint `mutates_input`、逐步骤落盘；未接 backend |
 | conformance harness | 基础已实现 | `check_variant()` 只做契约级检查，不检查物理 parity |
-| 插件发现/动态导入 | 目标切片 | 见 §2.2：manifest + lock 固定来源，`load_registry()` 替代显式注册；不做任意模块导入、不做运行时安装 |
+| 插件发现/动态导入 | 基础已实现 | 见 §2.2：manifest + lock 固定来源，`load_registry()` 替代显式注册；不做任意模块导入、不做运行时安装 |
 | 资源上限、超时、沙箱 | 未实现 | 属于 Runtime |
 | 自动引擎/变体选择 | 未实现 | 显式 `variant_id`，无降级 |
 
 ### 2.2 插件安装单元（manifest / lock）
 
-v2.1 的注册调用（`register_<name>(registry)`）回答“怎么装进 registry”，
+v2.1 的注册调用（`register(registry)`）回答“怎么装进 registry”，
 插件生命周期回答“装的是哪一份代码、能不能被信任”。两者是**不同层**，后者不改变
 本文任何契约类型：
 
@@ -645,13 +671,14 @@ v2.1 的注册调用（`register_<name>(registry)`）回答“怎么装进 regis
   见 §10.1。
 
 完整字段、哈希覆盖范围、lock 生成/校验命令与运维清单见
-[`plugin-lifecycle.md`](plugin-lifecycle.md)。该切片的精确测试结果单独报告，本文
-不预先写入数字。
+[`plugin-lifecycle.md`](plugin-lifecycle.md)。定向测试结果见 §9.2。
 
-v2.2 把 `isotropic` 的 `execute` 改成返回 `StepResult`，插件实现的代码字节因此变化，
-`plugins.lock` 必须用 `scripts/lock-plugins.py` 重新生成并用 `--check` 校验；lock 里
-记录的是身份与哈希事实，本文不写死任何 digest。`voxel_probe` 是树内 proof 插件、
-不在 lock 中，但同样要迁移到 `StepResult`。
+v2.4 把 `isotropic` 的包布局改成 `plugin.toml` + `params.py` + `step.py` +
+`spec.py` + `register.py` + `variants/native.py`，并把 ViennaPS helper 移到
+`process_models/v2/engines/`。插件实现的哈希覆盖包内全部 `.py`，再叠加变体声明的
+`implementation_files`（isotropic 用它覆盖引擎 helper）；因此 `plugins.lock` 必须用
+`scripts/lock-plugins.py` 重新生成并用 `--check` 校验。lock 里记录的是身份与哈希事实，
+本文不写死任何 digest。`voxel_probe` 是树内 proof 插件、不在 lock 中。
 
 ## 3. 契约类型
 
@@ -659,12 +686,14 @@ v2.2 把 `isotropic` 的 `execute` 改成返回 `StepResult`，插件实现的�
 
 | 类型 | 文件 | 回答的问题 | 关键字段 |
 | --- | --- | --- | --- |
-| `ProcessSpec` | `contract.py` | 这是什么工艺、参数长什么样 | `id`、`version`、`label`、`params_model`、`dimensions`、`operations`、`description` |
+| `ProcessSpec` | `contract.py` | 这是什么工艺、参数长什么样、如何认领 worker step | `id`、`version`、`label`、`params_model`、`dimensions`、`operations`、`description`、`default_variant`、`parse_step` |
 | `VariantRegistration` | `contract.py` | 用哪个实现、归属于哪个 process | `process_id`、`variant`；`variant_id`/`version`/`capabilities`/`engine`/`declared_hash` 由 variant 派生 |
 | `EngineVariant` | `contract.py` | 怎么校验、怎么执行 | `variant_id`、`version`、`capabilities`、`engine`、`implementation_hash`、`validate()`、`execute(state, params, ctx, engine) -> StepResult` |
 | `ResolvedVariant` | `registry.py` | 解析结果的四元身份 | `process`、`variant`、`process_version`、`variant_version`、`implementation_hash` |
 
 ```python
+from typing import Any, Callable, Mapping
+
 @dataclass(frozen=True)
 class ProcessSpec:
     id: str
@@ -674,6 +703,8 @@ class ProcessSpec:
     dimensions: tuple[int, ...]
     operations: tuple[str, ...]
     description: str = ""
+    default_variant: str | None = None
+    parse_step: Callable[[Mapping[str, Any], Mapping[str, Any]], BaseModel | None] | None = None
 
 @dataclass(frozen=True)
 class VariantRegistration:
@@ -695,7 +726,10 @@ class VariantRegistration:
 `ProcessSpec.version` 只随**参数 schema 或公开语义**变；新增变体不动它。变体版本在
 `EngineVariant.version` 上，所以“同 schema、两个实现版本”是合法且可区分的状态。
 `ProcessSpec` **没有** `describe()`：`registry.list_processes()` 用 spec 和它已注册的
-变体现场拼 `ModelDescriptor`，不再让 spec 自己描述自己。
+变体现场拼 `ModelDescriptor`，不再让 spec 自己描述自己。`default_variant` 与
+`parse_step` 都是运行时 hook，不会进入 `ModelDescriptor`；`resolve_step()` 对每个
+process 的最新版本各调用一次 `parse_step`，零个匹配返回 `None`，多个匹配报
+`ValueError`。
 
 `VariantRegistration.__post_init__` 只做结构校验：`process_id` 非空；variant 的
 `variant_id`/`version` 非空；`capabilities` 是 `VariantCapabilities`；`engine` 是
@@ -729,36 +763,37 @@ class VariantCapabilities:
 `reads`/`writes` 是**准入依据**，不是注释：`resolve_execution()` 会检查 `reads` 里
 每一种状态是否存在，`DefaultStateAdapter.commit()` 会检查 `writes` 是否允许这种写入。
 `output_kinds` 则是**声明式**的：registry 把它抄进 `VariantDescriptor`，executor
-记录它，本切片不据此做准入或强制产出。
+记录它，当前不据此做准入或强制产出。
 
 ### 3.3 状态、增量与步骤结果
 
 | 类型 | 表示 | 说明 |
 | --- | --- | --- |
-| `MaterialState` | `order: tuple[int, ...]` + `names: Mapping[int, str]` | 原生材料 ID 与显示名；`order` 按 level-set index，**允许同一材料 ID 重复**（例如两次 SiO2 沉积）；`name_for()` / `id_for()` 双向查 |
-| `LevelSetState` | `handle` + `dimension` + `grid_delta` + `material_order` | flow state 的几何表示 |
+| `MaterialState` | `order: tuple[int, ...]` + `names: Mapping[int, str]` | 材料顺序的**唯一**来源；`order` 按 level-set index，**允许同一材料 ID 重复**（例如两次 SiO2 沉积）；`names` 按 material ID 键；`name_for()` / `id_for()` 双向查 |
+| `LevelSetState` | `handle` + `dimension` + `grid_delta` | flow state 的几何表示；**不含材料顺序字段**，材料顺序只看 `ProcessState.materials` |
 | `Layer` / `LayerState` | `layer_id`/`material_id`/`name`/`source_step`/`thickness`；`LayerState.layers` | 层身份与厚度；`layer_id` 唯一，层序由 producer 声明。**有类型，当前无 producer** |
 | `GridSpec` / `Field` / `CellSetState` | 网格 + `material_ids` + 命名 `Field`（unit/association/dtype/shape/components） | 取代 v2.1 的 `FieldState`；支持标量/向量/张量、cell/point 关联。**有类型，当前无 producer** |
 | `VoxelState` | `grid`（`process_models.voxel.VoxelGrid`）+ `source` | 步骤内视图，默认 `"height-field-v1"` |
-| `ProcessState` | geometry / materials / layers / fields / voxels；**frozen**，没有 `engine`/`meta` | `has(kind)` / `require(kind)`；`require` 缺失时抛 `StateMissingError` |
-| `StateDelta` | `geometry` / `layers` / `fields` / `voxels` | **只有 flow state**；字段为 `None` 表示“没变”，不是“清空” |
-| `StepResult` | `state` / `outputs` / `metadata` / `warnings` | `execute()` 的返回类型；报告数据在 `outputs`，`metadata` 只放少量 bookkeeping |
+| `ProcessState` | geometry / materials / layers / fields / voxels；**frozen**，没有 `engine`/`meta` | `has(kind)` / `require(kind)`；`materials` 总是存在（`has("materials")` 恒为 true），`require` 其他缺失表示时抛 `StateMissingError` |
+| `StateDelta` | `geometry` / `materials` / `layers` / `fields` / `voxels` | **只有 flow state**；字段为 `None` 表示“没变”，不是“清空” |
+| `StepResult` | `delta` / `outputs` / `metadata` / `warnings` | `execute()` 的返回类型；报告数据在 `outputs`，`metadata` 只放少量 bookkeeping |
 | `OutputSet` | `metrology` / `artifacts` + `schema_version` | 报告输出；默认空 |
 
 ```python
 @dataclass
 class StateDelta:
     geometry: LevelSetState | None = None   # None = unchanged
+    materials: MaterialState | None = None
     layers: LayerState | None = None
     fields: CellSetState | None = None
     voxels: VoxelState | None = None
     # 没有 artifacts / metadata / warnings
 
-    def is_empty(self) -> bool: ...   # 只看 geometry/layers/fields/voxels
+    def is_empty(self) -> bool: ...   # 只看 geometry/materials/layers/fields/voxels
 
 @dataclass
 class StepResult:
-    state: StateDelta
+    delta: StateDelta
     outputs: OutputSet = OutputSet()
     metadata: dict[str, Any] = {}
     warnings: list[str] = []
@@ -770,6 +805,8 @@ class StepResult:
 关键语义变化：**变体只声明变化，不负责合并**。合并、写回、清空临时视图由 adapter 完成。
 `ProcessState` 是 frozen dataclass，adapter 与调用方用 `dataclasses.replace()` 产生新对象；
 引擎 lease 不再放进状态，而是作为 `execute(state, params, ctx, engine)` 的显式参数。
+`materials` 与 geometry 相互独立：geometry delta 不会改材料顺序，materials delta 会整体
+替换 `MaterialState`。
 
 ### 3.4 引擎
 
@@ -822,7 +859,8 @@ class ExecutionPlan:
     implementation_hash: str
     engine_version: str
     engine_fingerprint: str
-    def identity(self) -> dict[str, str]: ...
+    def identity(self) -> dict[str, str]: ...       # 内部 snake_case
+    def identity_json(self) -> dict[str, str]: ...  # plan.json/flow.json 的 camelCase 边界
     def run(self) -> ExecutionOutcome: ...   # == execute_plan(self)
 
 @dataclass(frozen=True)
@@ -838,14 +876,16 @@ def run_step(registry, provider, process_id, variant_id, params, context, state,
              adapter=None) -> ExecutionOutcome: ...
 ```
 
-`ExecutionOutcome` 的委托关系：`delta == result.state`、`metadata == result.metadata`、
+`ExecutionOutcome` 的委托关系：`delta == result.delta`、`metadata == result.metadata`、
 `warnings == result.warnings`、`outputs == result.outputs`、
 `artifacts == list(result.outputs.artifacts)`。`result` 是唯一的事实来源，避免
 “outcome 上另存一份 metadata 然后过期”的第二种表示。
 
 `ExecutionPlan` 是**唯一**允许被写进 run 记录的身份来源；调用方不要自己拼字段。
-它同时拥有 `request`，所以“准入时校验的输入”和“执行时使用的输入”是同一个对象，
-不存在把 plan 之外的 `state`/`params` 再传一遍的缝隙。
+落盘和未来 API 用 `identity_json()`（`processId`/`processVersion`/… 的 camelCase 键），
+`identity()` 只作内部 snake_case 形式。它同时拥有 `request`，所以“准入时校验的输入”
+和“执行时使用的输入”是同一个对象，不存在把 plan 之外的 `state`/`params` 再传一遍的
+缝隙。
 
 `execute_plan(plan)` 只读 `plan.request.state`、`plan.request.params`、
 `plan.request.context`；`plan.run()` 就是它的方法形式。`run_step(...)` 是给常见
@@ -866,7 +906,7 @@ class StateAdapter(Protocol):
 `DefaultStateAdapter.id == "default-v2"`，`provides == frozenset({"voxels"})`。
 `commit` 会拒绝“返回了未在 `capabilities.writes` 中声明的表示”的变体。
 
-v2.2 的 `layers`/`fields` 规则：
+当前 `layers`/`fields` 规则（v2.2 起）：
 
 - `prepare`：`layers`/`fields` 是 **stored-only**，不会从 geometry 派生；state 里没有
   就直接 `StateMissingError`。只有 `voxels` 仍由 geometry 派生。
@@ -894,14 +934,13 @@ checkpoint 和落盘（§0.4）。
    |                 |               |   process.params_model|              |               |
    |                 |               | 2 ctx.dimension ∈ caps.dimensions    |               |
    |                 |               | 3 state has all caps.reads           |               |
-   |                 |               | 4 materials ↔ geometry.order         |               |
-   |                 |               | 5 variant.validate(ctx, params)      |               |
+   |                 |               | 4 variant.validate(ctx, params)      |               |
    |                 |               |---------------------->|              |               |
    |                 |               |<---- list[Issue] -----|              |               |
-   |                 |               | 6 provider.acquire(requirement)      |               |
+   |                 |               | 5 provider.acquire(requirement)      |               |
    |                 |               |---------------------->|              |               |
    |                 |               |<---- EngineLease -----|              |               |
-   |                 |               | 7 adapter or DefaultStateAdapter()   |               |
+   |                 |               | 6 adapter or DefaultStateAdapter()   |               |
    |                 |<--ExecutionPlan (含 identity) ----------------------|               |
    |                 |               |                      |              |               |
    |  (runtime) plan.run()          |                      |              |               |
@@ -923,13 +962,13 @@ checkpoint 和落盘（§0.4）。
    取 `ResolvedVariant`；带 pin 时缺失即报错，不降级。
 2. 参数必须是 `spec.params_model` 的实例，否则 `ExecutionResolutionError`。
 3. `context.dimension` 必须在该变体的 `capabilities.dimensions` 内。
-4. `state` 必须满足 `capabilities.reads` 的每一种状态（`state.has()`）。
-5. 同时存在 `ProcessState.materials` 与 `geometry.material_order` 时必须一致。
-6. `variant.validate()` 返回任何 `severity == "error"` 的 `Issue` 都终止解析。
-7. `provider.acquire()` 失败 → `EngineUnavailableError` → 包成 `ExecutionResolutionError`，
+4. `state` 必须满足 `capabilities.reads` 的每一种状态（`state.has()`；`materials` 始终
+   存在，`order` 可以为空）。
+5. `variant.validate()` 返回任何 `severity == "error"` 的 `Issue` 都终止解析。
+6. `provider.acquire()` 失败 → `EngineUnavailableError` → 包成 `ExecutionResolutionError`，
    **不尝试其他引擎**。
-8. 适配器缺省为 `DefaultStateAdapter()`；调用方可以传自定义适配器。
-9. 返回 plan，**不调用** `variant.execute()`。
+7. 适配器缺省为 `DefaultStateAdapter()`；调用方可以传自定义适配器。
+8. 返回 plan，**不调用** `variant.execute()`。
 
 `execute_plan(plan)` 随后做四件事：
 
@@ -937,11 +976,11 @@ checkpoint 和落盘（§0.4）。
 2. `prepared = plan.state_adapter.prepare(plan.request.state, plan.variant.capabilities)`；
 3. `plan.variant.variant.execute(prepared, plan.request.params, plan.request.context, plan.engine)`，
    结果必须是 `StepResult`，否则 `ExecutionResolutionError`；
-4. `plan.state_adapter.commit(prepared, result.state, capabilities)`，返回
+4. `plan.state_adapter.commit(prepared, result.delta, capabilities)`，返回
    `ExecutionOutcome(plan, committed, result)`。
 
 不需要再把 engine lease `replace` 进 state：lease 是 `execute` 的显式参数。adapter
-只消费 `result.state`；`result.outputs` / `result.metadata` / `result.warnings` 原样
+只消费 `result.delta`；`result.outputs` / `result.metadata` / `result.warnings` 原样
 留在 `ExecutionOutcome` 上，不进 `ProcessState`。
 
 执行阶段由 adapter 收尾：
@@ -950,7 +989,7 @@ checkpoint 和落盘（§0.4）。
 | --- | --- | --- |
 | `prepare` | adapter | 补齐变体声明要读、但当前 state 里没有的表示：`voxels` 从 geometry 派生；`layers`/`fields` 只接受已存表示 |
 | `execute` | variant | 只读 `state`，只返回 `StepResult`，不写盘、不碰 adapter |
-| `commit` | adapter | 把 `result.state` 合并进新 `ProcessState`；`geometry` 优先于 `voxels`；`layers`/`fields` 独立应用 |
+| `commit` | adapter | 把 `result.delta` 合并进新 `ProcessState`；`geometry` 优先于 `voxels`；`materials`、`layers`、`fields` 各自独立应用 |
 
 ## 5. 版本与 replay 身份
 
@@ -968,14 +1007,17 @@ checkpoint 和落盘（§0.4）。
 ```python
 # registry.compute_implementation_hash(variant)
 # 1) inspect.getsourcefile(type(variant)) 取变体类所在模块文件
-# 2) 把该模块目录下参与实现的 .py 文件字节按相对路径排序后一起喂给 sha256
-# 3) 再把 type(variant).__module__ + "." + __qualname__ 写进哈希流
-# 4) 拿不到文件时退化为类源码哈希（并记录该退化，不假装等价）
+# 2) 若该文件在 plugins/<id>/ 包内（同级有 plugin.toml）：
+#    把包内全部 .py 字节按相对路径排序后喂给 sha256
+# 3) 再叠加变体声明的 implementation_files（isotropic 用它覆盖 engines/viennaps.py）
+# 4) 最后写入 type(variant).__module__ + "." + __qualname__
+# 5) 非包内变体退化为“变体源文件 + qualname”；取不到文件再退化为类源码/qualname
 ```
 
-与 v1 的差别：`_erode_top_layers()` 这种模块级 helper、模块常量、同文件 params 默认值
-发生变化都会改变哈希。仍未覆盖的是**跨模块 import 的第三方行为**（例如 numpy 版本），
-那由 `engine_version`/依赖锁定负责，不由实现哈希负责。
+与 v1 的差别：包内 `step.py`、`params.py`、`spec.py`、`register.py` 以及模块级 helper/
+常量发生变化都会改变哈希；共享引擎 helper 通过 `implementation_files` 覆盖。仍未覆盖
+的是**跨模块 import 的第三方行为**（例如 numpy 版本），那由 `engine_version`/依赖锁定
+负责，不由实现哈希负责。
 
 **没有静默回退**：
 
@@ -983,26 +1025,35 @@ checkpoint 和落盘（§0.4）。
 | --- | --- |
 | 变体不存在 / pin 的版本不存在 | `KeyError` → 调用方 4xx |
 | 参数类型不对 | `ExecutionResolutionError` |
-| 维度/状态/材料不满足 | `ExecutionResolutionError` |
+| 维度/状态不满足 | `ExecutionResolutionError` |
 | `variant.validate` 有 error | `ExecutionResolutionError`（带 issue 列表） |
 | 引擎缺失/版本不符/后端不符 | `EngineUnavailableError` → `ExecutionResolutionError` |
 | 写入了未声明的状态种类 | `DefaultStateAdapter.commit` 抛 `ExecutionResolutionError` |
 
-**旧 run 如何固定**：run 记录保存 `ExecutionPlan.identity()` 的九个键
-（`process_id`、`process_version`、`variant_id`、`variant_version`、`implementation_hash`、
-`engine_id`、`engine_version`、`engine_fingerprint`、`adapter`）。replay 时把这些值转成
-`expected_*` pin 重新 `resolve_execution()`，再逐键比对；任何一项不同都拒绝执行，
-既不“警告后继续”，也不“用最新版本代替”。
+**旧 run 如何固定（当前能力）**：run 记录保存 `ExecutionPlan.identity_json()` 的九个
+camelCase 键（`processId`、`processVersion`、`variantId`、`variantVersion`、
+`implementationHash`、`engineId`、`engineVersion`、`engineFingerprint`、`adapter`）。
+`ExecutionRequest` / `FlowStep` 已实现 `expected_process_version` /
+`expected_variant_version`：pin 到未安装版本直接报错，不“警告后继续”，也不“用最新版本
+代替”。
+
+但**不能**把这说成完整 replay：`implementation_hash` 与 engine fingerprint 只被记录，
+没有对应的 `expected_*` 校验入口；输入状态 hash、params hash、输出 artifact hash 都
+没有进入 run record；`plugins.lock` 也不在 identity 里。因此当前只能保证“同
+process/variant 版本 + 同代码部署”，字节级复现需要调用方自己保留代码/lock 并做外部
+比对。这些缺口属于未来工作，不是已实现能力。
 
 `StepResult.outputs` / `metadata` 的子字段**不**进入 identity：它们不是执行身份，而是
 本步结果。可复现的插件在相同 identity、相同输入 state/params 下应产出相同的
 `OutputSet`；做不到就是 `determinism` 声明错了，不能靠在 metadata 里写“结果可能不同”
 绕过。
 
-`FlowExecutor` 把每个 step 的 identity 写进 `steps/<step_id>/plan.json`，并在
-`flow.json` 里记录整个 run 的步骤顺序与版本；`StateStore` 保存 `state.json` /
-`fields.npz` / `outputs.json`。`state.json` 的 geometry 只有 `geometryRef`，replay 时
+`FlowExecutor` 把每个 step 的 `identity_json()` 写进 `steps/<step_id>/plan.json`，
+并在 `flow.json` 里记录整个 run 的步骤顺序与版本；`StateStore` 保存 `state.json` /
+`fields.npz` / `outputs.json`。`state.json` 的 geometry 只有 `geometry.ref`，replay 时
 需要调用方提供能把 ref 变成引擎 handle 的 `geometry_loader`；没有 loader 就报错。
+`state.json` 与 `outputs.json` 的 schema 版本由 `STATE_SCHEMA_VERSION` /
+`OUTPUTS_SCHEMA_VERSION` 独立管理。
 
 版本保留策略（旧版本能留多久）是开放决策，见 §10；本切片注册表只是内存字典。
 
@@ -1014,7 +1065,7 @@ checkpoint 和落盘（§0.4）。
 step N-1:  LevelSetState ──┐
                            │  prepare: read_voxels(geometry.handle)
 step N:                    ├─> VoxelState (步骤内，临时)
-                           │  variant.execute -> StepResult(state=StateDelta(voxels=...))
+                           │  variant.execute -> StepResult(delta=StateDelta(voxels=...))
                            │  commit: write_voxels(geometry.handle, grid)
 step N+1:  LevelSetState <─┘
 ```
@@ -1026,10 +1077,10 @@ step N+1:  LevelSetState <─┘
 
 ### 6.2 五种表示的分工
 
-| 表示 | 谁产生 | 谁消费 | 本切片 |
+| 表示 | 谁产生 | 谁消费 | 当前 |
 | --- | --- | --- | --- |
 | `geometry`（`LevelSetState`） | 原生变体 / adapter 回写 | 原生变体、voxel 读取 | 实现 |
-| `materials`（`MaterialState`） | 调用方 / 几何元数据 | 所有写入几何的变体 | 实现 |
+| `materials`（`MaterialState`） | 调用方 / 原生变体 | 所有写入几何的变体；材料顺序唯一来源 | 实现 |
 | `layers`（`LayerState`） | 未来 layer-aware 插件 / 调用方 | 未来 CMP/etch/deposition 插件 | 类型与 commit 写检查；**无 producer** |
 | `fields`（`CellSetState`） | 未来 field/cell-set 插件 | 未来插件 | 类型与校验；adapter 只做 stored-only；**无 producer** |
 | `voxels`（`VoxelState`） | adapter（从 geometry） | surrogate / voxel-native 插件 | 实现（height-field） |
@@ -1054,7 +1105,7 @@ v2 只加了一层：`VoxelState.grid` 承载 `VoxelGrid`，`source` 标记适�
 
 ### 6.4 未来的 field / cell-set / layer
 
-未实现，但 v2.2 已经把类型定清楚：
+未实现，但当前契约已经把类型定清楚：
 
 - `CellSetState` = `GridSpec` + `material_ids` + 命名 `Field` + `provenance`；
   `Field` 带 `unit`、`association`（`cell`/`point`）、`dtype`、`shape`、
@@ -1076,25 +1127,29 @@ v2 只加了一层：`VoxelState.grid` 承载 `VoxelGrid`，`source` 标记适�
 
 ### 7.1 复用而不是重写
 
-变体直接调用现有 worker helper，保证与线上路径同源：
+变体直接调用 worker 与插件共享的纯 Python helper，保证与线上路径同源。这些 helper
+现在位于 `process_models/v2/engines/viennaps.py`，插件 import 不会连带 import
+backend/worker：
 
 ```python
-import worker.simulate as simulate          # 延迟 import，避免契约层依赖 worker
+from process_models.v2.engines.viennaps import (
+    configure_advection, material_handle, protected_material_names, signed_rates,
+)
 
 ps = engine.handle                          # engine 是 execute(..., engine) 的显式参数
 domain = state.geometry.handle
 if params.operation == "deposit":
-    domain.duplicateTopLevelSet(simulate.material_handle(ps, params.depositMaterial))
+    domain.duplicateTopLevelSet(material_handle(ps, params.depositMaterial))
 
-rate, signed_material_rates = simulate.signed_rates(step_dict)
+rate, signed_material_rates = signed_rates(step)
 ```
 
 | 复用的 helper | 来源 | 作用 |
 | --- | --- | --- |
-| `simulate.material_handle(ps, name)` | `worker/simulate.py:995` | 名字 → 原生材料句柄，找不到就报错 |
-| `simulate.signed_rates(step)` | `backend/rates.py:77`（`simulate` 转出） | etch 取负、deposit 取正；返回默认速率 + 逐材料速率 |
-| `simulate.protected_material_names(project, step)` | `worker/mask_materials.py:14` | 几何派生的掩码材料；`rateMode == "material"` 时为空 |
-| `simulate.configure_advection(ps, project, time_step_ratio=...)` | `worker/simulate.py:565` | solver 默认值 + 步骤级 `isotropicTimeStepRatio` 覆盖，并记录实际值 |
+| `material_handle(ps, name)` | `process_models/v2/engines/viennaps.py` | 名字 → 原生材料句柄，找不到就报错 |
+| `signed_rates(step)` | 同上；`backend.rates` 重导出 | etch 取负、deposit 取正；返回默认速率 + 逐材料速率 |
+| `protected_material_names(project, step)` | 同上；`backend.materials` 重导出 | 几何派生的掩码材料；`rateMode == "material"` 时为空 |
+| `configure_advection(ps, project, time_step_ratio=...)` | 同上 | solver 默认值 + 步骤级 `isotropicTimeStepRatio` 覆盖，并记录实际值 |
 
 原生对象构造与 `worker/steps/process.py` 的 isotropic 分支逐行对应：
 
@@ -1106,9 +1161,10 @@ rate, signed_material_rates = simulate.signed_rates(step_dict)
 | 执行 | `ps.Process(domain, model, duration)`；`setFluxEngineType(CPU_DISK)`；`setParameters(advection)`；`apply()` | 相同 |
 
 变体签名是 `execute(self, state, params, ctx, engine) -> StepResult`：`engine` 由 resolver
-租好后显式传入，变体不再从 `state` 里取句柄。按 v2.2 契约，isotropic 迁移后的返回形状是
-`StepResult(state=StateDelta(geometry=...), metadata={...}, warnings=[...])`，
-`outputs` 保持默认空 `OutputSet`：它**不产出** metrology 或 artifact。
+租好后显式传入，变体不再从 `state` 里取句柄。isotropic 的返回形状是
+`StepResult(delta=StateDelta(geometry=..., materials=...), metadata={...}, warnings=[...])`，
+`outputs` 保持默认空 `OutputSet`：它**不产出** metrology 或 artifact。`materials` 是
+`MaterialState`，用于回写原生材料顺序。
 
 ### 7.2 参数与声明
 
@@ -1119,8 +1175,8 @@ rate, signed_material_rates = simulate.signed_rates(step_dict)
 ```python
 VariantCapabilities(
     dimensions=(2, 3),
-    reads=frozenset({"geometry"}),
-    writes=frozenset({"geometry"}),
+    reads=frozenset({"geometry", "materials"}),
+    writes=frozenset({"geometry", "materials"}),
     supports_masks=True,
     mutates_input=True,        # 原生 apply() 就地改 domain
     determinism="strict",
@@ -1129,11 +1185,13 @@ VariantCapabilities(
 EngineRequirement(kind="native", engine_id="viennaps", min_version="4.6.2")
 ```
 
+`IsotropicProcessSpec` 声明 `default_variant="native"` 和 `parse_step=parse_step`；
+`step.py::parse_step` 只认领 uniform level-set 的 isotropic step，其他情况返回 `None`。
 注册时只写 `VariantRegistration(process_id="isotropic", variant=IsotropicNativeVariant())`；
 `variant_id`、版本、capabilities、engine 和哈希来源都从变体上读取，不在 registration
 里重复声明。
 
-`mutates_input=True` 是诚实声明：原生路径就地改句柄，`commit` 信任 `result.state.geometry.handle`。
+`mutates_input=True` 是诚实声明：原生路径就地改句柄，`commit` 信任 `result.delta.geometry.handle`。
 `FlowExecutor` 在调用前用 `engine.handle.Domain(...)` 复制 geometry，避免污染上一步的
 输入 state；非原生引擎不暴露 `Domain` 时直接报错。
 
@@ -1164,47 +1222,51 @@ parity 的含义是“**同样的参数、同样的原生调用、同样的 solv
 - 没有 JSON schema / API / UI 字段，项目仍不能引用这个变体；
 - 多步 flow 级回归只有两个步骤的 smoke，不是全工艺矩阵。
 
-### 7.5 worker 影子校验（集成切片）
+### 7.5 worker 影子校验（通用 plugin hook）
 
 这一节描述**已落地并通过验证**的 worker 影子集成，但生产执行仍然只走旧路径。
-它的目的只有一个：在把 worker 切到 v2 执行之前，先证明 v2 isotropic 插件能复现
-现有 worker 路径的结果。v2.2 只改了 `execute` 的返回类型（`StepResult`），
-这里的比较逻辑和结论不变。
+worker hook 不点名任何具体工艺：它按 `ProcessSpec.parse_step` 判断某个 step 是否由已
+安装插件认领，因此新增插件不需要改 worker 代码。当前唯一安装的插件是 `isotropic`，
+所以实际被比较的 step 仍然落在它的 `parse_step` 范围内。
 
 #### 7.5.1 开关与范围
 
 | 项 | 值 |
 | --- | --- |
-| 影子开关 | `VIENNAPS_WORKBENCH_V2_ISOTROPIC_SHADOW=1`（默认关闭） |
-| 验证 apply 开关 | `VIENNAPS_WORKBENCH_V2_ISOTROPIC_APPLY=1`（默认关闭；只用于能力验证，不是生产 cutover） |
-| 模型 | 仅 `model: isotropic` |
-| 速率模式 | 仅 `rateMode: uniform` |
-| 分派 | `isotropicMethod` 解析结果必须是 `levelSet`，**不是** `geometric` |
-| schema | `>= 4`（实测 5 / 7） |
-| 维度 | 2D / 3D |
+| 影子开关 | `VIENNAPS_WORKBENCH_V2_PLUGIN_SHADOW=1`（默认关闭） |
+| 验证 apply 开关 | `VIENNAPS_WORKBENCH_V2_PLUGIN_APPLY=1`（默认关闭；只用于能力验证，不是生产 cutover） |
+| 分派 | `load_registry()` + `find_v2_process()`；后者调用 `registry.resolve_step(project, step)`，每个 process 的最新版 `parse_step` 各调用一次 |
+| 无匹配 | 写 `v2-plugin-shadow-skipped` 事件，step 继续走旧路径；不会静默跳过 |
+| 当前插件范围 | `isotropic` 的 `parse_step` 只认领 `model: isotropic`、`rateMode: uniform`、`isotropicMethod` 为 `levelSet`（不是 geometric）的 step；2D/3D。`parse_step` 本身不检查项目 schema；测试实测 schema 5 / 7 |
 
 **本阶段明确不做**：
 
-- `rateMode: material`（逐材料速率）不进影子比较；
-- `isotropicMethod` 走 geometric `SphereDistribution` 的步骤不进影子比较；
-- 其他模型（particle、directional、specialized、CSV 等）完全不触发影子路径。
+- `rateMode: material`（逐材料速率）不进入 isotropic 的 `parse_step`，因此只留下 skip
+  事件，不做影子比较；
+- `isotropicMethod` 走 geometric `SphereDistribution` 的步骤同样返回 `None`，只 skip；
+- 其他模型（particle、directional、specialized、CSV 等）只有在未来插件认领时才进入
+  hook；当前没有对应 `parse_step`，因此全部 skip。
 
 开关关闭时，worker 的行为、事件流和产物字节不变；没有任何“先算一遍再丢掉”的额外开销。
 
 #### 7.5.2 机制
 
 ```
-现有 isotropic apply
-  ├─ (仅开关打开且参数在范围内) deep copy domain ──┐
-  ├─ 旧路径 process.apply() 就地修改原 domain        │
+每个 process step（开关打开时）
+  ├─ registry = load_registry()                  # 按 lock 发现/校验
+  ├─ spec = find_v2_process(project, step)       # == registry.resolve_step
+  │    ├─ None → 写 v2-plugin-shadow-skipped，继续旧路径
+  │    └─ 有匹配 → 在旧路径 apply 前深拷贝 domain
+  ├─ 旧路径 process.apply() 就地修改原 domain
   │                                                  ▼
-  │                         worker.process_models_v2.run_isotropic_v2(copy, ...)
+  │                         worker.process_models_v2.run_v2_step(copy, ...)
   ├─ 记录原 domain 的 surface_state digest + 材料表
   │                         v2 副本的 surface_state digest + 材料表
   ▼                                                  │
-比较两个 digest / 材料表 ── 不一致 → 抛错，该 step 失败
+compare_domains(old, new) ── 不一致 → 先写 v2-plugin-shadow 事件，再抛错
   │
-  └─ 一致 → 写 events.ndjson: {"type": "v2-isotropic-shadow", ...}
+  └─ 一致 → 写 v2-plugin-shadow 事件
+       └─ 仅 APPLY=1：ctx.domain = v2 domain，写 v2-plugin-applied
 ```
 
 要点：
@@ -1212,18 +1274,21 @@ parity 的含义是“**同样的参数、同样的原生调用、同样的 solv
 - 深拷贝发生在**旧路径 apply 之前**，且只拷贝 domain，不复制 run 目录、快照或产物；
 - 影子执行在副本上进行，不触碰旧路径已经产出的 domain，因此不会改变快照、
   中间输出、VTK 或后续步骤；
+- `run_v2_step` 走通用 `FlowExecutor`，`isotropic` 声明 `mutates_input=True`，所以
+  executor 还会再 checkpoint 一次副本；调用方的 `domain` 始终不被修改；
 - 比较对象是 `worker/simulate.py::surface_state()` 的 `digest` 和 domain 的
   material map（`getMaterialMap()` 的逐项 material ID），覆盖点坐标、线/三角形拓扑、
   每个 cell 的 `MaterialIds` 和 level-set 材料映射；
-- 事件记录两侧 digest、两侧材料表、step id 以及 v2 plan identity
-  （`ExecutionPlan.identity()` 的九项），供事后排查；
+- 事件 `v2-plugin-shadow` 记录两侧 digest、两侧材料表、step id 以及 v2 plan identity
+  （`ExecutionPlan.identity()` 的九项 snake_case 键）；`plan.json` 落盘才用
+  `identity_json()` 的 camelCase 键；
 - 不一致时**抛错**而不是只写 warning，避免影子差异被当作通过；
 - 影子本身不产生快照、不推进 flow state、不写任何 sink。
 
 **验证 apply 模式**（`...APPLY=1`）在 shadow 比较通过之后，把 `ctx.domain` 替换成
-v2 的 domain，并写一条 `v2-isotropic-applied` 事件。这样后续 snapshot、native
-state、下一步和 replay 都来自 v2，但默认生产路径仍然不设置这个开关。apply 永远以
-shadow 比较为前提，不存在“未比较就 apply”。旧路径仍然会跑一遍以生成现有
+v2 的 domain，并写一条 `v2-plugin-applied` 事件。这样后续 snapshot、native state、
+下一步和 replay 都来自 v2，但默认生产路径仍然不设置这个开关。apply 永远以 shadow
+比较为前提，不存在“未比较就 apply”。旧路径仍然会跑一遍以生成现有
 `actualParameters`，所以这是**正确性验证**，不是性能 cutover。
 
 #### 7.5.3 “parity”在这里指什么
@@ -1241,12 +1306,16 @@ shadow 比较为前提，不存在“未比较就 apply”。旧路径仍然会�
 
 #### 7.5.4 这个影子**没有**证明的事
 
-- 没有 `rateMode: material` 的逐材料速率影子（目前记 skip 事件）；
-- 没有 geometric `SphereDistribution` 影子（目前记 skip 事件）；
+- 只证明了**当前已安装插件**在其 `parse_step` 认领范围内的影子一致；不是“所有 v2
+  插件”或“所有工艺”的通用证明；
+- 没有 `rateMode: material` 的逐材料速率影子，也没有 geometric
+  `SphereDistribution` 影子（两者都由 isotropic 的 `parse_step` 返回 `None`，只记
+  skip 事件）；
+- 没有 external 引擎、field/cell-set producer 或 API/UI 的影子；
 - **验证 apply 模式**已经跑过 2D 三步 + 3D 两步的完整 API/worker run，并 replay 了
-  2D apply run；默认生产路径仍然不执行 v2，`run_isotropic_v2` 只在显式开关下被调用；
+  2D apply run；默认生产路径仍然不执行 v2，`run_v2_step` 只在显式开关下被调用；
 - 默认生产路径的 snapshot/replay 不变；apply 模式是测试/验证开关，不是 cutover；
-- material/geometric 仍不覆盖；影子通过不等于可以删除旧路径。
+- 影子通过不等于可以删除旧路径。
 
 #### 7.5.5 怎么跑
 
@@ -1254,7 +1323,7 @@ worker 侧影子必须用仓库内的隔离数据目录，且显式打开开关�
 
 ```bash
 VIENNAPS_WORKBENCH_DATA_DIR=$PWD/var/test-v2-shadow \
-VIENNAPS_WORKBENCH_V2_ISOTROPIC_SHADOW=1 WORKBENCH_PORT=8767 \
+VIENNAPS_WORKBENCH_V2_PLUGIN_SHADOW=1 WORKBENCH_PORT=8767 \
   .venv/bin/python -m unittest -v tests.test_worker_v2_isotropic_shadow
 ```
 
@@ -1266,19 +1335,18 @@ VIENNAPS_WORKBENCH_DATA_DIR=$PWD/var/test-v2-bridge WORKBENCH_PORT=8767 \
 ```
 
 直接 bridge 测试用两个相同的 level-set domain 分别跑旧 worker 路径与
-`run_isotropic_v2`，再用 `compare_isotropic_surfaces()` 比较；它不启动服务，也不经过
+`run_v2_step`，再用 `compare_domains()` 比较；它不启动服务，也不经过
 worker 子进程。比较函数把差异作为数据返回（`matched` / `reasons`），是否抛错由影子
 hook 决定。
 
-验证结果（2026-11-01）：
+验证结果（2026-11-01，当前 v2.4 基线）：
 
 | 项 | 结果 |
 | --- | --- |
-| `tests.test_worker_v2_isotropic`（bridge 直接对比） | 8 项通过 |
-| `tests.test_worker_v2_isotropic_shadow`（影子 + apply + snapshot/state parity） | 16 项通过 |
+| `tests.test_worker_v2_isotropic`（bridge 直接对比） | 15 项通过 |
+| `tests.test_worker_v2_isotropic_shadow`（影子 + apply + snapshot/state parity） | 17 项通过 |
 | `tests.test_v2_isotropic_capability`（API/worker：2D 三步 + replay、3D 两步） | 2 项通过 |
 | `tests.test_isotropic_dispatch`（API/worker，开关关闭） | 12 项通过 |
-| `tests.test_isotropic_dispatch`（API/worker，开关打开） | 12 项通过；3 条 `v2-isotropic-shadow` 匹配，5 条 material-mode skip |
 
 匹配事件示例（3D deposit）：`oldDigest == newDigest`、两侧 material map 都是 `[10, 30]`、
 point/cell count 都是 `882/1600`；plan identity 记录 `viennaps 4.7.0`、isotropic/native
@@ -1320,7 +1388,7 @@ cutover，默认路径不设置 `...APPLY`。
 | `mutates_input` | `False` |
 | engine | `surrogate` / `python` / `>=3.12` |
 
-执行体只有一个动作（下面是 v2.2 迁移后的返回形状）：
+执行体只有一个动作（下面是当前契约的返回形状）：
 
 ```python
 def execute(self, state, params, ctx, engine) -> StepResult:  # surrogate 不用 engine，但签名必须接受
@@ -1328,7 +1396,7 @@ def execute(self, state, params, ctx, engine) -> StepResult:  # surrogate 不用
     if params.operation == "erode_top_layer":
         grid = _erode_top_layers(grid, params.layers)
     return StepResult(
-        state=StateDelta(voxels=VoxelState(grid=grid)),
+        delta=StateDelta(voxels=VoxelState(grid=grid)),
         metadata={...},
     )  # outputs 默认空 OutputSet
 ```
@@ -1366,9 +1434,9 @@ def execute(self, state, params, ctx, engine) -> StepResult:  # surrogate 不用
 
 ## 9.1 验证口径（v2.1 历史结果）
 
-> 这一节记录 **v2.1** 的验证结果，保留作为基线。v2.2 改了 `execute` 的返回类型、
-> 新增了 state/output 类型并迁移了 isotropic/voxel 插件；v2.2 的结果见 §9.2，
-> 不把 v2.1 的 150 项当成 v2.2 的通过证据。
+> 这一节记录 **v2.1** 的验证结果，保留作为基线。v2.2 及之后改了 `execute` 的返回
+> 类型、新增了 state/output 类型并迁移了 isotropic/voxel 插件；当前 v2.4 的结果见
+> §9.2，不把 v2.1 的 150 项当成当前基线的通过证据。
 
 v2.1 只改 API 形状，不改 isotropic/voxel 的物理语义。验证结果是：**v2.1 core/plugins、
 worker bridge/shadow/apply 与保持不变的 v1 测试一起通过下列定向套件（150 项，0 失败）**。
@@ -1379,7 +1447,7 @@ worker bridge/shadow/apply 与保持不变的 v1 测试一起通过下列定向�
 | v2 core + execution entry | frozen `ProcessState`、`VariantRegistration` 派生、registry 生成 descriptor、`plan.run()`/`run_step()`、write checks、adapter `provides` | 56 项通过 |
 | v2 isotropic native | 显式 `engine` 参数下的 parity/rates/masks/3D/identity | 17 项通过 |
 | v2 voxel probe | adapter prepare/commit/guard/determinism | 13 项通过 |
-| worker v2 bridge | 旧 worker 路径 vs `run_isotropic_v2` 的 2D/3D surface digest parity | 8 项通过 |
+| worker v2 bridge | 旧 worker 路径 vs `run_v2_step` 的 2D/3D surface digest parity | 8 项通过 |
 | worker v2 shadow/apply | 开关关闭无变化、开关打开匹配、apply 替换 domain、material/geometric skip、snapshot JSON 与 native state hash parity | 16 项通过 |
 | v2 capability validation | API/worker：2D 三步 + replay、3D 两步；baseline vs apply | 2 项通过 |
 | 合计 | v1 + v2.1 + worker 集成 + capability | **150 项通过** |
@@ -1399,30 +1467,35 @@ VIENNAPS_WORKBENCH_DATA_DIR=$PWD/var/test-v2-final WORKBENCH_PORT=8767 \
 这些测试覆盖 v2.1 契约、isotropic 原生路径、voxel proof、worker shadow/apply 和
 2D/3D capability validation；**默认生产路径没有切到 v2**，也不代表 16 个工艺都已迁移。
 
-## 9.2 验证结果（v2.2 结构化输出）
+## 9.2 验证结果（v2.4 当前基线）
 
-v2.2 的定向套件覆盖 core/execution/isotropic/voxel、worker bridge/shadow/apply、
-capability validation 和插件生命周期，另加 `GridSpec`/`Field`/`CellSetState`/
-`Layer`/`LayerState`/`MetrologyRecord`/`Artifact`/`OutputSet`/`StepResult`/adapter
-的校验，以及 runtime/storage/conformance 切片。结果是 **236 项通过，0 失败**。
+v2.4 的定向套件覆盖 core/execution/isotropic/voxel、worker bridge/shadow/apply、
+capability validation、插件生命周期、runtime/storage/conformance，另加 `GridSpec`/
+`Field`/`CellSetState`/`Layer`/`LayerState`/`MetrologyRecord`/`Artifact`/`OutputSet`/
+`StepResult`/adapter 的校验、native conformance 与 output schema。结果是
+**275 项通过，0 失败**。
 
 | 套件 | 覆盖 | 结果 |
 | --- | --- | --- |
 | v1 contract + voxel + proof plugin | v1 冻结契约与 voxel 往返 | 38 项通过 |
-| v2 core + execution entry | `StateDelta`/`StepResult`/`OutputSet`、grid/field/cell-set/layer/metrology、adapter write checks、resolver stored-only layers/fields | 84 项通过 |
-| v2 isotropic native | `StepResult` 迁移后的 parity/rates/masks/3D/identity | 19 项通过 |
-| v2 voxel probe | `StepResult` 迁移后的 adapter/guard/determinism | 14 项通过 |
-| worker v2 bridge | 旧 worker 路径 vs `run_isotropic_v2` 的 2D/3D surface digest parity | 8 项通过 |
-| worker v2 shadow/apply | 开关关闭无变化、apply 替换 domain、snapshot/native state parity | 16 项通过 |
+| v2 core + execution entry | `StateDelta`/`StepResult`/`OutputSet`、grid/field/cell-set/layer/metrology、adapter write checks、resolver stored-only layers/fields、`parse_step`/`resolve_step`/`default_variant` | 99 项通过 |
+| v2 isotropic native | parity/rates/masks/3D/identity、`materials` 回写 | 20 项通过 |
+| v2 voxel probe | adapter/guard/determinism | 14 项通过 |
+| worker v2 bridge | 旧 worker 路径 vs `run_v2_step` 的 2D/3D surface digest parity | 15 项通过 |
+| worker v2 shadow/apply | 开关关闭无变化、通用 plugin hook、apply 替换 domain、snapshot/native state parity | 17 项通过 |
 | v2 capability validation | API/worker：2D 三步 + replay、3D 两步 | 2 项通过 |
-| plugin lifecycle | manifest/discovery/lock/tamper/duplicate/temp plugin | 22 项通过 |
-| v2 storage | state/layers/fields/outputs/plan/flow 落盘与读回、geometry ref、原子写 | 16 项通过 |
-| v2 executor | 2D 两步 isotropic、checkpoint、逐步骤落盘、state threading | 6 项通过 |
-| v2 conformance | 契约级检查、legacy 返回、输入不可变、determinism | 11 项通过 |
-| 合计 | v1 + v2.2 + worker + lifecycle + runtime | **236 项通过** |
+| plugin lifecycle | manifest/discovery/lock/tamper/duplicate/temp plugin、package hash | 25 项通过 |
+| v2 storage | state/materials/geometry.ref/layers/fields/outputs/plan/flow 落盘与读回、原子写 | 19 项通过 |
+| v2 executor | 2D 两步 isotropic、checkpoint、lease 释放、版本 pin、逐步骤落盘 | 10 项通过 |
+| v2 conformance | 契约级检查、legacy 返回、输入不可变、determinism | 12 项通过 |
+| v2 conformance native | 真实 native 变体（isotropic）的契约检查 | 1 项通过 |
+| v2 output schema | `output_contract_schema()` 的字段/序列化契约 | 3 项通过 |
+| 合计 | v1 + v2.4 + worker + lifecycle + runtime | **275 项通过** |
 
-另外，默认 `tests.test_isotropic_dispatch` 12 项在影子/apply 开关未设置时通过。
-`plugins.lock` 在 isotropic 实现改为 `StepResult` 后已重新生成并通过 `--check`。
+另外，默认 `tests.test_isotropic_dispatch` 12 项在影子/apply 开关未设置时通过；
+本轮不把开关打开的 dispatch 结果计入这 12 项。
+`plugins.lock` 在 isotropic 包布局改为 `step.py` + `engines/viennaps.py` helper 后已
+重新生成并通过 `--check`。
 
 这些测试证明的是 **契约、类型、parity、生命周期、存储和 executor 基础**；它们不证明
 field/cell-set producer、stress/device 模拟、原生 geometry replay loader 或
@@ -1440,7 +1513,7 @@ API/UI 已经可用。
 - **不实现 field / cell-set / layer 的 producer 或原生 adapter**；只有类型、校验、
   stored-only 的 prepare/commit，以及 `StateStore` 对已有表示的落盘/读回；
 - **没有 stress / device simulator**，`Artifact(kind="device")` 只是报告类型；
-- **没有原生 geometry replay loader**：`state.json` 记录 `geometryRef`，重载需要调用方
+- **没有原生 geometry replay loader**：`state.json` 记录 `geometry.ref`，重载需要调用方
   提供 `geometry_loader`；store 不生成/解析原生几何；
 - **没有输出 schema / API / UI 的生产接入**：`output_contract_schema()` 只是 JSON 可
   序列化的契约描述，没有 HTTP API、前端字段或项目 JSON 引用；`OutputSet` 只随
@@ -1464,37 +1537,46 @@ API/UI 已经可用。
 | output schema 演进 | `output_contract_schema()` 给出 `schemaVersion: 1` 的 JSON 描述；`OutputSet`/`Artifact.schema_version` 已存在，但没有迁移策略 | 跨版本如何读取旧 `OutputSet`；是否要求 artifact 自带 payload schema |
 | metadata 边界 | “少量 bookkeeping” 只是约定，没有大小/键限制 | 是否给出允许的键前缀或大小上限，避免重新变成垃圾桶 |
 
-## 11. 在 v2.2 里新增一个 process 的清单
+## 11. 在 v2.4 里新增一个 process 的清单
+
+最省事的方式是复制 [`plugin-template/`](plugin-template/)：它是可导入、可注册的完整
+脚手架，故意放在 `docs/` 下，不会被 `plugins/*/plugin.toml` 扫描到。
 
 1. **定义参数模型**：Pydantic v2，`extra="forbid"`，范围用 `Field(...)` 表达；
    不要在 `validate()` 里重复 schema 已保证的约束（只补语义约束）。
-2. **定义 `ProcessSpec`**：`id`、`version`、`label`、`params_model`、`dimensions`、
-   `operations`。版本只随 schema/语义变；不要写 `describe()`。
-3. **实现 `EngineVariant`**：`variant_id`、`version`、`capabilities`、`engine`、
+2. **写 `step.py`**：`parse_step(project, step) -> BaseModel | None`。不属于本工艺返回
+   `None`；声称属于但字段缺失抛 `ValueError`。不要在这里做物理计算。
+3. **定义 `ProcessSpec`**：`id`、`version`、`label`、`params_model`、`dimensions`、
+   `operations`，并显式写 `default_variant` 与 `parse_step=parse_step`。版本只随
+   schema/语义变；不要写 `describe()`。
+4. **实现 `EngineVariant`**：`variant_id`、`version`、`capabilities`、`engine`、
    `validate(ctx, params) -> list[Issue]`、
-   `execute(state, params, ctx, engine) -> StepResult`。engine 是显式参数。
-   报告数据放 `outputs`，不要塞进 `state` 或 `metadata`。
-4. **声明 `EngineRequirement`**：`kind`、`engine_id`、`min_version`，需要 GPU 时写
+   `execute(state, params, ctx, engine) -> StepResult(delta=...)`。engine 是显式参数。
+   报告数据放 `outputs`，不要塞进 `delta` 或 `metadata`。
+5. **声明 `EngineRequirement`**：`kind`、`engine_id`、`min_version`，需要 GPU 时写
    `backend="gpu"`。不要写“任意版本”。
-5. **写清 `VariantCapabilities`**：`reads`/`writes` 必须与 `execute` 实际访问一致；
+6. **写清 `VariantCapabilities`**：`reads`/`writes` 必须与 `execute` 实际访问一致；
    原生就地修改必须 `mutates_input=True`；几何限制写进 `geometry_constraints`；
    产出计量/产物时在 `output_kinds` 里声明（例如 `("metrology", "artifact:profile")`）。
-6. **注册**：提供 `register_<name>(registry)`，内部 `register_process(spec)` +
+7. **注册**：提供 `register(registry)`，内部 `register_process(spec)` +
    `register_variant(VariantRegistration(process_id=spec.id, variant=...))`。
    只传这两个字段；id/版本/能力/引擎/哈希来源都从变体派生。不要复用别人的 `variant_id`。
-7. **一致性测试**（缺一不可）：
-   - `resolve_execution` 能出 plan，`identity()` 稳定；
+8. **一致性测试**（缺一不可）：
+   - `resolve_execution` 能出 plan，`identity()` / `identity_json()` 稳定；
+   - `registry.resolve_step()` 只认领本工艺，模糊匹配报错；
    - `plan.run()` / `run_step()` 与 `execute_plan(plan)` 结果一致；
    - 缺 `reads` 中的状态 → 解析失败；
    - 维度不支持 → 解析失败；
    - 引擎版本/后端不符 → 解析失败且无回退；
-   - 返回值是 `StepResult`，且 `state` / `outputs` / `metadata` 的边界正确
+   - 返回值是 `StepResult`，且 `delta` / `outputs` / `metadata` 的边界正确
      （报告值不出现在 `metadata`，flow state 不出现在 `outputs`）；
    - 形状/材料正确性（按模型定义）；
    - 输入 `ProcessState` 在 `execute` + `commit` 后未被原地修改
      （除非显式声明 `mutates_input=True`）；
    - `check_variant(...)` 通过；声明 `determinism="strict"` 时两次独立运行结果一致；
    - 2D 与 3D 各一个 smoke。
+9. **安装**：`scripts/lock-plugins.py` 生成 lock、`--check` 退出 0，然后重启进程
+   （没有热加载）。
 
 完整的最小可运行例子见 §0.2。这里只给注册部分的最小骨架：
 
@@ -1502,6 +1584,13 @@ API/UI 已经可用。
 class MyParams(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     rate: float = Field(gt=0)
+
+def parse_step(project: Mapping[str, Any], step: Mapping[str, Any]) -> MyParams | None:
+    if step.get("model") != "my_process":
+        return None
+    if step.get("rate") is None:
+        raise ValueError("my_process step requires rate")
+    return MyParams(rate=float(step["rate"]))
 
 class MyVariant:
     variant_id = "native"
@@ -1518,16 +1607,17 @@ class MyVariant:
 
     def validate(self, ctx, params): return []
     def execute(self, state, params, ctx, engine):
-        return StepResult(state=StateDelta(), metadata={"rate": params.rate})
+        return StepResult(delta=StateDelta(), metadata={"rate": params.rate})
 
 def register_my_process(registry: ProcessRegistry) -> None:
     spec = ProcessSpec(id="my_process", version="1.0.0", label="My process",
-                       params_model=MyParams, dimensions=(2, 3), operations=("etch",))
+                       params_model=MyParams, dimensions=(2, 3), operations=("etch",),
+                       default_variant="native", parse_step=parse_step)
     registry.register_process(spec)
     registry.register_variant(VariantRegistration(process_id=spec.id, variant=MyVariant()))
 ```
 
-## 附录：v2.2 文件清单
+## 附录：v2.4 文件清单
 
 | 文件 | 内容 |
 | --- | --- |
@@ -1535,17 +1625,19 @@ def register_my_process(registry: ProcessRegistry) -> None:
 | `process_models/v2/__init__.py` | 公开导出 |
 | `process_models/v2/state.py` | `StateKind`、`MaterialState`、`LevelSetState`、`GridSpec`、`Field`、`CellSetState`、`Layer`、`LayerState`、`VoxelState`、`ProcessState`（frozen）、`StateDelta`、`MetrologyRecord`、`Artifact`、`OutputSet`、`StepResult`、`StateMissingError` |
 | `process_models/v2/engine.py` | `EngineKind`、`Backend`、`EngineRequirement`、`EngineCapabilities`、`Engine`、`EngineLease`、`EngineProvider`、`StaticEngine`、`StaticEngineProvider`、`EngineUnavailableError` |
-| `process_models/v2/contract.py` | `Issue`、`ProcessContext`、`ModelDescriptor`、`VariantDescriptor`、`VariantCapabilities`（含 `output_kinds`）、`ProcessSpec`、`EngineVariant`、`VariantRegistration` |
-| `process_models/v2/registry.py` | `ProcessRegistry`、`ResolvedVariant`、`compute_implementation_hash()` |
+| `process_models/v2/engines/viennaps.py` | `material_handle`、`material_map`、`signed_rates`、`protected_material_names`、`configure_advection`、`geometry_mask_material_names`；只接收传入的 `ps`，不 import backend/worker |
+| `process_models/v2/contract.py` | `Issue`、`ProcessContext`、`ModelDescriptor`、`VariantDescriptor`、`VariantCapabilities`（含 `output_kinds`）、`ProcessSpec`（含 `default_variant` / `parse_step`）、`EngineVariant`、`VariantRegistration` |
+| `process_models/v2/registry.py` | `ProcessRegistry`、`ResolvedVariant`、`compute_implementation_hash()`、`resolve_step()`、`default_variant_id()` |
 | `process_models/v2/resolver.py` | `ExecutionRequest`、`ExecutionPlan`、`ExecutionOutcome`（`result: StepResult`）、`ExecutionResolutionError`、`resolve_execution()`、`execute_plan()`、`run_step()` |
 | `process_models/v2/adapters.py` | `StateAdapter`、`DefaultStateAdapter`（layers/fields 独立 commit，stored-only prepare） |
 | `process_models/v2/storage.py` | `StateStore`、`StateStoreError`：`state.json` / `fields.npz` / `outputs.json` / `plan.json` / `flow.json` |
-| `process_models/v2/executor.py` | `FlowStep`、`FlowRun`、`FlowExecutor`：多步执行、`mutates_input` checkpoint、逐步骤落盘 |
+| `process_models/v2/executor.py` | `FlowStep`（含版本 pin）、`FlowRun`、`FlowExecutor`：多步执行、`mutates_input` checkpoint、lease 释放、逐步骤落盘 |
 | `process_models/v2/conformance.py` | `ConformanceReport`、`check_variant()`：契约级一致性检查 |
 | `process_models/v2/output_schema.py` | `output_contract_schema()`：`schemaVersion: 1` 的 JSON 可序列化输出契约描述 |
 | `process_models/plugins/` | 生命周期库：`PluginManifest`/`read_manifest`、lock schema 与 `write_lock`/`verify_lock`、`discover`/`load_registry`、`PluginLifecycleError` |
 | `plugins/` + `plugins.lock` + `scripts/lock-plugins.py` | 树内 `isotropic` 的 manifest、生成的锁、生成/校验脚本；见 [`plugin-lifecycle.md`](plugin-lifecycle.md) |
-| `plugins/isotropic/` | 第一个真实原生插件（返回 `StepResult`，空 `OutputSet`） |
+| `plugins/isotropic/` | 第一个真实原生插件：`plugin.toml` + `params.py` + `step.py` + `spec.py` + `register.py` + `variants/native.py`；返回 `StepResult(delta=...)`，空 `OutputSet` |
+| `docs/plugin-template/` | 可复制脚手架：`plugin.toml` / `params.py` / `step.py` / `spec.py` / `register.py` / `variants/native.py`；不在 `plugins/*` 扫描范围 |
 | `process_models/v2/surrogate/voxel_probe.py` | 第一个 surrogate（proof，返回 `StepResult`，空 `OutputSet`） |
 
 v1 的 `process_models/voxel.py`、`contract.py`、`registry.py` 保持原样；v2 只**复用**
