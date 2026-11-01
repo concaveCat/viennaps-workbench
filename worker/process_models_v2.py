@@ -159,8 +159,7 @@ def run_v2_step(
     policy = compute_policy_for_step(ctx, step)
     variant = registry.get_variant(spec.id, variant_id).variant
     if variant.engine.profiles and not any(
-        profile.backend == policy.backend and profile.kernel == policy.kernel
-        for profile in variant.engine.profiles
+        profile.backend == policy.backend and profile.kernel == policy.kernel for profile in variant.engine.profiles
     ):
         raise V2ProfileUnavailable(
             f"step {step['id']!r} resolved to {policy.backend}/{policy.kernel!r}, but "
@@ -202,6 +201,7 @@ def run_v2_step(
         project=ctx.project,
         step=step,
         seed=getattr(ctx, "run_seed", None),
+        assets=(getattr(ctx, "config", {}) or {}).get("csvAssets", {}),
     )
     order = material_order(domain)
     state = ProcessState(

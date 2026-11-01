@@ -29,6 +29,19 @@
       }
     },
     {
+      "id": "csvProcess",
+      "version": "1.0.0",
+      "api": 1,
+      "entrypoint": "plugins.csvProcess:register",
+      "manifestSha256": "952938c1cbf2e6c36c6c39bcd21ac6a6639c314a368d27d86ac43c667ab4cd2d",
+      "variants": {
+        "native": {
+          "version": "1.0.0",
+          "implementationHash": "7c94927fec6770d2c7f3563febbfefd6ffeffee760428c1c3749cdb72fc40a43"
+        }
+      }
+    },
+    {
       "id": "directional",
       "version": "1.0.0",
       "api": 1,

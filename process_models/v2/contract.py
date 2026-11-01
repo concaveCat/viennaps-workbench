@@ -71,6 +71,7 @@ class ProcessContext:
     project: Mapping[str, Any] = field(default_factory=dict)
     step: Mapping[str, Any] = field(default_factory=dict)
     seed: int | None = None
+    assets: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if int(self.dimension) not in (2, 3):
@@ -84,6 +85,7 @@ class ProcessContext:
         object.__setattr__(self, "dimension", int(self.dimension))
         object.__setattr__(self, "grid_delta", grid_delta)
         object.__setattr__(self, "seed", int(self.seed) if self.seed is not None else None)
+        object.__setattr__(self, "assets", dict(self.assets))
 
 
 @dataclass(frozen=True)
