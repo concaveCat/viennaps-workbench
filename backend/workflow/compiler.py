@@ -19,8 +19,74 @@ from .models import (
     SourceMapEntryV1,
 )
 
-
 COMPILER_VERSION = "0.1.0"
+
+_FIELD_MODELS = frozenset({"implant", "anneal", "analysis"})
+
+
+def _normalized_step_payloads(flow: FlowRevisionV1) -> list[dict[str, Any]]:
+    """Return step payloads with one canonical cellSet per field sequence.
+
+    ``implant -> anneal -> analysis`` is one contiguous field sequence. Every
+    step in it must run on the same native lattice: ``height`` and
+    ``substrateDepth`` take the sequence maximum, while ``coverMaterial`` and
+    ``periodic`` must already agree. Normalizing here, before the project hash
+    is computed, means two flows that differ only in a per-step grid setting
+    still compile to the same execution project.
+    """
+    payloads = [step.model_dump(mode="json", exclude_none=True) for step in flow.steps]
+    run: list[int] = []
+    for index, payload in enumerate(payloads):
+        if not _is_enabled(payload):
+            # A disabled step never executes, so it cannot split a field
+            # sequence or impose its own lattice settings.
+            continue
+        if payload.get("model") in _FIELD_MODELS:
+            run.append(index)
+            continue
+        if run:
+            _normalize_field_sequence([payloads[item] for item in run], start=run[0])
+            run = []
+    if run:
+        _normalize_field_sequence([payloads[item] for item in run], start=run[0])
+    return payloads
+
+
+def _is_enabled(payload: dict[str, Any]) -> bool:
+    return bool(payload.get("enabled", True))
+
+
+def _normalize_field_sequence(payloads: list[dict[str, Any]], *, start: int) -> None:
+    """Apply the canonical cell-set lattice policy to one field sequence."""
+    configs = [payload.get("cellSet") for payload in payloads]
+    if any(not isinstance(config, dict) for config in configs):
+        raise ValueError(f"field sequence at step index {start} requires a cellSet object on every step")
+
+    heights = [float(config["height"]) for config in configs]
+    depths = [float(config["substrateDepth"]) for config in configs if config.get("substrateDepth") is not None]
+    if not depths:
+        raise ValueError(f"field sequence at step index {start} requires cellSet.substrateDepth on at least one step")
+    covers = {str(config.get("coverMaterial") or "GAS") for config in configs}
+    if len(covers) != 1:
+        step_ids = [str(payload.get("id")) for payload in payloads]
+        raise ValueError(
+            f"field sequence cellSet.coverMaterial must match across steps {step_ids}: got {sorted(covers)}"
+        )
+    periodic = {bool(config.get("periodic", False)) for config in configs}
+    if len(periodic) != 1:
+        step_ids = [str(payload.get("id")) for payload in payloads]
+        raise ValueError(f"field sequence cellSet.periodic must match across steps {step_ids}: got {sorted(periodic)}")
+
+    canonical = {
+        "height": max(heights),
+        "substrateDepth": max(depths),
+        "coverMaterial": covers.pop(),
+        "periodic": periodic.pop(),
+    }
+    for payload, config in zip(payloads, configs):
+        normalized = dict(config)
+        normalized.update(canonical)
+        payload["cellSet"] = normalized
 
 
 def _template_project(flow: FlowRevisionV1, binding: GeometryBindingV1) -> ProjectV7:
@@ -63,6 +129,7 @@ def _compiled_steps(
     flow_paths: dict[str, str] | None = None,
     parameter_provenance: dict[str, dict[str, ParameterProvenanceV1]] | None = None,
     variable_refs: dict[str, list[str]] | None = None,
+    step_payloads: list[dict[str, Any]] | None = None,
 ) -> tuple[list[Any], list[SourceMapEntryV1]]:
     adapter = TypeAdapter(StepV7)
     compiled: list[Any] = []
@@ -71,8 +138,9 @@ def _compiled_steps(
     flow_paths = flow_paths or {}
     parameter_provenance = parameter_provenance or {}
     variable_refs = variable_refs or {}
+    payloads = step_payloads if step_payloads is not None else _normalized_step_payloads(flow)
 
-    for step in flow.steps:
+    for step, source_payload in zip(flow.steps, payloads):
         module_path, iteration_key = placements.get(step.id, ("root", "i0"))
         step_id = stable_step_id(
             flow_id=flow.flowId,
@@ -80,7 +148,7 @@ def _compiled_steps(
             authored_step_id=step.id,
             iteration_key=iteration_key,
         )
-        payload = step.model_dump(mode="json", exclude_none=True)
+        payload = dict(source_payload)
         payload["id"] = step_id
         compiled_step = adapter.validate_python(payload)
         compiled.append(compiled_step)
@@ -160,12 +228,14 @@ def compile_flow(
 
     template = _template_project(flow, binding)
     normalized_geometry = dict(template.geometry)
+    step_payloads = _normalized_step_payloads(flow)
     steps, source_map = _compiled_steps(
         flow,
         placements,
         flow_paths,
         parameter_provenance=parameter_provenance,
         variable_refs=variable_refs,
+        step_payloads=step_payloads,
     )
 
     if binding.dimension == 3:
@@ -198,6 +268,7 @@ def compile_flow(
     module_revisions = _module_revisions_payload(module_revisions)
     source_map_digest = source_map_hash(source_map)
     flow_payload = flow.model_dump(mode="json", exclude_none=True)
+    flow_payload["steps"] = step_payloads
     if placements:
         flow_payload["placements"] = {
             authored: {"moduleInstanceIdPath": path, "iterationKey": key}

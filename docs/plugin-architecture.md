@@ -1,6 +1,6 @@
 # 插件组织与数据流
 
-> 状态：v2.5 契约 + 生命周期 + isotropic/sf6o2/cf4o2/hbro2/sf6c4f8/fluorocarbon/ionBeam/faradayCage/wetEtch/teosDeposition/teospecvd/directional/selectiveEpitaxy/geometricTrenchDeposition/ald/oxidation/singleParticle/multiParticle/oxideRegrowth/csvProcess + runtime/storage/conformance
+> 状态：v2.5 契约 + 生命周期 + isotropic/sf6o2/cf4o2/hbro2/sf6c4f8/fluorocarbon/ionBeam/faradayCage/wetEtch/teosDeposition/teospecvd/directional/selectiveEpitaxy/geometricTrenchDeposition/ald/oxidation/singleParticle/multiParticle/oxideRegrowth/csvProcess/implant/anneal/analysis + cell-set field 序列 + runtime/storage/conformance
 > 基础已落地。本文描述**插件应该如何组织、数据如何流动**；这一片是运行时基础，
 > 不是生产 backend 接入，也没有 API/UI，文中明确标出。v2.5 在 v2.4 之上增加了
 > 执行 profile（CPU/GPU backend + kernel）和引擎中立的状态 backend；v2.4 完成了
@@ -118,7 +118,9 @@ executor loads ProcessState S_i
         ▼
 adapter.prepare(S_i, variant.reads)
   - voxels: derive from geometry
-  - layers/fields: must already be stored
+  - layers: must already be stored
+  - fields: derived on demand from geometry by the engine's `CellSetBackend`
+    (or rehydrated from a persisted snapshot)
         │
         ▼
 variant.execute(S_i', params, ctx, engine_lease)
@@ -207,6 +209,16 @@ class FlowRun:
 
 规则：
 
+- Cell-set 是**按需派生的辅助场域**，不是第二套主状态：`ProcessState.geometry`
+  始终是 canonical level set；连续的 `implant -> anneal -> analysis` 自动组成一个
+  field 序列。
+- field 序列开始时 `CellSetBackend.ensure` 生成一次 native `DenseCellSet`，
+  后续步骤复用同一 handle；`snapshot` 只在序列边界执行一次，`rehydrate` 只在
+  replay/从磁盘恢复时执行。中间步骤不复制 cell set、不写 `fields.npz`、不写
+  native cell-set 文件。
+- 同一序列内 `height` / `substrateDepth` 在 route 编译阶段取最大值，
+  `coverMaterial` / `periodic` 必须一致；`sourceGeometryDigest` 不匹配时 fail
+  closed，不自动 remap。
 - `fields.npz` 以 `allow_pickle=False` 读取；`Field.data` 必须是 numpy 数组，opaque
   handle 直接报 `StateStoreError`。
 - `outputs.json` 拒绝 NaN/Inf 和不可序列化值，报 `StateStoreError`。
@@ -358,7 +370,7 @@ S_0 → step_1 → S_1 → step_2 → S_2 → ... → S_n
 | voxel proof surrogate（`StepResult.delta`） | ✅ |
 | 标准插件包布局（isotropic 含 `step.py` / `parse_step`） | ✅ |
 | 可复制脚手架 `docs/plugin-template/` | ✅ 不在 `plugins/*` 扫描范围 |
-| field/layer store + persistence | ✅ `StateStore`：`state.json` + `fields.npz`，原子写，geometry 只存 ref |
+| field/layer store + persistence | ✅ `StateStore`：`state.json` + `fields.npz`，原子写，geometry 只存 ref；field 序列只在边界写一次 `fields.npz` |
 | 通用 executor 消费 `StepResult`/`OutputSet` | ✅ `FlowExecutor`：多步状态转移、`mutates_input` checkpoint、逐 step 落盘；**尚未接入 backend** |
 | `OutputSet` 落盘 | ✅ `outputs.json`（metrology/artifacts，拒绝 NaN/Inf） |
 | `OutputSet` API / UI | ❌ 只有 Python 契约和 `output_contract_schema()` |

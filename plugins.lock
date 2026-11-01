@@ -16,6 +16,32 @@
       }
     },
     {
+      "id": "analysis",
+      "version": "1.0.0",
+      "api": 1,
+      "entrypoint": "plugins.analysis:register",
+      "manifestSha256": "a8ed18f14b40e8eafda912f9418e8fdb574eb740566e26a3e411c744fc1e7301",
+      "variants": {
+        "native": {
+          "version": "1.0.0",
+          "implementationHash": "2d320406ccb74f47bdc5329b694d56b0cf891681f3cc3b8bd758ec496c962cef"
+        }
+      }
+    },
+    {
+      "id": "anneal",
+      "version": "1.0.0",
+      "api": 1,
+      "entrypoint": "plugins.anneal:register",
+      "manifestSha256": "5fe622466ec72d230884a4a72b67f1a4ed600f2987bfdf533ba4fe416e04b7e1",
+      "variants": {
+        "native": {
+          "version": "1.0.0",
+          "implementationHash": "5cf94cee5a7a5875ab5f02f6484ee7cfdbe92bb3d6fe34de147ee32307369a82"
+        }
+      }
+    },
+    {
       "id": "cf4o2",
       "version": "1.0.0",
       "api": 1,
@@ -103,6 +129,19 @@
         "native": {
           "version": "1.0.0",
           "implementationHash": "0d55bd735e26ab2887878653e0876e396a3d58e892d12cf599675a5abad35e8d"
+        }
+      }
+    },
+    {
+      "id": "implant",
+      "version": "1.0.0",
+      "api": 1,
+      "entrypoint": "plugins.implant:register",
+      "manifestSha256": "c44662d2fbd6c8cc47a9351405dc0530325c41b4319a0df6b09cd15d76d57e84",
+      "variants": {
+        "native": {
+          "version": "1.0.0",
+          "implementationHash": "0673331f16d6e5e78533be43bb955439385429efd21b5b6e3f0831fc9161b978"
         }
       }
     },
