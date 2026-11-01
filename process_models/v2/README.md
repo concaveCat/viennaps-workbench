@@ -243,8 +243,10 @@ bridge 本身的直接测试：`tests.test_worker_v2_isotropic`（不需要开�
   `process_models/v2/engines/`），实现哈希覆盖包内全部 `.py` 加上显式
   `implementation_files`，lock 已重新生成并通过 `--check`。
 - replay 需要的插件版本没装是硬错误，不会用邻近/最新版本顶替。
-- 当前只注册 `isotropic`（`1.0.0`，变体 `native`）；`voxel_probe` 是树内 proof 插件，
-  没有 manifest，不在 `plugins/` 与 lock 里。
+- 当前 `plugins/` 注册 23 个 built-in 工艺插件（20 个 level-set 工艺 + `implant` /
+  `anneal` / `analysis` 三个 field 插件，完整列表见 `docs/plugin-architecture.md` 状态行）；
+  `voxel_probe` 是树内 proof 插件，没有 manifest，不在 `plugins/` 与 lock 里。
+  GeometryEngine 的 operation 是 core 内置 spec，不占用 `plugins/`。
 
 字段、哈希覆盖范围、失败场景与运维/开发清单见
 [`docs/plugin-lifecycle.md`](../../docs/plugin-lifecycle.md)。
@@ -257,8 +259,9 @@ bridge 本身的直接测试：`tests.test_worker_v2_isotropic`（不需要开�
 - 没有 warm pool、引擎复用池、并发调度；`StaticEngine.release()` 是 no-op。
 - 没有外部引擎（`external` 只是枚举值），没有自动引擎/变体选择。
 - `CellSetState` / `Field` / `LayerState` / `MetrologyRecord` / `Artifact` / `OutputSet`
-  有类型、校验、adapter 写入和 `StateStore` 落盘；仍**没有 producer**，没有从
-  level-set 到 cell-set 的转换。
+  有类型、校验、adapter 写入和 `StateStore` 落盘。`implant` / `anneal` / `analysis`
+  通过按需派生的 native `DenseCellSet` 产生 field；`CellSetBackend` 在 field 序列边界
+  做 `ensure`/`snapshot`/`rehydrate`。
 - field/layer 已能持久化到 `state.json` + `fields.npz`，但没有原生 geometry replay
   loader：`state.json` 只记 `geometry.ref`，重载要调用方提供 `geometry_loader`。
 - 没有 params/输入 state/输出 artifact 的 hash，也没有可执行的
@@ -267,7 +270,9 @@ bridge 本身的直接测试：`tests.test_worker_v2_isotropic`（不需要开�
 - 没有 stress / device simulator；`Artifact(kind="device")` 只是报告类型。
 - 没有 API/UI：`output_contract_schema()` 只是输出契约描述，项目 JSON、HTTP API 和
   前端都还没有消费 v2 run。
-- `isotropic` 与 `voxel_probe` 迁移后返回空 `OutputSet`：不产出 metrology 或 artifact。
+- 纯 level-set 工艺（如 `isotropic`）返回空或少量 `OutputSet`；`analysis` 输出
+  sheet-resistance/junction metrology，`csvProcess` 等按各自能力报告。`voxel_probe`
+  仍是 proof，不产出 metrology/artifact。
 - voxel 适配器只支持 height-field；fin/GDS cut-out 在 prepare 阶段被拒绝。
 - 只有 isotropic（native）是已安装插件（`plugins/isotropic/plugin.toml` + lock）；
   voxel_probe（surrogate proof）仍在树内、没有 manifest，只能由代码显式注册。
