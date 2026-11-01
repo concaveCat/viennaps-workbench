@@ -120,6 +120,19 @@
       }
     },
     {
+      "id": "multiParticle",
+      "version": "1.0.0",
+      "api": 1,
+      "entrypoint": "plugins.multiParticle:register",
+      "manifestSha256": "898139239f78ac1de31deb095ea69155f8e9b56e7d5009befd75bedc125df33f",
+      "variants": {
+        "native": {
+          "version": "1.0.0",
+          "implementationHash": "314898c19263bc6e409bd534e7c79bba6d5a6f114269b78a6817ac47c5bd95d8"
+        }
+      }
+    },
+    {
       "id": "oxidation",
       "version": "1.0.0",
       "api": 1,
@@ -129,6 +142,19 @@
         "native": {
           "version": "1.0.0",
           "implementationHash": "23ad7c3e081be8702361a85d01aef7822668d68915f53e3e815f5c8b58bde576"
+        }
+      }
+    },
+    {
+      "id": "oxideRegrowth",
+      "version": "1.0.0",
+      "api": 1,
+      "entrypoint": "plugins.oxideRegrowth:register",
+      "manifestSha256": "73f7bba937404cb74509db2cc86946f378e45480fa982edf2adb0e90794a31d2",
+      "variants": {
+        "native": {
+          "version": "1.0.0",
+          "implementationHash": "ac1ec173d643ec004d38445549b16ba8a61fb130f93a07b9a23190482ae0c394"
         }
       }
     },
