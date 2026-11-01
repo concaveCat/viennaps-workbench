@@ -23,7 +23,7 @@ fi
 
 targets=(backend/api backend/api_errors.py backend/packages.py backend/planning.py
          backend/supervisor.py worker/artifacts.py worker/engine_policy.py worker/steps
-         process_models)
+         process_models scripts/lock-plugins.py)
 
 echo "== compileall =="
 "$python_bin" -m compileall -q backend worker scripts process_models

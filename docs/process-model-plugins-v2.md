@@ -3,10 +3,14 @@
 > 范围：`process_models/v2/`。v1（`process_models/contract.py`、`registry.py`、
 > `voxel.py`、`surrogate/voxel_probe.py`）是**冻结的 legacy**，不再演进也**不改动**；
 > v2 包本身不依赖 backend/worker，不启动服务，不改项目 schema。worker 侧的接入只以
-> **默认关闭的影子校验**形式存在，见 §7.5（由集成切片加入，不改变生产执行路径）。
+> **默认关闭的影子校验**形式存在，见 §7.5（由集成切片加入，不改变生产执行路径）；
+> bridge 的 registry 由 manifest + `plugins.lock` 构建（§2.2），不再在代码里点名注册。
 >
 > 本文描述 v2.1 的契约与边界。凡是 v2 包内没有对应模块的能力，文中一律标为
 > “未实现”，不把设计意图写成已完成状态。
+>
+> “插件作为安装单元”（manifest / 发现 / `plugins.lock`）单独写在
+> [`plugin-lifecycle.md`](plugin-lifecycle.md)，本文只在 §2.2 与 §10 给出边界。
 >
 > v2.1 是 v2 的**收缩**而非扩张：字段更少、依赖更显式、样板代码更少，执行语义不变。
 
@@ -231,7 +235,7 @@ v1 的 `VariantCapabilities` 自己就写着：
 | --- | --- | --- | --- |
 | **Runtime** | 无（executor 边界） | 跨步骤持有 flow state、checkpoint/rollback、run 目录、快照、事件、种子、资源上限、超时 | **未实现**。只定义 `ProcessState` / `StateDelta` / `Artifact` 作为 runtime 将来对接的面 |
 | **Engine** | `engine.py` | 描述引擎能力、按 `EngineRequirement` 严格租用、给出 `engine_version` + `fingerprint` | 实现 `StaticEngine` / `StaticEngineProvider`（包装已初始化的句柄）；**没有**外部引擎、没有 warm pool、没有调度 |
-| **Service** | `registry.py` + `resolver.py` | 目录（多版本 spec/variant）、准入检查、解析出 `ExecutionPlan` | 内存注册表 + 纯函数解析器；**没有**持久化、没有 HTTP API、没有插件发现 |
+| **Service** | `registry.py` + `resolver.py` | 目录（多版本 spec/variant）、准入检查、解析出 `ExecutionPlan` | 内存注册表 + 纯函数解析器；插件来源由 manifest + `plugins.lock` 固定（§2.2）；**没有**持久化服务端状态、没有 HTTP API |
 | **State** | `state.py` + `adapters.py` | 多表示状态、`StateDelta`、`prepare/commit` 转换 | 四种表示类型 + `DefaultStateAdapter`；字段/cell-set 只占位 |
 | **Resolver** | `resolver.py` | 把 request 变成 plan：能力、参数、引擎、适配器、身份 | `resolve_execution()`，只解析不执行 |
 
@@ -250,13 +254,39 @@ v1 的 `VariantCapabilities` 自己就写着：
 
 | 能力 | 状态 | 原因 |
 | --- | --- | --- |
-| worker/backend 接入 | 未实现 | 本切片只到包内契约与两个插件；worker 侧仅集成切片加入的默认关闭影子校验（§7.5） |
+| worker/backend 接入 | 未实现 | 生产执行路径不变；worker 侧只有默认关闭的影子校验（§7.5），以及按 lock 构建 registry 的 bridge（§2.2） |
 | warm pool / 引擎复用池 | 未实现 | `StaticEngine` 只包装已存在的句柄，`release()` 是 no-op |
 | 外部引擎（Sentaurus 等） | 未实现 | `EngineKind` 有 `"external"`，但没有 provider |
 | 字段 / cell-set 表示 | 未实现 | `FieldState` 是占位；adapter 在 `prepare` 阶段直接报错 |
-| 插件发现/动态导入 | 未实现 | 仍然显式注册 |
+| 插件发现/动态导入 | 目标切片 | 见 §2.2：manifest + lock 固定来源，`load_registry()` 替代显式注册；不做任意模块导入、不做运行时安装 |
 | 资源上限、超时、沙箱 | 未实现 | 属于 Runtime |
 | 自动引擎/变体选择 | 未实现 | 显式 `variant_id`，无降级 |
+
+### 2.2 插件安装单元（manifest / lock）
+
+v2.1 的注册调用（`register_<name>(registry)`）回答“怎么装进 registry”，
+插件生命周期回答“装的是哪一份代码、能不能被信任”。两者是**不同层**，后者不改变
+本文任何契约类型：
+
+| 关注点 | 载体 | 约束 |
+| --- | --- | --- |
+| 身份与入口 | `plugins/<id>/plugin.toml` | 严格字段：`api`/`id`/`version`/`entrypoint`/`description`；未知键拒绝 |
+| 发现 | `VIENNAPS_WORKBENCH_PLUGIN_DIRS`，缺省 `<repo>/plugins` | `dir/*/plugin.toml`，不递归；运维安装的信任模型 |
+| 安装事实 | `plugins.lock` | pin id/version/api/entrypoint/manifest 字节哈希/每个变体的实现哈希 |
+| 加载 | `process_models.plugins.load_registry()` | 缺失、多出、字节漂移、注册越界一律 `PluginLifecycleError`，无回退 |
+
+三条与本文直接相关的结论：
+
+- **项目 JSON 仍然只写 `process_id`/`variant_id`/参数**，永远不含 module path 或
+  callable；插件选择属于部署面，不属于请求面。
+- 插件层固定的是“已安装版本集合”，replay 需要的版本没装就是硬错误，不会回退到
+  邻近或最新版本——与 §5 的“没有静默回退”同一条规则。
+- 生命周期只做 manifest/发现/lock；**不做** conformance harness、warm pool、API/UI、
+  市场、沙箱、自动引擎选择，见 §10.1。
+
+完整字段、哈希覆盖范围、lock 生成/校验命令与运维清单见
+[`plugin-lifecycle.md`](plugin-lifecycle.md)。该切片的精确测试结果单独报告，本文
+不预先写入数字。
 
 ## 3. 契约类型
 
@@ -944,7 +974,7 @@ VIENNAPS_WORKBENCH_DATA_DIR=$PWD/var/test-v2-final WORKBENCH_PORT=8767 \
 - 不做 warm pool、引擎复用池、并发调度；
 - 不实现外部引擎（`external` 只是枚举值）；
 - 不做不可信插件隔离（没有 netns/seccomp/独立 host）；
-- 不做插件发现、动态导入、运行时安装；
+- 不做运行时安装、热加载、插件市场或签名分发；插件发现与 lock 只覆盖运维已部署的目录（§2.2）；
 - 不实现字段/cell-set 的数值路径；
 - 不声称任何 surrogate 的物理精度。
 
@@ -955,7 +985,7 @@ VIENNAPS_WORKBENCH_DATA_DIR=$PWD/var/test-v2-final WORKBENCH_PORT=8767 \
 | 插件粒度 | `sf6o2` 是否独立于 `cf4o2`；isotropic 的 levelSet/geometric 是一个变体还是两个 | 按化学拆还是按家族 + 化学参数 |
 | 自动引擎选择 | 只支持显式 `variant_id` + 严格 requirement | 是否允许按 backend 自动挑；若允许，选择原因必须进 plan identity |
 | 确定性容差 | `determinism` 只有 `strict`/`tolerance` 两个标签，没有统一度量 | `tolerance` 的度量与阈值如何按 `gridDelta` 定义 |
-| 版本保留 | 注册表是内存字典，进程退出即丢 | 旧版本留多久；删除后旧 replay 是拒绝还是只读归档 |
+| 版本保留 | `plugins.lock` 只固定**已安装**的版本；未安装版本的 replay 直接拒绝（§2.2） | 旧版本留多久；删除后旧 replay 是拒绝还是只读归档 |
 | 插件依赖隔离 | 变体与 worker 共用同一 `.venv` | 是否需要 per-plugin venv / 子进程边界 |
 | warm pool | `StaticEngine.release()` 是 no-op | 何时引入池化，池化后 fingerprint 如何保持稳定 |
 | `mutates_input` 的 checkpoint | 只文档化，不强制 | 由 executor 统一 checkpoint，还是要求原生变体自证可重入 |
@@ -1030,6 +1060,8 @@ def register_my_process(registry: ProcessRegistry) -> None:
 | `process_models/v2/registry.py` | `ProcessRegistry`、`ResolvedVariant`、`compute_implementation_hash()` |
 | `process_models/v2/resolver.py` | `ExecutionRequest`、`ExecutionPlan`、`ExecutionOutcome`、`ExecutionResolutionError`、`resolve_execution()`、`execute_plan()`、`run_step()` |
 | `process_models/v2/adapters.py` | `StateAdapter`、`DefaultStateAdapter` |
+| `process_models/plugins/` | 生命周期库：`PluginManifest`/`read_manifest`、lock schema 与 `write_lock`/`verify_lock`、`discover`/`load_registry`、`PluginLifecycleError` |
+| `plugins/` + `plugins.lock` + `scripts/lock-plugins.py` | 树内 `isotropic` 的 manifest、生成的锁、生成/校验脚本；见 [`plugin-lifecycle.md`](plugin-lifecycle.md) |
 | `process_models/v2/native/isotropic.py` | 第一个真实原生插件 |
 | `process_models/v2/surrogate/voxel_probe.py` | 第一个 surrogate（proof） |
 

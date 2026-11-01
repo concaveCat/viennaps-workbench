@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "apiVersion": 1,
+  "plugins": [
+    {
+      "id": "isotropic",
+      "version": "1.0.0",
+      "api": 1,
+      "entrypoint": "process_models.v2.native.isotropic:register_isotropic",
+      "manifestSha256": "e52a91a3833efdbdafd29c2b511b199e81fd63cb3241394cc7c45ce02eb3190e",
+      "variants": {
+        "native": {
+          "version": "1.0.0",
+          "implementationHash": "dae0be30c65f3821d65ce9f97891550cb85b727ecf5ed48560e32374615893b2"
+        }
+      }
+    }
+  ]
+}

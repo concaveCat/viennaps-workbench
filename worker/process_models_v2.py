@@ -34,14 +34,14 @@ from __future__ import annotations
 
 from typing import Any
 
+from process_models.plugins import load_registry
 from process_models.v2.contract import ProcessContext
 from process_models.v2.engine import (
     EngineCapabilities,
     StaticEngine,
     StaticEngineProvider,
 )
-from process_models.v2.native.isotropic import IsotropicParams, register_isotropic
-from process_models.v2.registry import ProcessRegistry
+from process_models.v2.native.isotropic import IsotropicParams
 from process_models.v2.resolver import (
     ExecutionOutcome,
     ExecutionRequest,
@@ -121,8 +121,7 @@ def run_isotropic_v2(
     """
     params = build_isotropic_params(step)
 
-    registry = ProcessRegistry()
-    register_isotropic(registry)
+    registry = load_registry()
     provider = StaticEngineProvider(
         [
             StaticEngine(
