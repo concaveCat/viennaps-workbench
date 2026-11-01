@@ -70,13 +70,43 @@ VIENNAPS_WORKBENCH_DATA_DIR=$PWD/var/test-v2 WORKBENCH_PORT=8767 \
   tests.test_process_models_v2_isotropic tests.test_process_models_v2_voxel
 ```
 
-v1 回归测试保持原样，也应在同一轮跑通。本轮已验证 **124 项定向测试通过**
-（v1 38 + v2.1 core/execution 56 + isotropic 17 + voxel 13）；不含 backend/worker
-集成测试。
+v1 回归测试保持原样，也应在同一轮跑通。本轮已验证 **144 项定向测试通过**
+（v1 38 + v2.1 core/execution 56 + isotropic 17 + voxel 13 + worker bridge 8 +
+worker shadow 12）；另有 12 项现有 isotropic dispatch API/worker 套件在影子开关
+打开/关闭下都通过。
+
+## Worker shadow validation（v2 isotropic）
+
+切换 worker 之前，先用默认关闭的影子校验证明 v2.1 isotropic 插件复现现有 worker
+路径。这是**已落地**的集成切片，生产执行仍然走旧路径：
+
+- 开关：`VIENNAPS_WORKBENCH_V2_ISOTROPIC_SHADOW=1`，不设则完全不参与，输出不变。
+- 范围：`model: isotropic`、`rateMode: uniform`、`isotropicMethod` 解析为
+  `levelSet`（不是 geometric）、schema >= 4（实测 5/7）、2D/3D。
+- 机制：旧路径 apply 前深拷贝 domain → 老路径 apply → 在副本上跑
+  `worker.process_models_v2.run_isotropic_v2` → 比较 `surface_state` digest 与
+  material map → 写 `v2-isotropic-shadow` 事件（两侧 digest + plan identity）→
+  不一致直接抛错。
+- 不覆盖：`rateMode: material`、geometric `SphereDistribution`、快照/replay 切换、
+  完整 flow。
+
+```bash
+VIENNAPS_WORKBENCH_DATA_DIR=$PWD/var/test-v2-shadow \
+VIENNAPS_WORKBENCH_V2_ISOTROPIC_SHADOW=1 WORKBENCH_PORT=8767 \
+  .venv/bin/python -m unittest -v tests.test_worker_v2_isotropic_shadow
+```
+
+bridge 本身的直接测试：`tests.test_worker_v2_isotropic`（不需要开关，也不启动服务）。
+
+验证结果：bridge 8 项、shadow 12 项通过；现有 `tests.test_isotropic_dispatch`
+12 项在开关关闭/打开下都通过，开关打开时有 3 条匹配的 shadow 事件、5 条
+material-mode skip。离线 parity 还验证了 2D etch/deposit 的 snapshot JSON
+（除 run-relative outputs）与 native state 文件 `stateId` 与旧路径完全一致。
 
 ## 当前限制
 
-- 未接入 backend/worker，不改项目 schema；项目暂时不能引用 v2.1 变体。
+- 未切换生产执行路径，不改项目 schema；项目暂时不能引用 v2.1 变体。
+  仅有的 worker 接触点是上面的默认关闭影子校验。
 - 没有 warm pool、引擎复用池、并发调度；`StaticEngine.release()` 是 no-op。
 - 没有外部引擎（`external` 只是枚举值），没有自动引擎/变体选择。
 - `FieldState` 只是占位；字段/cell-set 的数值路径未实现，adapter 会显式拒绝。

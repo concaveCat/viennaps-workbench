@@ -2,7 +2,8 @@
 
 > 范围：`process_models/v2/`。v1（`process_models/contract.py`、`registry.py`、
 > `voxel.py`、`surrogate/voxel_probe.py`）是**冻结的 legacy**，不再演进也**不改动**；
-> 本切片不碰 backend/worker，不启动服务，不改项目 schema。
+> v2 包本身不依赖 backend/worker，不启动服务，不改项目 schema。worker 侧的接入只以
+> **默认关闭的影子校验**形式存在，见 §7.5（由集成切片加入，不改变生产执行路径）。
 >
 > 本文描述 v2.1 的契约与边界。凡是 v2 包内没有对应模块的能力，文中一律标为
 > “未实现”，不把设计意图写成已完成状态。
@@ -249,7 +250,7 @@ v1 的 `VariantCapabilities` 自己就写着：
 
 | 能力 | 状态 | 原因 |
 | --- | --- | --- |
-| worker/backend 接入 | 未实现 | 本切片只到包内契约与两个插件 |
+| worker/backend 接入 | 未实现 | 本切片只到包内契约与两个插件；worker 侧仅集成切片加入的默认关闭影子校验（§7.5） |
 | warm pool / 引擎复用池 | 未实现 | `StaticEngine` 只包装已存在的句柄，`release()` 是 no-op |
 | 外部引擎（Sentaurus 等） | 未实现 | `EngineKind` 有 `"external"`，但没有 provider |
 | 字段 / cell-set 表示 | 未实现 | `FieldState` 是占位；adapter 在 `prepare` 阶段直接报错 |
@@ -709,6 +710,130 @@ parity 的含义是“**同样的参数、同样的原生调用、同样的 solv
 - 没有 JSON schema / API / UI 字段，项目仍不能引用这个变体；
 - 没有多步 flow 级回归。
 
+### 7.5 worker 影子校验（集成切片）
+
+这一节描述**已落地并通过验证**的 worker 影子集成，但生产执行仍然只走旧路径。
+它的目的只有一个：在把 worker 切到 v2 执行之前，先证明 v2.1 isotropic 插件能复现
+现有 worker 路径的结果。
+
+#### 7.5.1 开关与范围
+
+| 项 | 值 |
+| --- | --- |
+| 开关 | `VIENNAPS_WORKBENCH_V2_ISOTROPIC_SHADOW=1`（默认关闭） |
+| 模型 | 仅 `model: isotropic` |
+| 速率模式 | 仅 `rateMode: uniform` |
+| 分派 | `isotropicMethod` 解析结果必须是 `levelSet`，**不是** `geometric` |
+| schema | `>= 4`（实测 5 / 7） |
+| 维度 | 2D / 3D |
+
+**本阶段明确不做**：
+
+- `rateMode: material`（逐材料速率）不进影子比较；
+- `isotropicMethod` 走 geometric `SphereDistribution` 的步骤不进影子比较；
+- 其他模型（particle、directional、specialized、CSV 等）完全不触发影子路径。
+
+开关关闭时，worker 的行为、事件流和产物字节不变；没有任何“先算一遍再丢掉”的额外开销。
+
+#### 7.5.2 机制
+
+```
+现有 isotropic apply
+  ├─ (仅开关打开且参数在范围内) deep copy domain ──┐
+  ├─ 旧路径 process.apply() 就地修改原 domain        │
+  │                                                  ▼
+  │                         worker.process_models_v2.run_isotropic_v2(copy, ...)
+  ├─ 记录原 domain 的 surface_state digest + 材料表
+  │                         v2 副本的 surface_state digest + 材料表
+  ▼                                                  │
+比较两个 digest / 材料表 ── 不一致 → 抛错，该 step 失败
+  │
+  └─ 一致 → 写 events.ndjson: {"type": "v2-isotropic-shadow", ...}
+```
+
+要点：
+
+- 深拷贝发生在**旧路径 apply 之前**，且只拷贝 domain，不复制 run 目录、快照或产物；
+- 影子执行在副本上进行，不触碰旧路径已经产出的 domain，因此不会改变快照、
+  中间输出、VTK 或后续步骤；
+- 比较对象是 `worker/simulate.py::surface_state()` 的 `digest` 和 domain 的
+  material map（`getMaterialMap()` 的逐项 material ID），覆盖点坐标、线/三角形拓扑、
+  每个 cell 的 `MaterialIds` 和 level-set 材料映射；
+- 事件记录两侧 digest、两侧材料表、step id 以及 v2 plan identity
+  （`ExecutionPlan.identity()` 的九项），供事后排查；
+- 不一致时**抛错**而不是只写 warning，避免影子差异被当作通过；
+- 影子本身不产生快照、不推进 flow state、不写任何 sink。
+
+#### 7.5.3 “parity”在这里指什么
+
+| 判定项 | 是否作为相等判据 |
+| --- | --- |
+| `surface_state(...)["digest"]` 相同 | 是（主判据） |
+| material map 逐项 material ID 相同 | 是 |
+| bounds / pointCount / cellCount 相同 | 是（digest 已覆盖，事件里单列便于阅读） |
+| v2 plan identity（process/variant/hash/engine） | 否，只记录；用于解释“哪一版实现跑出的影子” |
+| 执行耗时、事件顺序、日志文本 | 否 |
+
+注意：digest 已经包含 material map，因此“同一 digest”强于“同一材料表”；
+两者都记录是为了在失败时能直接看出是几何变了还是材料映射变了。
+
+#### 7.5.4 这个影子**没有**证明的事
+
+- 没有 `rateMode: material` 的逐材料速率影子（目前记 skip 事件）；
+- 没有 geometric `SphereDistribution` 影子（目前记 skip 事件）；
+- 没有做生产路径 cutover 后的完整多步 replay；离线 snapshot JSON 与 native state
+  文件哈希已对齐（2D etch/deposit）；
+- 生产路径仍然不执行 v2，`run_isotropic_v2` 只在开关打开时被调用；
+- 已跑现有 isotropic dispatch API/worker 套件（12 项）在开关打开/关闭下都通过，
+  并产生 3 条匹配的 `v2-isotropic-shadow` 事件；但没有做多步 full-flow 的逐字节产物对比；
+- 影子通过不等于可以删除旧路径；cutover 需要单独的验收。
+
+#### 7.5.5 怎么跑
+
+worker 侧影子必须用仓库内的隔离数据目录，且显式打开开关：
+
+```bash
+VIENNAPS_WORKBENCH_DATA_DIR=$PWD/var/test-v2-shadow \
+VIENNAPS_WORKBENCH_V2_ISOTROPIC_SHADOW=1 WORKBENCH_PORT=8767 \
+  .venv/bin/python -m unittest -v tests.test_worker_v2_isotropic_shadow
+```
+
+不经 worker、直接验证 bridge 的测试（不需要开关）：
+
+```bash
+VIENNAPS_WORKBENCH_DATA_DIR=$PWD/var/test-v2-bridge WORKBENCH_PORT=8767 \
+  .venv/bin/python -m unittest -v tests.test_worker_v2_isotropic
+```
+
+直接 bridge 测试用两个相同的 level-set domain 分别跑旧 worker 路径与
+`run_isotropic_v2`，再用 `compare_isotropic_surfaces()` 比较；它不启动服务，也不经过
+worker 子进程。比较函数把差异作为数据返回（`matched` / `reasons`），是否抛错由影子
+hook 决定。
+
+验证结果（2026-11-01）：
+
+| 项 | 结果 |
+| --- | --- |
+| `tests.test_worker_v2_isotropic`（bridge 直接对比） | 8 项通过 |
+| `tests.test_worker_v2_isotropic_shadow`（worker 影子 hook + snapshot/state parity） | 12 项通过 |
+| `tests.test_isotropic_dispatch`（API/worker，开关关闭） | 12 项通过 |
+| `tests.test_isotropic_dispatch`（API/worker，开关打开） | 12 项通过；3 条 `v2-isotropic-shadow` 匹配，5 条 material-mode skip |
+
+匹配事件示例（3D deposit）：`oldDigest == newDigest`、两侧 material map 都是 `[10, 30]`、
+point/cell count 都是 `882/1600`；plan identity 记录 `viennaps 4.7.0`、isotropic/native
+1.0.0、`default-v2` adapter。
+
+额外的离线 parity 测试（2D etch/deposit）还比较了：
+
+- `simulate.save_snapshot()` 写出的 JSON：除 run-relative `outputs` 路径外**逐字段相等**
+  （points、topology、cellData/MaterialIds、materials、materialTops、measured change、
+  domainReadback）；
+- `simulate.save_native_state()` 写出的 `.vpsd` 文件 `stateId`（文件 SHA-256）：**完全相同**。
+
+这两项说明：在相同的输入 domain 上，v2 路径产生的 snapshot 几何和 replay 原生状态文件
+与旧路径一致。它们还没有证明“把生产路径切换成 v2 后，完整多步 run 的 replay 端到端
+等价”；那需要 cutover 验收。
+
 ## 8. 第一个 surrogate：voxel probe
 
 文件：`process_models/v2/surrogate/voxel_probe.py`。从 v1 移植，语义不变。
@@ -765,8 +890,8 @@ def execute(self, state, params, ctx, engine):   # surrogate 不用 engine，但
 
 ## 9.1 验证口径（v2.1）
 
-v2.1 只改 API 形状，不改 isotropic/voxel 的物理语义。验证结果是：**更新后的 v2.1
-core/plugins 与保持不变的 v1 测试一起通过下列定向套件（124 项，0 失败）**。
+v2.1 只改 API 形状，不改 isotropic/voxel 的物理语义。验证结果是：**v2.1 core/plugins、
+worker bridge/shadow 与保持不变的 v1 测试一起通过下列定向套件（144 项，0 失败）**。
 
 | 套件 | 覆盖 | 结果 |
 | --- | --- | --- |
@@ -774,7 +899,9 @@ core/plugins 与保持不变的 v1 测试一起通过下列定向套件（124 �
 | v2 core + execution entry | frozen `ProcessState`、`VariantRegistration` 派生、registry 生成 descriptor、`plan.run()`/`run_step()`、write checks、adapter `provides` | 56 项通过 |
 | v2 isotropic native | 显式 `engine` 参数下的 parity/rates/masks/3D/identity | 17 项通过 |
 | v2 voxel probe | adapter prepare/commit/guard/determinism | 13 项通过 |
-| 合计 | v1 + v2.1 | **124 项通过** |
+| worker v2 bridge | 旧 worker 路径 vs `run_isotropic_v2` 的 2D/3D surface digest parity | 8 项通过 |
+| worker v2 shadow | 开关关闭无变化、开关打开匹配、material/geometric skip、snapshot JSON 与 native state hash parity | 12 项通过 |
+| 合计 | v1 + v2.1 + worker 集成 | **144 项通过** |
 
 命令（隔离数据目录，未启动服务）：
 
@@ -794,7 +921,7 @@ VIENNAPS_WORKBENCH_DATA_DIR=$PWD/var/test-v2-final WORKBENCH_PORT=8767 \
 
 ### 10.1 非目标（本切片）
 
-- 不接入 backend/worker，不改项目 schema，不改请求哈希；
+- 不接入 backend/worker 执行路径（仅默认关闭的影子校验见 §7.5），不改项目 schema，不改请求哈希；
 - 不做 warm pool、引擎复用池、并发调度；
 - 不实现外部引擎（`external` 只是枚举值）；
 - 不做不可信插件隔离（没有 netns/seccomp/独立 host）；

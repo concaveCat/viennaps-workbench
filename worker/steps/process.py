@@ -17,6 +17,96 @@ from typing import Any
 
 from worker.steps.context import RunContext, simulate_module
 
+V2_ISOTROPIC_SHADOW_ENV = "VIENNAPS_WORKBENCH_V2_ISOTROPIC_SHADOW"
+
+
+def _v2_isotropic_shadow_enabled() -> bool:
+    """The shadow hook is strictly opt-in; the default run must not change."""
+    return os.environ.get(V2_ISOTROPIC_SHADOW_ENV) == "1"
+
+
+def _v2_isotropic_shadow_eligible(simulate: Any, project: dict[str, Any], step: dict[str, Any]) -> tuple[bool, str]:
+    """Decide whether the v2 isotropic bridge covers this worker step.
+
+    The bridge only implements uniform level-set isotropic steps. Every
+    exclusion returns the reason that is written to the run record, so a
+    skipped step is auditable instead of silently unvalidated.
+    """
+    if step.get("model") != "isotropic":
+        return False, f"model={step.get('model')!r} is not isotropic"
+    operation = step.get("operation")
+    if operation not in ("etch", "deposit"):
+        return False, f"operation={operation!r} is not an isotropic etch or deposit"
+    try:
+        schema_version = int(project.get("schemaVersion", 0))
+    except (TypeError, ValueError):
+        schema_version = 0
+    if schema_version < 4:
+        return False, f"schemaVersion={project.get('schemaVersion')!r} is older than 4"
+    rate_mode = str(step.get("rateMode", "uniform"))
+    if rate_mode != "uniform":
+        return False, (
+            f"rateMode={rate_mode!r} needs the native material rate table; the v2 bridge only covers uniform"
+        )
+    if step.get("isotropicMethod") == "geometric":
+        return False, "isotropicMethod=geometric is not bridged to v2"
+    try:
+        method, method_reason = simulate.resolve_isotropic_method(project, step)
+    except Exception as error:  # eligibility must never fail the run
+        return False, f"resolve_isotropic_method failed: {error}"
+    if method != "levelSet":
+        return False, f"actual isotropic method {method!r} is not levelSet: {method_reason}"
+    try:
+        rate_magnitude = float(step.get("rateMagnitude", 0.0))
+        duration = float(step.get("duration", 0.0))
+        dimension = int(project.get("dimension", 0))
+    except (TypeError, ValueError):
+        return False, "rateMagnitude, duration and dimension must be numeric"
+    if not rate_magnitude > 0:
+        return False, f"rateMagnitude={rate_magnitude} is not positive"
+    if not duration > 0:
+        return False, f"duration={duration} is not positive"
+    if dimension not in (2, 3):
+        return False, f"dimension={dimension} is not 2 or 3"
+    return True, f"uniform level-set isotropic {operation} is bridgeable"
+
+
+def _run_v2_isotropic_shadow(ctx: RunContext, step: dict[str, Any], shadow_domain: Any, simulate: Any) -> None:
+    """Run the v2 bridge on a copy and compare it with the worker result.
+
+    The event is written before any mismatch is raised so the failed run keeps
+    the digests, material maps and plan identity that explain the divergence.
+    """
+    from worker.process_models_v2 import compare_isotropic_surfaces, run_isotropic_v2
+
+    outcome = run_isotropic_v2(
+        ctx.ps,
+        ctx.project,
+        step,
+        shadow_domain,
+        ps_version=ctx.ps_version,
+        engine_fingerprint=ctx.native_engine_fingerprint or "",
+    )
+    shadow_geometry = getattr(outcome.state, "geometry", None)
+    if shadow_geometry is None or getattr(shadow_geometry, "handle", None) is None:
+        raise RuntimeError(f"v2 isotropic shadow for step {step['id']!r} returned no geometry state")
+    comparison = compare_isotropic_surfaces(ctx.domain, shadow_geometry.handle, int(ctx.project["dimension"]))
+    ctx.event(
+        {
+            "type": "v2-isotropic-shadow",
+            "stepId": step["id"],
+            **comparison,
+            "v2Plan": outcome.plan.identity(),
+            "v2Metadata": outcome.metadata,
+            "v2Warnings": outcome.warnings,
+        }
+    )
+    if not comparison["matched"]:
+        raise RuntimeError(
+            f"v2 isotropic shadow for step {step['id']!r} did not match the worker path: "
+            + "; ".join(comparison["reasons"])
+        )
+
 
 @dataclass
 class ProcessStepResult:
@@ -27,6 +117,25 @@ class ProcessStepResult:
 
 def run_process_step(ctx: RunContext, index: int, step: dict[str, Any]) -> ProcessStepResult:
     simulate = simulate_module()
+    shadow_domain = None
+    shadow_skip_reason = None
+    if _v2_isotropic_shadow_enabled():
+        eligible, shadow_skip_reason = _v2_isotropic_shadow_eligible(simulate, ctx.project, step)
+        if eligible:
+            # Deep-copy before the worker path mutates ctx.domain so both
+            # branches start from the identical geometry.
+            shadow_domain = ctx.ps.Domain(ctx.domain)
+        elif step.get("model") == "isotropic":
+            # Only log isotropic skips. A full flow also contains directional,
+            # particle and specialized steps; recording a skip for every one of
+            # them would drown the useful validation records.
+            ctx.event(
+                {
+                    "type": "v2-isotropic-shadow-skipped",
+                    "stepId": step["id"],
+                    "reason": shadow_skip_reason,
+                }
+            )
     deposition = step["operation"] == "deposit"
     directional = ctx.project["schemaVersion"] in (5, 6, 7) and step.get("model") == "directional"
     specialized = ctx.project["schemaVersion"] == 7 and step.get("model") == "specialized"
@@ -550,6 +659,8 @@ def run_process_step(ctx: RunContext, index: int, step: dict[str, Any]) -> Proce
                 + (f", and the mask {masks} must not cover the whole exposed surface" if masks else "")
                 + ")"
             )
+    if shadow_domain is not None:
+        _run_v2_isotropic_shadow(ctx, step, shadow_domain, simulate)
     next_gpu_step_pending = any(
         simulate.uses_flux(future)
         and str(
