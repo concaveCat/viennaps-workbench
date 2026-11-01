@@ -3,6 +3,32 @@
   "apiVersion": 1,
   "plugins": [
     {
+      "id": "cf4o2",
+      "version": "1.0.0",
+      "api": 1,
+      "entrypoint": "plugins.cf4o2:register",
+      "manifestSha256": "9acdb8c7dc7e0ae81d982b5c424fb65ceee59e4e7fad3e172c95d2784d75662a",
+      "variants": {
+        "native": {
+          "version": "1.0.0",
+          "implementationHash": "9f8786105b666f9668da35152a2dd49cf5b18700009429547124d702aae1eb06"
+        }
+      }
+    },
+    {
+      "id": "hbro2",
+      "version": "1.0.0",
+      "api": 1,
+      "entrypoint": "plugins.hbro2:register",
+      "manifestSha256": "272b66a242c6fa72b4fa26e7052510b0be96b9c35bd1d74abebb1aecc82ba015",
+      "variants": {
+        "native": {
+          "version": "1.0.0",
+          "implementationHash": "0d55bd735e26ab2887878653e0876e396a3d58e892d12cf599675a5abad35e8d"
+        }
+      }
+    },
+    {
       "id": "isotropic",
       "version": "1.0.0",
       "api": 1,
@@ -12,6 +38,19 @@
         "native": {
           "version": "1.0.0",
           "implementationHash": "9425a048991ec5dc3b0fed4a65cf40ee028d32349a9cfdbc0ccaa20085a6b7d9"
+        }
+      }
+    },
+    {
+      "id": "sf6c4f8",
+      "version": "1.0.0",
+      "api": 1,
+      "entrypoint": "plugins.sf6c4f8:register",
+      "manifestSha256": "d3614fb31afa4b8db630e23bd7fad44675cd9fcb6d36e7edb1c74dedc6ec3369",
+      "variants": {
+        "native": {
+          "version": "1.0.0",
+          "implementationHash": "f6d14a8c51b75a142bb1f68ba4955f90b36762e623cabcdd4e99cf03e03106e0"
         }
       }
     },
