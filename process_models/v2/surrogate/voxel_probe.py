@@ -30,7 +30,7 @@ from ..contract import (
     VariantCapabilities,
     VariantRegistration,
 )
-from ..engine import EngineRequirement
+from ..engine import EngineLease, EngineRequirement
 from ..state import ProcessState, StateDelta, VoxelState
 
 __all__ = [
@@ -115,7 +115,17 @@ class VoxelProbeVariant(EngineVariant):
             )
         return issues
 
-    def execute(self, state: ProcessState, params: BaseModel, ctx: ProcessContext) -> StateDelta:
+    def execute(
+        self,
+        state: ProcessState,
+        params: BaseModel,
+        ctx: ProcessContext,
+        engine: EngineLease,
+    ) -> StateDelta:
+        # Surrogates run on the Python interpreter that hosts this process, so
+        # the lease is accepted for the uniform v2 signature and left unused.
+        del engine
+
         operation: str = str(getattr(params, "operation", "identity"))
         layers = int(getattr(params, "layers", 1))
 
@@ -177,18 +187,8 @@ def register_voxel_probe(registry: Any) -> VariantRegistration:
     Returns the registration so callers can inspect the resolved identity
     without resolving again.
     """
-    from ..registry import compute_implementation_hash
-
     variant = VoxelProbeVariant()
-    registration = VariantRegistration(
-        process_id=VoxelProbeProcessSpec.id,
-        variant_id=variant.variant_id,
-        version=variant.version,
-        variant=variant,
-        capabilities=variant.capabilities,
-        engine=variant.engine,
-        implementation_hash=variant.implementation_hash or compute_implementation_hash(variant),
-    )
+    registration = VariantRegistration(process_id=VoxelProbeProcessSpec.id, variant=variant)
     registry.register_process(VoxelProbeProcessSpec)
     registry.register_variant(registration)
     return registration

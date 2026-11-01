@@ -2,12 +2,14 @@
 
 Each test builds one small 2D/3D level-set domain, resolves the real
 ``isotropic``/``native`` registration against a static native engine whose
-handle is the installed ``viennaps`` module, and executes the step. No server,
-worker process, or data directory is involved.
+handle is the installed ``viennaps`` module, and executes the plan through
+:meth:`ExecutionPlan.run` (or :func:`run_step`). No server, worker process, or
+data directory is involved.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import unittest
 from typing import Any
@@ -31,11 +33,15 @@ from process_models.v2.native.isotropic import (
 )
 from process_models.v2.registry import ProcessRegistry
 from process_models.v2.resolver import (
+    ExecutionOutcome,
+    ExecutionPlan,
     ExecutionRequest,
     ExecutionResolutionError,
+    execute_plan,
     resolve_execution,
+    run_step,
 )
-from process_models.v2.state import LevelSetState, MaterialState, ProcessState, StateDelta
+from process_models.v2.state import FieldState, LevelSetState, MaterialState, ProcessState, StateDelta
 
 GRID_DELTA = 0.1
 X_EXTENT = 1.0
@@ -175,6 +181,22 @@ def _surface_digest(domain: Any) -> str:
     return hashlib.sha256(_sorted_surface(domain).tobytes()).hexdigest()
 
 
+class _RecordingHandle:
+    """Module proxy that records attribute access.
+
+    Used to prove the variant reads the ``viennaps`` module from the engine
+    lease (``engine.handle``) instead of importing or reaching into the state.
+    """
+
+    def __init__(self, module: Any) -> None:
+        self._module = module
+        self.accessed: list[str] = []
+
+    def __getattr__(self, name: str) -> Any:
+        self.accessed.append(name)
+        return getattr(self._module, name)
+
+
 class IsotropicNativePluginTest(unittest.TestCase):
     def setUp(self) -> None:
         ps.setNumThreads(1)
@@ -192,6 +214,7 @@ class IsotropicNativePluginTest(unittest.TestCase):
         state: ProcessState,
         ctx: ProcessContext,
         version: str = VIENNAPS_VERSION,
+        handle: Any = ps,
     ) -> Any:
         request = ExecutionRequest(
             process_id="isotropic",
@@ -200,7 +223,7 @@ class IsotropicNativePluginTest(unittest.TestCase):
             context=ctx,
             state=state,
         )
-        return resolve_execution(request, self.registry, _provider(version))
+        return resolve_execution(request, self.registry, _provider(version, handle))
 
     def _execute(
         self,
@@ -209,13 +232,13 @@ class IsotropicNativePluginTest(unittest.TestCase):
         dimension: int = 2,
         project: dict[str, Any] | None = None,
         ctx: ProcessContext | None = None,
-    ) -> tuple[Any, ProcessState, StateDelta, Any]:
+        handle: Any = ps,
+    ) -> tuple[ExecutionPlan, ExecutionOutcome, Any]:
         state = _state(domain if domain is not None else _plane(dimension), dimension)
         ctx = ctx or _context(dimension, project)
-        plan = self._resolve(params, state, ctx)
-        state.engine = plan.engine
-        delta = plan.variant.variant.execute(state, params, ctx)
-        return plan, state, delta, state.geometry.handle
+        plan = self._resolve(params, state, ctx, handle=handle)
+        outcome = plan.run()
+        return plan, outcome, outcome.state.geometry.handle
 
     # -- identity / registration ------------------------------------------
 
@@ -240,10 +263,20 @@ class IsotropicNativePluginTest(unittest.TestCase):
         self.assertEqual(variant.engine.engine_id, "viennaps")
         self.assertEqual(variant.engine.min_version, "4.6.2")
 
+        self.assertEqual(self.registration.process_id, "isotropic")
+        self.assertIsInstance(self.registration.variant, IsotropicNativeVariant)
+        self.assertEqual(self.registration.variant_id, variant.variant_id)
+        self.assertEqual(self.registration.version, variant.version)
+        self.assertEqual(self.registration.capabilities, variant.capabilities)
+        self.assertEqual(self.registration.engine, variant.engine)
+        self.assertIsNone(self.registration.declared_hash)
+
         resolved = self.registry.get_variant("isotropic", "native")
         self.assertIsInstance(resolved.variant, VariantRegistration)
+        self.assertIs(resolved.variant, self.registration)
         self.assertEqual(resolved.variant.capabilities, variant.capabilities)
         self.assertEqual(len(resolved.implementation_hash), 64)
+        int(resolved.implementation_hash, 16)
         descriptors = self.registry.list_variants("isotropic")
         self.assertEqual([descriptor.id for descriptor in descriptors], ["native"])
         self.assertEqual(descriptors[0].kind, "native")
@@ -310,7 +343,8 @@ class IsotropicNativePluginTest(unittest.TestCase):
     def test_etch_lowers_the_surface_by_rate_times_duration(self) -> None:
         domain = _plane(2)
         before = _top(domain, 2)
-        plan, _state_after, delta, executed_domain = self._execute(self._params(), domain=domain)
+        plan, outcome, executed_domain = self._execute(self._params(), domain=domain)
+        delta = outcome.delta
 
         self.assertIs(executed_domain, domain)
         self.assertIsInstance(delta, StateDelta)
@@ -319,6 +353,9 @@ class IsotropicNativePluginTest(unittest.TestCase):
         self.assertEqual(delta.geometry.dimension, 2)
         self.assertEqual(delta.geometry.grid_delta, GRID_DELTA)
         self.assertEqual(delta.geometry.material_order, (int(ps.Material.Si),))
+        self.assertIs(outcome.state.geometry.handle, domain)
+        self.assertIs(outcome.state.geometry, delta.geometry)
+        self.assertIs(outcome.plan, plan)
 
         after = _top(domain, 2)
         self.assertAlmostEqual(after - before, -0.3, delta=1e-6)
@@ -335,12 +372,14 @@ class IsotropicNativePluginTest(unittest.TestCase):
         self.assertEqual(delta.metadata["timeStepRatio"], 0.25)
         self.assertEqual(delta.metadata["maskMaterials"], [])
         self.assertEqual(plan.engine.engine_id, "viennaps")
+        self.assertEqual(outcome.metadata, delta.metadata)
 
     def test_deposit_raises_the_surface_and_adds_sio2(self) -> None:
         domain = _plane(2)
         before = _top(domain, 2)
         params = self._params(operation="deposit", depositMaterial="SiO2")
-        _plan, state, delta, _domain = self._execute(params, domain=domain)
+        plan, outcome, _domain = self._execute(params, domain=domain)
+        delta = outcome.delta
 
         after = _top(domain, 2)
         self.assertAlmostEqual(after - before, 0.3, delta=1e-6)
@@ -359,9 +398,10 @@ class IsotropicNativePluginTest(unittest.TestCase):
         self.assertIsNotNone(bounds)
         self.assertGreater(bounds[1], 0.2)
 
-        # The committed delta only replaces geometry; the state materials merge
-        # happens in the adapter, so the variant state keeps its original order.
-        self.assertEqual(state.materials.order, (int(ps.Material.Si),))
+        # The plan's request state keeps its original order; the adapter merges
+        # the new geometry's materials into the committed state.
+        self.assertEqual(plan.request.state.materials.order, (int(ps.Material.Si),))
+        self.assertEqual(outcome.state.materials.order, order)
 
     def test_material_rate_mode_moves_only_the_listed_material(self) -> None:
         domain = _masked_trench()
@@ -376,7 +416,7 @@ class IsotropicNativePluginTest(unittest.TestCase):
             rateMode="material",
             materialRates={"Si": 0.2},
         )
-        _plan, _state, delta, _domain = self._execute(
+        _plan, outcome, _domain = self._execute(
             params,
             domain=domain,
             project={
@@ -385,6 +425,7 @@ class IsotropicNativePluginTest(unittest.TestCase):
                 "solver": {"timeStepRatio": 0.25},
             },
         )
+        delta = outcome.delta
 
         mask_after = _material_bounds(domain, int(ps.Material.Mask))
         si_after = _material_bounds(domain, int(ps.Material.Si))
@@ -406,7 +447,7 @@ class IsotropicNativePluginTest(unittest.TestCase):
         self.assertIsNotNone(mask_before)
         self.assertIsNotNone(si_before)
 
-        _plan, _state, delta, _domain = self._execute(
+        _plan, outcome, _domain = self._execute(
             self._params(rateMagnitude=0.2, duration=0.3),
             domain=domain,
             project={
@@ -415,6 +456,7 @@ class IsotropicNativePluginTest(unittest.TestCase):
                 "solver": {"timeStepRatio": 0.25},
             },
         )
+        delta = outcome.delta
 
         mask_after = _material_bounds(domain, int(ps.Material.Mask))
         si_after = _material_bounds(domain, int(ps.Material.Si))
@@ -427,7 +469,7 @@ class IsotropicNativePluginTest(unittest.TestCase):
     def test_three_dimensional_plane_smoke(self) -> None:
         domain = _plane(3)
         before = _top(domain, 3)
-        _plan, _state, delta, _domain = self._execute(
+        _plan, outcome, _domain = self._execute(
             self._params(rateMagnitude=0.2, duration=0.5),
             domain=domain,
             dimension=3,
@@ -435,8 +477,9 @@ class IsotropicNativePluginTest(unittest.TestCase):
         )
         after = _top(domain, 3)
         self.assertAlmostEqual(after - before, -0.1, delta=1e-6)
-        self.assertEqual(delta.geometry.dimension, 3)
-        self.assertEqual(delta.metadata["dimension"], 3)
+        self.assertEqual(outcome.delta.geometry.dimension, 3)
+        self.assertEqual(outcome.delta.metadata["dimension"], 3)
+        self.assertEqual(outcome.state.geometry.dimension, 3)
 
     # -- resolver admission ------------------------------------------------
 
@@ -491,17 +534,7 @@ class IsotropicNativePluginTest(unittest.TestCase):
             )
 
         variant = TwoDimensionalIsotropic()
-        self.registry.register_variant(
-            VariantRegistration(
-                process_id="isotropic",
-                variant_id=variant.variant_id,
-                version=variant.version,
-                variant=variant,
-                capabilities=variant.capabilities,
-                engine=variant.engine,
-                implementation_hash="test-2d-variant",
-            )
-        )
+        self.registry.register_variant(VariantRegistration(process_id="isotropic", variant=variant))
 
         domain = _plane(3)
         state = _state(domain, 3)
@@ -529,6 +562,38 @@ class IsotropicNativePluginTest(unittest.TestCase):
             resolve_execution(request, self.registry, _provider())
         self.assertIn("materialRates", str(raised.exception))
 
+    # -- state / engine boundary ------------------------------------------
+
+    def test_process_state_is_frozen_and_carries_no_engine(self) -> None:
+        state = _state(_plane(2))
+        self.assertFalse(hasattr(state, "engine"))
+        self.assertFalse(hasattr(state, "meta"))
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            state.engine = None  # type: ignore[misc]
+
+        copied = dataclasses.replace(state, fields=FieldState(data={"witness": 1}))
+        self.assertIsNot(copied, state)
+        self.assertIsNone(state.fields)
+        self.assertEqual(copied.fields.data, {"witness": 1})
+        self.assertIs(copied.geometry, state.geometry)
+
+    def test_variant_uses_the_engine_lease_handle_explicitly(self) -> None:
+        domain = _plane(2)
+        before = _top(domain, 2)
+        state = _state(domain)
+        handle = _RecordingHandle(ps)
+        plan = self._resolve(self._params(), state, _context(), handle=handle)
+
+        self.assertIs(plan.engine.handle, handle)
+        self.assertFalse(hasattr(state, "engine"))
+        outcome = plan.run()
+
+        # The variant read the module from the lease, not from a global import.
+        self.assertIn("IsotropicProcess", handle.accessed)
+        self.assertIn("Process", handle.accessed)
+        self.assertEqual(outcome.delta.metadata["nativeClass"], "ps.IsotropicProcess")
+        self.assertAlmostEqual(_top(domain, 2) - before, -0.3, delta=1e-6)
+
     # -- identity / determinism --------------------------------------------
 
     def test_plan_identity_is_stable_and_complete(self) -> None:
@@ -540,6 +605,9 @@ class IsotropicNativePluginTest(unittest.TestCase):
         second = self._resolve(params, state, ctx)
 
         identity = first.identity()
+        self.assertIs(first.request.state, state)
+        self.assertIs(first.request.params, params)
+        self.assertIs(first.request.context, ctx)
         self.assertEqual(identity, second.identity())
         self.assertEqual(
             set(identity),
@@ -570,25 +638,50 @@ class IsotropicNativePluginTest(unittest.TestCase):
         params = self._params(rateMagnitude=0.25, duration=0.4)
         ctx = _context()
 
+        # ``execute_plan(plan)`` and ``plan.run()`` are the same entry point.
         first_domain = _plane(2)
         first_plan = self._resolve(params, _state(first_domain), ctx)
-        first_state = _state(first_domain)
-        first_state.engine = first_plan.engine
-        first_delta = first_plan.variant.variant.execute(first_state, params, ctx)
+        first_outcome = execute_plan(first_plan)
 
         second_domain = _plane(2)
         second_plan = self._resolve(params, _state(second_domain), ctx)
-        second_state = _state(second_domain)
-        second_state.engine = second_plan.engine
-        second_delta = second_plan.variant.variant.execute(second_state, params, ctx)
+        second_outcome = second_plan.run()
 
         first_surface = _sorted_surface(first_domain)
         second_surface = _sorted_surface(second_domain)
         np.testing.assert_array_equal(first_surface, second_surface)
         self.assertEqual(_surface_digest(first_domain), _surface_digest(second_domain))
-        self.assertEqual(first_delta.geometry.material_order, second_delta.geometry.material_order)
-        self.assertEqual(first_delta.metadata, second_delta.metadata)
+        self.assertEqual(
+            first_outcome.delta.geometry.material_order,
+            second_outcome.delta.geometry.material_order,
+        )
+        self.assertEqual(first_outcome.delta.metadata, second_outcome.delta.metadata)
+        self.assertEqual(first_outcome.state.geometry.material_order, second_outcome.state.geometry.material_order)
         self.assertEqual(first_plan.identity(), second_plan.identity())
+
+    def test_run_step_matches_resolve_and_run(self) -> None:
+        params = self._params(rateMagnitude=0.25, duration=0.4)
+        ctx = _context()
+
+        planned_domain = _plane(2)
+        planned = self._resolve(params, _state(planned_domain), ctx).run()
+
+        stepped_domain = _plane(2)
+        stepped = run_step(
+            self.registry,
+            _provider(),
+            "isotropic",
+            "native",
+            params,
+            ctx,
+            _state(stepped_domain),
+        )
+
+        np.testing.assert_array_equal(_sorted_surface(planned_domain), _sorted_surface(stepped_domain))
+        self.assertEqual(planned.delta.metadata, stepped.delta.metadata)
+        self.assertEqual(planned.delta.geometry.material_order, stepped.delta.geometry.material_order)
+        self.assertEqual(planned.state.materials, stepped.state.materials)
+        self.assertEqual(planned.plan.identity(), stepped.plan.identity())
 
 
 if __name__ == "__main__":

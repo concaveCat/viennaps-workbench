@@ -15,7 +15,7 @@ another version, backend, or implementation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
@@ -24,7 +24,7 @@ from .adapters import DefaultStateAdapter
 from .contract import Issue, ProcessContext, ProcessSpec, VariantRegistration
 from .engine import EngineLease, EngineProvider, EngineUnavailableError
 from .registry import ProcessRegistry
-from .state import ProcessState, StateDelta, StateKind
+from .state import Artifact, ProcessState, StateDelta, StateKind
 
 if TYPE_CHECKING:
     from .adapters import StateAdapter
@@ -36,6 +36,7 @@ __all__ = [
     "ExecutionResolutionError",
     "execute_plan",
     "resolve_execution",
+    "run_step",
 ]
 
 
@@ -82,14 +83,19 @@ class ExecutionOutcome:
         return self.delta.warnings
 
     @property
-    def artifacts(self) -> list[object]:
+    def artifacts(self) -> list[Artifact]:
         return list(self.delta.artifacts)
 
 
 @dataclass(frozen=True)
 class ExecutionPlan:
-    """A resolved, engine-backed execution without side effects."""
+    """A resolved, engine-backed execution without side effects.
 
+    The plan owns the :class:`ExecutionRequest` it was resolved from, so
+    :meth:`run` and :func:`execute_plan` never need duplicate parameters.
+    """
+
+    request: ExecutionRequest
     process: ProcessSpec
     variant: VariantRegistration
     engine: EngineLease
@@ -118,6 +124,10 @@ class ExecutionPlan:
             "engine_fingerprint": self.engine_fingerprint,
             "adapter": self.state_adapter.id,
         }
+
+    def run(self) -> ExecutionOutcome:
+        """Execute this plan, equivalent to ``execute_plan(self)``."""
+        return execute_plan(self)
 
 
 def resolve_execution(
@@ -182,6 +192,7 @@ def resolve_execution(
         ) from error
 
     return ExecutionPlan(
+        request=request,
         process=process,
         variant=variant,
         engine=lease,
@@ -194,29 +205,25 @@ def resolve_execution(
     )
 
 
-def execute_plan(
-    plan: ExecutionPlan,
-    state: ProcessState,
-    params: BaseModel,
-    context: ProcessContext,
-) -> ExecutionOutcome:
+def execute_plan(plan: ExecutionPlan) -> ExecutionOutcome:
     """Run one resolved plan end to end.
 
-    This is the single execution entry point: it binds the acquired engine
-    lease to the state, materializes any derived representation, calls the
-    variant, and commits the returned delta. It deliberately does not
-    checkpoint or roll back; variants that declare ``mutates_input=True`` must
-    be checkpointed by the caller before this function is invoked.
+    This is the single execution entry point: it uses only the plan's own
+    request (state, params, context), passes the acquired engine lease to the
+    variant explicitly, materializes any derived representation, and commits
+    the returned delta. It deliberately does not checkpoint or roll back;
+    variants that declare ``mutates_input=True`` must be checkpointed by the
+    caller before this function is invoked.
     """
-    if not isinstance(params, plan.process.params_model):
+    request = plan.request
+    if not isinstance(request.params, plan.process.params_model):
         raise ExecutionResolutionError(
             f"process {plan.process.id!r} version {plan.process_version!r} expects params "
-            f"{plan.process.params_model.__name__}, got {type(params).__name__}"
+            f"{plan.process.params_model.__name__}, got {type(request.params).__name__}"
         )
 
-    bound = replace(state, engine=plan.engine)
-    prepared = plan.state_adapter.prepare(bound, plan.variant.capabilities)
-    delta = plan.variant.variant.execute(prepared, params, context)
+    prepared = plan.state_adapter.prepare(request.state, plan.variant.capabilities)
+    delta = plan.variant.variant.execute(prepared, request.params, request.context, plan.engine)
     if not isinstance(delta, StateDelta):
         raise ExecutionResolutionError(
             f"variant {plan.process.id!r}/{plan.variant.variant_id!r} returned "
@@ -224,6 +231,37 @@ def execute_plan(
         )
     committed = plan.state_adapter.commit(prepared, delta, plan.variant.capabilities)
     return ExecutionOutcome(plan=plan, state=committed, delta=delta)
+
+
+def run_step(
+    registry: ProcessRegistry,
+    provider: EngineProvider,
+    process_id: str,
+    variant_id: str,
+    params: BaseModel,
+    context: ProcessContext,
+    state: ProcessState,
+    *,
+    expected_process_version: str | None = None,
+    expected_variant_version: str | None = None,
+    adapter: StateAdapter | None = None,
+) -> ExecutionOutcome:
+    """Resolve and execute one step in a single call.
+
+    This is the convenient entry point for callers that do not need to inspect
+    or cache the :class:`ExecutionPlan`. Admission checks are unchanged because
+    resolution goes through :func:`resolve_execution`.
+    """
+    request = ExecutionRequest(
+        process_id=process_id,
+        variant_id=variant_id,
+        params=params,
+        context=context,
+        state=state,
+        expected_process_version=expected_process_version,
+        expected_variant_version=expected_variant_version,
+    )
+    return execute_plan(resolve_execution(request, registry, provider, adapter=adapter))
 
 
 def _check_geometry_grid(state: ProcessState, context: ProcessContext) -> None:

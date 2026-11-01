@@ -1,14 +1,17 @@
 # 工艺模型插件架构（设计草案）
 
-> 状态：**设计 + 第一切片实现记录（v1）**。当前分支已落地 `process_models/contract.py`、
-> `registry.py`、`voxel.py`（height-field 适配器）以及一个实验性 `voxel_probe`
-> proof plugin 和 38 个定向测试；**尚未**接入 backend/worker，也没有 legacy 包装、
-> 真实工艺插件或 API/UI。
+> 状态：**v1 已冻结（frozen legacy）**。本文只保留为 v1 第一切片的历史记录，
+> **不再更新，也不要在新代码里继续使用 v1 API**。当前落地的是
+> `process_models/contract.py`、`registry.py`、`voxel.py`（height-field 适配器）
+> 以及一个实验性 `voxel_probe` proof plugin；v1 **尚未**接入 backend/worker，
+> 也没有 legacy 包装、真实工艺插件或 API/UI。
 >
-> **v2 设计/实现见 [`process-model-plugins-v2.md`](process-model-plugins-v2.md)**：
-> 拆分 `ProcessSpec` / `VariantRegistration`、引入 `Engine`/`RuntimeLease`、
-> 多表示 `ProcessState`/`StateDelta`、`resolve_execution()`/`execute_plan()`。
-> 本文保留为 v1 第一切片记录。本文其余部分描述目标契约与迁移顺序，未实现的内容不写成已完成。
+> **目标实现是 v2.1，见 [`process-model-plugins-v2.md`](process-model-plugins-v2.md)。**
+> v1 的 `ProcessPlugin` 已由 v2.1 的 `ProcessSpec` + `VariantRegistration` 取代，
+> 原生句柄改为显式 `EngineLease`，状态改为多表示 `ProcessState`/`StateDelta`，
+> 执行入口是 `resolve_execution()`、`ExecutionPlan.run()` / `execute_plan(plan)`
+> 和 `run_step()`。**v2.1 才是目标；v1 仅是历史。** 下文描述 v1 契约与当时的
+> 迁移顺序，其中的 API 不再演进；保留原文是为了记录设计演进，不是使用指南。
 
 ## 1. 为什么现在需要拆
 

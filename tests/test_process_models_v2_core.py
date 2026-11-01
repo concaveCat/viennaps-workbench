@@ -7,6 +7,7 @@ directory.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import unittest
 from unittest import mock
@@ -88,16 +89,19 @@ class DummyVariant:
     variant_id = "dummy"
     version = "1.0.0"
     capabilities = _DUMMY_CAPS
+    engine = EngineRequirement(kind="native", engine_id="dummy")
     implementation_hash = None
 
     def __init__(self) -> None:
         self.execute_calls = 0
+        self.last_engine = None
 
     def validate(self, ctx: ProcessContext, params: BaseModel) -> list[Issue]:
         return []
 
-    def execute(self, state: ProcessState, params: BaseModel, ctx: ProcessContext) -> StateDelta:
+    def execute(self, state: ProcessState, params: BaseModel, ctx: ProcessContext, engine: object) -> StateDelta:
         self.execute_calls += 1
+        self.last_engine = engine
         return StateDelta()
 
 
@@ -142,21 +146,15 @@ def _registration(
     variant: object | None = None,
     *,
     process_id: str = "dummy.deposit",
-    variant_id: str | None = None,
-    version: str | None = None,
     engine: EngineRequirement | None = None,
-    implementation_hash: str = "",
+    implementation_hash: str | None = None,
 ) -> VariantRegistration:
     variant = variant or DummyVariant()
-    return VariantRegistration(
-        process_id=process_id,
-        variant_id=variant_id if variant_id is not None else variant.variant_id,
-        version=version if version is not None else variant.version,
-        variant=variant,
-        capabilities=variant.capabilities,
-        engine=engine or EngineRequirement(kind="native", engine_id="dummy"),
-        implementation_hash=implementation_hash,
-    )
+    if engine is not None:
+        variant.engine = engine  # type: ignore[attr-defined]
+    if implementation_hash is not None:
+        variant.implementation_hash = implementation_hash  # type: ignore[attr-defined]
+    return VariantRegistration(process_id=process_id, variant=variant)  # type: ignore[arg-type]
 
 
 def _static_engine(
@@ -193,13 +191,12 @@ def _state(
     )
 
 
-def _context(dimension: int = 2, materials: MaterialState | None = None) -> ProcessContext:
+def _context(dimension: int = 2) -> ProcessContext:
     return ProcessContext(
         dimension=dimension,
         grid_delta=0.5,
         project={"name": "dummy"},
         step={"type": "deposit"},
-        materials=materials or MaterialState(order=(0,), names={0: "Si"}),
     )
 
 
@@ -256,6 +253,21 @@ class StateTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             LevelSetState(handle=object(), dimension=2, grid_delta=0.5, material_order=(-1,))
 
+    def test_process_state_is_frozen_and_has_no_engine_or_meta(self) -> None:
+        state = _state()
+        self.assertEqual(
+            {field.name for field in dataclasses.fields(ProcessState)},
+            {"geometry", "fields", "voxels", "materials"},
+        )
+        self.assertFalse(hasattr(state, "engine"))
+        self.assertFalse(hasattr(state, "meta"))
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            state.fields = FieldState(data={"temperature": 300.0})  # type: ignore[misc]
+
+        replaced = dataclasses.replace(state, voxels=VoxelState(grid=FakeGrid()))
+        self.assertIsNot(replaced, state)
+        self.assertIsNone(state.voxels)
+
     def test_process_state_has_require_and_missing_error(self) -> None:
         empty = ProcessState()
         self.assertFalse(empty.has("geometry"))
@@ -269,8 +281,7 @@ class StateTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             empty.has("bogus")  # type: ignore[arg-type]
 
-        state = _state()
-        state.fields = FieldState(data={"temperature": 300.0})
+        state = dataclasses.replace(_state(), fields=FieldState(data={"temperature": 300.0}))
         self.assertTrue(state.has("geometry"))
         self.assertTrue(state.has("fields"))
         self.assertTrue(state.has("materials"))
@@ -291,11 +302,16 @@ class StateTest(unittest.TestCase):
         self.assertFalse(StateDelta(voxels=VoxelState(grid=FakeGrid())).is_empty())
         self.assertFalse(StateDelta(fields=FieldState(data={"x": 1})).is_empty())
 
-    def test_process_context_validation(self) -> None:
+    def test_process_context_validation_and_no_materials(self) -> None:
         with self.assertRaises(ValueError):
             ProcessContext(dimension=1, grid_delta=0.5)
         with self.assertRaises(ValueError):
             ProcessContext(dimension=2, grid_delta=0.0)
+
+        context = ProcessContext(dimension=2, grid_delta=0.5)
+        self.assertFalse(hasattr(context, "materials"))
+        with self.assertRaises(TypeError):
+            ProcessContext(dimension=2, grid_delta=0.5, materials=MaterialState(order=(0,)))  # type: ignore[call-arg]
 
 
 # ---------------------------------------------------------------------------
@@ -373,48 +389,75 @@ class EngineTest(unittest.TestCase):
 # contract + registry
 # ---------------------------------------------------------------------------
 class ContractRegistryTest(unittest.TestCase):
-    def test_process_spec_describe(self) -> None:
-        descriptor = _spec().describe()
+    def test_list_processes_builds_descriptor_without_spec_method(self) -> None:
+        self.assertFalse(hasattr(ProcessSpec, "describe"))
+
+        registry = ProcessRegistry()
+        registry.register_process(_spec())
+        registry.register_variant(_registration(DummyVariant()))
+
+        descriptor = registry.list_processes()[0]
         self.assertEqual(descriptor.id, "dummy.deposit")
         self.assertEqual(descriptor.version, "1.0.0")
         self.assertEqual(descriptor.dimensions, (2, 3))
         self.assertEqual(descriptor.operations, ("deposit",))
-        self.assertEqual(descriptor.variants, ())
+        self.assertEqual([variant.id for variant in descriptor.variants], ["dummy"])
         self.assertEqual(descriptor.description, "test fixture")
+
+    def test_variant_registration_derives_identity(self) -> None:
+        variant = DummyVariant()
+        registration = VariantRegistration(process_id="dummy.deposit", variant=variant)
+
+        self.assertEqual(registration.process_id, "dummy.deposit")
+        self.assertEqual(registration.variant_id, "dummy")
+        self.assertEqual(registration.version, "1.0.0")
+        self.assertIs(registration.capabilities, variant.capabilities)
+        self.assertIs(registration.capabilities, _DUMMY_CAPS)
+        self.assertIs(registration.engine, variant.engine)
+        self.assertIsNone(registration.declared_hash)
+
+        variant.implementation_hash = "sha256:declared"
+        self.assertEqual(registration.declared_hash, "sha256:declared")
 
     def test_variant_registration_validation(self) -> None:
         with self.assertRaises(ValueError):
-            _registration(variant_id=" ")
+            VariantRegistration(process_id=" ", variant=DummyVariant())
+
+        class BlankIdVariant(DummyVariant):
+            variant_id = " "
+
         with self.assertRaises(ValueError):
-            _registration(version="")
+            VariantRegistration(process_id="dummy.deposit", variant=BlankIdVariant())
+
+        class BlankVersionVariant(DummyVariant):
+            version = ""
+
+        with self.assertRaises(ValueError):
+            VariantRegistration(process_id="dummy.deposit", variant=BlankVersionVariant())
+
+        class MissingEngineVariant(DummyVariant):
+            engine = None  # type: ignore[assignment]
+
         with self.assertRaises(TypeError):
-            VariantRegistration(
-                process_id="dummy.deposit",
-                variant_id="dummy",
-                version="1.0.0",
-                variant=DummyVariant(),
-                capabilities=_DUMMY_CAPS,
-                engine=None,  # type: ignore[arg-type]
-            )
+            VariantRegistration(process_id="dummy.deposit", variant=MissingEngineVariant())
 
-        class MismatchedVariant(DummyVariant):
-            capabilities = VariantCapabilities(dimensions=(2,), reads=frozenset(), writes=frozenset())
+        class BadCapabilitiesVariant(DummyVariant):
+            capabilities = "not-capabilities"  # type: ignore[assignment]
 
-        with self.assertRaises(ValueError):
-            VariantRegistration(
-                process_id="dummy.deposit",
-                variant_id="mismatch",
-                version="1.0.0",
-                variant=MismatchedVariant(),
-                capabilities=_DUMMY_CAPS,
-                engine=EngineRequirement(kind="native", engine_id="dummy"),
-            )
+        with self.assertRaises(TypeError):
+            VariantRegistration(process_id="dummy.deposit", variant=BadCapabilitiesVariant())
+
+        class BadHashVariant(DummyVariant):
+            implementation_hash = 123  # type: ignore[assignment]
+
+        with self.assertRaises(TypeError):
+            VariantRegistration(process_id="dummy.deposit", variant=BadHashVariant())
 
     def test_registry_multiple_process_versions_and_pins(self) -> None:
         registry = ProcessRegistry()
         registry.register_process(_spec("1.0.0"))
         registry.register_process(_spec("2.0.0"))
-        registry.register_variant(_registration(version="1.0.0"))
+        registry.register_variant(_registration())
 
         self.assertEqual(registry.get_process("dummy.deposit").version, "2.0.0")
         self.assertEqual(registry.get_process("dummy.deposit", "1.0.0").version, "1.0.0")
@@ -425,9 +468,9 @@ class ContractRegistryTest(unittest.TestCase):
     def test_registry_add_variant_without_process_bump(self) -> None:
         registry = ProcessRegistry()
         registry.register_process(_spec("1.0.0"))
-        registry.register_variant(_registration(DummyVariant(), version="1.0.0"))
+        registry.register_variant(_registration(DummyVariant()))
 
-        registry.register_variant(_registration(DummyVariantV2(), version="2.0.0"))
+        registry.register_variant(_registration(DummyVariantV2()))
 
         self.assertEqual(registry.get_process("dummy.deposit").version, "1.0.0")
         self.assertEqual(registry.get_variant("dummy.deposit", "dummy").variant_version, "2.0.0")
@@ -456,9 +499,9 @@ class ContractRegistryTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             registry.register_process(_spec("1.0.0"))
 
-        registry.register_variant(_registration(DummyVariant(), version="1.0.0"))
+        registry.register_variant(_registration(DummyVariant()))
         with self.assertRaises(ValueError):
-            registry.register_variant(_registration(DummyVariant(), version="1.0.0"))
+            registry.register_variant(_registration(DummyVariant()))
 
     def test_registry_unknown_keys_raise_key_error(self) -> None:
         registry = ProcessRegistry()
@@ -511,7 +554,7 @@ class ContractRegistryTest(unittest.TestCase):
         self.assertEqual(len(class_only), 64)
         self.assertNotEqual(class_only, digest)
 
-    def test_registry_uses_explicit_or_computed_hash(self) -> None:
+    def test_registry_uses_declared_or_computed_hash(self) -> None:
         registry = ProcessRegistry()
         registry.register_process(_spec())
         registry.register_variant(_registration(DummyVariant(), implementation_hash="sha256:explicit"))
@@ -519,12 +562,18 @@ class ContractRegistryTest(unittest.TestCase):
             registry.get_variant("dummy.deposit", "dummy").implementation_hash,
             "sha256:explicit",
         )
+        self.assertEqual(registry.list_variants("dummy.deposit")[0].implementation_hash, "sha256:explicit")
 
         computed = ProcessRegistry()
         computed.register_process(_spec())
         computed.register_variant(_registration(DummyVariant()))
+        self.assertIsNone(computed._variants["dummy.deposit"]["dummy"][0].declared_hash)
         self.assertEqual(
             computed.get_variant("dummy.deposit", "dummy").implementation_hash,
+            compute_implementation_hash(DummyVariant()),
+        )
+        self.assertEqual(
+            computed.list_variants("dummy.deposit")[0].implementation_hash,
             compute_implementation_hash(DummyVariant()),
         )
 
@@ -535,18 +584,16 @@ class ContractRegistryTest(unittest.TestCase):
 class ResolverTest(unittest.TestCase):
     def test_resolver_success_and_stable_identity(self) -> None:
         registry, provider, spec = _resolver_fixture()
-        plan = resolve_execution(
-            ExecutionRequest(
-                process_id="dummy.deposit",
-                variant_id="dummy",
-                params=DummyParams(amount=2.0),
-                context=_context(),
-                state=_state(),
-            ),
-            registry,
-            provider,
+        request = ExecutionRequest(
+            process_id="dummy.deposit",
+            variant_id="dummy",
+            params=DummyParams(amount=2.0),
+            context=_context(),
+            state=_state(),
         )
+        plan = resolve_execution(request, registry, provider)
 
+        self.assertIs(plan.request, request)
         self.assertEqual(plan.process.id, spec.id)
         self.assertEqual(plan.process_version, "1.0.0")
         self.assertEqual(plan.variant_version, "1.0.0")
@@ -647,6 +694,7 @@ class ResolverTest(unittest.TestCase):
             provider,
         )
         self.assertEqual(plan.state_adapter.id, "default-v2")
+        self.assertEqual(plan.state_adapter.provides, frozenset({"voxels"}))
 
     def test_resolver_rejects_material_order_mismatch(self) -> None:
         registry, provider, _ = _resolver_fixture()
@@ -664,6 +712,25 @@ class ResolverTest(unittest.TestCase):
                 provider,
             )
         self.assertIn("material order", str(caught.exception))
+
+    def test_resolver_uses_state_materials_not_context(self) -> None:
+        registry, provider, _ = _resolver_fixture()
+        context = _context()
+        self.assertFalse(hasattr(context, "materials"))
+        # A consistent state.materials passes even though the context has no
+        # material table at all.
+        plan = resolve_execution(
+            ExecutionRequest(
+                process_id="dummy.deposit",
+                variant_id="dummy",
+                params=DummyParams(),
+                context=context,
+                state=_state(materials=MaterialState(order=(0,), names={0: "Si"})),
+            ),
+            registry,
+            provider,
+        )
+        self.assertEqual(plan.process.id, "dummy.deposit")
 
     def test_resolver_rejects_any_validation_error_with_all_messages(self) -> None:
         variant = ScriptedVariant(
@@ -720,6 +787,10 @@ class ResolverTest(unittest.TestCase):
 # adapters
 # ---------------------------------------------------------------------------
 class AdapterTest(unittest.TestCase):
+    def test_adapter_provides_only_derived_representations(self) -> None:
+        self.assertEqual(DefaultStateAdapter.provides, frozenset({"voxels"}))
+        self.assertEqual(DefaultStateAdapter().provides, frozenset({"voxels"}))
+
     def test_prepare_reads_voxels_from_geometry_without_mutating_input(self) -> None:
         state = _state()
         grid = FakeGrid()
@@ -741,13 +812,11 @@ class AdapterTest(unittest.TestCase):
         with self.assertRaises(StateMissingError):
             DefaultStateAdapter().prepare(_state(), _FIELD_CAPS)
 
-        state = _state()
-        state.fields = FieldState(data={"x": 1})
+        state = dataclasses.replace(_state(), fields=FieldState(data={"x": 1}))
         self.assertIs(DefaultStateAdapter().prepare(state, _FIELD_CAPS), state)
 
     def test_commit_voxel_delta_writes_back_and_clears_voxels(self) -> None:
-        state = _state()
-        state.voxels = VoxelState(grid=FakeGrid())
+        state = dataclasses.replace(_state(), voxels=VoxelState(grid=FakeGrid()))
         grid = FakeGrid(material_order=(0, 1))
         new_handle = object()
         delta = StateDelta(voxels=VoxelState(grid=grid))
@@ -767,8 +836,7 @@ class AdapterTest(unittest.TestCase):
         self.assertIsNot(state.geometry, committed.geometry)
 
     def test_commit_geometry_delta_wins_over_voxels_and_applies_fields(self) -> None:
-        state = _state()
-        state.voxels = VoxelState(grid=FakeGrid())
+        state = dataclasses.replace(_state(), voxels=VoxelState(grid=FakeGrid()))
         new_geometry = LevelSetState(handle=object(), dimension=2, grid_delta=0.5, material_order=(0, 1))
         fields = FieldState(data={"temperature": 400.0})
         delta = StateDelta(geometry=new_geometry, voxels=VoxelState(grid=FakeGrid()), fields=fields)
@@ -787,6 +855,12 @@ class AdapterTest(unittest.TestCase):
         state = _state()
         with self.assertRaises(ExecutionResolutionError):
             DefaultStateAdapter().commit(state, StateDelta(voxels=VoxelState(grid=FakeGrid())), _DUMMY_CAPS)
+
+    def test_commit_rejects_geometry_delta_when_write_is_not_declared(self) -> None:
+        state = _state()
+        capabilities = VariantCapabilities(dimensions=(2,), reads=frozenset({"geometry"}), writes=frozenset())
+        with self.assertRaises(ExecutionResolutionError):
+            DefaultStateAdapter().commit(state, StateDelta(geometry=state.geometry), capabilities)
 
     def test_commit_requires_original_geometry_for_voxels(self) -> None:
         with self.assertRaises(StateMissingError):

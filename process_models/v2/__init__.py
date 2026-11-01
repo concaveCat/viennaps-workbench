@@ -50,6 +50,7 @@ from .resolver import (
     ExecutionResolutionError,
     execute_plan,
     resolve_execution,
+    run_step,
 )
 from .state import (
     Artifact,
@@ -104,5 +105,6 @@ __all__ = [
     "compute_implementation_hash",
     "execute_plan",
     "resolve_execution",
+    "run_step",
     "version_satisfies",
 ]

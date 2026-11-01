@@ -15,9 +15,10 @@ The state is deliberately representation-agnostic:
 * ``materials`` describes the native material IDs in level-set order. It may
   be empty for field-only steps.
 
-No backend, worker, or project-schema types appear here. ``ProcessState`` is
-mutable on purpose (adapters build a new one with ``dataclasses.replace``),
-while every nested value object is frozen.
+No backend, worker, or project-schema types appear here. ``ProcessState`` and
+every nested value object are frozen; adapters build new states with
+``dataclasses.replace`` and never mutate an input state. The engine lease is
+passed to variants explicitly, not stored in the state.
 """
 
 from __future__ import annotations
@@ -94,8 +95,8 @@ class LevelSetState:
     """An engine-specific level-set handle plus the grid metadata it carries.
 
     ``handle`` is opaque to this package. For native variants it is the
-    ViennaPS ``Domain``; the ``engine`` lease on :class:`ProcessState` holds
-    the module/handle needed to operate on it.
+    ViennaPS ``Domain``; the :class:`process_models.v2.engine.EngineLease`
+    handed to the variant provides the module/handle needed to operate on it.
     """
 
     handle: Any
@@ -141,21 +142,18 @@ class VoxelState:
     source: str = "height-field-v1"
 
 
-@dataclass
+@dataclass(frozen=True)
 class ProcessState:
-    """Everything a variant may read, plus the acquired engine lease.
+    """Everything a variant may read.
 
-    ``engine`` is intentionally opaque to this module. The resolver sets it
-    to an :class:`process_models.v2.engine.EngineLease`; native variants read
-    ``state.engine.handle`` to get the engine module.
+    The state is immutable. The engine lease is *not* part of it: the executor
+    passes the acquired lease to :meth:`EngineVariant.execute` explicitly.
     """
 
     geometry: LevelSetState | None = None
     fields: FieldState | None = None
     voxels: VoxelState | None = None
     materials: MaterialState = field(default_factory=lambda: MaterialState(()))
-    engine: Any = None
-    meta: Mapping[str, Any] = field(default_factory=dict)
 
     def has(self, kind: StateKind) -> bool:
         """Return whether ``kind`` is populated.

@@ -21,7 +21,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 
 from .contract import ModelDescriptor, ProcessSpec, VariantDescriptor, VariantRegistration
@@ -150,7 +150,7 @@ class ProcessRegistry:
             selected = _latest_version([item.version for item in registrations])
             registration = next(item for item in registrations if item.version == selected)
 
-        implementation_hash = registration.implementation_hash or compute_implementation_hash(registration.variant)
+        implementation_hash = registration.declared_hash or compute_implementation_hash(registration.variant)
         return ResolvedVariant(
             process=process,
             variant=registration,
@@ -164,7 +164,17 @@ class ProcessRegistry:
         descriptors: list[ModelDescriptor] = []
         for process_id, versions in self._processes.items():
             spec = versions[_latest_version(list(versions))]
-            descriptors.append(replace(spec.describe(), variants=tuple(self._variant_descriptors(process_id))))
+            descriptors.append(
+                ModelDescriptor(
+                    id=spec.id,
+                    version=spec.version,
+                    label=spec.label,
+                    dimensions=spec.dimensions,
+                    operations=spec.operations,
+                    variants=tuple(self._variant_descriptors(process_id)),
+                    description=spec.description,
+                )
+            )
         return descriptors
 
     def list_variants(self, process_id: str) -> list[VariantDescriptor]:
@@ -187,7 +197,7 @@ class ProcessRegistry:
                         reads=tuple(sorted(capabilities.reads)),
                         writes=tuple(sorted(capabilities.writes)),
                         experimental=capabilities.experimental,
-                        implementation_hash=registration.implementation_hash
+                        implementation_hash=registration.declared_hash
                         or compute_implementation_hash(registration.variant),
                     )
                 )

@@ -14,7 +14,9 @@ same ``ps.IsotropicProcess``. The only new part is the v2 packaging:
 
 The variant mutates the caller's level-set handle in place
 (``mutates_input=True``), exactly like the worker path. The executor is
-responsible for checkpointing before calling it.
+responsible for checkpointing before calling it. The engine lease is passed
+explicitly to :meth:`IsotropicNativeVariant.execute`; it is never stored in the
+process state.
 """
 
 from __future__ import annotations
@@ -32,7 +34,7 @@ from ..contract import (
     VariantCapabilities,
     VariantRegistration,
 )
-from ..engine import EngineRequirement
+from ..engine import EngineLease, EngineRequirement
 from ..state import LevelSetState, ProcessState, StateDelta
 
 __all__ = [
@@ -215,19 +217,23 @@ class IsotropicNativeVariant(EngineVariant):
 
         return issues
 
-    def execute(self, state: ProcessState, params: BaseModel, ctx: ProcessContext) -> StateDelta:
+    def execute(
+        self,
+        state: ProcessState,
+        params: BaseModel,
+        ctx: ProcessContext,
+        engine: EngineLease,
+    ) -> StateDelta:
         """Apply one isotropic step and return the mutated native geometry.
 
         The worker module is imported lazily so that registering the plugin
-        never imports the worker or native libraries.
+        never imports the worker or native libraries. ``engine.handle`` is the
+        installed ``viennaps`` module supplied by the executor's lease.
         """
         import worker.simulate as simulate
 
         geometry = state.require("geometry")
-        lease = state.engine
-        if lease is None:
-            raise RuntimeError("isotropic native variant requires an engine lease on the process state")
-        ps = lease.handle
+        ps = engine.handle
         domain = geometry.handle
 
         operation = str(getattr(params, "operation", "etch"))
@@ -341,21 +347,13 @@ IsotropicSpec = IsotropicProcessSpec
 def register_isotropic(registry: Any) -> VariantRegistration:
     """Register the isotropic spec and its single native variant.
 
-    Returns the registration so callers can inspect the resolved identity
-    without resolving again.
+    The registration is just ``(process_id, variant)``: the registry derives the
+    variant id/version, capabilities, engine requirement, and implementation
+    hash from the variant itself. Returns the registration so callers can
+    inspect the declared identity without resolving again.
     """
-    from ..registry import compute_implementation_hash
-
     variant = IsotropicNativeVariant()
-    registration = VariantRegistration(
-        process_id=IsotropicProcessSpec.id,
-        variant_id=variant.variant_id,
-        version=variant.version,
-        variant=variant,
-        capabilities=variant.capabilities,
-        engine=variant.engine,
-        implementation_hash=variant.implementation_hash or compute_implementation_hash(variant),
-    )
+    registration = VariantRegistration(process_id=IsotropicProcessSpec.id, variant=variant)
     registry.register_process(IsotropicProcessSpec)
     registry.register_variant(registration)
     return registration

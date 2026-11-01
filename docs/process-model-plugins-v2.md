@@ -1,11 +1,13 @@
-# 工艺模型插件 v2：设计/实现说明
+# 工艺模型插件 v2.1：设计/实现说明
 
 > 范围：`process_models/v2/`。v1（`process_models/contract.py`、`registry.py`、
-> `voxel.py`、`surrogate/voxel_probe.py`）**不改动**；本切片不碰 backend/worker，
-> 不启动服务，不改项目 schema。
+> `voxel.py`、`surrogate/voxel_probe.py`）是**冻结的 legacy**，不再演进也**不改动**；
+> 本切片不碰 backend/worker，不启动服务，不改项目 schema。
 >
-> 本文描述 v2 切片的契约与边界。凡是 v2 包内没有对应模块的能力，文中一律标为
+> 本文描述 v2.1 的契约与边界。凡是 v2 包内没有对应模块的能力，文中一律标为
 > “未实现”，不把设计意图写成已完成状态。
+>
+> v2.1 是 v2 的**收缩**而非扩张：字段更少、依赖更显式、样板代码更少，执行语义不变。
 
 ## 0. 一页结论
 
@@ -21,6 +23,105 @@ v1 把四件事塞进了同一层：进程身份、实现注册、原生引擎�
 | 表示转换 | 变体自己调 `read_voxels`/`write_voxels` | `StateAdapter.prepare/commit`，变体只看见自己声明的表示 |
 | 解析 | `registry.resolve()` 只查表 | `resolve_execution()` 做参数/能力/引擎/适配器全链路准入并产出 `ExecutionPlan` |
 | 实现哈希 | `inspect.getsource(type(variant))` | 变体模块的**全部 .py 文件字节** + 类 qualname |
+
+### 0.1 v2.1 相对 v2 的六项简化
+
+v2 的第一版能跑，但把同一事实写在了两三个地方（request 既在 plan 外又在 plan 内、
+variant 的 id/版本/能力既在变体上又在 registration 里、engine 既在 lease 里又塞进
+state）。v2.1 只做减法：
+
+| # | v2 | v2.1 | 去掉了什么重复/歧义 |
+| --- | --- | --- | --- |
+| 1 | `execute_plan(plan, state, params, context)` | `execute_plan(plan)`；plan 自带 `request`；另有 `run_step(...)` | 执行参数只有一个来源，不会出现“plan 是 A、传入 state 是 B” |
+| 2 | `ProcessState.engine` 保存 lease | `EngineVariant.execute(state, params, ctx, engine)` 显式传入 | 状态里不再藏运行时句柄；`ProcessState` 因此可 `frozen` |
+| 3 | `VariantRegistration(process_id, variant_id, version, variant, capabilities, engine, implementation_hash)` | `VariantRegistration(process_id, variant)`，其余由 variant 派生 | 变体身份只声明一次，不会 registration 与 variant 各写一份还对不上 |
+| 4 | `ProcessContext.materials`、`ProcessState.meta`、`ProcessSpec.describe()` | 全部删除；材料只在 `state.materials`，descriptor 由 registry 生成 | 上下文与状态各司其职；描述信息不再有“spec 方法 vs registry 拼装”两条路 |
+| 5 | `ExecutionPlan` 只有执行所需字段 | `ExecutionPlan.request` + `plan.run()` | 计划与它要执行的请求绑定，admission 结果不会被换掉的输入绕过 |
+| 6 | 注册/执行样板长 | 注册只需 `(process_id, variant)`；一步执行用 `run_step` | 新增一个 process 的代码量明显下降 |
+
+为什么这六项值得做：
+
+- **删除重复事实**：一个值只存一处，比较、哈希、replay 都只有一条路径。
+- **把准入绑定到执行**：`resolve_execution()` 校验的就是 `plan.request`，`execute_plan(plan)`
+  只读它；手工改 plan 的字段不会让未经准入的请求混进来。
+- **让引擎依赖显式**：变体签名里就有 `engine`，不需要去 state 里翻；surrogate 也必须
+  显式接受（即使不用），避免“有的变体偷偷依赖全局状态”。
+- **减少样板**：变体已经声明了 id/version/capabilities/engine/hash 来源，registration
+  再抄一遍没有信息增量，只增加写错的机会。
+
+### 0.2 v2.1 快速上手（最小 process 插件）
+
+下面是一个可注册、可解析、可执行的最小插件。实际原生实现里 `execute` 会用
+`engine.handle` 拿 ViennaPS 句柄；这里只用 `StateDelta` 说明形状。
+
+```python
+from __future__ import annotations
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from process_models.v2 import (
+    EngineRequirement,
+    ProcessContext,
+    ProcessRegistry,
+    ProcessSpec,
+    ProcessState,
+    StateDelta,
+    VariantCapabilities,
+    VariantRegistration,
+    run_step,
+)
+
+class MyParams(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    rate: float = Field(gt=0)
+
+class MyVariant:
+    variant_id = "native"
+    version = "1.0.0"
+    capabilities = VariantCapabilities(
+        dimensions=(2, 3),
+        reads=frozenset({"geometry"}),
+        writes=frozenset({"geometry"}),
+        mutates_input=False,
+        determinism="strict",
+    )
+    engine = EngineRequirement(kind="native", engine_id="viennaps", min_version="4.6.2")
+    implementation_hash = None  # None = 由 registry 按模块字节计算
+
+    def validate(self, ctx: ProcessContext, params: MyParams) -> list:
+        return []
+
+    def execute(self, state: ProcessState, params: MyParams, ctx: ProcessContext, engine):
+        # engine 是本步租约；原生插件用 engine.handle，surrogate 可以不用。
+        return StateDelta(metadata={"rate": params.rate})
+
+def register_my_process(registry: ProcessRegistry) -> None:
+    spec = ProcessSpec(
+        id="my_process",
+        version="1.0.0",
+        label="My process",
+        params_model=MyParams,
+        dimensions=(2, 3),
+        operations=("etch",),
+    )
+    registry.register_process(spec)
+    # id/version/capabilities/engine/hash 都从 variant 派生，不重复传。
+    registry.register_variant(VariantRegistration(process_id=spec.id, variant=MyVariant()))
+
+# 一步完成 resolve + execute；outcome.plan.identity() 可直接写进 run 记录。
+outcome = run_step(
+    registry,
+    provider,
+    process_id="my_process",
+    variant_id="native",
+    params=MyParams(rate=1.0),
+    context=ctx,
+    state=state,
+)
+```
+
+需要分两步时用 `plan = resolve_execution(request, registry, provider)`，再
+`outcome = plan.run()`（等价于 `execute_plan(plan)`）。
 
 ## 1. v1 的结构问题
 
@@ -163,8 +264,8 @@ v1 的 `VariantCapabilities` 自己就写着：
 | 类型 | 文件 | 回答的问题 | 关键字段 |
 | --- | --- | --- | --- |
 | `ProcessSpec` | `contract.py` | 这是什么工艺、参数长什么样 | `id`、`version`、`label`、`params_model`、`dimensions`、`operations`、`description` |
-| `VariantRegistration` | `contract.py` | 用哪个实现、要什么引擎、覆盖哪些状态 | `process_id`、`variant_id`、`version`、`variant`、`capabilities`、`engine`、`implementation_hash` |
-| `EngineVariant` | `contract.py` | 怎么校验、怎么执行 | `variant_id`、`version`、`capabilities`、`implementation_hash`、`validate()`、`execute()` |
+| `VariantRegistration` | `contract.py` | 用哪个实现、归属于哪个 process | `process_id`、`variant`；`variant_id`/`version`/`capabilities`/`engine`/`declared_hash` 由 variant 派生 |
+| `EngineVariant` | `contract.py` | 怎么校验、怎么执行 | `variant_id`、`version`、`capabilities`、`engine`、`implementation_hash`、`validate()`、`execute(state, params, ctx, engine)` |
 | `ResolvedVariant` | `registry.py` | 解析结果的四元身份 | `process`、`variant`、`process_version`、`variant_version`、`implementation_hash` |
 
 ```python
@@ -177,10 +278,32 @@ class ProcessSpec:
     dimensions: tuple[int, ...]
     operations: tuple[str, ...]
     description: str = ""
+
+@dataclass(frozen=True)
+class VariantRegistration:
+    process_id: str
+    variant: EngineVariant
+
+    @property
+    def variant_id(self) -> str: return self.variant.variant_id
+    @property
+    def version(self) -> str: return self.variant.version
+    @property
+    def capabilities(self) -> VariantCapabilities: return self.variant.capabilities
+    @property
+    def engine(self) -> EngineRequirement: return self.variant.engine
+    @property
+    def declared_hash(self) -> str | None: return self.variant.implementation_hash
 ```
 
-`ProcessSpec.version` 只随**参数 schema 或公开语义**变；新增变体不动它。`VariantRegistration`
-自带 `version`，所以“同 schema、两个实现版本”是合法且可区分的状态。
+`ProcessSpec.version` 只随**参数 schema 或公开语义**变；新增变体不动它。变体版本在
+`EngineVariant.version` 上，所以“同 schema、两个实现版本”是合法且可区分的状态。
+`ProcessSpec` **没有** `describe()`：`registry.list_processes()` 用 spec 和它已注册的
+变体现场拼 `ModelDescriptor`，不再让 spec 自己描述自己。
+
+`VariantRegistration.__post_init__` 只做结构校验：`process_id` 非空；variant 的
+`variant_id`/`version` 非空；`capabilities` 是 `VariantCapabilities`；`engine` 是
+`EngineRequirement`；`implementation_hash` 是 `str | None`。
 
 ### 3.2 上下文与能力
 
@@ -191,7 +314,7 @@ class ProcessContext:
     grid_delta: float              # > 0
     project: Mapping[str, Any]     # 只读原始 JSON
     step: Mapping[str, Any]
-    materials: MaterialState
+    # 没有 materials：材料只存在于 ProcessState.materials
 
 @dataclass(frozen=True)
 class VariantCapabilities:
@@ -217,7 +340,7 @@ class VariantCapabilities:
 | `LevelSetState` | `handle` + `dimension` + `grid_delta` + `material_order` | flow state 的唯一持久表示 |
 | `FieldState` | `data: Mapping[str, Any]` | 阶段 1 占位，没有 cell-set 集成 |
 | `VoxelState` | `grid`（`process_models.voxel.VoxelGrid`）+ `source` | 步骤内视图，默认 `"height-field-v1"` |
-| `ProcessState` | 上面四个 + `engine` + `meta` | `has(kind)` / `require(kind)`；`require` 缺失时抛 `StateMissingError` |
+| `ProcessState` | 上面四个；**frozen**，没有 `engine`/`meta` | `has(kind)` / `require(kind)`；`require` 缺失时抛 `StateMissingError` |
 | `StateDelta` | `geometry` / `fields` / `voxels` / `artifacts` / `metadata` / `warnings` | 字段为 `None` 表示“没变”，不是“清空” |
 
 ```python
@@ -234,6 +357,8 @@ class StateDelta:
 ```
 
 关键语义变化：**变体只声明变化，不负责合并**。合并、写回、清空临时视图由 adapter 完成。
+`ProcessState` 是 frozen dataclass，adapter 与调用方用 `dataclasses.replace()` 产生新对象；
+引擎 lease 不再放进状态，而是作为 `execute(state, params, ctx, engine)` 的显式参数。
 
 ### 3.4 引擎
 
@@ -276,6 +401,7 @@ class ExecutionRequest:
 
 @dataclass(frozen=True)
 class ExecutionPlan:
+    request: ExecutionRequest        # plan 拥有它要执行的完整请求
     process: ProcessSpec
     variant: VariantRegistration
     engine: EngineLease
@@ -286,6 +412,7 @@ class ExecutionPlan:
     engine_version: str
     engine_fingerprint: str
     def identity(self) -> dict[str, str]: ...
+    def run(self) -> ExecutionOutcome: ...   # == execute_plan(self)
 
 @dataclass(frozen=True)
 class ExecutionOutcome:
@@ -294,13 +421,20 @@ class ExecutionOutcome:
     delta: StateDelta
     # metadata / warnings / artifacts delegate to delta
 
-def execute_plan(plan, state, params, context) -> ExecutionOutcome: ...
+def execute_plan(plan: ExecutionPlan) -> ExecutionOutcome: ...
+def run_step(registry, provider, process_id, variant_id, params, context, state,
+             *, expected_process_version=None, expected_variant_version=None,
+             adapter=None) -> ExecutionOutcome: ...
 ```
 
 `ExecutionPlan` 是**唯一**允许被写进 run 记录的身份来源；调用方不要自己拼字段。
-`execute_plan()` 是唯一的执行入口：它把 engine lease 绑到 state 上，调用
-`adapter.prepare`、`variant.execute`、`adapter.commit`，并把 `StateDelta` 原样放进
-`ExecutionOutcome`，供 executor 记录 metadata/warnings/artifacts。
+它同时拥有 `request`，所以“准入时校验的输入”和“执行时使用的输入”是同一个对象，
+不存在把 plan 之外的 `state`/`params` 再传一遍的缝隙。
+
+`execute_plan(plan)` 只读 `plan.request.state`、`plan.request.params`、
+`plan.request.context`；`plan.run()` 就是它的方法形式。`run_step(...)` 是给常见
+“解析并立即执行一步”的调用方准备的便利函数：构造 `ExecutionRequest`、调用
+`resolve_execution()`、再 `execute_plan()`，不引入第三条执行路径。
 
 ### 3.6 适配器
 
@@ -318,8 +452,8 @@ class StateAdapter(Protocol):
 
 ## 4. 执行流程
 
-`resolve_execution()` 只解析；`execute_plan()` 负责真正执行一次 plan，并返回
-`ExecutionOutcome`。未来的 runtime 只需要拿到 plan 后调用 `execute_plan()`。
+`resolve_execution()` 只解析；`ExecutionPlan.run()` / `execute_plan(plan)` 负责真正执行
+一次 plan，并返回 `ExecutionOutcome`。未来的 runtime 只需要拿到 plan 后调用其中之一。
 
 ```
  caller           registry        resolver              provider        adapter         variant
@@ -345,7 +479,7 @@ class StateAdapter(Protocol):
    |                 |               | 7 adapter or DefaultStateAdapter()   |               |
    |                 |<--ExecutionPlan (含 identity) ----------------------|               |
    |                 |               |                      |              |               |
-   |  (runtime) execute             |                      |              |               |
+   |  (runtime) plan.run()          |                      |              |               |
    |------------------------------------------------------------------>|  |               |
    |                 |               |                      |  prepare()  |               |
    |                 |               |                      |------------>|               |
@@ -371,12 +505,16 @@ class StateAdapter(Protocol):
 8. 适配器缺省为 `DefaultStateAdapter()`；调用方可以传自定义适配器。
 9. 返回 plan，**不调用** `variant.execute()`。
 
-`execute_plan(plan, state, params, context)` 随后做四件事：
+`execute_plan(plan)` 随后做四件事：
 
-1. `dataclasses.replace(state, engine=plan.engine)`，把 lease 绑定到 state；
-2. `adapter.prepare()` 补齐 `capabilities.reads` 需要的表示；
-3. `variant.execute()`，结果必须是 `StateDelta`，否则 `ExecutionResolutionError`；
-4. `adapter.commit()` 合并 delta，返回 `ExecutionOutcome(plan, state, delta)`。
+1. 再次检查 `plan.request.params` 是 `plan.process.params_model` 的实例（防止手工构造的 plan）；
+2. `prepared = plan.state_adapter.prepare(plan.request.state, plan.variant.capabilities)`；
+3. `plan.variant.variant.execute(prepared, plan.request.params, plan.request.context, plan.engine)`，
+   结果必须是 `StateDelta`，否则 `ExecutionResolutionError`；
+4. `plan.state_adapter.commit(prepared, delta, capabilities)`，返回
+   `ExecutionOutcome(plan, committed, delta)`。
+
+不需要再把 engine lease `replace` 进 state：lease 是 `execute` 的显式参数。
 
 执行阶段由 adapter 收尾：
 
@@ -394,7 +532,7 @@ class StateAdapter(Protocol):
 | --- | --- | --- | --- |
 | `process_version` | `ProcessSpec.version` | 参数 schema 或公开语义变 | 固定“这一步的参数含义” |
 | `variant_version` | `VariantRegistration.version` | 实现行为/数值变 | 固定“这一版实现” |
-| `implementation_hash` | `VariantRegistration.implementation_hash` | 代码字节变（自动） | 发现“版本号没升但代码改了” |
+| `implementation_hash` | `VariantRegistration.declared_hash`，缺省时 registry 计算 | 代码字节变（自动） | 发现“版本号没升但代码改了” |
 | `engine_version` + `engine_fingerprint` | `EngineLease` | 引擎装/换/编译选项变 | 固定“用哪个引擎跑的” |
 
 **实现哈希覆盖范围**（v2 修正点）：
@@ -493,7 +631,7 @@ v2 只加了一层：`VoxelState.grid` 承载 `VoxelGrid`，`source` 标记适�
 ```python
 import worker.simulate as simulate          # 延迟 import，避免契约层依赖 worker
 
-ps = state.engine.handle
+ps = engine.handle                          # engine 是 execute(..., engine) 的显式参数
 domain = state.geometry.handle
 if params.operation == "deposit":
     domain.duplicateTopLevelSet(simulate.material_handle(ps, params.depositMaterial))
@@ -517,6 +655,9 @@ rate, signed_material_rates = simulate.signed_rates(step_dict)
 | deposit | `domain.duplicateTopLevelSet(...)` | 相同 |
 | 执行 | `ps.Process(domain, model, duration)`；`setFluxEngineType(CPU_DISK)`；`setParameters(advection)`；`apply()` | 相同 |
 
+变体签名是 `execute(self, state, params, ctx, engine)`：`engine` 由 resolver 租好后
+显式传入，变体不再从 `state` 里取句柄。
+
 ### 7.2 参数与声明
 
 `IsotropicParams`（Pydantic v2，`extra="forbid"`）：`operation`（`etch`/`deposit`）、
@@ -534,6 +675,10 @@ VariantCapabilities(
 )
 EngineRequirement(kind="native", engine_id="viennaps", min_version="4.6.2")
 ```
+
+注册时只写 `VariantRegistration(process_id="isotropic", variant=IsotropicNativeVariant())`；
+`variant_id`、版本、capabilities、engine 和哈希来源都从变体上读取，不在 registration
+里重复声明。
 
 `mutates_input=True` 是诚实声明：原生路径就地改句柄，`commit` 信任 `delta.geometry.handle`。
 **checkpoint 仍由未来 executor 负责**，本切片文档化但不强制。
@@ -581,11 +726,14 @@ parity 的含义是“**同样的参数、同样的原生调用、同样的 solv
 执行体只有一个动作：
 
 ```python
-grid = state.voxels.grid               # adapter 已经准备好
-if params.operation == "erode_top_layer":
-    grid = _erode_top_layers(grid, params.layers)
-return StateDelta(voxels=VoxelState(grid=grid), metadata={...})
+def execute(self, state, params, ctx, engine):   # surrogate 不用 engine，但签名必须接受
+    grid = state.voxels.grid                     # adapter 已经准备好
+    if params.operation == "erode_top_layer":
+        grid = _erode_top_layers(grid, params.layers)
+    return StateDelta(voxels=VoxelState(grid=grid), metadata={...})
 ```
+
+注册同样只写 `VariantRegistration(process_id="voxel_probe", variant=VoxelProbeVariant())`。
 
 **它不调用 `read_voxels` / `write_voxels`**。这是 v2 与 v1 的关键差别：v1 的变体自己
 读写几何，v2 把转换交给 adapter，变体只处理自己声明的表示。
@@ -605,7 +753,7 @@ return StateDelta(voxels=VoxelState(grid=grid), metadata={...})
 
 | 阶段 | 内容 | 行为约束 | 退出条件 |
 | --- | --- | --- | --- |
-| 1. legacy wrapper | 现有 `CATALOG` / `build_specialized_model()` 包成 v2 变体 | 纯包装，不复制原生调用；schema、快照、哈希不变 | 同一 project 走 wrapper 与走原路径结果一致 |
+| 1. legacy wrapper | 现有 `CATALOG` / `build_specialized_model()` 包成 v2.1 变体 | 纯包装，不复制原生调用；schema、快照、哈希不变 | 同一 project 走 wrapper 与走原路径结果一致 |
 | 2. isotropic | `native/isotropic.py` 落地 | 与 worker 路径 parity（§7.3）；不回退 legacy | 2D/3D、etch/deposit、逐材料速率全过 |
 | 3. sf6o2 / oxidation | 按同一模式搬 | 逐模型搬，参数映射逐行对照 | 每个模型有独立对照测试 |
 | 4. 可选 `variant` 字段 + API/UI | 项目 JSON 可写 `variant`；API 列 descriptor | 缺省不进请求哈希；显式写入才参与；前端只读 descriptor | 旧 fixture 哈希不变 |
@@ -615,17 +763,18 @@ return StateDelta(voxels=VoxelState(grid=grid), metadata={...})
 明确不做 big-bang 重写 `worker/simulate.py`：快照、种子、引擎策略、产物属于 executor
 稳定面，插件化只替换“模型构造与执行”这一段。
 
-## 9.1 本切片验证（2026-11-01）
+## 9.1 验证口径（v2.1）
 
-| 测试 | 结果 |
-| --- | --- |
-| v2 core（state/engine/registry/resolver/adapters） | 38 项通过 |
-| v2 execution entry（`execute_plan`/write checks/adapter `provides`） | 9 项通过 |
-| v2 isotropic native（parity/rates/masks/3D/identity） | 14 项通过 |
-| v2 voxel probe（adapter prepare/commit/guard/determinism） | 11 项通过 |
-| v1 contract + voxel + proof plugin 回归 | 38 项通过 |
-| 合计定向测试 | **110 项通过** |
-| `scripts/check-style.sh`（compileall/ruff/frontend typecheck/diff） | 通过 |
+v2.1 只改 API 形状，不改 isotropic/voxel 的物理语义。验证结果是：**更新后的 v2.1
+core/plugins 与保持不变的 v1 测试一起通过下列定向套件（124 项，0 失败）**。
+
+| 套件 | 覆盖 | 结果 |
+| --- | --- | --- |
+| v1 contract + voxel + proof plugin | v1 冻结契约与 voxel 往返 | 38 项通过 |
+| v2 core + execution entry | frozen `ProcessState`、`VariantRegistration` 派生、registry 生成 descriptor、`plan.run()`/`run_step()`、write checks、adapter `provides` | 56 项通过 |
+| v2 isotropic native | 显式 `engine` 参数下的 parity/rates/masks/3D/identity | 17 项通过 |
+| v2 voxel probe | adapter prepare/commit/guard/determinism | 13 项通过 |
+| 合计 | v1 + v2.1 | **124 项通过** |
 
 命令（隔离数据目录，未启动服务）：
 
@@ -638,7 +787,7 @@ VIENNAPS_WORKBENCH_DATA_DIR=$PWD/var/test-v2-final WORKBENCH_PORT=8767 \
   tests.test_process_models_v2_voxel
 ```
 
-这些测试覆盖的是 v2 契约、isotropic 原生路径和 voxel proof，不代表 backend/worker
+这些测试覆盖的是 v2.1 契约、isotropic 原生路径和 voxel proof，不代表 backend/worker
 已经接入，也不代表 16 个工艺都已迁移。
 
 ## 10. 非目标与开放决策
@@ -665,22 +814,25 @@ VIENNAPS_WORKBENCH_DATA_DIR=$PWD/var/test-v2-final WORKBENCH_PORT=8767 \
 | warm pool | `StaticEngine.release()` 是 no-op | 何时引入池化，池化后 fingerprint 如何保持稳定 |
 | `mutates_input` 的 checkpoint | 只文档化，不强制 | 由 executor 统一 checkpoint，还是要求原生变体自证可重入 |
 
-## 11. 在 v2 里新增一个 process 的清单
+## 11. 在 v2.1 里新增一个 process 的清单
 
 1. **定义参数模型**：Pydantic v2，`extra="forbid"`，范围用 `Field(...)` 表达；
    不要在 `validate()` 里重复 schema 已保证的约束（只补语义约束）。
 2. **定义 `ProcessSpec`**：`id`、`version`、`label`、`params_model`、`dimensions`、
-   `operations`。版本只随 schema/语义变。
-3. **实现 `EngineVariant`**：`variant_id`、`version`、`capabilities`、
-   `validate(ctx, params) -> list[Issue]`、`execute(state, params, ctx) -> StateDelta`。
+   `operations`。版本只随 schema/语义变；不要写 `describe()`。
+3. **实现 `EngineVariant`**：`variant_id`、`version`、`capabilities`、`engine`、
+   `validate(ctx, params) -> list[Issue]`、
+   `execute(state, params, ctx, engine) -> StateDelta`。engine 是显式参数。
 4. **声明 `EngineRequirement`**：`kind`、`engine_id`、`min_version`，需要 GPU 时写
    `backend="gpu"`。不要写“任意版本”。
 5. **写清 `VariantCapabilities`**：`reads`/`writes` 必须与 `execute` 实际访问一致；
    原生就地修改必须 `mutates_input=True`；几何限制写进 `geometry_constraints`。
 6. **注册**：提供 `register_<name>(registry)`，内部 `register_process(spec)` +
-   `register_variant(VariantRegistration(...))`。不要复用别人的 `variant_id`。
+   `register_variant(VariantRegistration(process_id=spec.id, variant=...))`。
+   只传这两个字段；id/版本/能力/引擎/哈希来源都从变体派生。不要复用别人的 `variant_id`。
 7. **一致性测试**（缺一不可）：
    - `resolve_execution` 能出 plan，`identity()` 稳定；
+   - `plan.run()` / `run_step()` 与 `execute_plan(plan)` 结果一致；
    - 缺 `reads` 中的状态 → 解析失败；
    - 维度不支持 → 解析失败；
    - 引擎版本/后端不符 → 解析失败且无回退；
@@ -689,7 +841,7 @@ VIENNAPS_WORKBENCH_DATA_DIR=$PWD/var/test-v2-final WORKBENCH_PORT=8767 \
      （除非显式声明 `mutates_input=True`）；
    - 2D 与 3D 各一个 smoke。
 
-最小骨架：
+完整的最小可运行例子见 §0.2。这里只给注册部分的最小骨架：
 
 ```python
 class MyParams(BaseModel):
@@ -706,33 +858,31 @@ class MyVariant:
         mutates_input=False,
         determinism="strict",
     )
+    engine = EngineRequirement(kind="native", engine_id="viennaps", min_version="4.6.2")
+    implementation_hash = None
 
     def validate(self, ctx, params): return []
-    def execute(self, state, params, ctx):
+    def execute(self, state, params, ctx, engine):
         return StateDelta(metadata={"rate": params.rate})
 
 def register_my_process(registry: ProcessRegistry) -> None:
     spec = ProcessSpec(id="my_process", version="1.0.0", label="My process",
                        params_model=MyParams, dimensions=(2, 3), operations=("etch",))
     registry.register_process(spec)
-    registry.register_variant(VariantRegistration(
-        process_id=spec.id, variant_id="native", version="1.0.0",
-        variant=MyVariant(), capabilities=MyVariant.capabilities,
-        engine=EngineRequirement(kind="native", engine_id="viennaps", min_version="4.6.2"),
-        implementation_hash=compute_implementation_hash(MyVariant()),
-    ))
+    registry.register_variant(VariantRegistration(process_id=spec.id, variant=MyVariant()))
 ```
 
-## 附录：v2 文件清单
+## 附录：v2.1 文件清单
 
 | 文件 | 内容 |
 | --- | --- |
+| `process_models/v2/README.md` | 一页 quickstart：分层、新增 process、运行方式、限制 |
 | `process_models/v2/__init__.py` | 公开导出 |
-| `process_models/v2/state.py` | `StateKind`、`MaterialState`、`LevelSetState`、`FieldState`、`VoxelState`、`ProcessState`、`StateDelta`、`Artifact`、`StateMissingError` |
+| `process_models/v2/state.py` | `StateKind`、`MaterialState`、`LevelSetState`、`FieldState`、`VoxelState`、`ProcessState`（frozen）、`StateDelta`、`Artifact`、`StateMissingError` |
 | `process_models/v2/engine.py` | `EngineKind`、`Backend`、`EngineRequirement`、`EngineCapabilities`、`Engine`、`EngineLease`、`EngineProvider`、`StaticEngine`、`StaticEngineProvider`、`EngineUnavailableError` |
 | `process_models/v2/contract.py` | `Issue`、`ProcessContext`、`ModelDescriptor`、`VariantDescriptor`、`VariantCapabilities`、`ProcessSpec`、`EngineVariant`、`VariantRegistration` |
 | `process_models/v2/registry.py` | `ProcessRegistry`、`ResolvedVariant`、`compute_implementation_hash()` |
-| `process_models/v2/resolver.py` | `ExecutionRequest`、`ExecutionPlan`、`ExecutionOutcome`、`ExecutionResolutionError`、`resolve_execution()`、`execute_plan()` |
+| `process_models/v2/resolver.py` | `ExecutionRequest`、`ExecutionPlan`、`ExecutionOutcome`、`ExecutionResolutionError`、`resolve_execution()`、`execute_plan()`、`run_step()` |
 | `process_models/v2/adapters.py` | `StateAdapter`、`DefaultStateAdapter` |
 | `process_models/v2/native/isotropic.py` | 第一个真实原生插件 |
 | `process_models/v2/surrogate/voxel_probe.py` | 第一个 surrogate（proof） |

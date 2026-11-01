@@ -26,8 +26,8 @@ from typing import Any, Literal, Mapping, Protocol
 
 from pydantic import BaseModel
 
-from .engine import EngineKind, EngineRequirement
-from .state import MaterialState, StateKind
+from .engine import EngineKind, EngineLease, EngineRequirement
+from .state import ProcessState, StateKind
 
 __all__ = [
     "EngineVariant",
@@ -69,7 +69,6 @@ class ProcessContext:
     grid_delta: float
     project: Mapping[str, Any] = field(default_factory=dict)
     step: Mapping[str, Any] = field(default_factory=dict)
-    materials: MaterialState = field(default_factory=lambda: MaterialState(()))
 
     def __post_init__(self) -> None:
         if int(self.dimension) not in (2, 3):
@@ -77,8 +76,6 @@ class ProcessContext:
         grid_delta = float(self.grid_delta)
         if not math.isfinite(grid_delta) or grid_delta <= 0.0:
             raise ValueError(f"grid_delta must be a positive finite number, got {self.grid_delta!r}")
-        if not isinstance(self.materials, MaterialState):
-            raise ValueError("materials must be a MaterialState")
         object.__setattr__(self, "dimension", int(self.dimension))
         object.__setattr__(self, "grid_delta", grid_delta)
 
@@ -125,20 +122,27 @@ class VariantCapabilities:
 class EngineVariant(Protocol):
     """One swappable implementation of a process.
 
-    ``capabilities`` must be identical to the value on the corresponding
-    :class:`VariantRegistration`; the registry rejects a mismatch.
+    Identity, capabilities, and the engine requirement live on the variant
+    itself; :class:`VariantRegistration` derives them.
     """
 
     variant_id: str
     version: str
     capabilities: VariantCapabilities
+    engine: EngineRequirement
     implementation_hash: str | None
 
     def validate(self, ctx: ProcessContext, params: BaseModel) -> list[Issue]:
         """Return issues for ``params`` in ``ctx``; empty means valid."""
 
-    def execute(self, state: Any, params: BaseModel, ctx: ProcessContext) -> Any:
-        """Run one step and return a :class:`process_models.v2.state.StateDelta`."""
+    def execute(
+        self,
+        state: ProcessState,
+        params: BaseModel,
+        ctx: ProcessContext,
+        engine: EngineLease,
+    ) -> Any:
+        """Run one step with ``engine`` and return a ``StateDelta``."""
 
 
 @dataclass(frozen=True)
@@ -173,65 +177,53 @@ class ProcessSpec:
         object.__setattr__(self, "dimensions", dimensions)
         object.__setattr__(self, "operations", operations)
 
-    def describe(self) -> ModelDescriptor:
-        """Return the public descriptor for this process version.
-
-        ``variants`` is empty here because variants are registered separately;
-        :class:`process_models.v2.registry.ProcessRegistry` fills it in.
-        """
-        return ModelDescriptor(
-            id=self.id,
-            version=self.version,
-            label=self.label,
-            dimensions=self.dimensions,
-            operations=self.operations,
-            variants=(),
-            description=self.description,
-        )
-
 
 @dataclass(frozen=True)
 class VariantRegistration:
-    """One implementation of a process, bound to an engine requirement.
+    """One implementation of a process.
 
-    Registration is independent of the process version: adding a variant does
-    not require a new :class:`ProcessSpec`.
+    The registration is just ``(process_id, variant)``: ``variant_id``,
+    ``version``, ``capabilities``, ``engine``, and the declared
+    ``implementation_hash`` are read from the variant itself.
     """
 
     process_id: str
-    variant_id: str
-    version: str
     variant: EngineVariant
-    capabilities: VariantCapabilities
-    engine: EngineRequirement
-    implementation_hash: str = ""
 
     def __post_init__(self) -> None:
-        for name in ("process_id", "variant_id", "version"):
-            value = getattr(self, name)
+        if not isinstance(self.process_id, str) or not self.process_id.strip():
+            raise ValueError("process_id must be a non-empty string")
+        for name in ("variant_id", "version"):
+            value = getattr(self.variant, name, None)
             if not isinstance(value, str) or not value.strip():
-                raise ValueError(f"{name} must be a non-empty string")
-        if not isinstance(self.capabilities, VariantCapabilities):
-            raise TypeError("capabilities must be a VariantCapabilities")
-        variant_capabilities = getattr(self.variant, "capabilities", None)
-        if variant_capabilities != self.capabilities:
-            raise ValueError(
-                f"{self.process_id}: registration capabilities do not match variant {self.variant_id!r} capabilities"
-            )
-        declared_variant_id = getattr(self.variant, "variant_id", None)
-        if declared_variant_id is not None and declared_variant_id != self.variant_id:
-            raise ValueError(
-                f"registration variant_id {self.variant_id!r} does not match implementation {declared_variant_id!r}"
-            )
-        declared_version = getattr(self.variant, "version", None)
-        if declared_version is not None and declared_version != self.version:
-            raise ValueError(
-                f"registration version {self.version!r} does not match implementation {declared_version!r}"
-            )
-        if not isinstance(self.engine, EngineRequirement):
-            raise TypeError("engine must be an EngineRequirement")
-        if not isinstance(self.implementation_hash, str):
-            raise ValueError("implementation_hash must be a string")
+                raise ValueError(f"variant {name} must be a non-empty string")
+        if not isinstance(getattr(self.variant, "capabilities", None), VariantCapabilities):
+            raise TypeError("variant capabilities must be a VariantCapabilities")
+        if not isinstance(getattr(self.variant, "engine", None), EngineRequirement):
+            raise TypeError("variant engine must be an EngineRequirement")
+        implementation_hash = getattr(self.variant, "implementation_hash", None)
+        if implementation_hash is not None and not isinstance(implementation_hash, str):
+            raise TypeError("variant implementation_hash must be a string or None")
+
+    @property
+    def variant_id(self) -> str:
+        return self.variant.variant_id
+
+    @property
+    def version(self) -> str:
+        return self.variant.version
+
+    @property
+    def capabilities(self) -> VariantCapabilities:
+        return self.variant.capabilities
+
+    @property
+    def engine(self) -> EngineRequirement:
+        return self.variant.engine
+
+    @property
+    def declared_hash(self) -> str | None:
+        return self.variant.implementation_hash
 
 
 @dataclass(frozen=True)

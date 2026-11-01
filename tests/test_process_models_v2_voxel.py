@@ -4,7 +4,7 @@ The v2 contract separates process identity, engine capability, state
 representation, and the level-set <-> voxel conversion. These tests drive one
 small 2D plane through the whole path:
 
-    resolve_execution -> DefaultStateAdapter.prepare -> variant.execute -> commit
+    resolve_execution -> ExecutionPlan.run (adapter prepare -> variant.execute(engine) -> commit)
 
 No server and no project data directory are used. The height-field guard case
 runs in a subprocess because the underlying native adapter can crash instead of
@@ -13,6 +13,8 @@ raising.
 
 from __future__ import annotations
 
+import dataclasses
+import inspect
 import subprocess
 import sys
 import unittest
@@ -20,17 +22,18 @@ from pathlib import Path
 
 import numpy as np
 import viennaps as ps
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from process_models.v2.adapters import DefaultStateAdapter
-from process_models.v2.contract import ProcessContext
-from process_models.v2.engine import EngineCapabilities, StaticEngine, StaticEngineProvider
-from process_models.v2.registry import ProcessRegistry
+from process_models.v2.contract import ProcessContext, VariantRegistration
+from process_models.v2.engine import EngineCapabilities, EngineLease, StaticEngine, StaticEngineProvider
+from process_models.v2.registry import ProcessRegistry, compute_implementation_hash
 from process_models.v2.resolver import ExecutionRequest, ExecutionResolutionError, resolve_execution
 from process_models.v2.state import (
     LevelSetState,
     MaterialState,
     ProcessState,
+    StateDelta,
     StateMissingError,
 )
 from process_models.v2.surrogate.voxel_probe import (
@@ -90,6 +93,25 @@ def _provider() -> StaticEngineProvider:
     return StaticEngineProvider([StaticEngine(capabilities, handle=None, fingerprint="python-3.12")])
 
 
+class _LeaseRecordingVariant(VoxelProbeVariant):
+    """Voxel-probe variant that records the lease passed by ``plan.run()``."""
+
+    variant_id = "voxel_probe_lease"
+
+    def __init__(self) -> None:
+        self.engines: list[EngineLease] = []
+
+    def execute(
+        self,
+        state: ProcessState,
+        params: BaseModel,
+        ctx: ProcessContext,
+        engine: EngineLease,
+    ) -> StateDelta:
+        self.engines.append(engine)
+        return super().execute(state, params, ctx, engine)
+
+
 def _surface_points(domain: ps.Domain) -> np.ndarray:
     mesh = domain.getSurfaceMesh()
     points = [[float(value) for value in node] for node in mesh.getNodes()]
@@ -125,13 +147,12 @@ class VoxelProbeV2Test(unittest.TestCase):
         self.variant = VoxelProbeVariant()
 
     # -- helpers -----------------------------------------------------------
-    def _context(self, state: ProcessState, dimension: int = 2) -> ProcessContext:
+    def _context(self, dimension: int = 2) -> ProcessContext:
         return ProcessContext(
             dimension=dimension,
             grid_delta=GRID_DELTA,
             project={},
             step={},
-            materials=state.materials,
         )
 
     def _plan(self, state: ProcessState, params: VoxelProbeParams, dimension: int = 2):
@@ -139,25 +160,16 @@ class VoxelProbeV2Test(unittest.TestCase):
             process_id="voxel_probe",
             variant_id="voxel_probe",
             params=params,
-            context=self._context(state, dimension),
+            context=self._context(dimension),
             state=state,
         )
         return resolve_execution(request, self.registry, _provider(), self.adapter)
 
     def _run(self, state: ProcessState, params: VoxelProbeParams, dimension: int = 2):
-        context = self._context(state, dimension)
-        request = ExecutionRequest(
-            process_id="voxel_probe",
-            variant_id="voxel_probe",
-            params=params,
-            context=context,
-            state=state,
-        )
-        plan = resolve_execution(request, self.registry, _provider(), self.adapter)
+        plan = self._plan(state, params, dimension)
         prepared = plan.state_adapter.prepare(state, plan.variant.capabilities)
-        delta = plan.variant.variant.execute(prepared, params, context)
-        committed = plan.state_adapter.commit(prepared, delta, plan.variant.capabilities)
-        return plan, prepared, delta, committed
+        outcome = plan.run()
+        return plan, prepared, outcome.delta, outcome.state
 
     # -- schema ------------------------------------------------------------
     def test_params_schema_bounds_and_extra_keys(self) -> None:
@@ -174,7 +186,7 @@ class VoxelProbeV2Test(unittest.TestCase):
 
     def test_validate_reports_dimension_and_layer_overflow(self) -> None:
         valid = self.variant.validate(
-            self._context(_state(_plane_domain())),
+            self._context(),
             VoxelProbeParams(operation="erode_top_layer", layers=8),
         )
         self.assertEqual(valid, [])
@@ -187,7 +199,7 @@ class VoxelProbeV2Test(unittest.TestCase):
         self.assertTrue(any(issue.path == "dimension" and issue.severity == "error" for issue in issues))
 
         overflow = VoxelProbeParams.model_construct(operation="erode_top_layer", layers=9)
-        issues = self.variant.validate(self._context(_state(_plane_domain())), overflow)
+        issues = self.variant.validate(self._context(), overflow)
         self.assertTrue(any(issue.path == "layers" and issue.severity == "error" for issue in issues))
 
     # -- registry / identity ----------------------------------------------
@@ -209,6 +221,16 @@ class VoxelProbeV2Test(unittest.TestCase):
         self.assertEqual(
             resolved.implementation_hash, self.registry.get_variant("voxel_probe", "voxel_probe").implementation_hash
         )
+        self.assertEqual(resolved.implementation_hash, compute_implementation_hash(resolved.variant.variant))
+
+        # v2.1: the registration is (process_id, variant); everything else is
+        # derived from the variant, and the registry computes the hash.
+        self.assertEqual(self.registration.process_id, "voxel_probe")
+        self.assertEqual(self.registration.variant_id, VoxelProbeVariant.variant_id)
+        self.assertEqual(self.registration.version, VoxelProbeVariant.version)
+        self.assertEqual(self.registration.capabilities, VoxelProbeVariant.capabilities)
+        self.assertEqual(self.registration.engine, VoxelProbeVariant.engine)
+        self.assertIsNone(self.registration.declared_hash)
 
         engine = self.registration.engine
         self.assertEqual(engine.kind, "surrogate")
@@ -252,6 +274,49 @@ class VoxelProbeV2Test(unittest.TestCase):
         empty = ProcessState(materials=MaterialState(()))
         with self.assertRaises(StateMissingError):
             self.adapter.prepare(empty, VoxelProbeVariant.capabilities)
+
+    # -- state immutability ------------------------------------------------
+    def test_process_state_is_frozen_and_has_no_engine(self) -> None:
+        state = _state(_plane_domain())
+        self.assertFalse(hasattr(state, "engine"))
+        self.assertFalse(hasattr(state, "meta"))
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            state.voxels = None
+
+        copy = dataclasses.replace(state, materials=MaterialState(()))
+        self.assertIsNot(copy, state)
+        self.assertIs(copy.geometry, state.geometry)
+        self.assertEqual(copy.materials.order, ())
+        self.assertTrue(state.materials.order)
+
+    # -- engine lease ------------------------------------------------------
+    def test_plan_run_passes_the_engine_lease_explicitly(self) -> None:
+        self.assertIn("engine", inspect.signature(VoxelProbeVariant.execute).parameters)
+
+        registry = ProcessRegistry()
+        register_voxel_probe(registry)
+        recording = _LeaseRecordingVariant()
+        registry.register_variant(VariantRegistration(process_id="voxel_probe", variant=recording))
+
+        state = _state(_plane_domain())
+        request = ExecutionRequest(
+            process_id="voxel_probe",
+            variant_id=recording.variant_id,
+            params=VoxelProbeParams(operation="identity"),
+            context=self._context(),
+            state=state,
+        )
+        plan = resolve_execution(request, registry, _provider(), self.adapter)
+
+        outcome = plan.run()
+
+        self.assertEqual(len(recording.engines), 1)
+        self.assertIs(recording.engines[0], plan.engine)
+        self.assertIsInstance(recording.engines[0], EngineLease)
+        self.assertEqual(recording.engines[0].engine_id, "python")
+        self.assertIs(outcome.plan, plan)
+        self.assertIsNotNone(outcome.delta.voxels)
+        self.assertIsNone(outcome.state.voxels)
 
     # -- identity round trip ----------------------------------------------
     def test_identity_round_trip_commits_with_zero_surface_deviation(self) -> None:
@@ -336,7 +401,7 @@ class VoxelProbeV2Test(unittest.TestCase):
             self._plan(empty, VoxelProbeParams(operation="identity"))
 
         state = _state(_plane_domain())
-        bad = ProcessContext(dimension=2, grid_delta=GRID_DELTA, materials=state.materials)
+        bad = ProcessContext(dimension=2, grid_delta=GRID_DELTA)
         object.__setattr__(bad, "dimension", 4)
         request = ExecutionRequest(
             process_id="voxel_probe",
