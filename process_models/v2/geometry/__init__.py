@@ -12,6 +12,8 @@ from __future__ import annotations
 from .engine import GeometryEngine, GeometryEngineError
 from .params import (
     BooleanParams,
+    GdsBooleanMaskParams,
+    GdsBooleanParams,
     ParticleShapeParams,
     PlanarizeParams,
     RemoveMaterialParams,
@@ -19,17 +21,27 @@ from .params import (
 from .register import register_geometry
 from .specs import (
     BooleanProcessSpec,
+    GdsBooleanProcessSpec,
     GeometryProcessSpecs,
     ParticleShapeProcessSpec,
     PlanarizeProcessSpec,
     RemoveMaterialProcessSpec,
 )
-from .step import parse_boolean, parse_particle_shape, parse_planarize, parse_remove_material
+from .step import (
+    parse_boolean,
+    parse_gds_boolean,
+    parse_particle_shape,
+    parse_planarize,
+    parse_remove_material,
+)
 from .variants import GeometryVariant
 
 __all__ = [
     "BooleanParams",
     "BooleanProcessSpec",
+    "GdsBooleanMaskParams",
+    "GdsBooleanParams",
+    "GdsBooleanProcessSpec",
     "GeometryEngine",
     "GeometryEngineError",
     "GeometryProcessSpecs",
@@ -41,6 +53,7 @@ __all__ = [
     "RemoveMaterialParams",
     "RemoveMaterialProcessSpec",
     "parse_boolean",
+    "parse_gds_boolean",
     "parse_particle_shape",
     "parse_planarize",
     "parse_remove_material",

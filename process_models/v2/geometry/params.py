@@ -15,6 +15,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 __all__ = [
     "BooleanParams",
+    "GdsBooleanMaskParams",
+    "GdsBooleanParams",
     "ParticleShapeParams",
     "PlanarizeParams",
     "RemoveMaterialParams",
@@ -24,11 +26,27 @@ _CONFIG = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
 
 
 class PlanarizeParams(BaseModel):
-    """One ``viennaps.Planarize(domain, cutoffHeight)`` call."""
+    """One ``viennaps.Planarize(domain, cutoffHeight)`` call.
+
+    The cutoff comes either from an explicit height or from the previous
+    step's exposed top of ``stopMaterial`` (area-weighted p90, falling back to
+    the median for older records) minus ``overPolish``. Both sources are kept
+    exclusive so a stale height cannot silently override the measured stop.
+    """
 
     model_config = _CONFIG
 
-    cutoffHeight: float
+    cutoffHeight: float | None = None
+    stopMaterial: str | None = Field(default=None, min_length=1, max_length=80)
+    overPolish: float | None = Field(default=None, ge=0, le=100)
+
+    @model_validator(mode="after")
+    def check_cutoff_source(self) -> "PlanarizeParams":
+        if (self.cutoffHeight is None) == (self.stopMaterial is None):
+            raise ValueError("planarize requires exactly one of cutoffHeight or stopMaterial")
+        if self.overPolish is not None and self.stopMaterial is None:
+            raise ValueError("overPolish applies only to stopMaterial planarize")
+        return self
 
 
 class ParticleShapeParams(BaseModel):
@@ -84,6 +102,30 @@ class BooleanParams(BaseModel):
         elif self.radius is not None:
             raise ValueError("radius applies only to shape=cylinder")
         return self
+
+
+class GdsBooleanMaskParams(BaseModel):
+    """One selected GDS layer/datatype extruded as a 3D boolean operand."""
+
+    model_config = _CONFIG
+
+    layer: int = Field(ge=0, le=65535)
+    datatype: int = Field(default=0, ge=0, le=32767)
+    unitScale: float = Field(default=1, gt=0, le=1000000)
+    position: Annotated[list[float], Field(min_length=3, max_length=3)] = Field(default_factory=lambda: [0.0, 0.0, 0.0])
+    baseHeight: float = Field(ge=0)
+    height: float = Field(gt=0)
+    retainedRegion: Literal["inside", "outside"] = "inside"
+
+
+class GdsBooleanParams(BaseModel):
+    """A GDS-asset boolean; the operand provider comes from the run assets."""
+
+    model_config = _CONFIG
+
+    booleanOperation: Literal["union", "intersection", "difference"]
+    gdsMask: GdsBooleanMaskParams
+    applyToAll: bool = True
 
 
 class RemoveMaterialParams(BaseModel):

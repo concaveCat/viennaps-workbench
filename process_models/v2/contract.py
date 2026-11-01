@@ -63,7 +63,9 @@ class ProcessContext:
     """Read-only project/step context used for validation.
 
     ``project`` and ``step`` are raw JSON mappings, not typed project models,
-    so this package does not depend on the backend schema.
+    so this package does not depend on the backend schema. ``previous_tops``
+    carries the previous step's measured material tops when an operation
+    derives a parameter from the incoming surface (material-aware CMP).
     """
 
     dimension: int
@@ -72,6 +74,9 @@ class ProcessContext:
     step: Mapping[str, Any] = field(default_factory=dict)
     seed: int | None = None
     assets: Mapping[str, Any] = field(default_factory=dict)
+    #: Measurements from the previous step, for operations that derive a
+    #: parameter from the incoming surface (for example CMP stop material).
+    previous_tops: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if int(self.dimension) not in (2, 3):
@@ -86,6 +91,7 @@ class ProcessContext:
         object.__setattr__(self, "grid_delta", grid_delta)
         object.__setattr__(self, "seed", int(self.seed) if self.seed is not None else None)
         object.__setattr__(self, "assets", dict(self.assets))
+        object.__setattr__(self, "previous_tops", dict(self.previous_tops))
 
 
 @dataclass(frozen=True)

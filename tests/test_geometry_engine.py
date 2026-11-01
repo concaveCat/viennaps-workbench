@@ -7,6 +7,7 @@ digest and material map.
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 import tempfile
 import unittest
@@ -37,6 +38,7 @@ from worker.process_models_v2 import compare_domains, run_v2_step
 
 ROOT = Path(__file__).resolve().parents[1]
 GRID = 0.05
+GDS_FIXTURE = ROOT / "docs" / "gds-mask-diagnosis" / "fixtures" / "multi-layer.gds"
 
 
 def _domain(dimension: int) -> Any:
@@ -105,7 +107,7 @@ def _material_order(domain: Any) -> tuple[int, ...]:
     return tuple(int(mapping.getMaterialIdAtIdx(index)) for index in range(mapping.size()))
 
 
-def _state(domain: Any, dimension: int) -> ProcessState:
+def _state(domain: Any, dimension: int, *, grid_delta: float = GRID) -> ProcessState:
     order = _material_order(domain)
     names = {
         int(ps.Material.Si): "Si",
@@ -113,7 +115,7 @@ def _state(domain: Any, dimension: int) -> ProcessState:
         int(ps.Material.Mask): "Mask",
     }
     return ProcessState(
-        geometry=LevelSetState(handle=domain, dimension=dimension, grid_delta=GRID),
+        geometry=LevelSetState(handle=domain, dimension=dimension, grid_delta=grid_delta),
         materials=MaterialState(order=order, names={key: value for key, value in names.items() if key in order}),
     )
 
@@ -141,6 +143,47 @@ def _provider() -> StaticEngineProvider:
     )
 
 
+def _gds_project(asset_id: str) -> dict[str, Any]:
+    return {
+        "schemaVersion": 7,
+        "name": "gds boolean geometry",
+        "dimension": 3,
+        "units": {"length": "um", "time": "s", "rate": "um/s", "angle": "deg"},
+        "domain": {
+            "gridDelta": 0.1,
+            "xExtent": 4.0,
+            "yExtent": 4.0,
+            "boundaryXY": "reflective",
+        },
+        "geometry": {
+            "kind": "gds",
+            "assetId": asset_id,
+            "fileName": "multi-layer.gds",
+            "structure": "MULTI",
+            "unitScale": 1.0,
+            "position": [0.0, 0.0, 0.0],
+            "layers": [
+                {
+                    "layer": 1,
+                    "material": "Si",
+                    "baseHeight": -0.6,
+                    "height": 1.2,
+                    "mask": False,
+                }
+            ],
+        },
+        "steps": [],
+        "solver": {
+            "timeStepRatio": 0.25,
+            "raysPerPoint": 32,
+            "cpuThreads": 1,
+            "random": {"mode": "fixed", "seed": 314159},
+            "enginePreference": "cpu",
+            "timeoutSeconds": 60,
+        },
+    }
+
+
 class GeometryEngineTest(unittest.TestCase):
     def setUp(self) -> None:
         self.work_dir = ROOT / "var" / f"test-geometry-{self._testMethodName}"
@@ -152,7 +195,15 @@ class GeometryEngineTest(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.work_dir, ignore_errors=True)
 
-    def _run_v2(self, raw: dict[str, Any], base: Any, dimension: int, project: dict[str, Any]) -> Any:
+    def _run_v2(
+        self,
+        raw: dict[str, Any],
+        base: Any,
+        dimension: int,
+        project: dict[str, Any],
+        *,
+        previous_tops: dict[str, Any] | None = None,
+    ) -> Any:
         spec, params = self.registry.resolve_step(project, raw)
         return (
             FlowExecutor(self.registry, _provider(), StateStore(self.work_dir / raw["id"]))
@@ -169,6 +220,7 @@ class GeometryEngineTest(unittest.TestCase):
                             grid_delta=GRID,
                             project=project,
                             step=raw,
+                            previous_tops=previous_tops or {},
                         ),
                     )
                 ],
@@ -177,11 +229,24 @@ class GeometryEngineTest(unittest.TestCase):
         )
 
     @staticmethod
-    def _run_v1(raw: dict[str, Any], base: Any, project: dict[str, Any]) -> Any:
+    def _run_v1(
+        raw: dict[str, Any],
+        base: Any,
+        project: dict[str, Any],
+        *,
+        previous_tops: dict[str, Any] | None = None,
+    ) -> Any:
         from worker import simulate
 
         domain = ps.Domain(base)
-        simulate.apply_geometry_operation(ps, domain, project, raw, run_dir=ROOT / "var")
+        simulate.apply_geometry_operation(
+            ps,
+            domain,
+            project,
+            raw,
+            previous_tops=previous_tops,
+            run_dir=ROOT / "var",
+        )
         return domain
 
     def test_planarize_cutoff_matches_the_worker_reference(self) -> None:
@@ -298,6 +363,88 @@ class GeometryEngineTest(unittest.TestCase):
                 self.assertTrue(comparison["matched"], comparison["reasons"])
                 self.assertNotIn(int(ps.Material.SiO2), outcome.state.materials.order)
 
+    def test_gds_boolean_matches_the_worker_reference(self) -> None:
+        work = self.work_dir / "gds"
+        work.mkdir()
+        asset = work / "multi-layer.gds"
+        shutil.copyfile(GDS_FIXTURE, asset)
+        project = _gds_project(hashlib.sha256(asset.read_bytes()).hexdigest())
+        raw = {
+            "id": "gds_step_01",
+            "name": "gds cut",
+            "enabled": True,
+            "model": "gdsBoolean",
+            "booleanOperation": "difference",
+            "applyToAll": True,
+            "gdsMask": {
+                "layer": 2,
+                "datatype": 0,
+                "unitScale": 1.0,
+                "position": [0.0, 0.0, 0.0],
+                "baseHeight": 0.0,
+                "height": 0.6,
+                "retainedRegion": "inside",
+            },
+        }
+        ps.setDimension(3)
+        domain = ps.Domain(0.1, 4.0, 4.0, boundary=ps.BoundaryType.REFLECTIVE_BOUNDARY)
+        simulate = __import__("worker.simulate", fromlist=["make_v3_geometry"])
+        simulate.make_v3_geometry(
+            ps,
+            domain,
+            project,
+            config={"gdsAssetPath": str(asset)},
+            run_dir=work,
+        )
+        reference = ps.Domain(domain)
+        simulate.apply_geometry_operation(
+            ps,
+            reference,
+            project,
+            raw,
+            config={"gdsAssetPath": str(asset)},
+            run_dir=work,
+        )
+
+        def build_operand(ps_module: Any, target: Any, proj: Any, step: Any, context: Any) -> Any:
+            del context
+            return simulate._gds_boolean_operand(
+                ps_module,
+                target,
+                proj,
+                {**step, "id": f"{step['id']}-v2"},
+                config={"gdsAssetPath": str(asset)},
+                run_dir=work,
+            )
+
+        spec, params = self.registry.resolve_step(project, raw)
+        outcome = (
+            FlowExecutor(self.registry, _provider(), StateStore(work / "store"))
+            .run(
+                _state(ps.Domain(domain), 3, grid_delta=0.1),
+                [
+                    FlowStep(
+                        step_id=raw["id"],
+                        process_id=spec.id,
+                        variant_id="native",
+                        params=params,
+                        context=ProcessContext(
+                            dimension=3,
+                            grid_delta=0.1,
+                            project=project,
+                            step=raw,
+                            assets={"gdsBooleanOperand": build_operand},
+                        ),
+                    )
+                ],
+            )
+            .outcomes[-1]
+        )
+        comparison = compare_domains(reference, outcome.state.geometry.handle, 3)
+        self.assertTrue(comparison["matched"], comparison["reasons"])
+        self.assertEqual(outcome.metadata["geometryOperation"], "gdsBoolean")
+        self.assertEqual(outcome.metadata["assetId"], project["geometry"]["assetId"])
+
     def test_boolean_cylinder_runs_in_three_dimensions(self) -> None:
         project = _project(3)
         base = _plane(3)
@@ -335,14 +482,26 @@ class GeometryEngineTest(unittest.TestCase):
             self._run_v2(raw, base, 2, project)
         self.assertIn("masked particleShape deposition", str(caught.exception))
 
-    def test_planarize_stop_material_is_declined(self) -> None:
+    def test_planarize_stop_material_matches_the_worker_reference(self) -> None:
+        project = _project(2, kind="trench", mask_height=0.6)
+        base = _trench(2, mask_height=0.6)
         raw = {
             "id": "planarize_step_stop",
+            "name": "cmp stop",
+            "enabled": True,
             "model": "planarize",
-            "stopMaterial": "SiO2",
-            "overPolish": 0.01,
+            "stopMaterial": "Mask",
+            "overPolish": 0.05,
         }
-        self.assertIsNone(parse_planarize(_project(2), raw))
+        previous_tops = {"Mask": {"p90TopHeight": 0.6, "medianTopHeight": 0.6}}
+        self.assertIsNotNone(parse_planarize(project, raw))
+        reference = self._run_v1(raw, base, project, previous_tops=previous_tops)
+        outcome = self._run_v2(raw, base, 2, project, previous_tops=previous_tops)
+        comparison = compare_domains(reference, outcome.state.geometry.handle, 2)
+        self.assertTrue(comparison["matched"], comparison["reasons"])
+        self.assertEqual(outcome.metadata["cutoffMode"], "material-aware")
+        self.assertAlmostEqual(outcome.metadata["measuredStopTopHeight"], 0.6)
+        self.assertAlmostEqual(outcome.metadata["cutoffHeight"], 0.55)
 
     def test_geometry_validation_rejects_dimension_mismatches(self) -> None:
         engine = GeometryEngine()
@@ -351,6 +510,14 @@ class GeometryEngineTest(unittest.TestCase):
         box3_params = ParticleShapeParams(operation="deposit", shape="box", halfAxes=[0.1, 0.1, 0.1])
         issues = engine.validate("particleShape", context2, box3_params)
         self.assertTrue(any(issue.path == "halfAxes" for issue in issues))
+
+        missing_stop = PlanarizeParams(stopMaterial="Missing")
+        issues = engine.validate(
+            "planarize",
+            ProcessContext(dimension=2, grid_delta=GRID, previous_tops={}),
+            missing_stop,
+        )
+        self.assertTrue(any(issue.path == "stopMaterial" for issue in issues))
 
         depth_in_2d = BooleanParams(
             booleanOperation="difference",
@@ -424,7 +591,7 @@ class GeometryEngineTest(unittest.TestCase):
         self.assertEqual(second, ())
         engines = [
             self.registry.get_variant(process_id, "native").variant.variant._geometry
-            for process_id in ("planarize", "particleShape", "boolean", "removeMaterial")
+            for process_id in ("planarize", "particleShape", "boolean", "gdsBoolean", "removeMaterial")
         ]
         self.assertTrue(all(engine is engines[0] for engine in engines))
 

@@ -6,6 +6,7 @@ from typing import Any, Mapping
 
 from .params import (
     BooleanParams,
+    GdsBooleanParams,
     ParticleShapeParams,
     PlanarizeParams,
     RemoveMaterialParams,
@@ -13,6 +14,7 @@ from .params import (
 
 __all__ = [
     "parse_boolean",
+    "parse_gds_boolean",
     "parse_particle_shape",
     "parse_planarize",
     "parse_remove_material",
@@ -20,21 +22,12 @@ __all__ = [
 
 
 def parse_planarize(project: Mapping[str, Any], step: Mapping[str, Any]) -> PlanarizeParams | None:
-    """Return cutoff planarize parameters, or ``None`` for another step.
-
-    The material-aware ``stopMaterial`` path is not part of this slice; it is
-    declined so the worker's existing path handles it instead of silently
-    substituting a cutoff height.
-    """
+    """Return planarize parameters for either cutoff source."""
     del project
     if step.get("model") != "planarize":
         return None
-    if step.get("stopMaterial") is not None:
-        return None
-    cutoff = step.get("cutoffHeight")
-    if cutoff is None:
-        raise ValueError("planarize requires cutoffHeight on the supported path")
-    return PlanarizeParams(cutoffHeight=cutoff)
+    payload = {name: step[name] for name in ("cutoffHeight", "stopMaterial", "overPolish") if name in step}
+    return PlanarizeParams(**payload)
 
 
 def parse_particle_shape(project: Mapping[str, Any], step: Mapping[str, Any]) -> ParticleShapeParams | None:
@@ -65,6 +58,14 @@ def parse_boolean(project: Mapping[str, Any], step: Mapping[str, Any]) -> Boolea
         if name in step
     }
     return BooleanParams(**payload)
+
+
+def parse_gds_boolean(project: Mapping[str, Any], step: Mapping[str, Any]) -> GdsBooleanParams | None:
+    del project
+    if step.get("model") != "gdsBoolean":
+        return None
+    payload = {name: step[name] for name in ("booleanOperation", "gdsMask", "applyToAll") if name in step}
+    return GdsBooleanParams(**payload)
 
 
 def parse_remove_material(project: Mapping[str, Any], step: Mapping[str, Any]) -> RemoveMaterialParams | None:

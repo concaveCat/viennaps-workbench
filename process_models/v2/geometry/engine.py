@@ -30,6 +30,7 @@ from ..state import (
 )
 from .params import (
     BooleanParams,
+    GdsBooleanParams,
     ParticleShapeParams,
     PlanarizeParams,
     RemoveMaterialParams,
@@ -47,16 +48,20 @@ class GeometryEngine:
 
     id = "viennaps-geometry"
     version = "1.0.0"
-    capabilities = frozenset({"planarize", "particleShape", "boolean", "removeMaterial"})
+    capabilities = frozenset({"planarize", "particleShape", "boolean", "gdsBoolean", "removeMaterial"})
 
     def validate(self, operation: str, ctx: ProcessContext, params: Any) -> list[Issue]:
         """Return semantic issues the per-operation parameters cannot express."""
         if operation not in self.capabilities:
             raise GeometryEngineError(f"unsupported geometry operation {operation!r}")
+        if operation == "planarize":
+            return self._validate_planarize(ctx, params)
         if operation == "particleShape":
             return self._validate_particle_shape(ctx, params)
         if operation == "boolean":
             return self._validate_boolean(ctx, params)
+        if operation == "gdsBoolean":
+            return self._validate_gds_boolean(ctx, params)
         return []
 
     def execute(
@@ -75,11 +80,13 @@ class GeometryEngine:
         ps = engine.handle
         warnings: list[str] = []
         if operation == "planarize":
-            metadata = self._planarize(ps, domain, params)
+            metadata = self._planarize(ps, domain, ctx, params)
         elif operation == "particleShape":
             metadata, warnings = self._particle_shape(ps, domain, state, ctx, params)
         elif operation == "boolean":
             metadata = self._boolean(ps, domain, ctx, params)
+        elif operation == "gdsBoolean":
+            metadata = self._gds_boolean(ps, domain, ctx, params)
         else:
             metadata = self._remove_material(ps, domain, params)
 
@@ -110,6 +117,23 @@ class GeometryEngine:
         )
 
     # -- validation ------------------------------------------------------
+
+    def _validate_planarize(self, ctx: ProcessContext, params: PlanarizeParams) -> list[Issue]:
+        if params.cutoffHeight is not None or params.stopMaterial is None:
+            return []
+        try:
+            self._stop_top(ctx, params.stopMaterial)
+        except GeometryEngineError:
+            return [
+                Issue(
+                    path="stopMaterial",
+                    message=(
+                        f"planarize stopMaterial {params.stopMaterial!r} has no exposed up-facing "
+                        "surface in the previous step's materialTops"
+                    ),
+                )
+            ]
+        return []
 
     def _validate_particle_shape(self, ctx: ProcessContext, params: ParticleShapeParams) -> list[Issue]:
         issues: list[Issue] = []
@@ -154,6 +178,32 @@ class GeometryEngine:
                 )
         return issues
 
+    def _validate_gds_boolean(self, ctx: ProcessContext, params: GdsBooleanParams) -> list[Issue]:
+        issues: list[Issue] = []
+        if int(ctx.dimension) != 3:
+            issues.append(Issue(path="model", message="GDS boolean requires a 3D project"))
+        geometry = ctx.project.get("geometry") if isinstance(ctx.project, Mapping) else None
+        if not isinstance(geometry, Mapping) or geometry.get("kind") != "gds":
+            issues.append(Issue(path="geometry", message="GDS boolean requires geometry.kind=gds"))
+        if not callable(ctx.assets.get("gdsBooleanOperand")):
+            issues.append(
+                Issue(
+                    path="assets.gdsBooleanOperand",
+                    message="GDS boolean requires the run's verified GDS operand provider",
+                )
+            )
+        if float(params.gdsMask.height) < 2.0 * float(ctx.grid_delta) - 1e-12:
+            issues.append(
+                Issue(
+                    path="gdsMask.height",
+                    message=(
+                        f"GDS mask height {params.gdsMask.height} must span at least two grid "
+                        f"intervals ({2.0 * float(ctx.grid_delta)})"
+                    ),
+                )
+            )
+        return issues
+
     def _validate_boolean(self, ctx: ProcessContext, params: BooleanParams) -> list[Issue]:
         issues: list[Issue] = []
         dimension = int(ctx.dimension)
@@ -182,10 +232,54 @@ class GeometryEngine:
     # -- native operations ----------------------------------------------
 
     @staticmethod
-    def _planarize(ps: Any, domain: Any, params: PlanarizeParams) -> dict[str, Any]:
-        cutoff = float(params.cutoffHeight)
+    def _planarize(ps: Any, domain: Any, ctx: ProcessContext, params: PlanarizeParams) -> dict[str, Any]:
+        metadata: dict[str, Any]
+        if params.cutoffHeight is not None:
+            cutoff = float(params.cutoffHeight)
+            metadata = {
+                "geometryOperation": "planarize",
+                "cutoffHeight": cutoff,
+                "cutoffMode": "explicit",
+            }
+        else:
+            if params.stopMaterial is None:
+                raise GeometryEngineError("planarize requires cutoffHeight or stopMaterial")
+            stop_top, method = GeometryEngine._stop_top(ctx, params.stopMaterial)
+            over_polish = float(params.overPolish or 0.0)
+            cutoff = stop_top - over_polish
+            metadata = {
+                "geometryOperation": "planarize",
+                "cutoffHeight": cutoff,
+                "stopMaterial": params.stopMaterial,
+                "measuredStopTopHeight": stop_top,
+                "overPolish": over_polish,
+                "stopHeight": stop_top,
+                "stopHeightMethod": method,
+                "cutoffMode": "material-aware",
+                "cutoffDerivation": (
+                    f"{method} height of the up-facing {params.stopMaterial} surface at the "
+                    "start of this step minus overPolish"
+                ),
+            }
         ps.Planarize(domain, cutoff).apply()
-        return {"geometryOperation": "planarize", "cutoffHeight": cutoff}
+        return metadata
+
+    @staticmethod
+    def _stop_top(ctx: ProcessContext, material: str) -> tuple[float, str]:
+        entry = ctx.previous_tops.get(material)
+        if not isinstance(entry, Mapping):
+            raise GeometryEngineError(f"planarize stopMaterial {material!r} has no previous material-top record")
+        for key, method in (
+            ("p90TopHeight", "area-weighted-p90"),
+            ("medianTopHeight", "area-weighted-median (p90 unavailable)"),
+        ):
+            value = entry.get(key)
+            if value is None:
+                continue
+            number = float(value)
+            if math.isfinite(number):
+                return number, method
+        raise GeometryEngineError(f"planarize stopMaterial {material!r} has no finite p90TopHeight or medianTopHeight")
 
     def _particle_shape(
         self,
@@ -333,6 +427,45 @@ class GeometryEngine:
             "angle": float(params.angle),
             "applyToAll": bool(params.applyToAll),
             "nativeBooleanEnum": enum_name,
+        }
+
+    @staticmethod
+    def _gds_boolean(
+        ps: Any,
+        domain: Any,
+        ctx: ProcessContext,
+        params: GdsBooleanParams,
+    ) -> dict[str, Any]:
+        provider = ctx.assets.get("gdsBooleanOperand")
+        if not callable(provider):
+            raise GeometryEngineError("GDS boolean requires a callable gdsBooleanOperand asset")
+        operand, transform = provider(ps, domain, ctx.project, ctx.step, ctx)
+        enum_name = {
+            "union": "UNION",
+            "intersection": "INTERSECT",
+            "difference": "RELATIVE_COMPLEMENT",
+        }[params.booleanOperation]
+        operation = getattr(ps.ls.BooleanOperationEnum, enum_name)
+        before = [int(level_set.getNumberOfPoints()) for level_set in domain.getLevelSets()]
+        domain.applyBooleanOperation(operand, operation, bool(params.applyToAll))
+        remaining = [int(level_set.getNumberOfPoints()) for level_set in domain.getLevelSets()]
+        erased = [index for index, (was, now) in enumerate(zip(before, remaining)) if was > 0 and now == 0]
+        if not remaining or erased:
+            raise GeometryEngineError(
+                "GDS boolean operand erased a material level set; adjust the mask region, "
+                f"retained region or operation (level-set point counts: {remaining}, erased: {erased})"
+            )
+        return {
+            "geometryOperation": "gdsBoolean",
+            "booleanOperation": params.booleanOperation,
+            "operand": "gds-mask",
+            "nativeBooleanEnum": enum_name,
+            "applyToAll": bool(params.applyToAll),
+            "mask": transform,
+            "assetId": transform.get("sourceAssetId"),
+            "structure": transform.get("selectedStructure"),
+            "unitScale": transform.get("unitScale"),
+            "levelSetPointCountsAfter": remaining,
         }
 
     @staticmethod

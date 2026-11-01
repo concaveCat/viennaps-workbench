@@ -11,14 +11,22 @@ from __future__ import annotations
 from ..contract import ProcessSpec
 from .params import (
     BooleanParams,
+    GdsBooleanParams,
     ParticleShapeParams,
     PlanarizeParams,
     RemoveMaterialParams,
 )
-from .step import parse_boolean, parse_particle_shape, parse_planarize, parse_remove_material
+from .step import (
+    parse_boolean,
+    parse_gds_boolean,
+    parse_particle_shape,
+    parse_planarize,
+    parse_remove_material,
+)
 
 __all__ = [
     "BooleanProcessSpec",
+    "GdsBooleanProcessSpec",
     "GeometryProcessSpecs",
     "ParticleShapeProcessSpec",
     "PlanarizeProcessSpec",
@@ -33,8 +41,9 @@ PlanarizeProcessSpec = ProcessSpec(
     dimensions=(2, 3),
     operations=("geometry",),
     description=(
-        "Native viennaps.Planarize(domain, cutoffHeight). The material-aware "
-        "stopMaterial path is not part of this version."
+        "Native viennaps.Planarize(domain, cutoffHeight). The cutoff is either "
+        "explicit or derived from the previous exposed top of a stop material "
+        "minus overPolish."
     ),
     default_variant="native",
     execution_kind="geometry",
@@ -74,6 +83,23 @@ BooleanProcessSpec = ProcessSpec(
     parse_step=parse_boolean,
 )
 
+GdsBooleanProcessSpec = ProcessSpec(
+    id="gdsBoolean",
+    version="1.0.0",
+    label="GDS-mask boolean",
+    params_model=GdsBooleanParams,
+    dimensions=(3,),
+    operations=("geometry",),
+    description=(
+        "Boolean with a 3D operand built from one selected GDS layer/datatype. "
+        "The run supplies the verified GDS operand provider through "
+        "ProcessContext.assets; the geometry engine applies the native boolean."
+    ),
+    default_variant="native",
+    execution_kind="geometry",
+    parse_step=parse_gds_boolean,
+)
+
 RemoveMaterialProcessSpec = ProcessSpec(
     id="removeMaterial",
     version="1.0.0",
@@ -91,5 +117,6 @@ GeometryProcessSpecs = (
     PlanarizeProcessSpec,
     ParticleShapeProcessSpec,
     BooleanProcessSpec,
+    GdsBooleanProcessSpec,
     RemoveMaterialProcessSpec,
 )

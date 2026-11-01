@@ -127,6 +127,8 @@ def run_v2_step(
     *,
     registry: ProcessRegistry | None = None,
     allow_gpu: bool = False,
+    previous_tops: Mapping[str, Any] | None = None,
+    assets: Mapping[str, Any] | None = None,
 ) -> ExecutionOutcome:
     """Run one worker step through the v2 registry and return its outcome.
 
@@ -198,13 +200,17 @@ def run_v2_step(
             f"the v2 worker bridge only provides {sorted(_CPU_KERNELS)!r}"
         )
 
+    run_assets = dict((getattr(ctx, "config", {}) or {}).get("csvAssets", {}))
+    if assets:
+        run_assets.update(assets)
     context = ProcessContext(
         dimension=int(ctx.project["dimension"]),
         grid_delta=float(ctx.project["domain"]["gridDelta"]),
         project=ctx.project,
         step=step,
         seed=getattr(ctx, "run_seed", None),
-        assets=(getattr(ctx, "config", {}) or {}).get("csvAssets", {}),
+        assets=run_assets,
+        previous_tops=previous_tops or {},
     )
     order = material_order(domain)
     state = ProcessState(
