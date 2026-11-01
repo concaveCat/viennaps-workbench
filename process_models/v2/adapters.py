@@ -5,12 +5,12 @@ making the declared read representation available and for committing the
 returned :class:`~process_models.v2.state.StateDelta` back into a
 :class:`~process_models.v2.state.ProcessState`.
 
-Phase-1 boundaries
-------------------
+Boundaries
+----------
 Only the default adapter exists. It converts height-field level-set geometry
-to/from :class:`process_models.voxel.VoxelGrid` on demand. Fields have no
-native cell-set integration yet, so requesting a missing field state is an
-error rather than a silent lossy conversion.
+to/from :class:`process_models.voxel.VoxelGrid` on demand. ``layers`` and
+``fields`` have no conversion path: requesting a missing typed representation
+is an error rather than a silent lossy derivation.
 
 The ViennaPS/viennals import lives behind :mod:`process_models.voxel` and is
 performed lazily inside methods, so importing this package does not require
@@ -62,27 +62,31 @@ class StateAdapter(Protocol):
 class DefaultStateAdapter:
     """The v2 default adapter.
 
-    ``prepare`` materializes voxels from geometry when a variant reads them and
-    raises :class:`StateMissingError` for missing fields. ``commit`` applies a
-    geometry delta, otherwise writes a voxel delta back into a *new* geometry,
-    and applies an independent fields delta. The input state is never mutated.
+    ``prepare`` materializes voxels from geometry when a variant reads them
+    and raises :class:`StateMissingError` for missing ``layers``/``fields``
+    (stored-only representations). ``commit`` applies a geometry delta,
+    otherwise writes a voxel delta back into a *new* geometry, then applies
+    ``layers`` and ``fields`` deltas independently. The input state is never
+    mutated.
     """
 
     id = "default-v2"
     #: Derived representations only. Geometry is passed through when present;
-    #: it cannot be materialized from nothing.
+    #: it cannot be materialized from nothing. ``layers``/``fields`` are
+    #: stored-only and therefore not listed.
     provides = frozenset({"voxels"})
 
     def prepare(self, state: ProcessState, capabilities: VariantCapabilities) -> ProcessState:
         """Ensure every representation in ``capabilities.reads`` is available."""
+        if "layers" in capabilities.reads and state.layers is None:
+            raise StateMissingError("layer state is not available and cannot be derived")
+        if "fields" in capabilities.reads and state.fields is None:
+            raise StateMissingError("field state is not available and cannot be derived")
         if "voxels" in capabilities.reads and state.voxels is None:
             if state.geometry is None:
                 raise StateMissingError("voxel state requires geometry to voxelize")
             grid = _read_voxels(state.geometry.handle)
             return replace(state, voxels=VoxelState(grid=grid))
-
-        if "fields" in capabilities.reads and state.fields is None:
-            raise StateMissingError("field state is not available in phase 1")
 
         return state
 
@@ -97,7 +101,8 @@ class DefaultStateAdapter:
         Geometry wins over voxels when a variant returns both: a variant that
         produced a new native geometry has already superseded any voxel view.
         A committed geometry also drops a stale voxel snapshot so the next
-        voxel reader re-derives it.
+        voxel reader re-derives it. ``layers`` and ``fields`` are independent
+        of geometry/voxels and of each other.
         """
         prepared = state
 
@@ -136,6 +141,13 @@ class DefaultStateAdapter:
                 voxels=None,
                 materials=_merge_materials(order, prepared.materials),
             )
+
+        if delta.layers is not None:
+            if "layers" not in capabilities.writes:
+                raise _resolution_error(
+                    "variant returned a layers delta but does not declare 'layers' in capabilities.writes"
+                )
+            prepared = replace(prepared, layers=delta.layers)
 
         if delta.fields is not None:
             if "fields" not in capabilities.writes:

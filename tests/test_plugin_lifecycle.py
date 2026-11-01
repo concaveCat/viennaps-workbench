@@ -523,7 +523,7 @@ class WorkerBridgeLifecycleTests(unittest.TestCase):
         loader.assert_called_once_with()
         self.assertEqual(outcome.plan.process.id, "isotropic")
         self.assertEqual(outcome.plan.variant.variant_id, "native")
-        self.assertEqual(outcome.delta.metadata["operation"], "etch")
+        self.assertEqual(outcome.metadata["operation"], "etch")
 
     def test_bridge_has_no_hardcoded_fallback_registration(self) -> None:
         empty = ProcessRegistry()

@@ -32,9 +32,11 @@ from process_models.v2.resolver import ExecutionRequest, ExecutionResolutionErro
 from process_models.v2.state import (
     LevelSetState,
     MaterialState,
+    OutputSet,
     ProcessState,
     StateDelta,
     StateMissingError,
+    StepResult,
 )
 from process_models.v2.surrogate.voxel_probe import (
     ADAPTER,
@@ -107,7 +109,7 @@ class _LeaseRecordingVariant(VoxelProbeVariant):
         params: BaseModel,
         ctx: ProcessContext,
         engine: EngineLease,
-    ) -> StateDelta:
+    ) -> StepResult:
         self.engines.append(engine)
         return super().execute(state, params, ctx, engine)
 
@@ -169,7 +171,7 @@ class VoxelProbeV2Test(unittest.TestCase):
         plan = self._plan(state, params, dimension)
         prepared = plan.state_adapter.prepare(state, plan.variant.capabilities)
         outcome = plan.run()
-        return plan, prepared, outcome.delta, outcome.state
+        return plan, prepared, outcome
 
     # -- schema ------------------------------------------------------------
     def test_params_schema_bounds_and_extra_keys(self) -> None:
@@ -325,8 +327,10 @@ class VoxelProbeV2Test(unittest.TestCase):
         before = _sorted_surface_points(domain)
         self.assertGreater(before.size, 0)
 
-        _, _, delta, committed = self._run(state, VoxelProbeParams(operation="identity"))
+        _, _, outcome = self._run(state, VoxelProbeParams(operation="identity"))
 
+        delta = outcome.delta
+        committed = outcome.state
         self.assertIsNotNone(delta.voxels)
         self.assertIsNone(delta.geometry)
         self.assertIsNotNone(committed.geometry)
@@ -339,30 +343,32 @@ class VoxelProbeV2Test(unittest.TestCase):
         self.assertEqual(after.shape, before.shape)
         self.assertLessEqual(float(np.max(np.abs(after - before))), 1e-9)
 
-        self.assertEqual(delta.metadata["operation"], "identity")
-        self.assertEqual(delta.metadata["layers"], 1)
-        self.assertEqual(delta.metadata["removedCells"], 0)
-        self.assertEqual(delta.metadata["adapter"], ADAPTER)
-        self.assertEqual(delta.metadata["voxelShape"], list(delta.metadata["voxelShape"]))
-        self.assertTrue(delta.metadata["materialOrder"])
-        self.assertTrue(delta.warnings)
+        metadata = outcome.metadata
+        self.assertEqual(metadata["operation"], "identity")
+        self.assertEqual(metadata["layers"], 1)
+        self.assertEqual(metadata["removedCells"], 0)
+        self.assertEqual(metadata["adapter"], ADAPTER)
+        self.assertEqual(metadata["voxelShape"], list(metadata["voxelShape"]))
+        self.assertTrue(metadata["materialOrder"])
+        self.assertTrue(outcome.warnings)
 
     def test_erode_top_layer_lowers_the_surface_by_about_one_grid_delta(self) -> None:
         domain = _plane_domain()
         state = _state(domain)
         top_before = _surface_top(domain)
 
-        _, _, delta, committed = self._run(
+        _, _, outcome = self._run(
             state,
             VoxelProbeParams(operation="erode_top_layer", layers=1),
         )
 
-        self.assertGreater(delta.metadata["removedCells"], 0)
-        self.assertEqual(delta.metadata["operation"], "erode_top_layer")
-        self.assertEqual(delta.metadata["layers"], 1)
-        self.assertEqual(delta.metadata["adapter"], ADAPTER)
+        metadata = outcome.metadata
+        self.assertGreater(metadata["removedCells"], 0)
+        self.assertEqual(metadata["operation"], "erode_top_layer")
+        self.assertEqual(metadata["layers"], 1)
+        self.assertEqual(metadata["adapter"], ADAPTER)
 
-        top_after = _surface_top(committed.geometry.handle)
+        top_after = _surface_top(outcome.state.geometry.handle)
         drop = top_before - top_after
         self.assertGreater(drop, 0.0)
         self.assertLessEqual(abs(drop - GRID_DELTA), 1.5 * GRID_DELTA)
@@ -376,10 +382,11 @@ class VoxelProbeV2Test(unittest.TestCase):
         before = _sorted_surface_points(domain)
         level_sets_before = len(domain.getLevelSets())
 
-        plan, prepared, delta, committed = self._run(
+        plan, prepared, outcome = self._run(
             state,
             VoxelProbeParams(operation="erode_top_layer", layers=1),
         )
+        committed = outcome.state
 
         self.assertIsNone(state.voxels)
         self.assertIs(prepared.geometry, state.geometry)
@@ -392,7 +399,7 @@ class VoxelProbeV2Test(unittest.TestCase):
         self.assertEqual(len(domain.getLevelSets()), level_sets_before)
         self.assertEqual(committed.geometry.material_order, state.geometry.material_order)
         self.assertEqual(committed.materials.order, state.materials.order)
-        self.assertEqual(delta.voxels.grid.material_order, state.geometry.material_order)
+        self.assertEqual(outcome.delta.voxels.grid.material_order, state.geometry.material_order)
 
     # -- resolver rejections ----------------------------------------------
     def test_resolver_rejects_missing_state_and_wrong_dimension(self) -> None:
@@ -421,11 +428,36 @@ class VoxelProbeV2Test(unittest.TestCase):
         first = self._run(_state(domain), params)
         second = self._run(_state(domain), params)
 
-        first_points = _sorted_surface_points(first[3].geometry.handle)
-        second_points = _sorted_surface_points(second[3].geometry.handle)
+        first_points = _sorted_surface_points(first[2].state.geometry.handle)
+        second_points = _sorted_surface_points(second[2].state.geometry.handle)
         np.testing.assert_array_equal(first_points, second_points)
         self.assertEqual(first[2].metadata, second[2].metadata)
         self.assertEqual(first[0].identity(), second[0].identity())
+
+    # -- structured outputs -------------------------------------------------
+    def test_step_result_carries_voxel_delta_and_empty_outputs(self) -> None:
+        state = _state(_plane_domain())
+        plan = self._plan(state, VoxelProbeParams(operation="erode_top_layer", layers=1))
+
+        outcome = plan.run()
+
+        result = outcome.result
+        self.assertIsInstance(result, StepResult)
+        self.assertIsInstance(result.state, StateDelta)
+        self.assertIsInstance(result.outputs, OutputSet)
+        self.assertEqual(result.outputs, OutputSet())
+        self.assertEqual(result.outputs.metrology, ())
+        self.assertEqual(result.outputs.artifacts, ())
+
+        # The voxel delta lives on ``result.state``; report data does not.
+        self.assertIsNotNone(result.state.voxels)
+        self.assertIsNone(result.state.geometry)
+        self.assertFalse(result.state.is_empty())
+        self.assertIs(outcome.delta, result.state)
+        self.assertIs(outcome.outputs, result.outputs)
+        self.assertIs(outcome.metadata, result.metadata)
+        self.assertIs(outcome.warnings, result.warnings)
+        self.assertEqual(outcome.artifacts, [])
 
     # -- height-field guard ------------------------------------------------
     def test_height_field_fin_is_rejected_in_a_subprocess(self) -> None:

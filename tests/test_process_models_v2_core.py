@@ -12,21 +12,28 @@ import json
 import unittest
 from unittest import mock
 
+import numpy as np
 from pydantic import BaseModel
 
 import process_models.v2.registry as registry_module
 from process_models.v2 import (
     Artifact,
+    CellSetState,
     DefaultStateAdapter,
     EngineCapabilities,
     EngineRequirement,
     EngineUnavailableError,
     ExecutionRequest,
     ExecutionResolutionError,
-    FieldState,
+    Field,
+    GridSpec,
     Issue,
+    Layer,
+    LayerState,
     LevelSetState,
     MaterialState,
+    MetrologyRecord,
+    OutputSet,
     ProcessContext,
     ProcessRegistry,
     ProcessSpec,
@@ -35,7 +42,9 @@ from process_models.v2 import (
     StateMissingError,
     StaticEngine,
     StaticEngineProvider,
+    StepResult,
     VariantCapabilities,
+    VariantDescriptor,
     VariantRegistration,
     VoxelState,
     compute_implementation_hash,
@@ -84,6 +93,19 @@ _FIELD_CAPS = VariantCapabilities(
     writes=frozenset({"fields"}),
 )
 
+_LAYER_CAPS = VariantCapabilities(
+    dimensions=(2, 3),
+    reads=frozenset({"layers"}),
+    writes=frozenset({"layers"}),
+)
+
+_STRUCTURED_CAPS = VariantCapabilities(
+    dimensions=(2, 3),
+    reads=frozenset({"layers", "fields"}),
+    writes=frozenset({"layers", "fields"}),
+    output_kinds=("metrology", "artifact:profile"),
+)
+
 
 class DummyVariant:
     variant_id = "dummy"
@@ -99,10 +121,10 @@ class DummyVariant:
     def validate(self, ctx: ProcessContext, params: BaseModel) -> list[Issue]:
         return []
 
-    def execute(self, state: ProcessState, params: BaseModel, ctx: ProcessContext, engine: object) -> StateDelta:
+    def execute(self, state: ProcessState, params: BaseModel, ctx: ProcessContext, engine: object) -> StepResult:
         self.execute_calls += 1
         self.last_engine = engine
-        return StateDelta()
+        return StepResult(state=StateDelta())
 
 
 class DummyVariantV2(DummyVariant):
@@ -128,6 +150,11 @@ class VoxelVariant(DummyVariant):
 class FieldVariant(DummyVariant):
     variant_id = "field"
     capabilities = _FIELD_CAPS
+
+
+class LayerVariant(DummyVariant):
+    variant_id = "layer"
+    capabilities = _LAYER_CAPS
 
 
 def _spec(version: str = "1.0.0", process_id: str = "dummy.deposit") -> ProcessSpec:
@@ -218,6 +245,55 @@ class FakeGrid:
         self.material_order = material_order
 
 
+def _grid(dimension: int = 2, shape: tuple[int, ...] = (4, 3), spacing: float = 0.5) -> GridSpec:
+    return GridSpec(dimension=dimension, origin=(0.0,) * dimension, spacing=spacing, shape=shape)
+
+
+def _field(
+    name: str = "temperature",
+    *,
+    unit: str = "K",
+    association: str = "cell",
+    dtype: str = "float64",
+    shape: tuple[int, ...] = (4, 3),
+    components: int = 1,
+    data: object = None,
+) -> Field:
+    return Field(
+        name=name,
+        unit=unit,
+        association=association,  # type: ignore[arg-type]
+        dtype=dtype,
+        shape=shape,
+        components=components,
+        data=data,
+    )
+
+
+def _cellset(
+    *,
+    shape: tuple[int, ...] = (4, 3),
+    fields: dict[str, Field] | None = None,
+    material_ids: object = None,
+) -> CellSetState:
+    return CellSetState(
+        grid=_grid(dimension=len(shape), shape=shape),
+        material_ids=np.zeros(shape, dtype=np.int32) if material_ids is None else material_ids,
+        fields=fields if fields is not None else {},
+        provenance={"producer": "test"},
+    )
+
+
+def _layers(*, layer_ids: tuple[str, ...] = ("oxide", "nitride")) -> LayerState:
+    names = {"oxide": ("SiO2", 1), "nitride": ("Si3N4", 2), "metal": ("W", 3)}
+    return LayerState(
+        layers=tuple(
+            Layer(layer_id=layer_id, material_id=names[layer_id][1], name=names[layer_id][0], thickness=2.0)
+            for layer_id in layer_ids
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # state
 # ---------------------------------------------------------------------------
@@ -261,12 +337,12 @@ class StateTest(unittest.TestCase):
         state = _state()
         self.assertEqual(
             {field.name for field in dataclasses.fields(ProcessState)},
-            {"geometry", "fields", "voxels", "materials"},
+            {"geometry", "materials", "layers", "fields", "voxels"},
         )
         self.assertFalse(hasattr(state, "engine"))
         self.assertFalse(hasattr(state, "meta"))
         with self.assertRaises(dataclasses.FrozenInstanceError):
-            state.fields = FieldState(data={"temperature": 300.0})  # type: ignore[misc]
+            state.fields = _cellset()  # type: ignore[misc]
 
         replaced = dataclasses.replace(state, voxels=VoxelState(grid=FakeGrid()))
         self.assertIsNot(replaced, state)
@@ -275,36 +351,36 @@ class StateTest(unittest.TestCase):
     def test_process_state_has_require_and_missing_error(self) -> None:
         empty = ProcessState()
         self.assertFalse(empty.has("geometry"))
+        self.assertFalse(empty.has("materials"))
+        self.assertFalse(empty.has("layers"))
         self.assertFalse(empty.has("fields"))
         self.assertFalse(empty.has("voxels"))
-        self.assertFalse(empty.has("materials"))
-        with self.assertRaises(StateMissingError):
-            empty.require("geometry")
-        with self.assertRaises(StateMissingError):
-            empty.require("fields")
+        for kind in ("geometry", "layers", "fields"):
+            with self.assertRaises(StateMissingError):
+                empty.require(kind)  # type: ignore[arg-type]
         with self.assertRaises(ValueError):
             empty.has("bogus")  # type: ignore[arg-type]
 
-        state = dataclasses.replace(_state(), fields=FieldState(data={"temperature": 300.0}))
+        state = dataclasses.replace(_state(), fields=_cellset(), layers=_layers())
         self.assertTrue(state.has("geometry"))
-        self.assertTrue(state.has("fields"))
         self.assertTrue(state.has("materials"))
+        self.assertTrue(state.has("layers"))
+        self.assertTrue(state.has("fields"))
         self.assertIs(state.require("geometry"), state.geometry)
-        self.assertIs(state.require("fields"), state.fields)
         self.assertIs(state.require("materials"), state.materials)
+        self.assertIs(state.require("layers"), state.layers)
+        self.assertIs(state.require("fields"), state.fields)
 
-    def test_state_delta_is_empty_ignores_bookkeeping(self) -> None:
-        self.assertTrue(StateDelta().is_empty())
-        self.assertTrue(
-            StateDelta(
-                artifacts=[Artifact(kind="json", name="summary")],
-                metadata={"rate": 1.0},
-                warnings=["heads up"],
-            ).is_empty()
+    def test_state_delta_is_empty_covers_every_flow_representation(self) -> None:
+        self.assertEqual(
+            {field.name for field in dataclasses.fields(StateDelta)},
+            {"geometry", "layers", "fields", "voxels"},
         )
+        self.assertTrue(StateDelta().is_empty())
         self.assertFalse(StateDelta(geometry=LevelSetState(handle=object(), dimension=2, grid_delta=0.5)).is_empty())
+        self.assertFalse(StateDelta(layers=_layers()).is_empty())
+        self.assertFalse(StateDelta(fields=_cellset()).is_empty())
         self.assertFalse(StateDelta(voxels=VoxelState(grid=FakeGrid())).is_empty())
-        self.assertFalse(StateDelta(fields=FieldState(data={"x": 1})).is_empty())
 
     def test_process_context_validation_and_no_materials(self) -> None:
         with self.assertRaises(ValueError):
@@ -316,6 +392,276 @@ class StateTest(unittest.TestCase):
         self.assertFalse(hasattr(context, "materials"))
         with self.assertRaises(TypeError):
             ProcessContext(dimension=2, grid_delta=0.5, materials=MaterialState(order=(0,)))  # type: ignore[call-arg]
+
+
+# ---------------------------------------------------------------------------
+# structured state: grid, fields, cell sets, layers, outputs
+# ---------------------------------------------------------------------------
+class GridSpecTest(unittest.TestCase):
+    def test_grid_spec_normalizes_values(self) -> None:
+        grid = GridSpec(dimension=2, origin=(0, 1.5), spacing=0.25, shape=(4, np.int64(3)))
+        self.assertEqual(grid.dimension, 2)
+        self.assertEqual(grid.origin, (0.0, 1.5))
+        self.assertEqual(grid.spacing, 0.25)
+        self.assertEqual(grid.shape, (4, 3))
+        self.assertIsInstance(grid.shape[1], int)
+
+        three_d = _grid(dimension=3, shape=(2, 3, 4))
+        self.assertEqual(three_d.shape, (2, 3, 4))
+
+    def test_grid_spec_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            GridSpec(dimension=1, origin=(0.0,), spacing=0.5, shape=(4,))
+        with self.assertRaises(ValueError):
+            GridSpec(dimension=2, origin=(0.0,), spacing=0.5, shape=(4, 4))
+        with self.assertRaises(ValueError):
+            GridSpec(dimension=2, origin=(0.0, 0.0), spacing=0.5, shape=(4,))
+        with self.assertRaises(ValueError):
+            GridSpec(dimension=2, origin=(0.0, 0.0), spacing=0.0, shape=(4, 4))
+        with self.assertRaises(ValueError):
+            GridSpec(dimension=2, origin=(0.0, 0.0), spacing=-0.5, shape=(4, 4))
+        with self.assertRaises(ValueError):
+            GridSpec(dimension=2, origin=(0.0, 0.0), spacing=float("nan"), shape=(4, 4))
+        with self.assertRaises(ValueError):
+            GridSpec(dimension=2, origin=(0.0, float("inf")), spacing=0.5, shape=(4, 4))
+        with self.assertRaises(ValueError):
+            GridSpec(dimension=2, origin=(0.0, 0.0), spacing=0.5, shape=(0, 4))
+        with self.assertRaises(ValueError):
+            GridSpec(dimension=2, origin=(0.0, 0.0), spacing=0.5, shape=(2.5, 4))
+
+
+class FieldTest(unittest.TestCase):
+    def test_scalar_field_with_numpy_data(self) -> None:
+        data = np.zeros((4, 3), dtype=np.float64)
+        field = _field(data=data)
+        self.assertEqual(field.name, "temperature")
+        self.assertEqual(field.shape, (4, 3))
+        self.assertEqual(field.components, 1)
+        self.assertIs(field.data, data)
+
+    def test_vector_and_tensor_component_shapes(self) -> None:
+        vector = _field(name="flux", components=3, data=np.zeros((3, 4, 3), dtype=np.float64))
+        self.assertEqual(vector.components, 3)
+
+        tensor = _field(name="stress", components=6, data=np.zeros((6, 4, 3), dtype=np.float64))
+        self.assertEqual(tensor.components, 6)
+
+        with self.assertRaises(ValueError):
+            _field(name="flux", components=3, data=np.zeros((4, 3), dtype=np.float64))
+        with self.assertRaises(ValueError):
+            _field(name="stress", components=6, data=np.zeros((9, 4, 3), dtype=np.float64))
+
+    def test_field_numpy_dtype_and_shape_must_match(self) -> None:
+        with self.assertRaises(ValueError):
+            _field(dtype="float32", data=np.zeros((4, 3), dtype=np.float64))
+        with self.assertRaises(ValueError):
+            _field(data=np.zeros((3, 4), dtype=np.float64))
+
+    def test_field_validation_and_opaque_handles(self) -> None:
+        with self.assertRaises(ValueError):
+            _field(name=" ")
+        with self.assertRaises(ValueError):
+            _field(unit="")
+        with self.assertRaises(ValueError):
+            _field(association="vertex")
+        with self.assertRaises(ValueError):
+            _field(dtype="not-a-dtype")
+        with self.assertRaises(ValueError):
+            _field(components=0)
+
+        handle = object()
+        # Non-array data is trusted: shape/dtype are only the contract.
+        field = _field(name="density", shape=(99, 99), data=handle)
+        self.assertIs(field.data, handle)
+
+
+class CellSetStateTest(unittest.TestCase):
+    def test_cell_set_with_fields_and_numpy_material_ids(self) -> None:
+        material_ids = np.zeros((4, 3), dtype=np.int32)
+        field = _field(data=np.zeros((4, 3), dtype=np.float64))
+        cell_set = CellSetState(
+            grid=_grid(),
+            material_ids=material_ids,
+            fields={"temperature": field},
+            provenance={"producer": "test"},
+        )
+        self.assertIs(cell_set.material_ids, material_ids)
+        self.assertEqual(cell_set.fields["temperature"].name, "temperature")
+        self.assertEqual(dict(cell_set.provenance), {"producer": "test"})
+
+    def test_cell_set_accepts_opaque_material_ids(self) -> None:
+        handle = object()
+        cell_set = CellSetState(grid=_grid(dimension=3, shape=(2, 3, 4)), material_ids=handle)
+        self.assertIs(cell_set.material_ids, handle)
+
+    def test_cell_set_validation(self) -> None:
+        with self.assertRaises(TypeError):
+            CellSetState(grid="not-a-grid", material_ids=None)  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            CellSetState(grid=_grid(), material_ids=np.zeros((3, 4), dtype=np.int32))
+        with self.assertRaises(ValueError):
+            CellSetState(grid=_grid(), material_ids=np.zeros((4, 3), dtype=np.float64))
+
+        good = _field(data=np.zeros((4, 3), dtype=np.float64))
+        with self.assertRaises(ValueError):
+            CellSetState(grid=_grid(), material_ids=None, fields={"other": good})
+        with self.assertRaises(ValueError):
+            CellSetState(
+                grid=_grid(),
+                material_ids=None,
+                fields={"temperature": _field(association="point")},
+            )
+        with self.assertRaises(ValueError):
+            CellSetState(
+                grid=_grid(),
+                material_ids=None,
+                fields={"temperature": _field(shape=(2, 2))},
+            )
+        with self.assertRaises(TypeError):
+            CellSetState(grid=_grid(), material_ids=None, fields={"temperature": "not-a-field"})  # type: ignore[dict-item]
+
+
+class LayerStateTest(unittest.TestCase):
+    def test_layer_defaults_and_layer_state_order(self) -> None:
+        layer = Layer(layer_id="gate", material_id=2, name="PolySi")
+        self.assertIsNone(layer.source_step)
+        self.assertIsNone(layer.thickness)
+        self.assertEqual(dict(layer.metadata), {})
+
+        state = _layers()
+        self.assertEqual([item.layer_id for item in state.layers], ["oxide", "nitride"])
+        self.assertEqual([item.material_id for item in state.layers], [1, 2])
+
+    def test_layer_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            Layer(layer_id="", material_id=0, name="Si")
+        with self.assertRaises(ValueError):
+            Layer(layer_id="si", material_id=-1, name="Si")
+        with self.assertRaises(ValueError):
+            Layer(layer_id="si", material_id=0, name=" ")
+        with self.assertRaises(ValueError):
+            Layer(layer_id="si", material_id=0, name="Si", source_step="")
+        for thickness in (0.0, -1.0, float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                Layer(layer_id="si", material_id=0, name="Si", thickness=thickness)
+
+    def test_layer_state_requires_unique_ids(self) -> None:
+        with self.assertRaises(ValueError):
+            LayerState(
+                layers=(
+                    Layer(layer_id="oxide", material_id=1, name="SiO2"),
+                    Layer(layer_id="oxide", material_id=2, name="Si3N4"),
+                )
+            )
+        state = LayerState(layers=())
+        self.assertEqual(state.layers, ())
+
+
+class MetrologyRecordTest(unittest.TestCase):
+    def test_metrology_defaults_and_values(self) -> None:
+        record = MetrologyRecord(metric="thickness", value=12.5, unit="nm")
+        self.assertEqual(record.method, "plugin")
+        self.assertIsNone(record.region)
+        self.assertIsNone(record.uncertainty)
+        self.assertEqual(record.value, 12.5)
+
+        explicit = MetrologyRecord(
+            metric="cd",
+            value=8,
+            unit="nm",
+            region="fin",
+            method="reference",
+            uncertainty=0.25,
+        )
+        self.assertEqual(explicit.value, 8.0)
+        self.assertEqual(explicit.uncertainty, 0.25)
+
+    def test_metrology_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            MetrologyRecord(metric=" ", value=1.0, unit="nm")
+        with self.assertRaises(ValueError):
+            MetrologyRecord(metric="thickness", value=float("nan"), unit="nm")
+        with self.assertRaises(ValueError):
+            MetrologyRecord(metric="thickness", value=float("inf"), unit="nm")
+        with self.assertRaises(ValueError):
+            MetrologyRecord(metric="thickness", value=1.0, unit="")
+        with self.assertRaises(ValueError):
+            MetrologyRecord(metric="thickness", value=1.0, unit="nm", region="")
+        with self.assertRaises(ValueError):
+            MetrologyRecord(metric="thickness", value=1.0, unit="nm", method="")
+
+        for uncertainty in (-0.1, float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                MetrologyRecord(metric="thickness", value=1.0, unit="nm", uncertainty=uncertainty)
+
+
+class OutputSetTest(unittest.TestCase):
+    def test_new_artifact_kinds_and_schema_version(self) -> None:
+        for kind in ("table", "profile", "device", "image", "surface_mesh", "native"):
+            artifact = Artifact(kind=kind, name=f"{kind}.dat")  # type: ignore[arg-type]
+            self.assertEqual(artifact.schema_version, 1)
+            self.assertIsNone(artifact.path)
+
+        versioned = Artifact(kind="profile", name="depth.profile", path="out/depth.profile", schema_version=2)
+        self.assertEqual(versioned.schema_version, 2)
+        self.assertEqual(versioned.path, "out/depth.profile")
+
+    def test_artifact_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            Artifact(kind="bogus", name="x")  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            Artifact(kind="json", name=" ")
+        with self.assertRaises(ValueError):
+            Artifact(kind="json", name="x", path="")
+        with self.assertRaises(ValueError):
+            Artifact(kind="json", name="x", schema_version=0)
+        with self.assertRaises(ValueError):
+            Artifact(kind="json", name="x", schema_version=1.5)  # type: ignore[arg-type]
+
+    def test_output_set_defaults_and_validation(self) -> None:
+        outputs = OutputSet()
+        self.assertEqual(outputs.schema_version, 1)
+        self.assertEqual(outputs.metrology, ())
+        self.assertEqual(outputs.artifacts, ())
+
+        record = MetrologyRecord(metric="thickness", value=10.0, unit="nm")
+        artifact = Artifact(kind="table", name="rates.csv")
+        populated = OutputSet(schema_version=2, metrology=(record,), artifacts=(artifact,))
+        self.assertEqual(populated.schema_version, 2)
+        self.assertEqual(populated.metrology, (record,))
+        self.assertEqual(populated.artifacts, (artifact,))
+
+        with self.assertRaises(ValueError):
+            OutputSet(schema_version=0)
+        with self.assertRaises(TypeError):
+            OutputSet(metrology=(record, "not-a-record"))  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            OutputSet(artifacts=("not-an-artifact",))  # type: ignore[arg-type]
+
+    def test_step_result_separates_state_from_report_data(self) -> None:
+        defaults = StepResult(state=StateDelta())
+        self.assertEqual(dict(defaults.metadata), {})
+        self.assertEqual(defaults.warnings, [])
+        self.assertEqual(defaults.outputs, OutputSet())
+        self.assertTrue(defaults.state.is_empty())
+
+        record = MetrologyRecord(metric="thickness", value=3.0, unit="nm")
+        artifact = Artifact(kind="profile", name="depth.profile")
+        result = StepResult(
+            state=StateDelta(layers=_layers()),
+            outputs=OutputSet(metrology=(record,), artifacts=(artifact,)),
+            metadata={"model": "dummy"},
+            warnings=["clipped"],
+        )
+        self.assertFalse(result.state.is_empty())
+        self.assertEqual(result.metadata["model"], "dummy")
+        self.assertEqual(result.warnings, ["clipped"])
+        self.assertEqual(result.outputs.metrology[0].metric, "thickness")
+        self.assertEqual([item.name for item in result.outputs.artifacts], ["depth.profile"])
+        # Report data never leaks into the flow delta.
+        self.assertIsNone(result.state.geometry)
+        self.assertIsNone(result.state.fields)
+        self.assertIsNone(result.state.voxels)
 
 
 # ---------------------------------------------------------------------------
@@ -543,6 +889,37 @@ class ContractRegistryTest(unittest.TestCase):
         self.assertTrue(variants["voxel"].experimental)
         self.assertEqual(len(registry.list_variants("dummy.deposit")), 2)
 
+    def test_capabilities_output_kinds_default_and_descriptor(self) -> None:
+        self.assertEqual(_DUMMY_CAPS.output_kinds, ())
+        with self.assertRaises(ValueError):
+            VariantCapabilities(
+                dimensions=(2,),
+                reads=frozenset(),
+                writes=frozenset(),
+                output_kinds=("",),
+            )
+
+        registry = ProcessRegistry()
+        registry.register_process(_spec())
+        variant = DummyVariant()
+        variant.capabilities = _STRUCTURED_CAPS
+        registry.register_variant(_registration(variant))
+
+        descriptor = registry.list_variants("dummy.deposit")[0]
+        self.assertEqual(descriptor.output_kinds, ("metrology", "artifact:profile"))
+
+        bare = VariantDescriptor(
+            id="dummy",
+            version="1.0.0",
+            kind="native",
+            engine_id="dummy",
+            reads=(),
+            writes=(),
+            experimental=False,
+            implementation_hash="x" * 64,
+        )
+        self.assertEqual(bare.output_kinds, ())
+
     def test_implementation_hash_is_file_based_and_stable(self) -> None:
         variant = DummyVariant()
         digest = compute_implementation_hash(variant)
@@ -700,6 +1077,63 @@ class ResolverTest(unittest.TestCase):
         self.assertEqual(plan.state_adapter.id, "default-v2")
         self.assertEqual(plan.state_adapter.provides, frozenset({"voxels"}))
 
+    def test_resolver_requires_stored_layers_and_fields(self) -> None:
+        # No adapter derives layers/fields; a read without stored state fails.
+        registry, provider, _ = _resolver_fixture(LayerVariant())
+        with self.assertRaises(ExecutionResolutionError) as caught:
+            resolve_execution(
+                ExecutionRequest(
+                    process_id="dummy.deposit",
+                    variant_id="layer",
+                    params=DummyParams(),
+                    context=_context(),
+                    state=_state(),
+                ),
+                registry,
+                provider,
+            )
+        self.assertIn("layers", str(caught.exception))
+        stored = dataclasses.replace(_state(), layers=_layers())
+        plan = resolve_execution(
+            ExecutionRequest(
+                process_id="dummy.deposit",
+                variant_id="layer",
+                params=DummyParams(),
+                context=_context(),
+                state=stored,
+            ),
+            registry,
+            provider,
+        )
+        self.assertEqual(plan.state_adapter.id, "default-v2")
+        self.assertEqual(plan.state_adapter.provides, frozenset({"voxels"}))
+
+        field_registry, field_provider, _ = _resolver_fixture(FieldVariant())
+        with self.assertRaises(ExecutionResolutionError) as caught:
+            resolve_execution(
+                ExecutionRequest(
+                    process_id="dummy.deposit",
+                    variant_id="field",
+                    params=DummyParams(),
+                    context=_context(),
+                    state=_state(),
+                ),
+                field_registry,
+                field_provider,
+            )
+        self.assertIn("fields", str(caught.exception))
+        resolve_execution(
+            ExecutionRequest(
+                process_id="dummy.deposit",
+                variant_id="field",
+                params=DummyParams(),
+                context=_context(),
+                state=dataclasses.replace(_state(), fields=_cellset()),
+            ),
+            field_registry,
+            field_provider,
+        )
+
     def test_resolver_rejects_material_order_mismatch(self) -> None:
         registry, provider, _ = _resolver_fixture()
         state = _state(material_order=(0, 1), materials=MaterialState(order=(0,)))
@@ -816,8 +1250,18 @@ class AdapterTest(unittest.TestCase):
         with self.assertRaises(StateMissingError):
             DefaultStateAdapter().prepare(_state(), _FIELD_CAPS)
 
-        state = dataclasses.replace(_state(), fields=FieldState(data={"x": 1}))
+        state = dataclasses.replace(_state(), fields=_cellset())
         self.assertIs(DefaultStateAdapter().prepare(state, _FIELD_CAPS), state)
+
+    def test_prepare_rejects_missing_layers_without_derivation(self) -> None:
+        with self.assertRaises(StateMissingError) as caught:
+            DefaultStateAdapter().prepare(_state(), _LAYER_CAPS)
+        self.assertIn("cannot be derived", str(caught.exception))
+
+        state = dataclasses.replace(_state(), layers=_layers())
+        self.assertIs(DefaultStateAdapter().prepare(state, _LAYER_CAPS), state)
+        self.assertNotIn("layers", DefaultStateAdapter.provides)
+        self.assertNotIn("fields", DefaultStateAdapter.provides)
 
     def test_commit_voxel_delta_writes_back_and_clears_voxels(self) -> None:
         state = dataclasses.replace(_state(), voxels=VoxelState(grid=FakeGrid()))
@@ -842,7 +1286,7 @@ class AdapterTest(unittest.TestCase):
     def test_commit_geometry_delta_wins_over_voxels_and_applies_fields(self) -> None:
         state = dataclasses.replace(_state(), voxels=VoxelState(grid=FakeGrid()))
         new_geometry = LevelSetState(handle=object(), dimension=2, grid_delta=0.5, material_order=(0, 1))
-        fields = FieldState(data={"temperature": 400.0})
+        fields = _cellset()
         delta = StateDelta(geometry=new_geometry, voxels=VoxelState(grid=FakeGrid()), fields=fields)
 
         with mock.patch("process_models.v2.adapters._write_voxels") as write:
@@ -880,11 +1324,54 @@ class AdapterTest(unittest.TestCase):
 
     def test_commit_fields_delta_returns_new_state(self) -> None:
         state = _state()
-        fields = FieldState(data={"temperature": 350.0})
+        fields = _cellset()
         committed = DefaultStateAdapter().commit(state, StateDelta(fields=fields), _FIELD_CAPS)
         self.assertIs(committed.fields, fields)
         self.assertIsNone(state.fields)
         self.assertIs(committed.geometry, state.geometry)
+
+    def test_commit_layers_delta_returns_new_state(self) -> None:
+        state = _state()
+        layers = _layers()
+        committed = DefaultStateAdapter().commit(state, StateDelta(layers=layers), _LAYER_CAPS)
+        self.assertIs(committed.layers, layers)
+        self.assertIsNone(state.layers)
+        self.assertIs(committed.geometry, state.geometry)
+        self.assertIs(committed.materials, state.materials)
+
+    def test_commit_applies_layers_and_fields_independently(self) -> None:
+        original_layers = _layers(layer_ids=("oxide",))
+        original_fields = _cellset(shape=(4, 3))
+        state = dataclasses.replace(_state(), layers=original_layers, fields=original_fields)
+        new_layers = _layers(layer_ids=("oxide", "nitride", "metal"))
+        new_fields = _cellset(shape=(6, 5), fields={"dose": _field(name="dose", unit="1/cm3", shape=(6, 5))})
+
+        layers_only = DefaultStateAdapter().commit(state, StateDelta(layers=new_layers), _STRUCTURED_CAPS)
+        self.assertIs(layers_only.layers, new_layers)
+        self.assertIs(layers_only.fields, original_fields)
+
+        fields_only = DefaultStateAdapter().commit(state, StateDelta(fields=new_fields), _STRUCTURED_CAPS)
+        self.assertIs(fields_only.fields, new_fields)
+        self.assertIs(fields_only.layers, original_layers)
+
+        both = DefaultStateAdapter().commit(
+            state,
+            StateDelta(layers=new_layers, fields=new_fields),
+            _STRUCTURED_CAPS,
+        )
+        self.assertIs(both.layers, new_layers)
+        self.assertIs(both.fields, new_fields)
+        # The input state is never mutated.
+        self.assertIs(state.layers, original_layers)
+        self.assertIs(state.fields, original_fields)
+
+    def test_commit_rejects_layers_delta_when_write_is_not_declared(self) -> None:
+        with self.assertRaises(ExecutionResolutionError):
+            DefaultStateAdapter().commit(_state(), StateDelta(layers=_layers()), _DUMMY_CAPS)
+
+    def test_commit_rejects_fields_delta_when_write_is_not_declared(self) -> None:
+        with self.assertRaises(ExecutionResolutionError):
+            DefaultStateAdapter().commit(_state(), StateDelta(fields=_cellset()), _DUMMY_CAPS)
 
 
 if __name__ == "__main__":

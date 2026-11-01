@@ -8,7 +8,8 @@ back, and the variant itself only edits a :class:`~process_models.voxel.VoxelGri
 Ownership of the conversion stays in the adapter. The variant never calls
 :func:`process_models.voxel.read_voxels` or
 :func:`process_models.voxel.write_voxels` and never mutates the input state; it
-returns a :class:`StateDelta` whose ``voxels`` entry the adapter commits.
+returns a :class:`StepResult` whose ``state`` carries the new ``voxels`` entry
+the adapter commits.
 
 Only height-field geometries are supported: the erosion model removes one
 horizontal material slice at a time and cannot express re-entrant shapes.
@@ -31,7 +32,7 @@ from ..contract import (
     VariantRegistration,
 )
 from ..engine import EngineLease, EngineRequirement
-from ..state import ProcessState, StateDelta, VoxelState
+from ..state import ProcessState, StateDelta, StepResult, VoxelState
 
 __all__ = [
     "ADAPTER",
@@ -74,9 +75,9 @@ class VoxelProbeVariant(EngineVariant):
     """Apply an identity or top-layer erosion on a voxel round trip.
 
     The variant reads ``state.voxels`` (materialised by the state adapter) and
-    writes a new ``VoxelState`` inside a :class:`StateDelta`. Witness metadata
-    records the effective operation, grid shape, material order, and how many
-    cells the erosion removed.
+    writes a new ``VoxelState`` into the returned :class:`StepResult`'s
+    ``state`` delta. Witness metadata records the effective operation, grid
+    shape, material order, and how many cells the erosion removed.
     """
 
     variant_id = "voxel_probe"
@@ -121,7 +122,7 @@ class VoxelProbeVariant(EngineVariant):
         params: BaseModel,
         ctx: ProcessContext,
         engine: EngineLease,
-    ) -> StateDelta:
+    ) -> StepResult:
         # Surrogates run on the Python interpreter that hosts this process, so
         # the lease is accepted for the uniform v2 signature and left unused.
         del engine
@@ -150,8 +151,8 @@ class VoxelProbeVariant(EngineVariant):
             new_grid = grid
             warnings.append("identity operation: surface is round-tripped through the voxel grid unchanged")
 
-        return StateDelta(
-            voxels=VoxelState(grid=new_grid, source=ADAPTER),
+        return StepResult(
+            state=StateDelta(voxels=VoxelState(grid=new_grid, source=ADAPTER)),
             metadata={
                 "operation": operation,
                 "layers": layers,

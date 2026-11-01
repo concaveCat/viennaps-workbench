@@ -2,7 +2,8 @@
 
 Public surface:
 
-* :mod:`process_models.v2.state` - multi-representation state and deltas.
+* :mod:`process_models.v2.state` - multi-representation state, deltas, and
+  structured step outputs (``StepResult``/``OutputSet``).
 * :mod:`process_models.v2.engine` - engine requirements, leases, providers.
 * :mod:`process_models.v2.contract` - process specs, variant registrations,
   capabilities, descriptors, issues, and context.
@@ -55,13 +56,21 @@ from .resolver import (
 from .state import (
     Artifact,
     ArtifactKind,
-    FieldState,
+    CellSetState,
+    Field,
+    FieldAssociation,
+    GridSpec,
+    Layer,
+    LayerState,
     LevelSetState,
     MaterialState,
+    MetrologyRecord,
+    OutputSet,
     ProcessState,
     StateDelta,
     StateKind,
     StateMissingError,
+    StepResult,
     VoxelState,
 )
 
@@ -69,6 +78,7 @@ __all__ = [
     "Artifact",
     "ArtifactKind",
     "Backend",
+    "CellSetState",
     "DefaultStateAdapter",
     "Engine",
     "EngineCapabilities",
@@ -82,11 +92,17 @@ __all__ = [
     "ExecutionPlan",
     "ExecutionRequest",
     "ExecutionResolutionError",
-    "FieldState",
+    "Field",
+    "FieldAssociation",
+    "GridSpec",
     "Issue",
+    "Layer",
+    "LayerState",
     "LevelSetState",
     "MaterialState",
+    "MetrologyRecord",
     "ModelDescriptor",
+    "OutputSet",
     "ProcessContext",
     "ProcessRegistry",
     "ProcessSpec",
@@ -98,6 +114,7 @@ __all__ = [
     "StateMissingError",
     "StaticEngine",
     "StaticEngineProvider",
+    "StepResult",
     "VariantCapabilities",
     "VariantDescriptor",
     "VariantRegistration",

@@ -234,9 +234,9 @@ class IsotropicParityTests(unittest.TestCase):
         self.assertIs(outcome.state.geometry.handle, candidate)
         self.assertEqual(outcome.delta.geometry.dimension, 2)
         self.assertEqual(outcome.delta.geometry.material_order, material_order(candidate))
-        self.assertEqual(outcome.delta.metadata["nativeClass"], "ps.IsotropicProcess")
-        self.assertEqual(outcome.delta.metadata["operation"], "etch")
-        self.assertEqual(outcome.delta.metadata["timeStepRatio"], 0.25)
+        self.assertEqual(outcome.metadata["nativeClass"], "ps.IsotropicProcess")
+        self.assertEqual(outcome.metadata["operation"], "etch")
+        self.assertEqual(outcome.metadata["timeStepRatio"], 0.25)
 
         identity = outcome.plan.identity()
         self.assertEqual(identity["process_id"], "isotropic")
@@ -265,7 +265,7 @@ class IsotropicParityTests(unittest.TestCase):
         self._assert_parity(reference, candidate, 2)
         self.assertAlmostEqual(_top(candidate, 2) - before, 0.3, delta=1e-6)
         self.assertIn(int(ps.Material.SiO2), simulate.material_map(candidate))
-        self.assertEqual(outcome.delta.metadata["depositMaterial"], "SiO2")
+        self.assertEqual(outcome.metadata["depositMaterial"], "SiO2")
         self.assertEqual(outcome.plan.identity()["engine_fingerprint"], "worker-v2-test")
 
     def test_masked_trench_matches_the_worker_level_set_path(self) -> None:
@@ -279,7 +279,7 @@ class IsotropicParityTests(unittest.TestCase):
         outcome = run_isotropic_v2(ps, project, step, candidate, ps_version=VIENNAPS_VERSION)
 
         self._assert_parity(reference, candidate, 2)
-        self.assertEqual(outcome.delta.metadata["maskMaterials"], ["Mask"])
+        self.assertEqual(outcome.metadata["maskMaterials"], ["Mask"])
         self.assertIn(int(ps.Material.Mask), simulate.material_map(candidate))
 
     def test_three_dimensional_plane_smoke(self) -> None:
@@ -294,7 +294,7 @@ class IsotropicParityTests(unittest.TestCase):
         self.assertEqual(outcome.delta.geometry.dimension, 3)
         self.assertEqual(outcome.delta.geometry.material_order, material_order(candidate))
         self.assertEqual(outcome.state.geometry.dimension, 3)
-        self.assertEqual(outcome.delta.metadata["dimension"], 3)
+        self.assertEqual(outcome.metadata["dimension"], 3)
         surface = simulate.surface_state(candidate, 3)
         self.assertGreater(surface["pointCount"], 0)
         self.assertEqual(material_order(candidate), (int(ps.Material.Si),))

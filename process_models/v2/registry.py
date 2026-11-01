@@ -199,6 +199,7 @@ class ProcessRegistry:
                         experimental=capabilities.experimental,
                         implementation_hash=registration.declared_hash
                         or compute_implementation_hash(registration.variant),
+                        output_kinds=capabilities.output_kinds,
                     )
                 )
         return descriptors

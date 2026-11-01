@@ -24,7 +24,7 @@ from .adapters import DefaultStateAdapter
 from .contract import Issue, ProcessContext, ProcessSpec, VariantRegistration
 from .engine import EngineLease, EngineProvider, EngineUnavailableError
 from .registry import ProcessRegistry
-from .state import Artifact, ProcessState, StateDelta, StateKind
+from .state import Artifact, OutputSet, ProcessState, StateDelta, StateKind, StepResult
 
 if TYPE_CHECKING:
     from .adapters import StateAdapter
@@ -63,28 +63,36 @@ class ExecutionRequest:
 
 @dataclass(frozen=True)
 class ExecutionOutcome:
-    """The committed state plus the delta and plan that produced it.
+    """The committed state plus the :class:`StepResult` that produced it.
 
-    The executor keeps ``delta.metadata``, ``delta.warnings`` and
-    ``delta.artifacts`` for the run record; the state adapter only commits the
-    representation changes.
+    ``state`` is what the adapter committed from ``result.state``; outputs,
+    metadata, and warnings stay on the result and are read through the
+    delegating properties below.
     """
 
     plan: ExecutionPlan
     state: ProcessState
-    delta: StateDelta
+    result: StepResult
+
+    @property
+    def delta(self) -> StateDelta:
+        return self.result.state
 
     @property
     def metadata(self) -> dict[str, object]:
-        return self.delta.metadata
+        return self.result.metadata
 
     @property
     def warnings(self) -> list[str]:
-        return self.delta.warnings
+        return self.result.warnings
+
+    @property
+    def outputs(self) -> OutputSet:
+        return self.result.outputs
 
     @property
     def artifacts(self) -> list[Artifact]:
-        return list(self.delta.artifacts)
+        return list(self.result.outputs.artifacts)
 
 
 @dataclass(frozen=True)
@@ -211,7 +219,7 @@ def execute_plan(plan: ExecutionPlan) -> ExecutionOutcome:
     This is the single execution entry point: it uses only the plan's own
     request (state, params, context), passes the acquired engine lease to the
     variant explicitly, materializes any derived representation, and commits
-    the returned delta. It deliberately does not checkpoint or roll back;
+    ``result.state``. It deliberately does not checkpoint or roll back;
     variants that declare ``mutates_input=True`` must be checkpointed by the
     caller before this function is invoked.
     """
@@ -223,14 +231,14 @@ def execute_plan(plan: ExecutionPlan) -> ExecutionOutcome:
         )
 
     prepared = plan.state_adapter.prepare(request.state, plan.variant.capabilities)
-    delta = plan.variant.variant.execute(prepared, request.params, request.context, plan.engine)
-    if not isinstance(delta, StateDelta):
+    result = plan.variant.variant.execute(prepared, request.params, request.context, plan.engine)
+    if not isinstance(result, StepResult):
         raise ExecutionResolutionError(
             f"variant {plan.process.id!r}/{plan.variant.variant_id!r} returned "
-            f"{type(delta).__name__}, expected StateDelta"
+            f"{type(result).__name__}, expected StepResult"
         )
-    committed = plan.state_adapter.commit(prepared, delta, plan.variant.capabilities)
-    return ExecutionOutcome(plan=plan, state=committed, delta=delta)
+    committed = plan.state_adapter.commit(prepared, result.state, plan.variant.capabilities)
+    return ExecutionOutcome(plan=plan, state=committed, result=result)
 
 
 def run_step(
@@ -284,10 +292,10 @@ def _check_geometry_grid(state: ProcessState, context: ProcessContext) -> None:
 def _state_provides(state: ProcessState, kind: StateKind, adapter: StateAdapter) -> bool:
     """Return whether ``state`` plus ``adapter`` can supply ``kind``.
 
-    Stored representations always count. A derived read counts only when the
-    selected adapter declares it in ``provides`` and its prerequisite state is
-    present. Voxels are the only derived read in phase 1: the default adapter
-    materializes them from an existing geometry before the variant runs.
+    ``layers`` and ``fields`` are stored-only: no adapter derives them, so a
+    variant that reads them needs an existing representation. ``voxels`` are
+    the one derived read in this slice: the default adapter materializes them
+    from an existing geometry before the variant runs.
     """
     if state.has(kind):
         return True

@@ -9,8 +9,12 @@ same ``ps.IsotropicProcess``. The only new part is the v2 packaging:
 * parameters are validated by :class:`IsotropicParams` (Pydantic v2);
 * the implementation is registered as a variant bound to a
   :class:`~process_models.v2.engine.EngineRequirement` (native ``viennaps``);
-* execution returns a :class:`~process_models.v2.state.StateDelta` instead of
-  a bare native domain.
+* execution returns a :class:`~process_models.v2.state.StepResult` instead of
+  a bare native domain: the mutated level sets travel in
+  ``StepResult.state`` (a :class:`~process_models.v2.state.StateDelta`) while
+  the step report travels in ``metadata``/``warnings``. ``outputs`` stays an
+  empty :class:`~process_models.v2.state.OutputSet` because this plugin
+  produces no metrology records or artifacts yet.
 
 The variant mutates the caller's level-set handle in place
 (``mutates_input=True``), exactly like the worker path. The executor is
@@ -35,7 +39,7 @@ from ..contract import (
     VariantRegistration,
 )
 from ..engine import EngineLease, EngineRequirement
-from ..state import LevelSetState, ProcessState, StateDelta
+from ..state import LevelSetState, ProcessState, StateDelta, StepResult
 
 __all__ = [
     "IsotropicNativeVariant",
@@ -223,10 +227,12 @@ class IsotropicNativeVariant(EngineVariant):
         params: BaseModel,
         ctx: ProcessContext,
         engine: EngineLease,
-    ) -> StateDelta:
-        """Apply one isotropic step and return the mutated native geometry.
+    ) -> StepResult:
+        """Apply one isotropic step and return the committed state change.
 
-        The worker module is imported lazily so that registering the plugin
+        ``result.state`` carries the mutated native geometry; ``metadata`` and
+        ``warnings`` are report data and never count as a state change. The
+        worker module is imported lazily so that registering the plugin
         never imports the worker or native libraries. ``engine.handle`` is the
         installed ``viennaps`` module supplied by the executor's lease.
         """
@@ -324,7 +330,11 @@ class IsotropicNativeVariant(EngineVariant):
             "materialMap": list(material_order),
         }
 
-        return StateDelta(geometry=delta_geometry, metadata=metadata, warnings=warnings)
+        return StepResult(
+            state=StateDelta(geometry=delta_geometry),
+            metadata=metadata,
+            warnings=warnings,
+        )
 
 
 IsotropicProcessSpec = ProcessSpec(

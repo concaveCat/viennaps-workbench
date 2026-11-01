@@ -41,7 +41,16 @@ from process_models.v2.resolver import (
     resolve_execution,
     run_step,
 )
-from process_models.v2.state import FieldState, LevelSetState, MaterialState, ProcessState, StateDelta
+from process_models.v2.state import (
+    CellSetState,
+    GridSpec,
+    LevelSetState,
+    MaterialState,
+    OutputSet,
+    ProcessState,
+    StateDelta,
+    StepResult,
+)
 
 GRID_DELTA = 0.1
 X_EXTENT = 1.0
@@ -347,7 +356,9 @@ class IsotropicNativePluginTest(unittest.TestCase):
         delta = outcome.delta
 
         self.assertIs(executed_domain, domain)
+        self.assertIsInstance(outcome.result, StepResult)
         self.assertIsInstance(delta, StateDelta)
+        self.assertIs(delta, outcome.result.state)
         self.assertIsInstance(delta.geometry, LevelSetState)
         self.assertIs(delta.geometry.handle, domain)
         self.assertEqual(delta.geometry.dimension, 2)
@@ -360,19 +371,60 @@ class IsotropicNativePluginTest(unittest.TestCase):
         after = _top(domain, 2)
         self.assertAlmostEqual(after - before, -0.3, delta=1e-6)
 
-        self.assertEqual(delta.metadata["operation"], "etch")
-        self.assertEqual(delta.metadata["rateMode"], "uniform")
-        self.assertEqual(delta.metadata["requestedRate"], 0.3)
-        self.assertEqual(delta.metadata["actualRate"], 0.3)
-        self.assertAlmostEqual(delta.metadata["signedRate"], -0.3)
-        self.assertEqual(delta.metadata["duration"], 1.0)
-        self.assertEqual(delta.metadata["nativeClass"], "ps.IsotropicProcess")
-        self.assertEqual(delta.metadata["fluxEngineType"], "CPU_DISK")
-        self.assertEqual(delta.metadata["dimension"], 2)
-        self.assertEqual(delta.metadata["timeStepRatio"], 0.25)
-        self.assertEqual(delta.metadata["maskMaterials"], [])
+        self.assertIs(outcome.metadata, outcome.result.metadata)
+        self.assertEqual(outcome.metadata["operation"], "etch")
+        self.assertEqual(outcome.metadata["rateMode"], "uniform")
+        self.assertEqual(outcome.metadata["requestedRate"], 0.3)
+        self.assertEqual(outcome.metadata["actualRate"], 0.3)
+        self.assertAlmostEqual(outcome.metadata["signedRate"], -0.3)
+        self.assertEqual(outcome.metadata["duration"], 1.0)
+        self.assertEqual(outcome.metadata["nativeClass"], "ps.IsotropicProcess")
+        self.assertEqual(outcome.metadata["fluxEngineType"], "CPU_DISK")
+        self.assertEqual(outcome.metadata["dimension"], 2)
+        self.assertEqual(outcome.metadata["timeStepRatio"], 0.25)
+        self.assertEqual(outcome.metadata["maskMaterials"], [])
         self.assertEqual(plan.engine.engine_id, "viennaps")
-        self.assertEqual(outcome.metadata, delta.metadata)
+
+    def test_step_result_keeps_outputs_empty_and_states_only_geometry(self) -> None:
+        domain = _plane(2)
+        _plan, outcome, _domain = self._execute(self._params(), domain=domain)
+        result = outcome.result
+
+        self.assertIsInstance(result, StepResult)
+        self.assertIsInstance(result.outputs, OutputSet)
+        self.assertEqual(result.outputs, OutputSet())
+        self.assertEqual(result.outputs.metrology, ())
+        self.assertEqual(result.outputs.artifacts, ())
+        self.assertIs(outcome.outputs, result.outputs)
+        self.assertEqual(outcome.artifacts, [])
+
+        # Report data lives on the result, never in the state delta.
+        self.assertIsInstance(result.state, StateDelta)
+        self.assertFalse(hasattr(result.state, "metadata"))
+        self.assertFalse(hasattr(result.state, "warnings"))
+        self.assertIs(result.state.geometry.handle, domain)
+        self.assertEqual(result.state.geometry.material_order, (int(ps.Material.Si),))
+        self.assertIsNone(result.state.layers)
+        self.assertIsNone(result.state.fields)
+        self.assertIsNone(result.state.voxels)
+        self.assertIs(outcome.state.geometry, result.state.geometry)
+        self.assertIs(outcome.warnings, result.warnings)
+        self.assertEqual(result.warnings, [])
+
+    def test_step_result_carries_warnings_outside_the_state(self) -> None:
+        params = self._params(
+            rateMagnitude=0.2,
+            duration=0.2,
+            rateMode="material",
+            materialRates={"Si": 0.2},
+            maskMaterials=["Mask"],
+        )
+        _plan, outcome, _domain = self._execute(params, domain=_masked_trench())
+
+        self.assertIs(outcome.warnings, outcome.result.warnings)
+        self.assertTrue(outcome.warnings)
+        self.assertIn("maskMaterials", outcome.warnings[0])
+        self.assertIsNone(outcome.result.state.layers)
 
     def test_deposit_raises_the_surface_and_adds_sio2(self) -> None:
         domain = _plane(2)
@@ -387,9 +439,9 @@ class IsotropicNativePluginTest(unittest.TestCase):
         order = _material_order(domain)
         self.assertEqual(order, (int(ps.Material.Si), int(ps.Material.SiO2)))
         self.assertEqual(delta.geometry.material_order, order)
-        self.assertEqual(delta.metadata["depositMaterial"], "SiO2")
-        self.assertEqual(delta.metadata["levelSetCount"], 2)
-        self.assertEqual(delta.metadata["materialMap"], list(order))
+        self.assertEqual(outcome.metadata["depositMaterial"], "SiO2")
+        self.assertEqual(outcome.metadata["levelSetCount"], 2)
+        self.assertEqual(outcome.metadata["materialMap"], list(order))
 
         # The deposited material is the new top level set, as in the worker path.
         self.assertEqual(domain.getNumberOfLevelSets(), 2)
@@ -426,6 +478,7 @@ class IsotropicNativePluginTest(unittest.TestCase):
             },
         )
         delta = outcome.delta
+        self.assertIs(delta.geometry.handle, domain)
 
         mask_after = _material_bounds(domain, int(ps.Material.Mask))
         si_after = _material_bounds(domain, int(ps.Material.Si))
@@ -434,11 +487,11 @@ class IsotropicNativePluginTest(unittest.TestCase):
 
         self.assertAlmostEqual(mask_after[1], mask_before[1], delta=1e-6)
         self.assertAlmostEqual(si_after[0] - si_before[0], -0.2 * 0.3, delta=1e-6)
-        self.assertEqual(delta.metadata["rateMode"], "material")
-        self.assertEqual(delta.metadata["actualRate"], 0.2)
-        self.assertEqual(delta.metadata["nativeDefaultRate"], 0.0)
-        self.assertAlmostEqual(delta.metadata["nativeMaterialRates"]["Si"], -0.2)
-        self.assertEqual(delta.metadata["maskMaterials"], [])
+        self.assertEqual(outcome.metadata["rateMode"], "material")
+        self.assertEqual(outcome.metadata["actualRate"], 0.2)
+        self.assertEqual(outcome.metadata["nativeDefaultRate"], 0.0)
+        self.assertAlmostEqual(outcome.metadata["nativeMaterialRates"]["Si"], -0.2)
+        self.assertEqual(outcome.metadata["maskMaterials"], [])
 
     def test_uniform_masks_come_from_the_project_geometry(self) -> None:
         domain = _masked_trench()
@@ -457,12 +510,13 @@ class IsotropicNativePluginTest(unittest.TestCase):
             },
         )
         delta = outcome.delta
+        self.assertEqual(delta.geometry.material_order, _material_order(domain))
 
         mask_after = _material_bounds(domain, int(ps.Material.Mask))
         si_after = _material_bounds(domain, int(ps.Material.Si))
         self.assertIsNotNone(mask_after)
         self.assertIsNotNone(si_after)
-        self.assertEqual(delta.metadata["maskMaterials"], ["Mask"])
+        self.assertEqual(outcome.metadata["maskMaterials"], ["Mask"])
         self.assertAlmostEqual(mask_after[1], mask_before[1], delta=1e-6)
         self.assertAlmostEqual(si_after[0] - si_before[0], -0.2 * 0.3, delta=1e-6)
 
@@ -478,7 +532,7 @@ class IsotropicNativePluginTest(unittest.TestCase):
         after = _top(domain, 3)
         self.assertAlmostEqual(after - before, -0.1, delta=1e-6)
         self.assertEqual(outcome.delta.geometry.dimension, 3)
-        self.assertEqual(outcome.delta.metadata["dimension"], 3)
+        self.assertEqual(outcome.metadata["dimension"], 3)
         self.assertEqual(outcome.state.geometry.dimension, 3)
 
     # -- resolver admission ------------------------------------------------
@@ -571,10 +625,12 @@ class IsotropicNativePluginTest(unittest.TestCase):
         with self.assertRaises(dataclasses.FrozenInstanceError):
             state.engine = None  # type: ignore[misc]
 
-        copied = dataclasses.replace(state, fields=FieldState(data={"witness": 1}))
+        grid = GridSpec(dimension=2, origin=(0.0, 0.0), spacing=GRID_DELTA, shape=(4, 4))
+        cell_set = CellSetState(grid=grid, material_ids=np.zeros((4, 4), dtype=np.int32))
+        copied = dataclasses.replace(state, fields=cell_set)
         self.assertIsNot(copied, state)
         self.assertIsNone(state.fields)
-        self.assertEqual(copied.fields.data, {"witness": 1})
+        self.assertIs(copied.fields, cell_set)
         self.assertIs(copied.geometry, state.geometry)
 
     def test_variant_uses_the_engine_lease_handle_explicitly(self) -> None:
@@ -591,7 +647,7 @@ class IsotropicNativePluginTest(unittest.TestCase):
         # The variant read the module from the lease, not from a global import.
         self.assertIn("IsotropicProcess", handle.accessed)
         self.assertIn("Process", handle.accessed)
-        self.assertEqual(outcome.delta.metadata["nativeClass"], "ps.IsotropicProcess")
+        self.assertEqual(outcome.metadata["nativeClass"], "ps.IsotropicProcess")
         self.assertAlmostEqual(_top(domain, 2) - before, -0.3, delta=1e-6)
 
     # -- identity / determinism --------------------------------------------
@@ -655,7 +711,7 @@ class IsotropicNativePluginTest(unittest.TestCase):
             first_outcome.delta.geometry.material_order,
             second_outcome.delta.geometry.material_order,
         )
-        self.assertEqual(first_outcome.delta.metadata, second_outcome.delta.metadata)
+        self.assertEqual(first_outcome.metadata, second_outcome.metadata)
         self.assertEqual(first_outcome.state.geometry.material_order, second_outcome.state.geometry.material_order)
         self.assertEqual(first_plan.identity(), second_plan.identity())
 
@@ -678,7 +734,7 @@ class IsotropicNativePluginTest(unittest.TestCase):
         )
 
         np.testing.assert_array_equal(_sorted_surface(planned_domain), _sorted_surface(stepped_domain))
-        self.assertEqual(planned.delta.metadata, stepped.delta.metadata)
+        self.assertEqual(planned.metadata, stepped.metadata)
         self.assertEqual(planned.delta.geometry.material_order, stepped.delta.geometry.material_order)
         self.assertEqual(planned.state.materials, stepped.state.materials)
         self.assertEqual(planned.plan.identity(), stepped.plan.identity())

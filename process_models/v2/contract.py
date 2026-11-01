@@ -27,7 +27,7 @@ from typing import Any, Literal, Mapping, Protocol
 from pydantic import BaseModel
 
 from .engine import EngineKind, EngineLease, EngineRequirement
-from .state import ProcessState, StateKind
+from .state import STATE_KINDS, ProcessState, StateKind, StepResult
 
 __all__ = [
     "EngineVariant",
@@ -86,7 +86,10 @@ class VariantCapabilities:
 
     ``reads``/``writes`` drive the resolver's state checks and the adapter's
     prepare/commit behaviour. ``geometry_constraints`` is descriptive only in
-    phase 1 (for example ``("height-field",)``).
+    phase 1 (for example ``("height-field",)``). ``output_kinds`` is a
+    declarative hint of the structured outputs a variant can emit (for example
+    ``("metrology", "artifact:profile")``); the executor records it but does not
+    enforce it in this slice.
     """
 
     dimensions: tuple[int, ...]
@@ -98,6 +101,7 @@ class VariantCapabilities:
     experimental: bool = False
     mutates_input: bool = False
     determinism: Determinism = "strict"
+    output_kinds: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         dimensions = tuple(int(dimension) for dimension in self.dimensions)
@@ -109,14 +113,17 @@ class VariantCapabilities:
             raise ValueError(f"unknown determinism {self.determinism!r}")
         reads = frozenset(self.reads)
         writes = frozenset(self.writes)
-        known = {"geometry", "fields", "voxels", "materials"}
-        unknown = sorted((reads | writes) - known)
+        unknown = sorted((reads | writes) - STATE_KINDS)
         if unknown:
-            raise ValueError(f"unknown state kinds {unknown!r}; expected a subset of {sorted(known)!r}")
+            raise ValueError(f"unknown state kinds {unknown!r}; expected a subset of {sorted(STATE_KINDS)!r}")
+        output_kinds = tuple(self.output_kinds)
+        if any(not isinstance(kind, str) or not kind.strip() for kind in output_kinds):
+            raise ValueError(f"output_kinds must be non-empty strings, got {output_kinds!r}")
         object.__setattr__(self, "dimensions", dimensions)
         object.__setattr__(self, "reads", reads)
         object.__setattr__(self, "writes", writes)
         object.__setattr__(self, "geometry_constraints", tuple(self.geometry_constraints))
+        object.__setattr__(self, "output_kinds", output_kinds)
 
 
 class EngineVariant(Protocol):
@@ -141,8 +148,8 @@ class EngineVariant(Protocol):
         params: BaseModel,
         ctx: ProcessContext,
         engine: EngineLease,
-    ) -> Any:
-        """Run one step with ``engine`` and return a ``StateDelta``."""
+    ) -> StepResult:
+        """Run one step with ``engine`` and return a :class:`StepResult`."""
 
 
 @dataclass(frozen=True)
@@ -238,6 +245,7 @@ class VariantDescriptor:
     writes: tuple[StateKind, ...]
     experimental: bool
     implementation_hash: str
+    output_kinds: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
