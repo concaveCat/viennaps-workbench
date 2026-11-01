@@ -22,10 +22,11 @@ else
 fi
 
 targets=(backend/api backend/api_errors.py backend/packages.py backend/planning.py
-         backend/supervisor.py worker/artifacts.py worker/engine_policy.py worker/steps)
+         backend/supervisor.py worker/artifacts.py worker/engine_policy.py worker/steps
+         process_models)
 
 echo "== compileall =="
-"$python_bin" -m compileall -q backend worker scripts
+"$python_bin" -m compileall -q backend worker scripts process_models
 
 echo "== ruff =="
 "${ruff_cmd[@]}" check "${targets[@]}"
