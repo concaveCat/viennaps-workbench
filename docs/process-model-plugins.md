@@ -1,9 +1,14 @@
 # 工艺模型插件架构（设计草案）
 
-> 状态：**设计 + 第一切片实现记录**。当前分支已落地 `process_models/contract.py`、
+> 状态：**设计 + 第一切片实现记录（v1）**。当前分支已落地 `process_models/contract.py`、
 > `registry.py`、`voxel.py`（height-field 适配器）以及一个实验性 `voxel_probe`
 > proof plugin 和 38 个定向测试；**尚未**接入 backend/worker，也没有 legacy 包装、
-> 真实工艺插件或 API/UI。本文其余部分描述目标契约与迁移顺序，未实现的内容不写成已完成。
+> 真实工艺插件或 API/UI。
+>
+> **v2 设计/实现见 [`process-model-plugins-v2.md`](process-model-plugins-v2.md)**：
+> 拆分 `ProcessSpec` / `VariantRegistration`、引入 `Engine`/`RuntimeLease`、
+> 多表示 `ProcessState`/`StateDelta`、`resolve_execution()`/`execute_plan()`。
+> 本文保留为 v1 第一切片记录。本文其余部分描述目标契约与迁移顺序，未实现的内容不写成已完成。
 
 ## 1. 为什么现在需要拆
 
