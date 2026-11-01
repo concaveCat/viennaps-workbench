@@ -19,8 +19,9 @@ Representations
   layer stack (for example a FinFET flow) instead of a single signed-distance
   field. Producers decide the layer order; the contract does not impose one.
 * ``fields`` is a typed :class:`CellSetState`: a :class:`GridSpec`, per-cell
-  material IDs, and named scalar/vector/tensor :class:`Field` values. No
-  producer exists in this slice; a state may still carry one.
+  material IDs, named scalar/vector/tensor :class:`Field` values, and an
+  optional native handle. It is derived on demand for a contiguous
+  ``implant -> anneal -> analysis`` sequence; geometry remains canonical.
 * ``voxels`` is the dense height-field grid from :mod:`process_models.voxel`.
   Conversions in and out of voxels live in
   :class:`process_models.v2.adapters.DefaultStateAdapter`, never in a variant.
@@ -125,13 +126,19 @@ class GridSpec:
     """Geometry of a regular cell grid.
 
     ``origin``/``shape`` have exactly ``dimension`` entries; ``spacing`` is the
-    edge length of one cell and must be positive.
+    edge length of one cell and must be positive. ``array_order`` records how a
+    flat native cell stream maps onto ``shape``: ``"C"`` makes the last axis
+    fastest, ``"F"`` makes the first axis fastest. Native ViennaPS
+    ``DenseCellSet`` streams are x-fastest, so a snapshot uses ``"F"`` with an
+    ``(nx, ny, nz)`` shape; keeping the axes in x/y/z order makes
+    ``data[i, j, k]`` address cell ``(i, j, k)`` directly.
     """
 
     dimension: int
     origin: tuple[float, ...]
     spacing: float
     shape: tuple[int, ...]
+    array_order: Literal["C", "F"] = "C"
 
     def __post_init__(self) -> None:
         dimension = int(self.dimension)
@@ -149,6 +156,9 @@ class GridSpec:
         shape = tuple(_positive_index(value, "grid shape") for value in self.shape)
         if len(shape) != dimension:
             raise ValueError(f"shape must have {dimension} entries, got {len(shape)}")
+
+        if self.array_order not in ("C", "F"):
+            raise ValueError(f"array_order must be 'C' or 'F', got {self.array_order!r}")
 
         object.__setattr__(self, "dimension", dimension)
         object.__setattr__(self, "origin", origin)
@@ -214,12 +224,25 @@ class CellSetState:
     ``material_ids`` is a numpy array (checked for shape and integer dtype) or
     an opaque handle. ``fields`` is keyed by field name; every field must be
     cell-associated and cover the grid. ``provenance`` is informational only.
+
+    ``handle`` is the engine's native cell-set object (for ViennaPS, a
+    ``DenseCellSet``). It is authoritative while a contiguous field sequence is
+    running; the arrays are a snapshot taken at sequence boundaries. A state
+    loaded from disk has ``handle=None`` until a :class:`CellSetBackend`
+    rehydrates it from the current geometry.
+
+    ``domain_handle`` is the opaque engine domain that owns the native cell
+    set. ViennaPS ``Process`` expects a ``Domain`` and looks up its cell set,
+    so a field step needs the widened *copy* that carries the dense grid; the
+    canonical ``ProcessState.geometry`` handle is never that copy.
     """
 
     grid: GridSpec
     material_ids: Any
     fields: Mapping[str, Field] = field(default_factory=dict)
     provenance: Mapping[str, Any] = field(default_factory=dict)
+    handle: Any = field(default=None, compare=False, repr=False)
+    domain_handle: Any = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.grid, GridSpec):

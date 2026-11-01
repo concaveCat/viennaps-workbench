@@ -31,6 +31,7 @@ SNAKE_TO_CAMEL = {
     "schema_version": "schemaVersion",
     "material_ids": "materialIds",
     "grid_delta": "gridDelta",
+    "domain_handle": "domainHandle",
 }
 
 #: Contract type name -> dataclass the schema describes.

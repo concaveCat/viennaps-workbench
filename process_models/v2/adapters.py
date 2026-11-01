@@ -8,9 +8,10 @@ returned :class:`~process_models.v2.state.StateDelta` back into a
 Boundaries
 ----------
 Only the default adapter exists. It converts height-field level-set geometry
-to/from :class:`process_models.voxel.VoxelGrid` on demand. ``layers`` and
-``fields`` have no conversion path: requesting a missing typed representation
-is an error rather than a silent lossy derivation.
+to/from :class:`process_models.voxel.VoxelGrid` on demand. ``fields`` is derived
+when the selected engine supplies a cell-set backend: the adapter calls
+``ensure`` at the start of a field sequence and ``rehydrate`` for a snapshot
+loaded from disk. ``layers`` remains stored-only.
 
 The ViennaPS/viennals import lives behind :mod:`process_models.voxel` and is
 performed lazily inside methods, so importing this package does not require
@@ -19,10 +20,12 @@ native libraries.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any, Protocol, runtime_checkable
 
-from .contract import VariantCapabilities
+from .cellset import CellSetBackend, CellSetBackendError, CellSetConfig
+from .contract import ProcessContext, VariantCapabilities
 from .state import (
     LevelSetState,
     ProcessState,
@@ -61,33 +64,107 @@ class StateAdapter(Protocol):
 class DefaultStateAdapter:
     """The v2 default adapter.
 
-    ``prepare`` materializes voxels from geometry when a variant reads them
-    and raises :class:`StateMissingError` for missing ``layers``/``fields``
-    (stored-only representations). ``commit`` applies a geometry delta,
-    otherwise writes a voxel delta back into a *new* geometry, then applies
-    ``layers`` and ``fields`` deltas independently. The input state is never
-    mutated.
+    ``prepare`` materializes voxels from geometry when a variant reads them,
+    derives or rehydrates fields when a cell-set backend is present, and raises
+    :class:`StateMissingError` for missing ``layers`` (stored-only). ``commit``
+    applies a geometry delta, otherwise writes a voxel delta back into a *new*
+    geometry, then applies ``layers`` and ``fields`` deltas independently. The
+    input state is never mutated.
     """
 
     id = "default-v2"
     #: Derived representations only. Geometry is passed through when present;
-    #: it cannot be materialized from nothing. ``layers``/``fields`` are
-    #: stored-only and therefore not listed.
+    #: it cannot be materialized from nothing. ``fields`` is derived when the
+    #: selected engine supplies a :class:`CellSetBackend`; ``layers`` remains
+    #: stored-only.
     provides = frozenset({"voxels"})
+
+    def __init__(
+        self,
+        *,
+        cellset_backend: CellSetBackend | None = None,
+        context: ProcessContext | None = None,
+        cellset_config: CellSetConfig | None = None,
+    ) -> None:
+        self._cellset_backend = cellset_backend
+        self._context = context
+        self._cellset_config = cellset_config
+        self.provides = frozenset({"voxels"}) | ({"fields"} if cellset_backend is not None else set())
 
     def prepare(self, state: ProcessState, capabilities: VariantCapabilities) -> ProcessState:
         """Ensure every representation in ``capabilities.reads`` is available."""
         if "layers" in capabilities.reads and state.layers is None:
             raise StateMissingError("layer state is not available and cannot be derived")
-        if "fields" in capabilities.reads and state.fields is None:
-            raise StateMissingError("field state is not available and cannot be derived")
-        if "voxels" in capabilities.reads and state.voxels is None:
-            if state.geometry is None:
+        prepared = state
+        if "fields" in capabilities.reads:
+            prepared = self._prepare_fields(prepared)
+        if "voxels" in capabilities.reads and prepared.voxels is None:
+            if prepared.geometry is None:
                 raise StateMissingError("voxel state requires geometry to voxelize")
-            grid = _read_voxels(state.geometry.handle)
-            return replace(state, voxels=VoxelState(grid=grid))
+            grid = _read_voxels(prepared.geometry.handle)
+            prepared = replace(prepared, voxels=VoxelState(grid=grid))
 
-        return state
+        return prepared
+
+    def _prepare_fields(self, state: ProcessState) -> ProcessState:
+        """Derive, rehydrate, or validate the cell-set sidecar.
+
+        Derivation is the only place a field sequence pays the native
+        ``generateCellSet`` cost. A snapshot loaded from disk has no native
+        handle and is rehydrated once; an in-memory sequence reuses the handle.
+        A snapshot from a different geometry is refused instead of remapped.
+        """
+        backend = self._cellset_backend
+        if backend is None:
+            if state.fields is None:
+                raise StateMissingError("field state is not available and cannot be derived")
+            return state
+        if state.geometry is None:
+            raise StateMissingError("field state requires geometry to derive a cell set")
+
+        context = self._context
+        if context is None:
+            if state.fields is None:
+                raise StateMissingError("field state derivation requires a ProcessContext")
+            return state
+
+        config = self._cellset_config
+        if config is None and state.fields is not None:
+            config = CellSetConfig.from_state(state.fields)
+        if config is None:
+            raw = context.step.get("cellSet") if isinstance(context.step, Mapping) else None
+            if raw is None:
+                raise StateMissingError("field state derivation requires canonical cellSet settings on the step")
+            try:
+                config = CellSetConfig.from_mapping(raw)
+            except CellSetBackendError as error:
+                raise StateMissingError(str(error)) from error
+
+        source_step_id = context.step.get("id") if isinstance(context.step, Mapping) else None
+        try:
+            if state.fields is None:
+                fields = backend.ensure(
+                    state.geometry,
+                    context,
+                    config,
+                    source_step_id=str(source_step_id) if source_step_id is not None else None,
+                )
+                return replace(state, fields=fields)
+            backend.validate(state.fields, context, config)
+            digest = backend.geometry_digest(state.geometry)
+            stored = state.fields.provenance.get("sourceGeometryDigest")
+            if stored is not None and str(stored) != digest:
+                raise StateMissingError(
+                    "cell-set snapshot belongs to a different geometry "
+                    f"(stored {stored}, current {digest}); this version does not remap fields "
+                    "across a geometry change"
+                )
+            if state.fields.handle is None:
+                fields = backend.rehydrate(state.geometry, state.fields, context, config)
+                return replace(state, fields=fields)
+            return state
+        except CellSetBackendError as error:
+            raise StateMissingError(str(error)) from error
 
     def commit(
         self,

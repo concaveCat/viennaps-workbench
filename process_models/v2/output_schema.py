@@ -182,7 +182,22 @@ def _cell_set_state() -> dict[str, Any]:
                     "origin": {"type": "array", "items": {"type": "number"}},
                     "spacing": {"type": "number", "exclusiveMinimum": 0},
                     "shape": {"type": "array", "items": {"type": "integer", "minimum": 1}},
+                    "arrayOrder": {"type": "string", "enum": ["C", "F"], "default": "C"},
                 },
+            ),
+            "handle": _value(
+                "CellSetHandle",
+                "Opaque engine cell-set handle (for native variants a ViennaPS DenseCellSet).",
+                nullable=True,
+                persisted=False,
+                note="Authoritative while a field sequence runs; never serialized.",
+            ),
+            "domainHandle": _value(
+                "CellSetDomainHandle",
+                "Opaque engine domain that owns the native cell set; ViennaPS Process needs it.",
+                nullable=True,
+                persisted=False,
+                note="Recreated with the native cell set on rehydration; never serialized.",
             ),
             "materialIds": _value(
                 "array",

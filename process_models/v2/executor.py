@@ -20,13 +20,21 @@ previous step's state is left untouched. A backend that cannot checkpoint is a
 hard :class:`ExecutionResolutionError`, never a "mutates_input is probably
 fine" fallback.
 
+``execution_kind="field"`` steps are the deliberate exception: they mutate an
+auxiliary native cell set, not the canonical level set. They do not
+checkpoint, their domain/cell-set ownership is transferred directly to the
+next step, and a failure aborts the run instead of restoring an earlier state.
+
 Persistence
 -----------
-For every step the executor writes ``state.json``/``fields.npz``,
+For every ordinary step the executor writes ``state.json``/``fields.npz``,
 ``outputs.json``, and ``plan.json`` through :class:`StateStore`, plus the
 geometry reference returned by the engine's state backend (the step's
-``geometry_ref`` is that file name, otherwise ``None``). After the
-last step one ``flow.json`` records the run::
+``geometry_ref`` is that file name, otherwise ``None``). A contiguous
+``execution_kind="field"`` sequence is different: intermediate steps write
+``state.json`` with ``fieldsOmitted`` (no dense arrays) and no geometry copy;
+only the last step of the sequence snapshots the cell set and writes
+``fields.npz`` once. After the last step one ``flow.json`` records the run::
 
     {
       "schemaVersion": 1,
@@ -58,7 +66,7 @@ release only drops the acquisition, not the dataclass fields.
 
 Costs
 -----
-A ``mutates_input`` step copies the native geometry handle before executing.
+A non-field ``mutates_input`` step copies the native geometry handle before executing.
 From the second step on the incoming state is already executor-private (the
 previous step committed it), so that is a redundant second copy. It is kept as
 an accepted validation cost for now: re-resolution must validate the exact
@@ -73,12 +81,13 @@ engines; it is the runtime foundation only.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from pydantic import BaseModel
 
 from .adapters import StateAdapter
+from .cellset import CellSetBackendError
 from .contract import ProcessContext
 from .engine import ComputePolicy, EngineProvider
 from .registry import ProcessRegistry
@@ -90,7 +99,7 @@ from .resolver import (
     execute_plan,
     resolve_execution,
 )
-from .state import ProcessState
+from .state import ProcessState, StepResult
 from .state_backend import StateBackendError
 from .storage import StateStore
 
@@ -160,19 +169,33 @@ class FlowExecutor:
         """
         ordered = tuple(steps)
         _check_steps(ordered)
+        kinds = self._execution_kinds(ordered)
 
         state = initial_state
         outcomes: list[ExecutionOutcome] = []
         identities: list[dict[str, str]] = []
         versions: dict[str, str] = {}
 
-        for step in ordered:
+        for index, step in enumerate(ordered):
             plan = self._resolve(step, state)
+            is_field = plan.process.execution_kind == "field"
+            sequence_end = is_field and (index + 1 == len(ordered) or kinds[index + 1] != "field")
             try:
                 outcome = execute_plan(plan)
-
-                geometry_ref = self._write_geometry(step, plan, outcome.state)
-                self._store.save_state(step.step_id, outcome.state, geometry_ref=geometry_ref)
+                if is_field:
+                    if sequence_end:
+                        outcome = self._snapshot_field_state(plan, step, outcome)
+                        geometry_ref = self._write_geometry(step, plan, outcome.state)
+                        self._store.save_state(step.step_id, outcome.state, geometry_ref=geometry_ref)
+                    else:
+                        # Intermediate field steps share one native handle and
+                        # one in-memory state. Their arrays are not a replay
+                        # boundary, so do not duplicate the dense fields or
+                        # geometry on disk.
+                        self._store.save_state(step.step_id, outcome.state, persist_fields=False)
+                else:
+                    geometry_ref = self._write_geometry(step, plan, outcome.state)
+                    self._store.save_state(step.step_id, outcome.state, geometry_ref=geometry_ref)
                 self._store.save_outputs(step.step_id, outcome.outputs)
                 identities.append(self._store.save_plan(step.step_id, plan))
                 versions.setdefault(plan.engine.engine_id, plan.engine_version)
@@ -194,6 +217,24 @@ class FlowExecutor:
         )
         return FlowRun(run_dir=self._store.root, outcomes=tuple(outcomes), state=state)
 
+    def _execution_kinds(self, steps: tuple[FlowStep, ...]) -> tuple[str, ...]:
+        """Return each step's static process execution kind.
+
+        This runs before the first write so an unknown or pinned-away process
+        cannot leave a partial run directory behind, and it lets the loop know
+        where a field sequence ends.
+        """
+        kinds: list[str] = []
+        for step in steps:
+            resolved = self._registry.get_variant(
+                step.process_id,
+                step.variant_id,
+                expected_process_version=step.expected_process_version,
+                expected_variant_version=step.expected_variant_version,
+            )
+            kinds.append(resolved.process.execution_kind)
+        return tuple(kinds)
+
     def _resolve(self, step: FlowStep, state: ProcessState) -> ExecutionPlan:
         """Resolve ``step`` against ``state``, checkpointing native geometry first.
 
@@ -201,8 +242,14 @@ class FlowExecutor:
         state (admission), then against a copied handle (execution). The first
         plan is abandoned, so its engine lease is released before the second
         resolution acquires another one.
+
+        ``execution_kind="field"`` steps deliberately skip checkpointing: they
+        mutate the auxiliary native cell set, not the canonical level set, and
+        their native handle is transferred to the next step in the sequence.
         """
         plan = resolve_execution(self._request(step, state), self._registry, self._provider, adapter=self._adapter)
+        if plan.process.execution_kind == "field":
+            return plan
         if not plan.variant.capabilities.mutates_input:
             return plan
 
@@ -255,6 +302,48 @@ class FlowExecutor:
                 f"mutates_input=True but state backend {backend.id!r} cannot checkpoint "
                 f"the native geometry: {error}"
             ) from error
+
+    def _snapshot_field_state(
+        self,
+        plan: ExecutionPlan,
+        step: FlowStep,
+        outcome: ExecutionOutcome,
+    ) -> ExecutionOutcome:
+        """Snapshot the native cell set once at a field-sequence boundary."""
+        fields = outcome.state.fields
+        if fields is None:
+            raise ExecutionResolutionError(f"field step {step.step_id!r} completed without cell-set state")
+        backend = getattr(plan.engine, "cellset_backend", None)
+        if backend is None:
+            raise ExecutionResolutionError(
+                f"field step {step.step_id!r} has no cell-set backend on engine {plan.engine.engine_id!r}"
+            )
+        try:
+            snapshot = backend.snapshot(
+                fields.handle,
+                step.context,
+                base=fields,
+                geometry=outcome.state.geometry,
+                source_step_id=step.step_id,
+            )
+        except CellSetBackendError as error:
+            raise ExecutionResolutionError(
+                f"could not snapshot the cell set at the end of the field sequence for step {step.step_id!r}: {error}"
+            ) from error
+        result = outcome.result
+        delta = result.delta
+        if delta.fields is not None:
+            delta = replace(delta, fields=snapshot)
+        return ExecutionOutcome(
+            plan=outcome.plan,
+            state=replace(outcome.state, fields=snapshot),
+            result=StepResult(
+                delta=delta,
+                outputs=result.outputs,
+                metadata=result.metadata,
+                warnings=result.warnings,
+            ),
+        )
 
     def _write_geometry(self, step: FlowStep, plan: ExecutionPlan, state: ProcessState) -> str | None:
         """Persist the step's native geometry through the state backend.

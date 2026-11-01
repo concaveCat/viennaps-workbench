@@ -250,6 +250,10 @@ class EngineLease(Protocol):
     backend: str
     profile: ExecutionProfile
     state_backend: StateBackend
+    #: Optional native cell-set lifecycle supplied by engines that can derive
+    #: a ``DenseCellSet`` from their level-set geometry. ``None`` means the
+    #: engine has no cell-set field path.
+    cellset_backend: Any
     fingerprint: str
     handle: Any
 
@@ -289,6 +293,7 @@ class _StaticLease:
     state_backend: StateBackend
     fingerprint: str
     handle: Any
+    cellset_backend: Any = None
 
     @property
     def backend(self) -> str:
@@ -333,6 +338,7 @@ class StaticEngine:
     handle: Any
     fingerprint: str
     state_backend: StateBackend | None = None
+    cellset_backend: Any = None
 
     def __post_init__(self) -> None:
         if self.state_backend is None:
@@ -372,6 +378,7 @@ class StaticEngine:
             state_backend=self.state_backend,
             fingerprint=self.fingerprint,
             handle=self.handle,
+            cellset_backend=self.cellset_backend,
         )
 
 

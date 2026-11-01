@@ -22,7 +22,8 @@ Layout (all paths below ``<root>``)::
                              "sourceStep": "...", "thickness": 0.1,
                              "metadata": {}}]} | null,
       "fields": {"grid": {"dimension": 2, "origin": [-1.0, -1.0],
-                          "spacing": 0.1, "shape": [20, 20]},
+                          "spacing": 0.1, "shape": [20, 20],
+                          "arrayOrder": "F"},
                  "fields": {"P_total": {"unit": "1/cm3", "association": "cell",
                                         "dtype": "float64", "shape": [20, 20],
                                         "components": 1}},
@@ -33,6 +34,9 @@ Layout (all paths below ``<root>``)::
 The ``materialIds`` descriptor is only written when ``CellSetState.material_ids``
 is set; the array itself lives in ``fields.npz`` under ``material_ids``. Named
 field arrays are stored as ``field_000``, ``field_001``, ... in JSON field order.
+``arrayOrder`` is omitted for the default ``"C"``; a native cell-set snapshot
+uses ``"F"`` so the flat x-fastest native stream maps to ``[i, j, k]``. Opaque
+``handle``/``domain_handle`` values are never serialized.
 
 ``outputs.json`` schema v1::
 
@@ -274,6 +278,8 @@ def _fields_payload(cell_set: CellSetState) -> dict[str, Any]:
         },
         "provenance": dict(cell_set.provenance),
     }
+    if cell_set.grid.array_order != "C":
+        payload["grid"]["arrayOrder"] = cell_set.grid.array_order
     if isinstance(cell_set.material_ids, np.ndarray):
         payload["materialIds"] = {
             "dtype": cell_set.material_ids.dtype.name,
@@ -313,6 +319,7 @@ def _fields_from_payload(directory: Path, payload: Any) -> CellSetState | None:
             origin=tuple(grid_payload["origin"]),
             spacing=grid_payload["spacing"],
             shape=tuple(grid_payload["shape"]),
+            array_order=grid_payload.get("arrayOrder", "C"),
         )
         definitions = payload.get("fields") or {}
         material_descriptor = payload.get("materialIds")
@@ -441,12 +448,17 @@ class StateStore:
         state: ProcessState,
         *,
         geometry_ref: str | None = None,
+        persist_fields: bool = True,
     ) -> dict[str, Any]:
         """Persist ``state`` for ``step_id`` and return the ``state.json`` payload.
 
         ``geometry_ref`` names the file (relative to the step directory) that
         holds the native level-set handle; the handle itself is not serialized.
-        ``voxels`` are deliberately ignored.
+        ``voxels`` are deliberately ignored. ``persist_fields=False`` writes the
+        non-field state but omits the dense cell-set arrays and records
+        ``fieldsOmitted: true``; the executor uses it for intermediate steps of
+        a field sequence, which are not replay boundaries. The boundary step is
+        written with the arrays once.
         """
         step_id = _validate_step_id(step_id)
         if geometry_ref is not None:
@@ -457,7 +469,8 @@ class StateStore:
 
         fields_payload = None
         arrays: dict[str, np.ndarray] = {}
-        if state.fields is not None:
+        fields_omitted = state.fields is not None and not persist_fields
+        if state.fields is not None and persist_fields:
             arrays = _field_arrays(state.fields)
             fields_payload = _fields_payload(state.fields)
 
@@ -469,12 +482,16 @@ class StateStore:
             "layers": _layers_payload(state.layers),
             "fields": fields_payload,
         }
+        if fields_omitted:
+            payload["fieldsOmitted"] = True
         text = _dumps(payload, what=f"state for step {step_id!r}")
 
         directory = self.step_dir(step_id)
         directory.mkdir(parents=True, exist_ok=True)
         if arrays:
             _atomic_write_arrays(directory / FIELDS_FILE, arrays)
+        elif fields_omitted:
+            (directory / FIELDS_FILE).unlink(missing_ok=True)
         _atomic_write_text(directory / STATE_FILE, text)
         return payload
 

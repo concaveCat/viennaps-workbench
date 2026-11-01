@@ -219,6 +219,7 @@ class ProcessSpec:
     operations: tuple[str, ...]
     description: str = ""
     default_variant: str | None = None
+    execution_kind: Literal["process", "field", "geometry"] = "process"
     parse_step: Callable[[Mapping[str, Any], Mapping[str, Any]], BaseModel | None] | None = None
 
     def __post_init__(self) -> None:
@@ -240,6 +241,8 @@ class ProcessSpec:
             raise ValueError("default_variant must be a non-empty string or None")
         if self.parse_step is not None and not callable(self.parse_step):
             raise TypeError("parse_step must be callable or None")
+        if self.execution_kind not in ("process", "field", "geometry"):
+            raise ValueError(f"execution_kind must be 'process', 'field', or 'geometry', got {self.execution_kind!r}")
         object.__setattr__(self, "dimensions", dimensions)
         object.__setattr__(self, "operations", operations)
 

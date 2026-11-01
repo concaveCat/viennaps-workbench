@@ -8,6 +8,8 @@ Public surface:
   leases, and providers.
 * :mod:`process_models.v2.state_backend` - engine-neutral checkpoint/write/load
   and material-registry boundary.
+* :mod:`process_models.v2.cellset` - on-demand native cell-set field domain,
+  its canonical config, and the ``ensure``/``snapshot``/``rehydrate`` protocol.
 * :mod:`process_models.v2.contract` - process specs, variant registrations,
   capabilities, descriptors, issues, and context.
 * :mod:`process_models.v2.registry` - explicit ID-based registry and hashing.
@@ -28,6 +30,13 @@ Python modules, paths, or callables.
 from __future__ import annotations
 
 from .adapters import DefaultStateAdapter, StateAdapter
+from .cellset import (
+    CELLSET_CONVERSION,
+    CellSetBackend,
+    CellSetBackendError,
+    CellSetCapabilities,
+    CellSetConfig,
+)
 from .conformance import ConformanceReport, check_variant
 from .contract import (
     EngineVariant,
@@ -102,6 +111,11 @@ __all__ = [
     "Artifact",
     "ArtifactKind",
     "Backend",
+    "CELLSET_CONVERSION",
+    "CellSetBackend",
+    "CellSetBackendError",
+    "CellSetCapabilities",
+    "CellSetConfig",
     "CellSetState",
     "ComputePolicy",
     "ConformanceReport",

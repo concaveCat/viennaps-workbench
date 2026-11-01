@@ -45,6 +45,7 @@ from process_models.v2.engine import (
     StaticEngineProvider,
 )
 from process_models.v2.engines.viennaps import ViennaPSMaterialRegistry, material_map
+from process_models.v2.engines.viennaps_cellset import ViennaPSCellSetBackend
 from process_models.v2.executor import FlowExecutor, FlowStep
 from process_models.v2.registry import ProcessRegistry
 from process_models.v2.resolver import ExecutionOutcome
@@ -218,6 +219,7 @@ def run_v2_step(
         version=str(ctx.ps_version),
         material_registry=ViennaPSMaterialRegistry(ctx.ps),
     )
+    cellset_backend = ViennaPSCellSetBackend(ctx.ps)
     engines = [
         StaticEngine(
             capabilities=EngineCapabilities(
@@ -230,6 +232,7 @@ def run_v2_step(
             handle=ctx.ps,
             fingerprint=ctx.native_engine_fingerprint or DEFAULT_ENGINE_FINGERPRINT,
             state_backend=state_backend,
+            cellset_backend=cellset_backend,
         )
     ]
     selected_device = getattr(ctx, "selected_gpu_device", None)
@@ -247,6 +250,7 @@ def run_v2_step(
                 handle=ctx.ps,
                 fingerprint=ctx.native_engine_fingerprint or DEFAULT_ENGINE_FINGERPRINT,
                 state_backend=state_backend,
+                cellset_backend=cellset_backend,
             )
         )
     provider = StaticEngineProvider(engines)

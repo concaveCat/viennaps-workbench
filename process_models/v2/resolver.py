@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel
 
 from .adapters import DefaultStateAdapter
+from .cellset import CellSetBackendError, CellSetConfig
 from .contract import Issue, ProcessContext, ProcessSpec, StateProfile, VariantRegistration
 from .engine import ComputePolicy, EngineLease, EngineProvider, EngineUnavailableError
 from .materials import MaterialRegistryError
@@ -252,7 +253,15 @@ def resolve_execution(
 
     _check_geometry_grid(request.state, request.context)
     selected_adapter = adapter or DefaultStateAdapter()
-    missing = sorted(kind for kind in capabilities.reads if not _state_provides(request.state, kind, selected_adapter))
+    # A fields read may be satisfied by the engine's cell-set backend, which is
+    # only known after acquisition. Defer that one check for the default
+    # adapter; a custom adapter must declare its own `provides` up front.
+    deferred_fields = adapter is None and "fields" in capabilities.reads
+    missing = sorted(
+        kind
+        for kind in capabilities.reads
+        if not (deferred_fields and kind == "fields") and not _state_provides(request.state, kind, selected_adapter)
+    )
     if missing:
         raise ExecutionResolutionError(
             f"variant {process.id!r}/{variant.variant_id!r} requires state kinds {missing}, "
@@ -274,6 +283,30 @@ def resolve_execution(
         ) from error
 
     try:
+        if adapter is None:
+            config = None
+            raw_cell_set = None
+            if "fields" in capabilities.reads or process.execution_kind == "field":
+                raw_cell_set = request.context.step.get("cellSet")
+            if raw_cell_set is not None:
+                try:
+                    config = CellSetConfig.from_mapping(raw_cell_set)
+                except CellSetBackendError as error:
+                    raise ExecutionResolutionError(str(error)) from error
+            selected_adapter = DefaultStateAdapter(
+                cellset_backend=getattr(lease, "cellset_backend", None),
+                context=request.context,
+                cellset_config=config,
+            )
+            missing = sorted(
+                kind for kind in capabilities.reads if not _state_provides(request.state, kind, selected_adapter)
+            )
+            if missing:
+                raise ExecutionResolutionError(
+                    f"variant {process.id!r}/{variant.variant_id!r} requires state kinds {missing}, "
+                    f"but the process state does not provide them"
+                )
+
         lease.state_backend.validate(request.state)
     except StateBackendError as error:
         lease.release()
@@ -281,6 +314,9 @@ def resolve_execution(
             f"variant {process.id!r}/{variant.variant_id!r} cannot use state backend "
             f"{lease.state_backend.id!r}: {error}"
         ) from error
+    except BaseException:
+        lease.release()
+        raise
 
     try:
         contract = resolve_state_contract(capabilities.state_profile, request.context, request.state, lease)
@@ -318,11 +354,15 @@ def resolve_state_contract(
     capabilities = backend.capabilities
     declared = profile or StateProfile()
     conversions = tuple(declared.conversions)
-    missing_conversions = sorted(set(conversions) - set(capabilities.conversions))
+    advertised = set(capabilities.conversions)
+    cellset_backend = getattr(lease, "cellset_backend", None)
+    if cellset_backend is not None:
+        advertised.update(cellset_backend.capabilities.conversions)
+    missing_conversions = sorted(set(conversions) - advertised)
     if missing_conversions:
         raise ExecutionResolutionError(
             f"state backend {backend.id!r} does not provide conversions {missing_conversions!r}; "
-            f"advertised conversions are {sorted(capabilities.conversions)!r}"
+            f"advertised conversions are {sorted(advertised)!r}"
         )
 
     if declared.required_materials:
@@ -443,14 +483,13 @@ def _check_geometry_grid(state: ProcessState, context: ProcessContext) -> None:
 def _state_provides(state: ProcessState, kind: StateKind, adapter: StateAdapter) -> bool:
     """Return whether ``state`` plus ``adapter`` can supply ``kind``.
 
-    ``layers`` and ``fields`` are stored-only: no adapter derives them, so a
-    variant that reads them needs an existing representation. ``voxels`` are
-    the one derived read in this slice: the default adapter materializes them
-    from an existing geometry before the variant runs.
+    ``layers`` is stored-only. ``voxels`` is derived from geometry by the
+    default adapter. ``fields`` is derived when the adapter has a cell-set
+    backend; without one it is stored-only.
     """
     if state.has(kind):
         return True
-    if kind != "voxels" or kind not in adapter.provides:
+    if kind not in adapter.provides:
         return False
     return state.has("geometry")
 
