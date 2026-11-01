@@ -157,6 +157,16 @@ def run_v2_step(
 
     variant_id = registry.default_variant_id(spec.id)
     policy = compute_policy_for_step(ctx, step)
+    variant = registry.get_variant(spec.id, variant_id).variant
+    if variant.engine.profiles and not any(
+        profile.backend == policy.backend and profile.kernel == policy.kernel
+        for profile in variant.engine.profiles
+    ):
+        raise V2ProfileUnavailable(
+            f"step {step['id']!r} resolved to {policy.backend}/{policy.kernel!r}, but "
+            f"variant {spec.id!r}/{variant_id!r} declares profiles "
+            f"{[profile.identity() for profile in variant.engine.profiles]!r}"
+        )
     if policy.backend == "gpu":
         if not allow_gpu:
             raise V2ProfileUnavailable(

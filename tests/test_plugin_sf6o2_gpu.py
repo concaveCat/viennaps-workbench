@@ -23,8 +23,8 @@ from typing import Any
 import viennaps as ps
 
 import worker.simulate as simulate
-from backend.gpu_devices import cuda_devices
 from process_models.v2.engines.viennaps import configure_advection, configure_rays
+from tests.gpu_support import acquire_gpu
 from tests.test_plugin_sf6o2 import (
     GRID_DELTA,
     RAY_SEED,
@@ -87,16 +87,7 @@ def _stack_domain(project: dict[str, Any]) -> Any:
 class SF6O2GpuTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        inventory = cuda_devices()
-        if inventory.get("status") != "available" or not inventory.get("devices"):
-            raise unittest.SkipTest(f"no CUDA device: {inventory.get('reason')}")
-        cls.device = dict(inventory["devices"][0])
-        os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(cls.device["uuid"])
-        ps.setNumThreads(1)
-        ps.Length.setUnit("um")
-        ps.Time.setUnit("s")
-        cls.readback = simulate.cuda_runtime_readback(cls.device)
+        cls.device, cls.readback = acquire_gpu()
 
     def setUp(self) -> None:
         self.work_dir = TEST_ROOT / self._testMethodName
