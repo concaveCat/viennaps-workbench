@@ -16,6 +16,32 @@
       }
     },
     {
+      "id": "faradayCage",
+      "version": "1.0.0",
+      "api": 1,
+      "entrypoint": "plugins.faradayCage:register",
+      "manifestSha256": "c383f4eef4476e820f65b1f3ca8dd68bdc4776962d9f8535b89ac07e4cd68862",
+      "variants": {
+        "native": {
+          "version": "1.0.0",
+          "implementationHash": "4c6b5b57ff8ab4233402c5c983d385fa34b280d99fba8dba3085d8540b8c9c2c"
+        }
+      }
+    },
+    {
+      "id": "fluorocarbon",
+      "version": "1.0.0",
+      "api": 1,
+      "entrypoint": "plugins.fluorocarbon:register",
+      "manifestSha256": "b3ba0c445bf257759a7b70a2bc6ea6370e34787fb2b4013338f5f3d7dc937bb7",
+      "variants": {
+        "native": {
+          "version": "1.0.0",
+          "implementationHash": "91808636d0faa0ba7b8102ba5b1ed6f1f07bae306b37f29aae132e8ac1a98347"
+        }
+      }
+    },
+    {
       "id": "hbro2",
       "version": "1.0.0",
       "api": 1,
@@ -25,6 +51,19 @@
         "native": {
           "version": "1.0.0",
           "implementationHash": "0d55bd735e26ab2887878653e0876e396a3d58e892d12cf599675a5abad35e8d"
+        }
+      }
+    },
+    {
+      "id": "ionBeam",
+      "version": "1.0.0",
+      "api": 1,
+      "entrypoint": "plugins.ionBeam:register",
+      "manifestSha256": "9a95f7f3027d276f4d86c776ff0462b044bb64c276d21c9257979c0a20d4d1e2",
+      "variants": {
+        "native": {
+          "version": "1.0.0",
+          "implementationHash": "e37beb2a59919acd82cbd4220f994c1557585ef02291287251861aa18917d06a"
         }
       }
     },

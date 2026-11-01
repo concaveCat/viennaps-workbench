@@ -1,6 +1,6 @@
 # 插件组织与数据流
 
-> 状态：v2.5 契约 + 生命周期 + isotropic/sf6o2/cf4o2/hbro2/sf6c4f8 + runtime/storage/conformance
+> 状态：v2.5 契约 + 生命周期 + isotropic/sf6o2/cf4o2/hbro2/sf6c4f8/fluorocarbon/ionBeam/faradayCage + runtime/storage/conformance
 > 基础已落地。本文描述**插件应该如何组织、数据如何流动**；这一片是运行时基础，
 > 不是生产 backend 接入，也没有 API/UI，文中明确标出。v2.5 在 v2.4 之上增加了
 > 执行 profile（CPU/GPU backend + kernel）和引擎中立的状态 backend；v2.4 完成了
@@ -291,7 +291,9 @@ ProcessState.geometry.handle + EngineLease.handle (ps)
 ```
 
 - 当前：`isotropic`（2D/3D，uniform/material level-set，mask，StepResult）；
-  `sf6o2` / `cf4o2` / `hbro2` / `sf6c4f8`（flat plasma etch + CoverageParameters）。
+  `sf6o2` / `cf4o2` / `hbro2` / `sf6c4f8`（flat plasma etch + CoverageParameters）；
+  `fluorocarbon`（完整 FluorocarbonParameters + material table）、`ionBeam`（IBEParameters + masks）、
+  `faradayCage`（FaradayCageParameters + masks，CPU_DISK only）。
 - 引擎：ViennaPS；CPU/GPU/kernel 由 `EngineRequirement.profiles` + 平台 `ComputePolicy` 解析。
 
 ### 4.2 surrogate

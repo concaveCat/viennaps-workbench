@@ -22,6 +22,18 @@ import viennaps as ps
 from tests.gpu_support import acquire_gpu
 from tests.test_plugin_cf4o2 import cf4o2_project
 from tests.test_plugin_cf4o2 import plane_domain as cf4o2_domain
+from tests.test_plugin_fluorocarbon import (
+    RAY_SEED as FLUOROCARBON_RAY_SEED,
+)
+from tests.test_plugin_fluorocarbon import (
+    _reference as fluorocarbon_reference,
+)
+from tests.test_plugin_fluorocarbon import (
+    fluorocarbon_project,
+)
+from tests.test_plugin_fluorocarbon import (
+    plane_domain as fluorocarbon_domain,
+)
 from tests.test_plugin_hbro2 import (
     RAY_SEED as HBRO2_RAY_SEED,
 )
@@ -33,6 +45,18 @@ from tests.test_plugin_hbro2 import (
 )
 from tests.test_plugin_hbro2 import (
     plane_domain as hbro2_domain,
+)
+from tests.test_plugin_ionBeam import (
+    RAY_SEED as ION_BEAM_RAY_SEED,
+)
+from tests.test_plugin_ionBeam import (
+    _reference as ion_beam_reference,
+)
+from tests.test_plugin_ionBeam import (
+    ion_beam_project,
+)
+from tests.test_plugin_ionBeam import (
+    plane_domain as ion_beam_domain,
 )
 from tests.test_plugin_sf6c4f8 import (
     RAY_SEED as SF6C4F8_RAY_SEED,
@@ -109,6 +133,40 @@ class PlasmaPluginGpuTest(unittest.TestCase):
         self.assertEqual(outcome.plan.identity()["engine_kernel"], "GPU_DISK")
 
         reference = sf6c4f8_reference(ps, project, sf6c4f8_domain(2), 1e-3, kernel="GPU_DISK")
+        comparison = compare_domains(reference, outcome.state.geometry.handle, 2)
+        self.assertTrue(comparison["matched"], comparison["reasons"])
+
+    def test_fluorocarbon_gpu_disk_matches_direct_reference(self) -> None:
+        project = fluorocarbon_project(2)
+        project["solver"]["enginePreference"] = "gpu"
+        project["solver"]["gpuEngine"] = "GPU_DISK"
+        step = project["steps"][0]
+        ctx = self._context(project, "fluorocarbon", "GPU_DISK", FLUOROCARBON_RAY_SEED)
+
+        outcome = run_v2_step(ctx, step, fluorocarbon_domain(2), allow_gpu=True)
+        self.assertEqual(outcome.plan.identity()["engine_kernel"], "GPU_DISK")
+
+        reference = fluorocarbon_reference(
+            ps,
+            project,
+            fluorocarbon_domain(2),
+            step["nativeParameters"]["materialParametersByMaterial"],
+            kernel="GPU_DISK",
+        )
+        comparison = compare_domains(reference, outcome.state.geometry.handle, 2)
+        self.assertTrue(comparison["matched"], comparison["reasons"])
+
+    def test_ion_beam_gpu_disk_matches_direct_reference(self) -> None:
+        project = ion_beam_project(2)
+        project["solver"]["enginePreference"] = "gpu"
+        project["solver"]["gpuEngine"] = "GPU_DISK"
+        step = project["steps"][0]
+        ctx = self._context(project, "ionBeam", "GPU_DISK", ION_BEAM_RAY_SEED)
+
+        outcome = run_v2_step(ctx, step, ion_beam_domain(2), allow_gpu=True)
+        self.assertEqual(outcome.plan.identity()["engine_kernel"], "GPU_DISK")
+
+        reference = ion_beam_reference(ps, project, ion_beam_domain(2), kernel="GPU_DISK")
         comparison = compare_domains(reference, outcome.state.geometry.handle, 2)
         self.assertTrue(comparison["matched"], comparison["reasons"])
 
