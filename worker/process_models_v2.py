@@ -115,6 +115,7 @@ def run_v2_step(
         grid_delta=float(ctx.project["domain"]["gridDelta"]),
         project=ctx.project,
         step=step,
+        seed=getattr(ctx, "run_seed", None),
     )
     order = material_order(domain)
     state = ProcessState(

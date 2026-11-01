@@ -69,6 +69,7 @@ class ProcessContext:
     grid_delta: float
     project: Mapping[str, Any] = field(default_factory=dict)
     step: Mapping[str, Any] = field(default_factory=dict)
+    seed: int | None = None
 
     def __post_init__(self) -> None:
         if int(self.dimension) not in (2, 3):
@@ -76,8 +77,12 @@ class ProcessContext:
         grid_delta = float(self.grid_delta)
         if not math.isfinite(grid_delta) or grid_delta <= 0.0:
             raise ValueError(f"grid_delta must be a positive finite number, got {self.grid_delta!r}")
+        if self.seed is not None:
+            if isinstance(self.seed, bool) or not isinstance(self.seed, int):
+                raise ValueError(f"seed must be an integer or None, got {self.seed!r}")
         object.__setattr__(self, "dimension", int(self.dimension))
         object.__setattr__(self, "grid_delta", grid_delta)
+        object.__setattr__(self, "seed", int(self.seed) if self.seed is not None else None)
 
 
 @dataclass(frozen=True)

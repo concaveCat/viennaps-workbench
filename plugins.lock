@@ -11,7 +11,20 @@
       "variants": {
         "native": {
           "version": "1.0.0",
-          "implementationHash": "e549815b815061d64734caddc1a453eaee1c3db122067cf1a72b942af466fe96"
+          "implementationHash": "3fe48af5854b7296366053f62064fe9e2c3eaf5d0356b26b3f7457fd86658550"
+        }
+      }
+    },
+    {
+      "id": "sf6o2",
+      "version": "1.0.0",
+      "api": 1,
+      "entrypoint": "plugins.sf6o2:register",
+      "manifestSha256": "47538fe37709adc338c21a37b549b7635932825811813985d6f15d8a0e51e841",
+      "variants": {
+        "native": {
+          "version": "1.0.0",
+          "implementationHash": "e86d09734838aa7fbdf9521aa03e0477adf660bf3f03b9b2213cecbe183cfb99"
         }
       }
     }

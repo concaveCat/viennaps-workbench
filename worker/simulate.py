@@ -45,6 +45,7 @@ from backend.gpu_devices import cuda_devices, resolve_gpu_device
 from backend.gds import MAX_GDS_BLUR_CELLS, blur_exposure_cell_count
 from process_models.v2.engines.viennaps import (
     configure_advection,
+    configure_rays,
     material_handle,
     material_map,
     protected_material_names,
@@ -565,28 +566,6 @@ def native_mesh_report(mesh: Any) -> dict[str, Any]:
     mesh_identity = hashlib.sha256(json.dumps(mesh_identity_payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
     return {"points": points, **topology, "pointData": point_data, "cellData": cell_data,
             "meshIdentity": mesh_identity, "fields": fields}
-
-
-def configure_rays(ps: Any, project: dict[str, Any], seed: int) -> tuple[Any, dict[str, Any]]:
-    params = ps.RayTracingParameters()
-    params.raysPerPoint = int(project["solver"]["raysPerPoint"])
-    params.rngSeed = int(seed)
-    params.useRandomSeeds = False
-    actual: dict[str, Any] = {"raysPerPoint": int(params.raysPerPoint), "rngSeed": int(params.rngSeed),
-                              "useRandomSeeds": bool(params.useRandomSeeds)}
-    if project["schemaVersion"] >= 7:
-        requested = project["solver"]["rayTracing"]
-        for name in ("diskRadius", "ignoreFluxBoundaries", "maxBoundaryHits", "maxReflections",
-                     "minNodeDistanceFactor", "smoothingNeighbors"):
-            setattr(params, name, requested[name])
-        params.normalizationType = getattr(ps.NormalizationType, requested["normalizationType"])
-        actual.update({name: getattr(params, name) for name in (
-            "diskRadius", "ignoreFluxBoundaries", "maxBoundaryHits", "maxReflections",
-            "minNodeDistanceFactor", "smoothingNeighbors")})
-        actual["normalizationType"] = params.normalizationType.name
-        actual["normalizationTypeValue"] = int(params.normalizationType)
-        actual["nativeRayTracingMetadata"] = params.toMetaData()
-    return params, actual
 
 
 def mesh_report(mesh: Any) -> dict[str, Any]:

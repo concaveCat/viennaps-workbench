@@ -68,6 +68,48 @@ def geometry_mask_material_names(geometry: Any) -> list[str]:
     return []
 
 
+def configure_rays(ps: Any, project: dict[str, Any], seed: int) -> tuple[Any, dict[str, Any]]:
+    """Build deterministic ray-tracing parameters for a flux step."""
+    params = ps.RayTracingParameters()
+    params.raysPerPoint = int(project["solver"]["raysPerPoint"])
+    params.rngSeed = int(seed)
+    params.useRandomSeeds = False
+    actual: dict[str, Any] = {
+        "raysPerPoint": int(params.raysPerPoint),
+        "rngSeed": int(params.rngSeed),
+        "useRandomSeeds": bool(params.useRandomSeeds),
+    }
+    if project["schemaVersion"] >= 7:
+        requested = project["solver"]["rayTracing"]
+        for name in (
+            "diskRadius",
+            "ignoreFluxBoundaries",
+            "maxBoundaryHits",
+            "maxReflections",
+            "minNodeDistanceFactor",
+            "smoothingNeighbors",
+        ):
+            setattr(params, name, requested[name])
+        params.normalizationType = getattr(ps.NormalizationType, requested["normalizationType"])
+        actual.update(
+            {
+                name: getattr(params, name)
+                for name in (
+                    "diskRadius",
+                    "ignoreFluxBoundaries",
+                    "maxBoundaryHits",
+                    "maxReflections",
+                    "minNodeDistanceFactor",
+                    "smoothingNeighbors",
+                )
+            }
+        )
+        actual["normalizationType"] = params.normalizationType.name
+        actual["normalizationTypeValue"] = int(params.normalizationType)
+        actual["nativeRayTracingMetadata"] = params.toMetaData()
+    return params, actual
+
+
 def material_handle(ps: Any, name: str) -> Any:
     """Return the installed ViennaPS material handle for ``name``.
 
