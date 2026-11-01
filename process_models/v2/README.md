@@ -6,14 +6,20 @@ v2.2 是工艺模型插件契约：把“工艺身份 / 实现 / 引擎 / 状态
 `StateDelta` 只描述下一步要消费的状态，计量/产物走 `OutputSet`。v1 已冻结，只作历史
 保留；完整设计与边界见 [`docs/process-model-plugins-v2.md`](../../docs/process-model-plugins-v2.md)。
 
-## 四层（外加 resolver）
+后续的 runtime/storage/conformance 切片补上跨步骤落盘、通用 `FlowExecutor`、变体一致性
+检查和输出契约描述；它仍是运行时基础，不接 backend/API/UI。见下面的
+[Runtime / storage / conformance](#runtime--storage--conformance) 和
+[`docs/plugin-architecture.md`](../../docs/plugin-architecture.md)。
+
+## 分层（外加 resolver / conformance）
 
 | 层 | 模块 | 职责 |
 | --- | --- | --- |
-| Runtime | 无（executor 边界） | 跨步骤 flow state、checkpoint、run 目录、快照、种子——本切片未实现 |
+| Runtime | `executor.py` + `storage.py` | 跨步骤 flow state、`mutates_input` checkpoint、逐步骤 `state`/`outputs`/plan identity 落盘；未接 backend |
 | Engine | `engine.py` | `EngineRequirement` / `EngineLease` / `StaticEngineProvider`，严格租用、不回退 |
 | Service | `registry.py` + `resolver.py` | 多版本 spec/variant 目录、准入检查、产出 `ExecutionPlan` |
 | State | `state.py` + `adapters.py` | `ProcessState{geometry, materials, layers, fields, voxels}`、`StateDelta`（只有 flow state）、`OutputSet`/`StepResult`、`prepare/commit` |
+| Conformance | `conformance.py` + `output_schema.py` | `check_variant()` 契约级一致性检查；`output_contract_schema()` 输出描述 |
 
 `resolver.py` 把 request 变成 plan：参数类型、维度、`reads`、材料、`validate()`、
 引擎租约都在这里检查。`ProcessState` 是 frozen，不含 engine/meta；engine 作为
@@ -39,8 +45,52 @@ FinFET 需要的 state 类型：`GridSpec` / `Field` / `CellSetState` 承载掺�
 6/9 分量应力（`unit`、`association` = cell/point、`dtype`、`shape`、`components`）；
 `Layer` / `LayerState` 承载 dummy gate、ILD、spacer 的层身份（`layer_id` 唯一，
 `material_id` 可以重复）。当前**没有** field/cell-set producer、没有原生 cell-set
-adapter、没有 stress/device simulator、没有 UI schema/API、没有 field 持久化/replay；
+adapter、没有 stress/device simulator、没有 UI schema/API；
 `isotropic` 与 `voxel_probe` 迁移后返回空 `OutputSet`。
+
+## Runtime / storage / conformance
+
+运行时基础切片新增四个模块：
+
+| 模块 | 内容 |
+| --- | --- |
+| `storage.py` | `StateStore` / `StateStoreError`：逐步骤保存/读取 state、outputs、plan identity 和 `flow.json` |
+| `executor.py` | `FlowStep` / `FlowRun` / `FlowExecutor`：多步执行与 checkpoint |
+| `conformance.py` | `ConformanceReport` / `check_variant()`：契约级一致性检查 |
+| `output_schema.py` | `output_contract_schema()`：`schemaVersion: 1` 的 JSON 可序列化契约描述 |
+
+执行顺序：
+
+```text
+S_i -> resolve -> checkpoint (mutates_input) -> prepare -> execute
+    -> commit -> S_{i+1} -> store
+```
+
+落盘布局：
+
+```text
+<root>/
+  flow.json
+  steps/<step_id>/
+    state.json      # schemaVersion 1：materials / geometry ref / layers / field 元数据
+    fields.npz      # 仅在有 fields/cell-set 时，field_000, field_001, ...（可选 material_ids）
+    outputs.json    # OutputSet：metrology + artifacts
+    plan.json       # plan.identity()
+    geometry.vpsd   # 可选，引擎暴露 Writer 时由 executor 写
+```
+
+边界：
+
+- **没有 API/UI**；`output_contract_schema()` 只是给未来 API/UI 的契约，不改变项目
+  schema，也不代表服务端已能查询 v2 run。
+- **没有原生 geometry replay loader**：`state.json` 只记录 `geometryRef`，重载需要
+  调用方传 `geometry_loader`。
+- **没有外部引擎 adapter**，也没有把 v2 run 接入 backend/worker 生产路径；worker 侧
+  仍只有默认关闭的影子/apply 开关。
+
+数据流细节、组件职责和剩余缺口见
+[`docs/plugin-architecture.md`](../../docs/plugin-architecture.md)。新切片的测试结果
+按实际运行单独报告，本文不写死数字。
 
 ## 新增一个 process
 
@@ -93,13 +143,14 @@ outcome = run_step(
 VIENNAPS_WORKBENCH_DATA_DIR=$PWD/var/test-v2 WORKBENCH_PORT=8767 \
   .venv/bin/python -m unittest \
   tests.test_process_models_v2_core tests.test_process_models_v2_execution \
-  tests.test_process_models_v2_isotropic tests.test_process_models_v2_voxel
+  tests.test_process_models_v2_isotropic tests.test_process_models_v2_voxel \
+  tests.test_v2_storage tests.test_v2_executor tests.test_v2_conformance
 ```
 
-v1 回归测试保持原样，也应在同一轮跑通。v2.2 已验证 **203 项定向测试通过**
+v1 回归测试保持原样，也应在同一轮跑通。本轮已验证 **236 项定向测试通过**
 （v1 38 + core/execution 84 + isotropic 19 + voxel 14 + worker bridge 8 +
-shadow/apply 16 + capability 2 + lifecycle 22），另加默认 isotropic dispatch 12 项
-通过。v2.1 的 150 项是历史基线，不再作为 v2.2 的通过证据。
+shadow/apply 16 + capability 2 + lifecycle 22 + storage 16 + executor 6 +
+conformance 11），另加默认 isotropic dispatch 12 项通过。
 
 ## Worker shadow validation（v2 isotropic）
 
@@ -127,7 +178,7 @@ bridge 本身的直接测试：`tests.test_worker_v2_isotropic`（不需要开�
 
 v2.2 的验证结果是 bridge 8 项、shadow/apply 16 项通过；`tests.test_v2_isotropic_capability`
 2 项通过（2D 三步 + replay、3D 两步）。这些套件已经跟着 `StepResult` 迁移，行为语义
-不变；完整的 203 项结果见 `docs/process-model-plugins-v2.md` §9.2。
+不变；完整的 236 项结果见 `docs/process-model-plugins-v2.md` §9.2。
 
 ## 插件生命周期（manifest + lock）
 
@@ -156,18 +207,23 @@ v2.2 的验证结果是 bridge 8 项、shadow/apply 16 项通过；`tests.test_v
 ## 当前限制
 
 - 未切换默认生产执行路径，不改项目 schema；项目暂时不能引用 v2.2 变体。
-  仅有的 worker 接触点是上面的默认关闭影子/验证 apply 开关。
+  仅有的 worker 接触点是上面的默认关闭影子/验证 apply 开关。`FlowExecutor` /
+  `StateStore` 是独立运行时组件，没有 backend 集成。
 - 没有 warm pool、引擎复用池、并发调度；`StaticEngine.release()` 是 no-op。
 - 没有外部引擎（`external` 只是枚举值），没有自动引擎/变体选择。
 - `CellSetState` / `Field` / `LayerState` / `MetrologyRecord` / `Artifact` / `OutputSet`
-  只有类型、校验和 adapter 写入；**没有 producer**，没有从 level-set 到 cell-set 的
-  转换，也没有 field/layer 持久化或 replay。
+  有类型、校验、adapter 写入和 `StateStore` 落盘；仍**没有 producer**，没有从
+  level-set 到 cell-set 的转换。
+- field/layer 已能持久化到 `state.json` + `fields.npz`，但没有原生 geometry replay
+  loader：`state.json` 只记 `geometryRef`，重载要调用方提供 `geometry_loader`。
 - 没有 stress / device simulator；`Artifact(kind="device")` 只是报告类型。
-- 没有输出 schema / API / UI；`OutputSet` 目前只在 Python 契约里。
+- 没有 API/UI：`output_contract_schema()` 只是输出契约描述，项目 JSON、HTTP API 和
+  前端都还没有消费 v2 run。
 - `isotropic` 与 `voxel_probe` 迁移后返回空 `OutputSet`：不产出 metrology 或 artifact。
 - voxel 适配器只支持 height-field；fin/GDS cut-out 在 prepare 阶段被拒绝。
 - 只有 isotropic（native）是已安装插件（`plugins/isotropic/plugin.toml` + lock）；
   voxel_probe（surrogate proof）仍在树内、没有 manifest，只能由代码显式注册。
-  快照、VTK、预览、事件、产物落盘仍属未来的 executor。
-- 插件生命周期本切片只做 manifest/发现/lock：没有 conformance harness、warm pool、
-  API/UI、插件市场、不可信代码沙箱，也没有自动引擎/变体选择。
+  快照、VTK、预览、事件仍不在当前 executor 范围内；已落盘的是 state、outputs、
+  plan identity 和 `flow.json`。
+- conformance harness 只做契约级检查（`check_variant`），不做物理 parity；仍没有
+  warm pool、API/UI、插件市场、不可信代码沙箱，也没有自动引擎/变体选择。

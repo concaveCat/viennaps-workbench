@@ -10,6 +10,10 @@ Public surface:
 * :mod:`process_models.v2.registry` - explicit ID-based registry and hashing.
 * :mod:`process_models.v2.resolver` - ``resolve_execution`` and plans.
 * :mod:`process_models.v2.adapters` - state representation adapters.
+* :mod:`process_models.v2.storage` - on-disk state/output/plan persistence.
+* :mod:`process_models.v2.executor` - multi-step ``FlowExecutor``.
+* :mod:`process_models.v2.conformance` - mechanical variant conformance checks.
+* :mod:`process_models.v2.output_schema` - JSON-serializable output contract.
 
 Installed plugins live in ``plugins/<id>/`` next to their ``plugin.toml`` and
 are loaded by :mod:`process_models.plugins`. The voxel-probe proof remains in
@@ -21,6 +25,7 @@ Python modules, paths, or callables.
 from __future__ import annotations
 
 from .adapters import DefaultStateAdapter, StateAdapter
+from .conformance import ConformanceReport, check_variant
 from .contract import (
     EngineVariant,
     Issue,
@@ -44,6 +49,8 @@ from .engine import (
     StaticEngineProvider,
     version_satisfies,
 )
+from .executor import FlowExecutor, FlowRun, FlowStep
+from .output_schema import output_contract_schema
 from .registry import ProcessRegistry, ResolvedVariant, compute_implementation_hash
 from .resolver import (
     ExecutionOutcome,
@@ -74,12 +81,14 @@ from .state import (
     StepResult,
     VoxelState,
 )
+from .storage import StateStore, StateStoreError
 
 __all__ = [
     "Artifact",
     "ArtifactKind",
     "Backend",
     "CellSetState",
+    "ConformanceReport",
     "DefaultStateAdapter",
     "Engine",
     "EngineCapabilities",
@@ -95,6 +104,9 @@ __all__ = [
     "ExecutionResolutionError",
     "Field",
     "FieldAssociation",
+    "FlowExecutor",
+    "FlowRun",
+    "FlowStep",
     "GridSpec",
     "Issue",
     "Layer",
@@ -113,6 +125,8 @@ __all__ = [
     "StateDelta",
     "StateKind",
     "StateMissingError",
+    "StateStore",
+    "StateStoreError",
     "StaticEngine",
     "StaticEngineProvider",
     "StepResult",
@@ -120,8 +134,10 @@ __all__ = [
     "VariantDescriptor",
     "VariantRegistration",
     "VoxelState",
+    "check_variant",
     "compute_implementation_hash",
     "execute_plan",
+    "output_contract_schema",
     "resolve_execution",
     "run_step",
     "version_satisfies",
