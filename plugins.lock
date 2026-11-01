@@ -16,6 +16,19 @@
       }
     },
     {
+      "id": "directional",
+      "version": "1.0.0",
+      "api": 1,
+      "entrypoint": "plugins.directional:register",
+      "manifestSha256": "ea7e5a3a68b79386b40346acf57c5db876c9caff4ca87d72f75b30d6a78abccb",
+      "variants": {
+        "native": {
+          "version": "1.0.0",
+          "implementationHash": "42f465673faf6f173133f5c849e4ca888305efc5b0d6a5fab8e1cb2d6f688bbe"
+        }
+      }
+    },
+    {
       "id": "faradayCage",
       "version": "1.0.0",
       "api": 1,
@@ -38,6 +51,19 @@
         "native": {
           "version": "1.0.0",
           "implementationHash": "91808636d0faa0ba7b8102ba5b1ed6f1f07bae306b37f29aae132e8ac1a98347"
+        }
+      }
+    },
+    {
+      "id": "geometricTrenchDeposition",
+      "version": "1.0.0",
+      "api": 1,
+      "entrypoint": "plugins.geometricTrenchDeposition:register",
+      "manifestSha256": "a2474e3e9bffce840b271403e93f21198fe6f7508c25fd24d24c3f1a85be48f9",
+      "variants": {
+        "native": {
+          "version": "1.0.0",
+          "implementationHash": "0232e5ec4f66623dff99ec833ba511df0322b8e0164d00c185596fdcc39a2cdf"
         }
       }
     },
@@ -77,6 +103,19 @@
         "native": {
           "version": "1.0.0",
           "implementationHash": "9425a048991ec5dc3b0fed4a65cf40ee028d32349a9cfdbc0ccaa20085a6b7d9"
+        }
+      }
+    },
+    {
+      "id": "selectiveEpitaxy",
+      "version": "1.0.0",
+      "api": 1,
+      "entrypoint": "plugins.selectiveEpitaxy:register",
+      "manifestSha256": "34b4cb6e4d121999424f310084d60dd32aef60cc2d114e202488bdc50b8d570d",
+      "variants": {
+        "native": {
+          "version": "1.0.0",
+          "implementationHash": "16e490a0fd370484da480909028578f23f61274241032babcaa16cc99ab0de78"
         }
       }
     },
