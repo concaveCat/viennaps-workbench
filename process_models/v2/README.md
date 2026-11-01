@@ -200,8 +200,8 @@ worker bridge 15 + shadow/apply 17 + capability 2），另加默认 isotropic di
 - 分派是通用的：worker hook 不点名具体工艺，只用 `load_registry()` +
   `find_v2_process()`（内部 `registry.resolve_step(project, step)`）。没有插件认领时写
   `v2-plugin-shadow-skipped` 事件，不静默跳过。
-- 当前唯一安装的插件 `isotropic` 的 `parse_step` 只认领 `model: isotropic`、
-  `rateMode: uniform`、`isotropicMethod` 为 `levelSet`（不是 geometric）的步骤；
+- 每个插件的 `parse_step` 只认领自己的模型和受支持分支；例如 `isotropic` 只认领
+  `model: isotropic`、`rateMode: uniform`、`isotropicMethod` 为 `levelSet` 的步骤，
   维度 2D/3D（测试实测 schema 5/7；`parse_step` 本身不检查 schema）。这是**插件自身**
   的范围，不是 worker hook 的特例。
 - 机制：旧路径 apply 前深拷贝 domain → 老路径 apply → 在副本上跑
@@ -209,7 +209,9 @@ worker bridge 15 + shadow/apply 17 + capability 2），另加默认 isotropic di
   `surface_state` digest 与 material map → 写 `v2-plugin-shadow` 事件（两侧 digest +
   plan identity）→ 一致后可选 apply 替换 domain 并写 `v2-plugin-applied`；不一致
   先写事件再抛错。
-- 不覆盖：`rateMode: material`、geometric `SphereDistribution`、默认生产 cutover。
+- process hook 不覆盖：`rateMode: material`、未迁移到 v2 的插件分支、默认生产 cutover。
+  geometry hook 单独覆盖 `execution_kind="geometry"` 的 planarize/particleShape/boolean/
+  gdsBoolean/removeMaterial。
   `rateMode: material` 和 geometric 步骤由 isotropic 的 `parse_step` 返回 `None`，
   因而只留下 skip 事件。
 
@@ -274,8 +276,9 @@ bridge 本身的直接测试：`tests.test_worker_v2_isotropic`（不需要开�
   sheet-resistance/junction metrology，`csvProcess` 等按各自能力报告。`voxel_probe`
   仍是 proof，不产出 metrology/artifact。
 - voxel 适配器只支持 height-field；fin/GDS cut-out 在 prepare 阶段被拒绝。
-- 只有 isotropic（native）是已安装插件（`plugins/isotropic/plugin.toml` + lock）；
-  voxel_probe（surrogate proof）仍在树内、没有 manifest，只能由代码显式注册。
+- `plugins/` 下 23 个 built-in 工艺插件由 manifest + lock 安装；GeometryEngine 的
+  operation 是 core 内置 spec。voxel_probe（surrogate proof）仍在树内、没有 manifest，
+  只能由代码显式注册。
   快照、VTK、预览、事件仍不在当前 executor 范围内；已落盘的是 state、outputs、
   plan identity 和 `flow.json`。
 - conformance harness 只做契约级检查（`check_variant`），不做物理 parity；仍没有
