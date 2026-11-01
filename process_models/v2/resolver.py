@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -285,14 +286,18 @@ def resolve_execution(
     try:
         if adapter is None:
             config = None
-            raw_cell_set = None
             if "fields" in capabilities.reads or process.execution_kind == "field":
-                raw_cell_set = request.context.step.get("cellSet")
-            if raw_cell_set is not None:
-                try:
-                    config = CellSetConfig.from_mapping(raw_cell_set)
-                except CellSetBackendError as error:
-                    raise ExecutionResolutionError(str(error)) from error
+                # The canonical parameter model is authoritative. The raw step
+                # is only a compatibility fallback for callers whose params
+                # class does not expose a cellSet object.
+                config = _cellset_config_from_params(request.params)
+                if config is None:
+                    raw_cell_set = request.context.step.get("cellSet")
+                    if raw_cell_set is not None:
+                        try:
+                            config = CellSetConfig.from_mapping(raw_cell_set)
+                        except CellSetBackendError as error:
+                            raise ExecutionResolutionError(str(error)) from error
             selected_adapter = DefaultStateAdapter(
                 cellset_backend=getattr(lease, "cellset_backend", None),
                 context=request.context,
@@ -461,6 +466,23 @@ def run_step(
         compute=compute,
     )
     return execute_plan(resolve_execution(request, registry, provider, adapter=adapter))
+
+
+def _cellset_config_from_params(params: BaseModel) -> CellSetConfig | None:
+    """Return the canonical cell-set config carried by a typed params model."""
+    cell_set = getattr(params, "cellSet", None)
+    if cell_set is None:
+        return None
+    if hasattr(cell_set, "model_dump"):
+        payload = cell_set.model_dump(mode="json", by_alias=True, exclude_none=False)
+    elif isinstance(cell_set, Mapping):
+        payload = dict(cell_set)
+    else:
+        return None
+    try:
+        return CellSetConfig.from_mapping(payload)
+    except CellSetBackendError as error:
+        raise ExecutionResolutionError(str(error)) from error
 
 
 def _check_geometry_grid(state: ProcessState, context: ProcessContext) -> None:

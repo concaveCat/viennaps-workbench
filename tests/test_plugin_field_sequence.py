@@ -31,6 +31,7 @@ from process_models.v2.engine import (
 from process_models.v2.engines.viennaps import ViennaPSMaterialRegistry
 from process_models.v2.engines.viennaps_cellset import ViennaPSCellSetBackend
 from process_models.v2.executor import FlowExecutor, FlowStep
+from process_models.v2.geometry import register_geometry
 from process_models.v2.registry import ProcessRegistry
 from process_models.v2.state import (
     LevelSetState,
@@ -282,6 +283,7 @@ def _registry() -> ProcessRegistry:
     register_implant(registry)
     register_anneal(registry)
     register_analysis(registry)
+    register_geometry(registry)
     return registry
 
 
@@ -312,6 +314,15 @@ def _provider(
                 cellset_backend=cellset_backend or ViennaPSCellSetBackend(ps),
             )
         ]
+    )
+
+
+def _normal_backend() -> HandleStateBackend:
+    return HandleStateBackend(
+        ps,
+        id="viennaps",
+        version=str(ps.__version__),
+        material_registry=ViennaPSMaterialRegistry(ps),
     )
 
 
@@ -431,7 +442,8 @@ class FieldSequenceTest(unittest.TestCase):
             step_dir = self.work_dir / "v2" / "steps" / step_id
             payload = json.loads((step_dir / "state.json").read_text(encoding="utf-8"))
             self.assertTrue(payload["fieldsOmitted"])
-            self.assertIsNone(payload["fields"])
+            self.assertIsNotNone(payload["fields"])
+            self.assertTrue(payload["fields"]["arraysOmitted"])
             self.assertFalse((step_dir / "fields.npz").exists())
             self.assertFalse((step_dir / "geometry.vpsd").exists())
 
@@ -634,6 +646,81 @@ class FieldSequenceTest(unittest.TestCase):
                 np.asarray(reference.getScalarData(label), dtype=np.float64),
                 err_msg=label,
             )
+
+    def test_canonical_params_control_the_cell_set_lattice(self) -> None:
+        canonical = dict(self.raw_steps[0])
+        canonical["cellSet"] = {**canonical["cellSet"], "height": 0.2, "substrateDepth": 0.1}
+        raw_step = dict(self.raw_steps[0])
+        raw_step["cellSet"] = {**raw_step["cellSet"], "height": 0.3, "substrateDepth": 0.2}
+        spec, params = self.registry.resolve_step(self.project, canonical)
+        outcome = (
+            FlowExecutor(
+                self.registry,
+                _provider(
+                    _NoCheckpointBackend(
+                        ps,
+                        id="viennaps",
+                        version=str(ps.__version__),
+                        material_registry=ViennaPSMaterialRegistry(ps),
+                    )
+                ),
+                StateStore(self.work_dir / "canonical"),
+            )
+            .run(
+                _state(_plane()),
+                [
+                    FlowStep(
+                        step_id=raw_step["id"],
+                        process_id=spec.id,
+                        variant_id="native",
+                        params=params,
+                        context=ProcessContext(
+                            dimension=2,
+                            grid_delta=GRID_DELTA,
+                            project=self.project,
+                            step=raw_step,
+                        ),
+                    )
+                ],
+            )
+            .outcomes[-1]
+        )
+        fields = outcome.state.fields
+        self.assertIsNotNone(fields)
+        assert fields is not None
+        self.assertEqual(fields.provenance["height"], 0.2)
+        self.assertEqual(fields.provenance["substrateDepth"], 0.1)
+
+    def test_reloaded_geometry_step_keeps_field_invalidation(self) -> None:
+        geometry_step = {
+            "id": "planarize_step_01",
+            "name": "cmp",
+            "enabled": True,
+            "model": "planarize",
+            "cutoffHeight": -0.05,
+        }
+        first_two = self.raw_steps[:1] + [geometry_step]
+        store = StateStore(self.work_dir / "invalidation")
+        run = FlowExecutor(
+            self.registry,
+            _provider(_normal_backend()),
+            store,
+        ).run(_state(_plane()), _flow_steps(self.registry, self.project, first_two))
+        loaded = store.load_state(
+            geometry_step["id"],
+            geometry_loader=lambda _ref: run.state.geometry.handle,
+        )
+        self.assertIsNotNone(loaded.fields)
+        assert loaded.fields is not None
+        self.assertIsNone(loaded.fields.handle)
+        self.assertTrue(loaded.fields.provenance.get("arraysOmitted"))
+        with self.assertRaises(Exception) as caught:
+            FlowExecutor(
+                self.registry,
+                _provider(_normal_backend()),
+                StateStore(self.work_dir / "invalidation-next"),
+            ).run(loaded, _flow_steps(self.registry, self.project, [self.raw_steps[-1]]))
+        self.assertIn("different geometry", str(caught.exception))
 
     def test_a_failed_field_step_aborts_the_whole_run(self) -> None:
         bad = dict(self.raw_steps[-1])

@@ -23,6 +23,8 @@ from process_models.v2.engine import EngineCapabilities, StaticEngine, StaticEng
 from process_models.v2.executor import FlowExecutor, FlowStep
 from process_models.v2.geometry import (
     BooleanParams,
+    GdsBooleanMaskParams,
+    GdsBooleanParams,
     GeometryEngine,
     GeometryEngineError,
     ParticleShapeParams,
@@ -444,6 +446,46 @@ class GeometryEngineTest(unittest.TestCase):
         self.assertTrue(comparison["matched"], comparison["reasons"])
         self.assertEqual(outcome.metadata["geometryOperation"], "gdsBoolean")
         self.assertEqual(outcome.metadata["assetId"], project["geometry"]["assetId"])
+
+    def test_gds_boolean_operand_uses_canonical_params(self) -> None:
+        ps.setDimension(3)
+        domain = ps.Domain(GRID, 0.4, 0.4, boundary=ps.BoundaryType.REFLECTIVE_BOUNDARY)
+        ps.MakePlane(domain, height=0.0, material=ps.Material.Si, addToExisting=False).apply()
+        params = GdsBooleanParams(
+            booleanOperation="difference",
+            gdsMask=GdsBooleanMaskParams(
+                layer=2,
+                baseHeight=0.0,
+                height=0.6,
+            ),
+        )
+        seen: dict[str, Any] = {}
+
+        def provider(ps_module: Any, target: Any, project: Any, step: Any, context: Any) -> Any:
+            del ps_module, target, project, context
+            seen.update(step)
+            raise RuntimeError("captured")
+
+        context = ProcessContext(
+            dimension=3,
+            grid_delta=GRID,
+            project={"geometry": {"kind": "gds"}},
+            step={
+                "id": "gds_step_01",
+                "model": "gdsBoolean",
+                "gdsMask": {"layer": 2, "baseHeight": 0.0, "height": 0.2},
+            },
+            assets={"gdsBooleanOperand": provider},
+        )
+        with self.assertRaises(RuntimeError):
+            GeometryEngine().execute(
+                "gdsBoolean",
+                _state(domain, 3),
+                params,
+                context,
+                SimpleNamespace(handle=ps),
+            )
+        self.assertEqual(seen["gdsMask"]["height"], 0.6)
 
     def test_boolean_cylinder_runs_in_three_dimensions(self) -> None:
         project = _project(3)

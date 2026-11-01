@@ -115,6 +115,7 @@ class AnalysisNativeVariant(EngineVariant):
             doping.apply()
             if net.outputLabel not in {str(label) for label in cell_set.getScalarDataLabels()}:
                 raise RuntimeError(f"native NetDoping did not write {net.outputLabel!r}")
+            known.add(str(net.outputLabel))
 
             values = [float(value) for value in cell_set.getScalarData(net.outputLabel)]
             junction_depth = _finite_or_none(doping.junctionDepth())

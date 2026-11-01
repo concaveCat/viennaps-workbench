@@ -161,6 +161,24 @@ class StateStoreTest(unittest.TestCase):
         vector = restored.fields.fields["stress"]
         self.assertEqual(vector.data.shape, (3, 4, 5))
 
+    def test_omitted_fields_keep_invalidation_metadata_without_arrays(self) -> None:
+        state = ProcessState(materials=_materials(), fields=_cell_set())
+        payload = self.store.save_state("geometry", state, persist_fields=False)
+
+        self.assertTrue(payload["fieldsOmitted"])
+        self.assertIsNotNone(payload["fields"])
+        self.assertTrue(payload["fields"]["arraysOmitted"])
+        self.assertFalse((self.store.step_dir("geometry") / "fields.npz").exists())
+
+        restored = self.store.load_state("geometry")
+        self.assertIsNotNone(restored.fields)
+        assert restored.fields is not None
+        self.assertIsNone(restored.fields.handle)
+        self.assertIsNone(restored.fields.material_ids)
+        self.assertTrue(restored.fields.provenance["arraysOmitted"])
+        self.assertIsNone(restored.fields.fields["P_total"].data)
+        self.assertEqual(restored.fields.grid, GRID)
+
     def test_state_round_trip_without_fields_skips_npz(self) -> None:
         state = ProcessState(materials=_materials(), layers=_layers())
         payload = self.store.save_state("plain", state)

@@ -323,14 +323,15 @@ def _fields_from_payload(directory: Path, payload: Any) -> CellSetState | None:
         )
         definitions = payload.get("fields") or {}
         material_descriptor = payload.get("materialIds")
+        arrays_omitted = bool(payload.get("arraysOmitted", False))
         arrays: dict[str, np.ndarray] = {}
-        if definitions or material_descriptor is not None:
+        if not arrays_omitted and (definitions or material_descriptor is not None):
             arrays = _read_arrays(directory / FIELDS_FILE, what="cell-set arrays")
 
         fields: dict[str, Field] = {}
         for index, (name, specification) in enumerate(definitions.items()):
             key = f"field_{index:03d}"
-            if key not in arrays:
+            if not arrays_omitted and key not in arrays:
                 raise StateStoreError(f"cell-set field {name!r} is missing array {key!r} in {FIELDS_FILE}")
             fields[name] = Field(
                 name=name,
@@ -339,20 +340,23 @@ def _fields_from_payload(directory: Path, payload: Any) -> CellSetState | None:
                 dtype=specification["dtype"],
                 shape=tuple(specification["shape"]),
                 components=specification.get("components", 1),
-                data=arrays[key],
+                data=None if arrays_omitted else arrays[key],
             )
 
         material_ids: Any = None
-        if material_descriptor is not None:
+        if material_descriptor is not None and not arrays_omitted:
             if "material_ids" not in arrays:
                 raise StateStoreError(f"cell-set material_ids is missing from {FIELDS_FILE}")
             material_ids = arrays["material_ids"]
 
+        provenance = dict(payload.get("provenance") or {})
+        if arrays_omitted:
+            provenance["arraysOmitted"] = True
         return CellSetState(
             grid=grid,
             material_ids=material_ids,
             fields=fields,
-            provenance=payload.get("provenance") or {},
+            provenance=provenance,
         )
     except (AttributeError, KeyError, TypeError, ValueError) as error:
         raise StateStoreError(f"invalid fields payload: {error}") from error
@@ -470,9 +474,17 @@ class StateStore:
         fields_payload = None
         arrays: dict[str, np.ndarray] = {}
         fields_omitted = state.fields is not None and not persist_fields
-        if state.fields is not None and persist_fields:
-            arrays = _field_arrays(state.fields)
+        if state.fields is not None:
             fields_payload = _fields_payload(state.fields)
+            if persist_fields:
+                arrays = _field_arrays(state.fields)
+            else:
+                # Keep the grid/provenance so a reloaded state still knows the
+                # cell set existed and which geometry it belongs to. The arrays
+                # are deliberately absent; the next field step must fail closed
+                # on a geometry digest mismatch instead of silently deriving a
+                # fresh cell set.
+                fields_payload["arraysOmitted"] = True
 
         payload = {
             "schemaVersion": STATE_SCHEMA_VERSION,

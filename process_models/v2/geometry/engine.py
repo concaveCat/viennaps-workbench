@@ -439,7 +439,12 @@ class GeometryEngine:
         provider = ctx.assets.get("gdsBooleanOperand")
         if not callable(provider):
             raise GeometryEngineError("GDS boolean requires a callable gdsBooleanOperand asset")
-        operand, transform = provider(ps, domain, ctx.project, ctx.step, ctx)
+        canonical_step = {
+            "id": str(ctx.step.get("id") or "gdsBoolean"),
+            "model": "gdsBoolean",
+            **params.model_dump(mode="json", by_alias=True, exclude_none=True),
+        }
+        operand, transform = provider(ps, domain, ctx.project, canonical_step, ctx)
         enum_name = {
             "union": "UNION",
             "intersection": "INTERSECT",
