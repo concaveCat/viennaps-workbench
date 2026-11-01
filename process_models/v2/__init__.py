@@ -10,6 +10,8 @@ Public surface:
   and material-registry boundary.
 * :mod:`process_models.v2.cellset` - on-demand native cell-set field domain,
   its canonical config, and the ``ensure``/``snapshot``/``rehydrate`` protocol.
+* :mod:`process_models.v2.geometry` - one native ``GeometryEngine`` and the
+  ``execution_kind="geometry"`` operation specs it backs.
 * :mod:`process_models.v2.contract` - process specs, variant registrations,
   capabilities, descriptors, issues, and context.
 * :mod:`process_models.v2.registry` - explicit ID-based registry and hashing.
@@ -65,6 +67,21 @@ from .engine import (
     version_satisfies,
 )
 from .executor import FlowExecutor, FlowRun, FlowStep
+from .geometry import (
+    BooleanParams,
+    BooleanProcessSpec,
+    GeometryEngine,
+    GeometryEngineError,
+    GeometryProcessSpecs,
+    GeometryVariant,
+    ParticleShapeParams,
+    ParticleShapeProcessSpec,
+    PlanarizeParams,
+    PlanarizeProcessSpec,
+    RemoveMaterialParams,
+    RemoveMaterialProcessSpec,
+    register_geometry,
+)
 from .materials import MaterialRegistry, MaterialRegistryError, StaticMaterialRegistry
 from .output_schema import output_contract_schema
 from .registry import ProcessRegistry, ResolvedVariant, compute_implementation_hash
@@ -111,6 +128,8 @@ __all__ = [
     "Artifact",
     "ArtifactKind",
     "Backend",
+    "BooleanParams",
+    "BooleanProcessSpec",
     "CELLSET_CONVERSION",
     "CellSetBackend",
     "CellSetBackendError",
@@ -135,6 +154,10 @@ __all__ = [
     "ExecutionResolutionError",
     "Field",
     "FieldAssociation",
+    "GeometryEngine",
+    "GeometryEngineError",
+    "GeometryProcessSpecs",
+    "GeometryVariant",
     "FlowExecutor",
     "FlowRun",
     "FlowStep",
@@ -151,10 +174,16 @@ __all__ = [
     "MetrologyRecord",
     "ModelDescriptor",
     "OutputSet",
+    "ParticleShapeParams",
+    "ParticleShapeProcessSpec",
+    "PlanarizeParams",
+    "PlanarizeProcessSpec",
     "ProcessContext",
     "ProcessRegistry",
     "ProcessSpec",
     "ProcessState",
+    "RemoveMaterialParams",
+    "RemoveMaterialProcessSpec",
     "ResolvedVariant",
     "StateAdapter",
     "StateBackend",
@@ -179,6 +208,7 @@ __all__ = [
     "compute_implementation_hash",
     "execute_plan",
     "output_contract_schema",
+    "register_geometry",
     "resolve_execution",
     "run_step",
     "version_satisfies",

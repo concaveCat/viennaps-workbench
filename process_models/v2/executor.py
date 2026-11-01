@@ -195,7 +195,20 @@ class FlowExecutor:
                         self._store.save_state(step.step_id, outcome.state, persist_fields=False)
                 else:
                     geometry_ref = self._write_geometry(step, plan, outcome.state)
-                    self._store.save_state(step.step_id, outcome.state, geometry_ref=geometry_ref)
+                    # A geometry step is not a cell-set boundary. If a previous
+                    # field sequence left a snapshot, keep the contract
+                    # metadata but do not write the now-stale dense arrays a
+                    # second time; the next field step fails closed on the
+                    # geometry digest instead.
+                    persist_fields = not (
+                        plan.process.execution_kind == "geometry" and outcome.state.fields is not None
+                    )
+                    self._store.save_state(
+                        step.step_id,
+                        outcome.state,
+                        geometry_ref=geometry_ref,
+                        persist_fields=persist_fields,
+                    )
                 self._store.save_outputs(step.step_id, outcome.outputs)
                 identities.append(self._store.save_plan(step.step_id, plan))
                 versions.setdefault(plan.engine.engine_id, plan.engine_version)

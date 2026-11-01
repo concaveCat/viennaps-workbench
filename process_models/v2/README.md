@@ -17,7 +17,8 @@ ViennaPS helper 移到 `process_models/v2/engines/`。v1 已冻结，只作历�
 | 层 | 模块 | 职责 |
 | --- | --- | --- |
 | Runtime | `executor.py` + `storage.py` | 跨步骤 flow state、`mutates_input` checkpoint、逐步骤 `state`/`outputs`/plan identity 落盘；未接 backend |
-| Engine | `engine.py` + `engines/viennaps.py` | `EngineRequirement` / `EngineLease` / `StaticEngineProvider`，严格租用、不回退；ViennaPS helper 只依赖传入的 `ps`，不 import backend/worker |
+| Engine | `engine.py` + `engines/viennaps.py` + `engines/viennaps_cellset.py` | `EngineRequirement` / `EngineLease` / `StaticEngineProvider`，严格租用、不回退；ViennaPS helper 与 native cell-set 生命周期只依赖传入的 `ps`，不 import backend/worker |
+| Geometry | `geometry/` | 一个共享 `GeometryEngine` 承载 `planarize` / `particleShape` / `boolean` / `removeMaterial`；每个 operation 是 `execution_kind="geometry"` 的 step spec |
 | Service | `registry.py` + `resolver.py` | 多版本 spec/variant 目录、`resolve_step` / `default_variant_id`、准入检查、产出 `ExecutionPlan` |
 | State | `state.py` + `adapters.py` | `ProcessState{geometry, materials, layers, fields, voxels}`、`StateDelta`（只有 flow state）、`OutputSet`/`StepResult`、`prepare/commit` |
 | Conformance | `conformance.py` + `output_schema.py` | `check_variant()` 契约级一致性检查；`output_contract_schema()` 输出描述 |
@@ -51,9 +52,9 @@ StepResult(delta=StateDelta(geometry=..., materials=...), outputs=OutputSet(metr
 FinFET 需要的 state 类型：`GridSpec` / `Field` / `CellSetState` 承载掺杂、损伤和
 6/9 分量应力（`unit`、`association` = cell/point、`dtype`、`shape`、`components`）；
 `Layer` / `LayerState` 承载 dummy gate、ILD、spacer 的层身份（`layer_id` 唯一，
-`material_id` 可以重复）。当前**没有** field/cell-set producer、没有原生 cell-set
-adapter、没有 stress/device simulator、没有 UI schema/API；
-`isotropic` 与 `voxel_probe` 迁移后返回空 `OutputSet`。
+`material_id` 可以重复）。`implant` / `anneal` / `analysis` 通过按需派生的 native
+`DenseCellSet` 产生 cell-set 字段；`CellSetBackend` 只在 field 序列边界做
+`ensure`/`snapshot`/`rehydrate`。当前没有 stress/device simulator、没有 UI schema/API。
 
 ## Runtime / storage / conformance
 
@@ -86,7 +87,7 @@ S_i -> resolve -> checkpoint (mutates_input) -> prepare -> execute
   flow.json
   steps/<step_id>/
     state.json      # schemaVersion 1：materials / geometry.ref / layers / field 元数据
-    fields.npz      # 仅在有 fields/cell-set 时，field_000, field_001, ...（可选 material_ids）
+    fields.npz      # field 序列边界一次；field_000, field_001, ...（可选 material_ids）
     outputs.json    # OutputSet：metrology + artifacts
     plan.json       # plan.identity_json()（camelCase）
     geometry.vpsd   # 可选，引擎暴露 Writer 时由 executor 写

@@ -47,6 +47,7 @@ from process_models.v2.engine import (
 from process_models.v2.engines.viennaps import ViennaPSMaterialRegistry, material_map
 from process_models.v2.engines.viennaps_cellset import ViennaPSCellSetBackend
 from process_models.v2.executor import FlowExecutor, FlowStep
+from process_models.v2.geometry import register_geometry
 from process_models.v2.registry import ProcessRegistry
 from process_models.v2.resolver import ExecutionOutcome
 from process_models.v2.state import LevelSetState, MaterialState, ProcessState
@@ -151,6 +152,7 @@ def run_v2_step(
     """
     if registry is None:
         registry = load_registry()
+    register_geometry(registry)
     resolved = registry.resolve_step(ctx.project, step)
     if resolved is None:
         raise RuntimeError(f"no registered v2 process matches step {step['id']!r}")

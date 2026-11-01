@@ -1,6 +1,6 @@
 # 插件组织与数据流
 
-> 状态：v2.5 契约 + 生命周期 + isotropic/sf6o2/cf4o2/hbro2/sf6c4f8/fluorocarbon/ionBeam/faradayCage/wetEtch/teosDeposition/teospecvd/directional/selectiveEpitaxy/geometricTrenchDeposition/ald/oxidation/singleParticle/multiParticle/oxideRegrowth/csvProcess/implant/anneal/analysis + cell-set field 序列 + runtime/storage/conformance
+> 状态：v2.5 契约 + 生命周期 + isotropic/sf6o2/cf4o2/hbro2/sf6c4f8/fluorocarbon/ionBeam/faradayCage/wetEtch/teosDeposition/teospecvd/directional/selectiveEpitaxy/geometricTrenchDeposition/ald/oxidation/singleParticle/multiParticle/oxideRegrowth/csvProcess/implant/anneal/analysis + cell-set field 序列 + GeometryEngine + runtime/storage/conformance
 > 基础已落地。本文描述**插件应该如何组织、数据如何流动**；这一片是运行时基础，
 > 不是生产 backend 接入，也没有 API/UI，文中明确标出。v2.5 在 v2.4 之上增加了
 > 执行 profile（CPU/GPU backend + kernel）和引擎中立的状态 backend；v2.4 完成了
@@ -219,6 +219,10 @@ class FlowRun:
 - 同一序列内 `height` / `substrateDepth` 在 route 编译阶段取最大值，
   `coverMaterial` / `periodic` 必须一致；`sourceGeometryDigest` 不匹配时 fail
   closed，不自动 remap。
+- Geometry step 也是普通 step spec（`execution_kind="geometry"`），复用同一个
+  registry / resolver / executor / state backend / persistence，但不是物理工艺：
+  `planarize`、`particleShape`、`boolean`、`removeMaterial` 由一个共享的
+  `GeometryEngine` 实现，每个 operation 有自己的 params，且只操作 Domain/level set。
 - `fields.npz` 以 `allow_pickle=False` 读取；`Field.data` 必须是 numpy 数组，opaque
   handle 直接报 `StateStoreError`。
 - `outputs.json` 拒绝 NaN/Inf 和不可序列化值，报 `StateStoreError`。
