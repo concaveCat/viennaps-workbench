@@ -258,10 +258,10 @@ engine = EngineRequirement(
 
 平台把 `solver.enginePreference` / `stepEngines` 解析成 `ComputePolicy`，再选出
 `ExecutionProfile`；插件在 `execute` 里调用 `apply_execution_profile(ps, process,
-engine.profile)`，不再写死 `CPU_DISK`。worker bridge 默认只提供 `CPU_DISK`；
-GPU 路径需要显式 `VIENNAPS_WORKBENCH_V2_PLUGIN_GPU=1`，并要求 worker 已选择
-CUDA 设备并完成 readback。`GPU_TRIANGLE` 继续走 capability evidence gate；
-不能执行的步骤记录 `v2-plugin-shadow-skipped`，不会静默降级到 CPU。
+engine.profile)`，不再写死 `CPU_DISK`。worker bridge 默认提供 `CPU_DISK` /
+`CPU_TRIANGLE`；GPU 路径需要显式 `VIENNAPS_WORKBENCH_V2_PLUGIN_GPU=1`，并要求
+worker 已选择 CUDA 设备并完成 readback。`GPU_TRIANGLE` 继续走 capability evidence
+gate；不能执行的步骤记录 `v2-plugin-shadow-skipped`，不会静默降级到 CPU。
 
 状态侧：
 
@@ -274,8 +274,8 @@ CUDA 设备并完成 readback。`GPU_TRIANGLE` 继续走 capability evidence gat
   自己的 `StateBackend`，executor 和插件协议都不需要改。
 - `MaterialRegistry` 统一 name ↔ native id；worker bridge 使用
   `ViennaPSMaterialRegistry`，`StateProfile.required_materials` 在 resolve 阶段校验。
-- `sf6o2` 声明 `CPU_DISK`、`GPU_DISK`、`GPU_TRIANGLE` 三个 profile；GPU 路径由
-  `VIENNAPS_WORKBENCH_V2_PLUGIN_GPU=1` 显式打开，GPU_TRIANGLE 仍要求证据行。
+- `sf6o2` 声明 `CPU_DISK`、`CPU_TRIANGLE`、`GPU_DISK`、`GPU_TRIANGLE` 四个 profile；
+  GPU 路径由 `VIENNAPS_WORKBENCH_V2_PLUGIN_GPU=1` 显式打开，GPU_TRIANGLE 仍要求证据行。
 
 当前状态 backend 只覆盖 level set + materials 的 copy/write/load/validate；voxel
 转换仍在 adapter，cell-set / surface field / layer / GDS 按后续批次增加。

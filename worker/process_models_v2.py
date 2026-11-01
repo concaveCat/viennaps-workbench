@@ -62,7 +62,7 @@ __all__ = [
 ]
 
 DEFAULT_ENGINE_FINGERPRINT = "worker-v2-plugin"
-_CPU_KERNELS = frozenset({"CPU_DISK"})
+_CPU_KERNELS = frozenset({"CPU_DISK", "CPU_TRIANGLE"})
 
 
 class V2ProfileUnavailable(RuntimeError):

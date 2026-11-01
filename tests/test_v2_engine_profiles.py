@@ -285,6 +285,7 @@ class InstalledPluginProfileTest(unittest.TestCase):
             SF6O2NativeVariant.engine.profiles,
             (
                 cpu,
+                ExecutionProfile(backend="cpu", kernel="CPU_TRIANGLE"),
                 ExecutionProfile(backend="gpu", kernel="GPU_DISK"),
                 ExecutionProfile(backend="gpu", kernel="GPU_TRIANGLE"),
             ),

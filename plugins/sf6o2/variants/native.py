@@ -74,6 +74,7 @@ class SF6O2NativeVariant(EngineVariant):
         min_version="4.6.2",
         profiles=(
             ExecutionProfile(backend="cpu", kernel="CPU_DISK"),
+            ExecutionProfile(backend="cpu", kernel="CPU_TRIANGLE"),
             ExecutionProfile(backend="gpu", kernel="GPU_DISK"),
             ExecutionProfile(backend="gpu", kernel="GPU_TRIANGLE"),
         ),

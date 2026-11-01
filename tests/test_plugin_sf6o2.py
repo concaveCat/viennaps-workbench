@@ -232,6 +232,8 @@ def _reference(
     project: dict[str, Any],
     domain: Any,
     coverage_tolerance: float,
+    *,
+    kernel: str = "CPU_DISK",
 ) -> Any:
     """Build the flat SF6O2Etching path directly, with no worker code."""
     step = project["steps"][0]
@@ -247,7 +249,7 @@ def _reference(
         values["etchStopDepth"],
     )
     process = ps_module.Process(domain, model, float(step["duration"]))
-    process.setFluxEngineType(ps_module.FluxEngineType.CPU_DISK)
+    process.setFluxEngineType(getattr(ps_module.FluxEngineType, kernel))
     advection, _actual = configure_advection(ps_module, project)
     process.setParameters(advection)
     rays, _ray_actual = configure_rays(ps_module, project, RAY_SEED)
@@ -624,6 +626,25 @@ class SF6O2PluginTest(unittest.TestCase):
         self._assert_parity(reference, new_domain, 2)
         self.assertEqual(outcome.metadata["coverageTolerance"], 0.0)
         self.assertEqual(outcome.metadata["coverageToleranceSource"], "param")
+
+    def test_cpu_triangle_matches_direct_reference(self) -> None:
+        project = sf6o2_project(2, duration=0.2)
+        reference = plane_domain(2)
+        candidate = plane_domain(2)
+
+        _reference(self.ps, project, reference, coverage_tolerance=1e-3, kernel="CPU_TRIANGLE")
+        ctx = SimpleNamespace(
+            project=project,
+            ps=self.ps,
+            run_dir=self.work_dir / "cpu-triangle",
+            ps_version=VIENNAPS_VERSION,
+            native_engine_fingerprint=None,
+            run_seed=RAY_SEED,
+            step_engines={project["steps"][0]["id"]: "CPU_TRIANGLE"},
+        )
+        outcome = run_v2_step(ctx, project["steps"][0], candidate)
+        self.assertEqual(outcome.plan.identity()["engine_kernel"], "CPU_TRIANGLE")
+        self._assert_parity(reference, outcome.state.geometry.handle, 2)
 
     def test_incomplete_project_fails_loudly(self) -> None:
         project = sf6o2_project(2)
