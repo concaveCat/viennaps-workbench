@@ -72,7 +72,7 @@ class IsotropicNativeVariant(EngineVariant):
     )
     engine = EngineRequirement(kind="native", engine_id="viennaps", min_version="4.6.2")
     implementation_hash: str | None = None
-    implementation_files = (getattr(_engine_helpers, "__file__", ""),)
+    implementation_files = (("process_models/v2/engines/viennaps.py", getattr(_engine_helpers, "__file__", "")),)
 
     def validate(self, ctx: ProcessContext, params: BaseModel) -> list[Issue]:
         """Return the semantic issues Pydantic and the resolver cannot express.

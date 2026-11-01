@@ -35,6 +35,8 @@ __all__ = [
     "compute_implementation_hash",
 ]
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
 _SEMVER = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
 
 
@@ -302,21 +304,21 @@ def compute_implementation_hash(variant: object) -> str:
     if source_file:
         source_path = Path(source_file).resolve()
         plugin_root = _plugin_root(source_path)
+        digest = hashlib.sha256()
         if plugin_root is not None:
-            digest = hashlib.sha256()
             for path in sorted(plugin_root.rglob("*.py")):
                 relative = path.relative_to(plugin_root).as_posix().encode("utf-8")
                 digest.update(relative + b"\x00" + path.read_bytes() + b"\x00")
-            for extra in _implementation_files(variant):
-                digest.update(str(extra).encode("utf-8") + b"\x00" + Path(extra).read_bytes() + b"\x00")
-            digest.update(suffix)
-            return digest.hexdigest()
-        try:
-            file_bytes = source_path.read_bytes()
-        except OSError:
-            file_bytes = None
-        if file_bytes is not None:
-            return hashlib.sha256(file_bytes + b"\x00" + suffix).hexdigest()
+        else:
+            try:
+                digest.update(b"variant-source\x00" + source_path.read_bytes() + b"\x00")
+            except OSError:
+                source = inspect.getsource(cls)
+                digest.update(b"variant-source\x00" + source.encode("utf-8") + b"\x00")
+        for label, path in _implementation_files(variant):
+            digest.update(label.encode("utf-8") + b"\x00" + path.read_bytes() + b"\x00")
+        digest.update(suffix)
+        return digest.hexdigest()
 
     try:
         source = inspect.getsource(cls)
@@ -326,24 +328,41 @@ def compute_implementation_hash(variant: object) -> str:
 
 
 def _plugin_root(source_path: Path) -> Path | None:
-    """Return the plugin package root for a variant source file, if any."""
-    parts = source_path.parts
-    try:
-        index = parts.index("plugins")
-    except ValueError:
-        return None
-    if index + 1 >= len(parts):
-        return None
-    root = Path(*parts[: index + 2])
-    return root if (root / "plugin.toml").is_file() else None
+    """Return the nearest ancestor directory containing ``plugin.toml``."""
+    for parent in source_path.parents:
+        if (parent / "plugin.toml").is_file():
+            return parent
+    return None
 
 
-def _implementation_files(variant: object) -> tuple[Path, ...]:
-    """Return explicit extra implementation files declared by the variant."""
+def _implementation_files(variant: object) -> tuple[tuple[str, Path], ...]:
+    """Return ``(stable_label, path)`` pairs declared by the variant.
+
+    A declaration may be a path (the label is the repo-relative path when
+    possible, otherwise the basename) or an explicit ``(label, path)`` pair.
+    A missing declared file is an error rather than a silent omission: the
+    lock must never pass while a declared implementation file is absent.
+    """
     values = getattr(variant, "implementation_files", ()) or ()
-    files: list[Path] = []
+    files: list[tuple[str, Path]] = []
     for value in values:
+        if isinstance(value, (tuple, list)):
+            if len(value) != 2:
+                raise ValueError(f"implementation_files entries must be paths or (label, path) pairs, got {value!r}")
+            label, raw_path = value
+            if not isinstance(label, str) or not label.strip():
+                raise ValueError(f"implementation_files label must be a non-empty string, got {label!r}")
+            path = Path(raw_path).expanduser().resolve()
+            if not path.is_file():
+                raise ValueError(f"declared implementation file {raw_path!r} does not exist")
+            files.append((label, path))
+            continue
         path = Path(value).expanduser().resolve()
-        if path.is_file():
-            files.append(path)
+        if not path.is_file():
+            raise ValueError(f"declared implementation file {value!r} does not exist")
+        try:
+            label = path.relative_to(_REPO_ROOT).as_posix()
+        except ValueError:
+            label = path.name
+        files.append((label, path))
     return tuple(files)

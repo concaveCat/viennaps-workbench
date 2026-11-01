@@ -25,7 +25,7 @@ from unittest import mock
 
 import viennaps as ps
 
-from plugins.isotropic import IsotropicProcessSpec, parse_step
+from plugins.isotropic import IsotropicNativeVariant, IsotropicProcessSpec, parse_step
 from process_models.plugins import (
     PLUGIN_API_VERSION,
     PluginLifecycleError,
@@ -447,6 +447,47 @@ class ManifestAndLockTamperTests(_TempPluginCase):
 
 
 class TempPluginRoundTripTests(_TempPluginCase):
+    def test_implementation_files_hash_is_path_independent(self) -> None:
+        first = self.temp_dir() / "first.py"
+        second = self.temp_dir() / "second.py"
+        payload = b"VALUE = 1\n"
+        first.write_bytes(payload)
+        second.write_bytes(payload)
+        with mock.patch.object(
+            IsotropicNativeVariant,
+            "implementation_files",
+            (("engine/helper.py", str(first)),),
+        ):
+            one = compute_implementation_hash(IsotropicNativeVariant())
+        with mock.patch.object(
+            IsotropicNativeVariant,
+            "implementation_files",
+            (("engine/helper.py", str(second)),),
+        ):
+            two = compute_implementation_hash(IsotropicNativeVariant())
+        self.assertEqual(one, two)
+
+    def test_missing_declared_implementation_file_fails_closed(self) -> None:
+        with mock.patch.object(
+            IsotropicNativeVariant,
+            "implementation_files",
+            (("engine/missing.py", "/definitely/not/a/file.py"),),
+        ):
+            with self.assertRaises(ValueError):
+                compute_implementation_hash(IsotropicNativeVariant())
+
+    def test_plugin_root_need_not_be_named_plugins(self) -> None:
+        base = self.temp_dir()
+        operator = base / "operator"
+        operator.mkdir()
+        plugin_dir, _ = self.make_plugin(operator)
+        lock_path = base / "plugins.lock"
+        write_lock([operator], lock_path)
+        verify_lock([operator], lock_path)
+        (plugin_dir / "step.py").write_text("VALUE = 1\n", encoding="utf-8")
+        with self.assertRaises(PluginLifecycleError):
+            verify_lock([operator], lock_path)
+
     def test_changing_any_plugin_package_file_invalidates_lock(self) -> None:
         base = self.temp_dir()
         plugin_root = base / "plugins"
