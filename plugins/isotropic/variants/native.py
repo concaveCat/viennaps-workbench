@@ -1,20 +1,9 @@
-"""Native isotropic etch/deposit plugin for the v2 contract.
+"""Native isotropic etch/deposit variant.
 
-The plugin is a thin, *parity-first* wrapper around the existing worker path
+The variant is a parity-first wrapper around the existing worker path
 (:mod:`worker.steps.process` and the helpers in :mod:`worker.simulate`). It
-does not re-derive physics: it builds the same synthetic step dictionary the
-worker would see, calls the same rate/advection helpers, and constructs the
-same ``ps.IsotropicProcess``. The only new part is the v2 packaging:
-
-* parameters are validated by :class:`IsotropicParams` (Pydantic v2);
-* the implementation is registered as a variant bound to a
-  :class:`~process_models.v2.engine.EngineRequirement` (native ``viennaps``);
-* execution returns a :class:`~process_models.v2.state.StepResult` instead of
-  a bare native domain: the mutated level sets travel in
-  ``StepResult.state`` (a :class:`~process_models.v2.state.StateDelta`) while
-  the step report travels in ``metadata``/``warnings``. ``outputs`` stays an
-  empty :class:`~process_models.v2.state.OutputSet` because this plugin
-  produces no metrology records or artifacts yet.
+builds the same synthetic step dictionary the worker would see, calls the same
+rate/advection helpers, and constructs the same ``ps.IsotropicProcess``.
 
 The variant mutates the caller's level-set handle in place
 (``mutates_input=True``), exactly like the worker path. The executor is
@@ -26,87 +15,27 @@ process state.
 from __future__ import annotations
 
 import math
-from typing import Any, Literal
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel
 
-from ..contract import (
+from process_models.v2.contract import (
     EngineVariant,
     Issue,
     ProcessContext,
-    ProcessSpec,
     VariantCapabilities,
-    VariantRegistration,
 )
-from ..engine import EngineLease, EngineRequirement
-from ..state import LevelSetState, ProcessState, StateDelta, StepResult
+from process_models.v2.engine import EngineLease, EngineRequirement
+from process_models.v2.state import LevelSetState, ProcessState, StateDelta, StepResult
 
-__all__ = [
-    "IsotropicNativeVariant",
-    "IsotropicParams",
-    "IsotropicProcessSpec",
-    "IsotropicSpec",
-    "register_isotropic",
-]
+__all__ = ["IsotropicNativeVariant"]
 
-Operation = Literal["etch", "deposit"]
-RateMode = Literal["uniform", "material"]
 
-#: Worker-shaped project defaults used when the caller does not supply a project.
-#: Schema 3 keeps ``configure_advection`` on its legacy branch (solver ratio
-#: only) and makes ``protected_material_names`` derive masks from ``geometry``.
 _DEFAULT_PROJECT: dict[str, Any] = {
     "schemaVersion": 3,
     "geometry": {"kind": "plane", "substrateMaterial": "Si"},
     "solver": {"timeStepRatio": 0.25},
 }
-
-
-class IsotropicParams(BaseModel):
-    """Parameters of one isotropic etch/deposit step.
-
-    ``rateMagnitude`` is the uniform (default) rate. In ``rateMode="material"``
-    the rate table is authoritative and unlisted materials do not move, which
-    mirrors the worker's material-mode convention of a zero default rate.
-    """
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    operation: Operation
-    rateMagnitude: float = Field(gt=0)
-    duration: float = Field(gt=0)
-    depositMaterial: str = "SiO2"
-    rateMode: RateMode = "uniform"
-    materialRates: dict[str, float] = Field(default_factory=dict)
-    maskMaterials: list[str] = Field(default_factory=list)
-    isotropicTimeStepRatio: float | None = Field(default=None, ge=0.05, le=0.5)
-
-    @field_validator("rateMagnitude", "duration")
-    @classmethod
-    def _finite_positive(cls, value: float, info: Any) -> float:
-        if not math.isfinite(value):
-            raise ValueError(f"{info.field_name} must be finite")
-        return value
-
-    @field_validator("materialRates")
-    @classmethod
-    def _finite_material_rates(cls, value: dict[str, float]) -> dict[str, float]:
-        for name, rate in value.items():
-            if not isinstance(name, str) or not name.strip():
-                raise ValueError("materialRates keys must be non-empty material names")
-            if not math.isfinite(rate):
-                raise ValueError(f"materialRates[{name!r}] must be finite")
-            if rate < 0.0:
-                raise ValueError(f"materialRates[{name!r}] must be non-negative")
-        return value
-
-    @field_validator("maskMaterials")
-    @classmethod
-    def _non_empty_mask_names(cls, value: list[str]) -> list[str]:
-        for name in value:
-            if not isinstance(name, str) or not name.strip():
-                raise ValueError("maskMaterials entries must be non-empty material names")
-        return value
 
 
 class IsotropicNativeVariant(EngineVariant):
@@ -335,38 +264,6 @@ class IsotropicNativeVariant(EngineVariant):
             metadata=metadata,
             warnings=warnings,
         )
-
-
-IsotropicProcessSpec = ProcessSpec(
-    id="isotropic",
-    version="1.0.0",
-    label="Isotropic etch/deposit (native)",
-    params_model=IsotropicParams,
-    dimensions=(2, 3),
-    operations=("etch", "deposit"),
-    description=(
-        "Native ViennaPS IsotropicProcess driven through the worker rate and "
-        "advection helpers; parity with worker/steps/process.py."
-    ),
-)
-
-#: Alias matching the short name used in the v2 spec.
-IsotropicSpec = IsotropicProcessSpec
-
-
-def register_isotropic(registry: Any) -> VariantRegistration:
-    """Register the isotropic spec and its single native variant.
-
-    The registration is just ``(process_id, variant)``: the registry derives the
-    variant id/version, capabilities, engine requirement, and implementation
-    hash from the variant itself. Returns the registration so callers can
-    inspect the declared identity without resolving again.
-    """
-    variant = IsotropicNativeVariant()
-    registration = VariantRegistration(process_id=IsotropicProcessSpec.id, variant=variant)
-    registry.register_process(IsotropicProcessSpec)
-    registry.register_variant(registration)
-    return registration
 
 
 def _worker_project(ctx: ProcessContext) -> dict[str, Any]:

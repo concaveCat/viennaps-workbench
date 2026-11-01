@@ -18,18 +18,18 @@ import numpy as np
 import viennaps as ps
 from pydantic import ValidationError
 
-from process_models.v2.contract import ProcessContext, VariantCapabilities, VariantRegistration
-from process_models.v2.engine import (
-    EngineCapabilities,
-    StaticEngine,
-    StaticEngineProvider,
-)
-from process_models.v2.native.isotropic import (
+from plugins.isotropic import (
     IsotropicNativeVariant,
     IsotropicParams,
     IsotropicProcessSpec,
     IsotropicSpec,
     register_isotropic,
+)
+from process_models.v2.contract import ProcessContext, VariantCapabilities, VariantRegistration
+from process_models.v2.engine import (
+    EngineCapabilities,
+    StaticEngine,
+    StaticEngineProvider,
 )
 from process_models.v2.registry import ProcessRegistry
 from process_models.v2.resolver import (

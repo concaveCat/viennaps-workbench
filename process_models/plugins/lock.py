@@ -17,7 +17,7 @@ Schema version 1:
          "id": "isotropic",
          "version": "1.0.0",
          "api": 1,
-         "entrypoint": "process_models.v2.native.isotropic:register_isotropic",
+         "entrypoint": "plugins.isotropic:register",
          "manifestSha256": "<sha256 of plugin.toml bytes>",
          "variants": {
            "native": {

@@ -7,7 +7,7 @@ A manifest is a small TOML file with a fixed field set:
    api = 1
    id = "isotropic"
    version = "1.0.0"
-   entrypoint = "process_models.v2.native.isotropic:register_isotropic"
+   entrypoint = "plugins.isotropic:register"
    description = "Native isotropic etch/deposit"
 
 The manifest is the only place a Python module path is allowed. Project JSON

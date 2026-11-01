@@ -11,10 +11,11 @@ Public surface:
 * :mod:`process_models.v2.resolver` - ``resolve_execution`` and plans.
 * :mod:`process_models.v2.adapters` - state representation adapters.
 
-Plugins (native isotropic, surrogate voxel probe) live in subpackages and must
-be registered explicitly; importing this package never imports native
-libraries. Projects reference stable process/variant IDs only - never Python
-modules, paths, or callables.
+Installed plugins live in ``plugins/<id>/`` next to their ``plugin.toml`` and
+are loaded by :mod:`process_models.plugins`. The voxel-probe proof remains in
+``surrogate/`` and is not installed. Importing this package never imports
+native libraries. Projects reference stable process/variant IDs only - never
+Python modules, paths, or callables.
 """
 
 from __future__ import annotations

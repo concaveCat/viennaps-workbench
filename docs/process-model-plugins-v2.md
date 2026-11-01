@@ -1005,7 +1005,7 @@ v2 只加了一层：`VoxelState.grid` 承载 `VoxelGrid`，`source` 标记适�
 
 ## 7. 第一个真实工艺：isotropic 原生插件
 
-文件：`process_models/v2/native/isotropic.py`。
+文件：`plugins/isotropic/`。
 
 ### 7.1 复用而不是重写
 
@@ -1285,7 +1285,7 @@ def execute(self, state, params, ctx, engine) -> StepResult:  # surrogate 不用
 | 阶段 | 内容 | 行为约束 | 退出条件 |
 | --- | --- | --- | --- |
 | 1. legacy wrapper | 现有 `CATALOG` / `build_specialized_model()` 包成 v2 变体 | 纯包装，不复制原生调用；schema、快照、哈希不变 | 同一 project 走 wrapper 与走原路径结果一致 |
-| 2. isotropic | `native/isotropic.py` 落地 | 与 worker 路径 parity（§7.3）；不回退 legacy | 2D/3D、etch/deposit、逐材料速率全过 |
+| 2. isotropic | `plugins/isotropic/` 落地 | 与 worker 路径 parity（§7.3）；不回退 legacy | 2D/3D、etch/deposit、逐材料速率全过 |
 | 3. sf6o2 / oxidation | 按同一模式搬 | 逐模型搬，参数映射逐行对照 | 每个模型有独立对照测试 |
 | 4. 可选 `variant` 字段 + API/UI | 项目 JSON 可写 `variant`；API 列 descriptor | 缺省不进请求哈希；显式写入才参与；前端只读 descriptor | 旧 fixture 哈希不变 |
 | 5. 生产 CMP surrogate | 第一个非 proof 的 Python 模型 | 通过完整一致性测试；默认仍是 native；不自动选 surrogate | 参考 flow + golden |
@@ -1462,7 +1462,7 @@ def register_my_process(registry: ProcessRegistry) -> None:
 | `process_models/v2/adapters.py` | `StateAdapter`、`DefaultStateAdapter`（layers/fields 独立 commit，stored-only prepare） |
 | `process_models/plugins/` | 生命周期库：`PluginManifest`/`read_manifest`、lock schema 与 `write_lock`/`verify_lock`、`discover`/`load_registry`、`PluginLifecycleError` |
 | `plugins/` + `plugins.lock` + `scripts/lock-plugins.py` | 树内 `isotropic` 的 manifest、生成的锁、生成/校验脚本；见 [`plugin-lifecycle.md`](plugin-lifecycle.md) |
-| `process_models/v2/native/isotropic.py` | 第一个真实原生插件（返回 `StepResult`，空 `OutputSet`） |
+| `plugins/isotropic/` | 第一个真实原生插件（返回 `StepResult`，空 `OutputSet`） |
 | `process_models/v2/surrogate/voxel_probe.py` | 第一个 surrogate（proof，返回 `StepResult`，空 `OutputSet`） |
 
 v1 的 `process_models/voxel.py`、`contract.py`、`registry.py` 保持原样；v2 只**复用**

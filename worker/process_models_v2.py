@@ -34,6 +34,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from plugins.isotropic import IsotropicParams
 from process_models.plugins import load_registry
 from process_models.v2.contract import ProcessContext
 from process_models.v2.engine import (
@@ -41,7 +42,6 @@ from process_models.v2.engine import (
     StaticEngine,
     StaticEngineProvider,
 )
-from process_models.v2.native.isotropic import IsotropicParams
 from process_models.v2.resolver import (
     ExecutionOutcome,
     ExecutionRequest,

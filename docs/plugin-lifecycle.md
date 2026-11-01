@@ -68,7 +68,7 @@ scripts/lock-plugins.py     # 生成 / 校验
 api = 1
 id = "isotropic"
 version = "1.0.0"
-entrypoint = "process_models.v2.native.isotropic:register_isotropic"
+entrypoint = "plugins.isotropic:register"
 description = "Native isotropic etch/deposit"
 ```
 
@@ -106,7 +106,7 @@ lock 是**运维签字**：它把“这次部署实际装的是哪份代码”�
       "id": "isotropic",
       "version": "1.0.0",
       "api": 1,
-      "entrypoint": "process_models.v2.native.isotropic:register_isotropic",
+      "entrypoint": "plugins.isotropic:register",
       "manifestSha256": "<plugin.toml 原始字节的 sha256>",
       "variants": {
         "native": {
@@ -272,11 +272,11 @@ lock”。第三方行为（`viennaps`/`numpy` 版本）由 `requirements*.lock`
 | 项 | `isotropic` |
 | --- | --- |
 | 类型 | 原生（native）工艺插件 |
-| 树内位置 | `process_models/v2/native/isotropic.py` |
+| 树内位置 | `plugins/isotropic/` |
 | manifest | `plugins/isotropic/plugin.toml` |
 | `api` | `1` |
 | `id` @ `version` | `isotropic` @ `1.0.0` |
-| `entrypoint` | `process_models.v2.native.isotropic:register_isotropic` |
+| `entrypoint` | `plugins.isotropic:register` |
 | 变体 | `native` @ `1.0.0`（2D/3D，etch/deposit） |
 | lock 条目 | `plugins` 数组中唯一一条 `("isotropic", "1.0.0")` |
 | `manifestSha256` | 由 `scripts/lock-plugins.py` 生成，以仓库内 `plugins.lock` 为准 |

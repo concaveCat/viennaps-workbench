@@ -205,7 +205,7 @@ class InTreePluginTests(unittest.TestCase):
         self.assertEqual(manifest.api, 1)
         self.assertEqual(manifest.id, "isotropic")
         self.assertEqual(manifest.version, "1.0.0")
-        self.assertEqual(manifest.entrypoint, "process_models.v2.native.isotropic:register_isotropic")
+        self.assertEqual(manifest.entrypoint, "plugins.isotropic:register")
         self.assertIsInstance(manifest, PluginManifest)
 
     def test_default_dirs_use_repo_plugins_and_honour_env(self) -> None:
@@ -232,7 +232,7 @@ class InTreePluginTests(unittest.TestCase):
         self.assertEqual(lock.schema_version, 1)
         self.assertEqual(lock.api_version, 1)
         entry = lock.entries()[("isotropic", "1.0.0")]
-        self.assertEqual(entry.entrypoint, "process_models.v2.native.isotropic:register_isotropic")
+        self.assertEqual(entry.entrypoint, "plugins.isotropic:register")
         variant = entry.variants["native"]
         self.assertEqual(variant.version, "1.0.0")
         self.assertRegex(variant.implementation_hash, r"^[0-9a-f]{64}$")
@@ -332,7 +332,7 @@ class ManifestAndLockTamperTests(_TempPluginCase):
             plugin_dir,
             plugin_id="other-isotropic",
             version="1.0.0",
-            entrypoint="process_models.v2.native.isotropic:register_isotropic",
+            entrypoint="plugins.isotropic:register",
         )
         with self.assertRaises(PluginLifecycleError):
             load_registry([base], lock_path)
@@ -347,7 +347,7 @@ class ManifestAndLockTamperTests(_TempPluginCase):
             plugin_dir,
             plugin_id="isotropic",
             version="2.0.0",
-            entrypoint="process_models.v2.native.isotropic:register_isotropic",
+            entrypoint="plugins.isotropic:register",
         )
         with self.assertRaises(PluginLifecycleError):
             load_registry([base], lock_path)
@@ -356,7 +356,7 @@ class ManifestAndLockTamperTests(_TempPluginCase):
             plugin_dir,
             plugin_id="isotropic",
             version="1.0.0",
-            entrypoint="process_models.v2.native.isotropic:not_a_registration",
+            entrypoint="plugins.isotropic:not_a_registration",
         )
         with self.assertRaises(PluginLifecycleError):
             load_registry([base], lock_path)
@@ -371,7 +371,7 @@ class ManifestAndLockTamperTests(_TempPluginCase):
             plugin_dir,
             plugin_id="isotropic",
             version="1.0.0",
-            entrypoint="process_models.v2.native.isotropic:register_isotropic",
+            entrypoint="plugins.isotropic:register",
             api=2,
         )
         with self.assertRaises(PluginLifecycleError):

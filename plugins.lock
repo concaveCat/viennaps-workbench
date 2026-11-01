@@ -6,12 +6,12 @@
       "id": "isotropic",
       "version": "1.0.0",
       "api": 1,
-      "entrypoint": "process_models.v2.native.isotropic:register_isotropic",
-      "manifestSha256": "e52a91a3833efdbdafd29c2b511b199e81fd63cb3241394cc7c45ce02eb3190e",
+      "entrypoint": "plugins.isotropic:register",
+      "manifestSha256": "cdac531fc7edf63df687735c79485883e8d6f944a2efc2417c8d7b7317fc3686",
       "variants": {
         "native": {
           "version": "1.0.0",
-          "implementationHash": "40806f46c9234d117843f647a96567b444b066c399385d01b9fa9f4c796d8734"
+          "implementationHash": "3e0266e50b9121e45e99a2ead33eb7bc48e6f8786db6e43756ad6e93f43a7b04"
         }
       }
     }

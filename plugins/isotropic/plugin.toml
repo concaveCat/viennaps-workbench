@@ -1,5 +1,5 @@
 api = 1
 id = "isotropic"
 version = "1.0.0"
-entrypoint = "process_models.v2.native.isotropic:register_isotropic"
+entrypoint = "plugins.isotropic:register"
 description = "Native isotropic etch/deposit"
