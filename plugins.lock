@@ -105,6 +105,45 @@
           "implementationHash": "d222d60e004fd09d037ef40776c72e9ee8bd86b285adfba22466b896f0c3d98c"
         }
       }
+    },
+    {
+      "id": "teosDeposition",
+      "version": "1.0.0",
+      "api": 1,
+      "entrypoint": "plugins.teosDeposition:register",
+      "manifestSha256": "577eeab02348af1af6d3117f68f5f1d307f956c0b16db89d622769b02e1fa142",
+      "variants": {
+        "native": {
+          "version": "1.0.0",
+          "implementationHash": "6a8a1583730cd5c34c3058455a22704734b5a2e37b740f0aad3eb712e00392cc"
+        }
+      }
+    },
+    {
+      "id": "teospecvd",
+      "version": "1.0.0",
+      "api": 1,
+      "entrypoint": "plugins.teospecvd:register",
+      "manifestSha256": "b2339bae60789429e52a875520cfbe0158594fe790567fb41b498b094bb4e42d",
+      "variants": {
+        "native": {
+          "version": "1.0.0",
+          "implementationHash": "cc4cba6613f48a4b5f6fa6ab7ce807a13b0ebaf49b065dfc1f6ecb615e729e7a"
+        }
+      }
+    },
+    {
+      "id": "wetEtch",
+      "version": "1.0.0",
+      "api": 1,
+      "entrypoint": "plugins.wetEtch:register",
+      "manifestSha256": "c32fa97ba18a212427033f8e6685528d984ef00ecedb5d2f3c4645870396eefd",
+      "variants": {
+        "native": {
+          "version": "1.0.0",
+          "implementationHash": "a8dc32c65a515e261b817803984fab424e3e3c67de655b778b42aaf1bf6ccd00"
+        }
+      }
     }
   ]
 }
