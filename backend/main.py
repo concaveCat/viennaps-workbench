@@ -22,6 +22,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import storage
 from . import packages
+from . import settings as settings_store
 from . import preflight as artifact_preflight
 from . import materials as material_registry
 from .api.deps import supervisor as _supervisor, version as _version
@@ -40,6 +41,8 @@ from .runtime_limits import (artifact_limit_startup_message,
                              deployment_limit_status,
                              deployment_limits_startup_message, cpu_thread_limit)
 from .gpu_devices import cuda_devices
+from .workflow.api import router as workflow_router
+from .engine import EngineVersionMismatch, multi_ion_gpu_error
 
 
 ROOT = storage.ROOT
@@ -114,7 +117,10 @@ class ApiContentTypeMiddleware:
             # potentially large native state package in middleware memory.
             await self.app(scope, receive, send)
             return
-        bodyless_cancel = scope.get("method") == "POST" and path.startswith("/api/runs/") and path.endswith("/cancel")
+        bodyless_cancel = scope.get("method") == "POST" and (
+            (path.startswith("/api/runs/") and path.endswith("/cancel"))
+            or (path.startswith("/api/v1/workflow/") and path.endswith("/cancel"))
+        )
         if bodyless_cancel and content_length in (None, "0") and not transfer_encoding:
             await self.app(scope, receive, send)
             return
@@ -141,6 +147,12 @@ async def lifespan(app: FastAPI):
     supervisor = Supervisor(lock_fd)
     app.state.supervisor = supervisor
     try:
+        from .workflow.api import get_store
+        from .workflow.experiments import resume_experiments
+        resume_experiments(get_store(), supervisor)
+    except Exception:
+        STARTUP_LOGGER.exception("experiment queue recovery failed")
+    try:
         yield
     finally:
         # Lifespan shutdown is already draining requests. Keeping close
@@ -151,6 +163,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="ViennaPS Workbench", version=APP_VERSION, docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 app.add_middleware(ApiContentTypeMiddleware)
+app.include_router(workflow_router)
 
 
 @app.middleware("http")
@@ -237,6 +250,40 @@ async def capabilities() -> dict[str, Any]:
         capability_data["knownEngineLimitations"] = []
     return {"capabilities": capability_data, "resourcePolicy": resource_policy,
             "runtimeLimits": limits}
+
+
+@app.get("/api/settings")
+async def get_settings() -> dict[str, Any]:
+    """Return persistent limits, storage usage, and installed engine versions."""
+    return settings_store.settings_response()
+
+
+@app.put("/api/settings", responses={
+    422: {
+        "description": "Validation Error",
+        "content": {"application/json": {"schema": {
+            "type": "object",
+            "required": ["detail"],
+            "properties": {"detail": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["path", "message"],
+                    "properties": {
+                        "path": {"type": "string"},
+                        "message": {"type": "string"},
+                    },
+                },
+            }},
+        }}},
+    },
+})
+async def put_settings(payload: Any = Body(...)) -> dict[str, Any]:
+    """Update limit overrides; ``null`` removes an override."""
+    try:
+        return settings_store.apply_update(payload)
+    except settings_store.SettingsValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.issues) from exc
 
 
 @app.get("/api/gpu-devices")
