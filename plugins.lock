@@ -3,6 +3,19 @@
   "apiVersion": 1,
   "plugins": [
     {
+      "id": "ald",
+      "version": "1.0.0",
+      "api": 1,
+      "entrypoint": "plugins.ald:register",
+      "manifestSha256": "477f50c6396293a685776c35f979d7b880ba3e4cada842e3b3b80f5c7d186ff7",
+      "variants": {
+        "native": {
+          "version": "1.0.0",
+          "implementationHash": "f9208e6a5c53921d5ac9c9eb648fa3243aa7003be76378e5c4d82d40fc9a9288"
+        }
+      }
+    },
+    {
       "id": "cf4o2",
       "version": "1.0.0",
       "api": 1,
@@ -107,6 +120,19 @@
       }
     },
     {
+      "id": "oxidation",
+      "version": "1.0.0",
+      "api": 1,
+      "entrypoint": "plugins.oxidation:register",
+      "manifestSha256": "88ef12bb53ae517f5fcef54d8bef48c89293685c2e4443d1dd5fd1cbe801ec81",
+      "variants": {
+        "native": {
+          "version": "1.0.0",
+          "implementationHash": "23ad7c3e081be8702361a85d01aef7822668d68915f53e3e815f5c8b58bde576"
+        }
+      }
+    },
+    {
       "id": "selectiveEpitaxy",
       "version": "1.0.0",
       "api": 1,
@@ -142,6 +168,19 @@
         "native": {
           "version": "1.0.0",
           "implementationHash": "d222d60e004fd09d037ef40776c72e9ee8bd86b285adfba22466b896f0c3d98c"
+        }
+      }
+    },
+    {
+      "id": "singleParticle",
+      "version": "1.0.0",
+      "api": 1,
+      "entrypoint": "plugins.singleParticle:register",
+      "manifestSha256": "5be61fbb4400637b33c8294a34889642bbeb8503791b57499f8f9493f6556ae9",
+      "variants": {
+        "native": {
+          "version": "1.0.0",
+          "implementationHash": "c1735f1d0bb9ce3d5f4ec3fa9e8776d191fdf663c6c2ee29cdccccc6b3067886"
         }
       }
     },
