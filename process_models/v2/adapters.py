@@ -142,6 +142,14 @@ class DefaultStateAdapter:
                 raise _resolution_error(
                     "variant returned a materials delta but does not declare 'materials' in capabilities.writes"
                 )
+            profile = capabilities.state_profile
+            if profile is not None and not profile.allow_new_materials:
+                added = sorted(set(delta.materials.names.values()) - set(state.materials.names.values()))
+                if added:
+                    raise _resolution_error(
+                        f"variant is not allowed to introduce materials {added!r}; "
+                        "set StateProfile.allow_new_materials=True to permit material creation"
+                    )
             prepared = replace(prepared, materials=delta.materials)
 
         if delta.layers is not None:

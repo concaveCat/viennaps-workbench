@@ -945,6 +945,8 @@ class ContractRegistryTest(unittest.TestCase):
         self.assertEqual(variants["voxel"].reads, ("geometry", "voxels"))
         self.assertEqual(variants["voxel"].writes, ("voxels",))
         self.assertTrue(variants["voxel"].experimental)
+        self.assertEqual(variants["voxel"].execution_profiles, ())
+        self.assertIsNone(variants["voxel"].state_profile)
         self.assertEqual(len(registry.list_variants("dummy.deposit")), 2)
 
     def test_capabilities_output_kinds_default_and_descriptor(self) -> None:
@@ -965,6 +967,7 @@ class ContractRegistryTest(unittest.TestCase):
 
         descriptor = registry.list_variants("dummy.deposit")[0]
         self.assertEqual(descriptor.output_kinds, ("metrology", "artifact:profile"))
+        self.assertEqual(descriptor.execution_profiles, ())
 
         bare = VariantDescriptor(
             id="dummy",
@@ -1182,6 +1185,13 @@ class ResolverTest(unittest.TestCase):
                 "engine_version",
                 "engine_fingerprint",
                 "adapter",
+                "engine_backend",
+                "engine_kernel",
+                "engine_device",
+                "engine_strategy",
+                "state_backend_id",
+                "state_backend_version",
+                "state_contract",
             },
         )
         self.assertTrue(all(isinstance(value, str) for value in identity.values()))

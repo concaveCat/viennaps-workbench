@@ -35,6 +35,7 @@ __all__ = [
     "ModelDescriptor",
     "ProcessContext",
     "ProcessSpec",
+    "StateProfile",
     "VariantCapabilities",
     "VariantDescriptor",
     "VariantRegistration",
@@ -86,6 +87,38 @@ class ProcessContext:
 
 
 @dataclass(frozen=True)
+class StateProfile:
+    """Declarative state requirements beyond ``reads``/``writes``.
+
+    ``reads``/``writes`` answer *which* representations a variant uses. This
+    profile answers *how* it may use them: which conversions are allowed, which
+    materials must exist, whether a step may introduce materials, and which
+    outputs are intended to be replayable. The resolver materializes a concrete
+    :class:`StateContract` from this profile and the selected state backend.
+    """
+
+    conversions: tuple[str, ...] = ()
+    required_materials: tuple[str, ...] = ()
+    allow_new_materials: bool = False
+    persistence: frozenset[StateKind] = frozenset()
+
+    def __post_init__(self) -> None:
+        conversions = tuple(str(conversion) for conversion in self.conversions)
+        if any(not conversion.strip() for conversion in conversions):
+            raise ValueError(f"state conversions must be non-empty strings, got {conversions!r}")
+        required_materials = tuple(str(name) for name in self.required_materials)
+        if any(not name.strip() for name in required_materials):
+            raise ValueError(f"required material names must be non-empty strings, got {required_materials!r}")
+        persistence = frozenset(self.persistence)
+        unknown = sorted(persistence - STATE_KINDS)
+        if unknown:
+            raise ValueError(f"unknown persistence state kinds {unknown!r}")
+        object.__setattr__(self, "conversions", conversions)
+        object.__setattr__(self, "required_materials", required_materials)
+        object.__setattr__(self, "persistence", persistence)
+
+
+@dataclass(frozen=True)
 class VariantCapabilities:
     """Declarative limits of a variant.
 
@@ -107,6 +140,7 @@ class VariantCapabilities:
     mutates_input: bool = False
     determinism: Determinism = "strict"
     output_kinds: tuple[str, ...] = ()
+    state_profile: StateProfile | None = None
 
     def __post_init__(self) -> None:
         dimensions = tuple(int(dimension) for dimension in self.dimensions)
@@ -127,6 +161,9 @@ class VariantCapabilities:
         object.__setattr__(self, "dimensions", dimensions)
         object.__setattr__(self, "reads", reads)
         object.__setattr__(self, "writes", writes)
+        state_profile = self.state_profile
+        if state_profile is not None and not isinstance(state_profile, StateProfile):
+            raise TypeError(f"state_profile must be a StateProfile or None, got {type(state_profile).__name__}")
         object.__setattr__(self, "geometry_constraints", tuple(self.geometry_constraints))
         object.__setattr__(self, "output_kinds", output_kinds)
 
@@ -269,6 +306,8 @@ class VariantDescriptor:
     experimental: bool
     implementation_hash: str
     output_kinds: tuple[str, ...] = ()
+    execution_profiles: tuple[str, ...] = ()
+    state_profile: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)

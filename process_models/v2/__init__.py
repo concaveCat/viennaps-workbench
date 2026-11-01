@@ -4,7 +4,10 @@ Public surface:
 
 * :mod:`process_models.v2.state` - multi-representation state, deltas, and
   structured step outputs (``StepResult``/``OutputSet``).
-* :mod:`process_models.v2.engine` - engine requirements, leases, providers.
+* :mod:`process_models.v2.engine` - engine requirements, execution profiles,
+  leases, and providers.
+* :mod:`process_models.v2.state_backend` - engine-neutral checkpoint/write/load
+  and material-registry boundary.
 * :mod:`process_models.v2.contract` - process specs, variant registrations,
   capabilities, descriptors, issues, and context.
 * :mod:`process_models.v2.registry` - explicit ID-based registry and hashing.
@@ -32,12 +35,14 @@ from .contract import (
     ModelDescriptor,
     ProcessContext,
     ProcessSpec,
+    StateProfile,
     VariantCapabilities,
     VariantDescriptor,
     VariantRegistration,
 )
 from .engine import (
     Backend,
+    ComputePolicy,
     Engine,
     EngineCapabilities,
     EngineKind,
@@ -45,11 +50,13 @@ from .engine import (
     EngineProvider,
     EngineRequirement,
     EngineUnavailableError,
+    ExecutionProfile,
     StaticEngine,
     StaticEngineProvider,
     version_satisfies,
 )
 from .executor import FlowExecutor, FlowRun, FlowStep
+from .materials import MaterialRegistry, MaterialRegistryError, StaticMaterialRegistry
 from .output_schema import output_contract_schema
 from .registry import ProcessRegistry, ResolvedVariant, compute_implementation_hash
 from .resolver import (
@@ -57,6 +64,7 @@ from .resolver import (
     ExecutionPlan,
     ExecutionRequest,
     ExecutionResolutionError,
+    StateContract,
     execute_plan,
     resolve_execution,
     run_step,
@@ -81,6 +89,13 @@ from .state import (
     StepResult,
     VoxelState,
 )
+from .state_backend import (
+    GeometryRef,
+    HandleStateBackend,
+    StateBackend,
+    StateBackendError,
+    StateCapabilities,
+)
 from .storage import StateStore, StateStoreError
 
 __all__ = [
@@ -88,6 +103,7 @@ __all__ = [
     "ArtifactKind",
     "Backend",
     "CellSetState",
+    "ComputePolicy",
     "ConformanceReport",
     "DefaultStateAdapter",
     "Engine",
@@ -100,6 +116,7 @@ __all__ = [
     "EngineVariant",
     "ExecutionOutcome",
     "ExecutionPlan",
+    "ExecutionProfile",
     "ExecutionRequest",
     "ExecutionResolutionError",
     "Field",
@@ -107,11 +124,15 @@ __all__ = [
     "FlowExecutor",
     "FlowRun",
     "FlowStep",
+    "GeometryRef",
     "GridSpec",
+    "HandleStateBackend",
     "Issue",
     "Layer",
     "LayerState",
     "LevelSetState",
+    "MaterialRegistry",
+    "MaterialRegistryError",
     "MaterialState",
     "MetrologyRecord",
     "ModelDescriptor",
@@ -122,10 +143,16 @@ __all__ = [
     "ProcessState",
     "ResolvedVariant",
     "StateAdapter",
+    "StateBackend",
+    "StateBackendError",
+    "StateCapabilities",
+    "StateContract",
     "StateDelta",
     "StateKind",
     "StateMissingError",
+    "StateProfile",
     "StateStore",
+    "StaticMaterialRegistry",
     "StateStoreError",
     "StaticEngine",
     "StaticEngineProvider",

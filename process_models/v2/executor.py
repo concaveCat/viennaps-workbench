@@ -12,21 +12,20 @@ result is persisted, and the committed state is threaded into the next step.
 Checkpointing
 -------------
 Variants that declare ``VariantCapabilities.mutates_input`` may change the
-native geometry handle in place. Before such a step runs, the executor copies
-the handle with ``engine.handle.Domain(handle)`` (the ViennaPS copy
-constructor) and re-resolves the request against the copy, so
+native geometry handle in place. Before such a step runs, the executor asks the
+engine's :class:`~process_models.v2.state_backend.StateBackend` to checkpoint
+the state, then re-resolves the request against the copy, so
 ``plan.request.state`` and the plan's execution both point at the copy and the
-previous step's state is left untouched. An engine that does not expose
-``Domain`` cannot be checkpointed; that is a hard
-:class:`ExecutionResolutionError`, never a "mutates_input is probably fine"
-fallback.
+previous step's state is left untouched. A backend that cannot checkpoint is a
+hard :class:`ExecutionResolutionError`, never a "mutates_input is probably
+fine" fallback.
 
 Persistence
 -----------
 For every step the executor writes ``state.json``/``fields.npz``,
-``outputs.json``, and ``plan.json`` through :class:`StateStore`, plus
-``geometry.vpsd`` when the engine exposes ``Writer`` (the step's
-``geometry_ref`` is then ``"geometry.vpsd"``, otherwise ``None``). After the
+``outputs.json``, and ``plan.json`` through :class:`StateStore`, plus the
+geometry reference returned by the engine's state backend (the step's
+``geometry_ref`` is that file name, otherwise ``None``). After the
 last step one ``flow.json`` records the run::
 
     {
@@ -74,14 +73,14 @@ engines; it is the runtime foundation only.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 
 from pydantic import BaseModel
 
 from .adapters import StateAdapter
 from .contract import ProcessContext
-from .engine import EngineProvider
+from .engine import ComputePolicy, EngineProvider
 from .registry import ProcessRegistry
 from .resolver import (
     ExecutionOutcome,
@@ -92,12 +91,12 @@ from .resolver import (
     resolve_execution,
 )
 from .state import ProcessState
+from .state_backend import StateBackendError
 from .storage import StateStore
 
 __all__ = ["FlowExecutor", "FlowRun", "FlowStep"]
 
 FLOW_SCHEMA_VERSION = 1
-GEOMETRY_FILE = "geometry.vpsd"
 
 
 @dataclass(frozen=True)
@@ -117,6 +116,7 @@ class FlowStep:
     context: ProcessContext
     expected_process_version: str | None = None
     expected_variant_version: str | None = None
+    compute: ComputePolicy | None = None
 
 
 @dataclass(frozen=True)
@@ -232,50 +232,46 @@ class FlowExecutor:
             state=state,
             expected_process_version=step.expected_process_version,
             expected_variant_version=step.expected_variant_version,
+            compute=step.compute,
         )
 
     @staticmethod
     def _checkpoint(plan: ExecutionPlan, state: ProcessState) -> ProcessState:
         """Return ``state`` with a copied native geometry handle.
 
-        The copy comes from ``engine.handle.Domain(handle)``. Derived voxels
+        The copy comes from the engine's :class:`StateBackend`. Derived voxels
         belong to the old handle, so they are dropped just like a committed
         geometry delta does. A state without geometry has nothing native to
         checkpoint and is returned unchanged.
         """
-        geometry = state.geometry
-        if geometry is None:
+        if state.geometry is None:
             return state
-
-        domain_factory = getattr(plan.engine.handle, "Domain", None)
-        if domain_factory is None or not callable(domain_factory):
+        backend = plan.engine.state_backend
+        try:
+            return backend.checkpoint(state)
+        except StateBackendError as error:
             raise ExecutionResolutionError(
                 f"variant {plan.process.id!r}/{plan.variant.variant_id!r} declares "
-                f"mutates_input=True but engine {plan.engine.engine_id!r} exposes no Domain "
-                "constructor for checkpointing the native geometry"
-            )
-        copied = domain_factory(geometry.handle)
-        if copied is None:
-            raise ExecutionResolutionError(
-                f"engine {plan.engine.engine_id!r} could not checkpoint the native geometry "
-                f"for variant {plan.process.id!r}/{plan.variant.variant_id!r}: Domain() returned None"
-            )
-        return replace(state, geometry=replace(geometry, handle=copied), voxels=None)
+                f"mutates_input=True but state backend {backend.id!r} cannot checkpoint "
+                f"the native geometry: {error}"
+            ) from error
 
     def _write_geometry(self, step: FlowStep, plan: ExecutionPlan, state: ProcessState) -> str | None:
-        """Write ``<step>/geometry.vpsd`` when the engine exposes ``Writer``.
+        """Persist the step's native geometry through the state backend.
 
         Returns the file name relative to the step directory, or ``None`` when
-        the engine has no writer or the step has no geometry.
+        the backend does not persist geometry or the step has no geometry.
         """
-        writer_factory = getattr(plan.engine.handle, "Writer", None)
-        if writer_factory is None or not callable(writer_factory) or state.geometry is None:
+        if state.geometry is None:
             return None
-
-        path = self._store.step_dir(step.step_id) / GEOMETRY_FILE
-        path.parent.mkdir(parents=True, exist_ok=True)
-        writer_factory(state.geometry.handle, str(path)).apply()
-        return path.name
+        try:
+            reference = plan.engine.state_backend.write(state, self._store.step_dir(step.step_id))
+        except StateBackendError as error:
+            raise ExecutionResolutionError(
+                f"state backend {plan.engine.state_backend.id!r} could not write geometry "
+                f"for step {step.step_id!r}: {error}"
+            ) from error
+        return None if reference is None else reference.path
 
 
 def _check_steps(steps: tuple[FlowStep, ...]) -> None:

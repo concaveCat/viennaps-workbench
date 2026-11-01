@@ -1,9 +1,10 @@
 # 插件组织与数据流
 
-> 状态：v2.4 契约 + 生命周期 + 第一个真实插件（isotropic）+ runtime/storage/conformance
+> 状态：v2.5 契约 + 生命周期 + isotropic/sf6o2 + runtime/storage/conformance
 > 基础已落地。本文描述**插件应该如何组织、数据如何流动**；这一片是运行时基础，
-> 不是生产 backend 接入，也没有 API/UI，文中明确标出。v2.4 在 v2.2 结构化输出之上
-> 完成了 3C 清理：单步 dispatch 走 `ProcessSpec.parse_step`、插件包拆出 `step.py`、
+> 不是生产 backend 接入，也没有 API/UI，文中明确标出。v2.5 在 v2.4 之上增加了
+> 执行 profile（CPU/GPU backend + kernel）和引擎中立的状态 backend；v2.4 完成了
+> 3C 清理：单步 dispatch 走 `ProcessSpec.parse_step`、插件包拆出 `step.py`、
 > 引擎 helper 移到 `process_models/v2/engines/`。
 
 ## 1. 分层
@@ -234,6 +235,47 @@ class FlowRun:
 `output_contract_schema()` 给出同一组类型的 `schemaVersion: 1` 描述，供未来 API/UI
 复用；当前没有 HTTP API 或前端字段消费它。
 
+### 3.6 执行 profile 与状态 backend
+
+执行侧和状态侧是两个正交边界：
+
+| 概念 | 取值/接口 | 归属 |
+| --- | --- | --- |
+| engine | `viennaps` / 自创引擎 | `EngineRequirement.engine_id` |
+| backend | `cpu` / `gpu` | `ExecutionProfile.backend` |
+| kernel | ViennaPS: `CPU_DISK`/`GPU_DISK`/`CPU_TRIANGLE`/`GPU_TRIANGLE`；自创引擎自定义 | `ExecutionProfile.kernel` |
+| device | GPU UUID / CPU 线程池 | 平台解析，不由插件声明 |
+| strategy | multi-ion split/merge 等 | `ExecutionProfile.strategy` |
+
+插件只声明自己支持的 profile：
+
+```python
+engine = EngineRequirement(
+    kind="native", engine_id="viennaps", min_version="4.6.2",
+    profiles=(ExecutionProfile(backend="cpu", kernel="CPU_DISK"),),
+)
+```
+
+平台把 `solver.enginePreference` / `stepEngines` 解析成 `ComputePolicy`，再选出
+`ExecutionProfile`；插件在 `execute` 里调用 `apply_execution_profile(ps, process,
+engine.profile)`，不再写死 `CPU_DISK`。当前 worker bridge 只提供 `CPU_DISK`；
+GPU 步骤会记录 `v2-plugin-shadow-skipped`，不会静默降级到 CPU。
+
+状态侧：
+
+- `StateProfile` 是插件声明（允许的转换、必需材料、是否允许新材料、persistence）；
+- `StateContract` 是平台解析出的具体契约（grid、材料、转换策略、backend id/version），
+  进入 `ExecutionPlan.identity()`；
+- `StateBackend` 是引擎实现（`checkpoint` / `write` / `load` / `validate` / 材料 registry）。
+  `FlowExecutor` 不再直接调用 `Domain`/`Writer`，而是调用 `plan.engine.state_backend`。
+- 内置 `HandleStateBackend` 兼容暴露 `Domain`/`Writer`/`Reader` 的引擎；自创引擎实现
+  自己的 `StateBackend`，executor 和插件协议都不需要改。
+- `MaterialRegistry` 统一 name ↔ native id；worker bridge 使用
+  `ViennaPSMaterialRegistry`，`StateProfile.required_materials` 在 resolve 阶段校验。
+
+当前状态 backend 只覆盖 level set + materials 的 copy/write/load/validate；voxel
+转换仍在 adapter，cell-set / surface field / layer / GDS 按后续批次增加。
+
 ## 4. 三类插件的数据流
 
 ### 4.1 native
@@ -245,7 +287,7 @@ ProcessState.geometry.handle + EngineLease.handle (ps)
 ```
 
 - 当前：`isotropic`（2D/3D，uniform/material level-set，mask，StepResult）。
-- 引擎：ViennaPS；CPU/GPU 由 engine requirement 选择。
+- 引擎：ViennaPS；CPU/GPU/kernel 由 `EngineRequirement.profiles` + 平台 `ComputePolicy` 解析。
 
 ### 4.2 surrogate
 

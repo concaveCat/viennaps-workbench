@@ -23,11 +23,17 @@ from process_models.v2.contract import (
     EngineVariant,
     Issue,
     ProcessContext,
+    StateProfile,
     VariantCapabilities,
 )
-from process_models.v2.engine import EngineLease, EngineRequirement
+from process_models.v2.engine import EngineLease, EngineRequirement, ExecutionProfile
 from process_models.v2.engines import viennaps as _engine_helpers
-from process_models.v2.engines.viennaps import configure_advection, configure_rays, material_map
+from process_models.v2.engines.viennaps import (
+    apply_execution_profile,
+    configure_advection,
+    configure_rays,
+    material_map,
+)
 from process_models.v2.state import (
     LevelSetState,
     MaterialState,
@@ -60,8 +66,14 @@ class SF6O2NativeVariant(EngineVariant):
         supports_masks=True,
         mutates_input=True,
         determinism="strict",
+        state_profile=StateProfile(allow_new_materials=False),
     )
-    engine = EngineRequirement(kind="native", engine_id="viennaps", min_version="4.6.2")
+    engine = EngineRequirement(
+        kind="native",
+        engine_id="viennaps",
+        min_version="4.6.2",
+        profiles=(ExecutionProfile(backend="cpu", kernel="CPU_DISK"),),
+    )
     implementation_hash: str | None = None
     implementation_files = (("process_models/v2/engines/viennaps.py", getattr(_engine_helpers, "__file__", "")),)
 
@@ -97,7 +109,7 @@ class SF6O2NativeVariant(EngineVariant):
         flat_values = params.flat_values()
         model = ps.SF6O2Etching(*(flat_values[name] for name in FLAT_FIELDS))
         process = ps.Process(domain, model, float(params.duration))
-        process.setFluxEngineType(ps.FluxEngineType.CPU_DISK)
+        execution = apply_execution_profile(ps, process, engine.profile)
 
         advection, advection_actual = configure_advection(ps, project)
         process.setParameters(advection)
@@ -152,7 +164,8 @@ class SF6O2NativeVariant(EngineVariant):
             "coverageToleranceSource": ("workbench-default" if requested_tolerance is None else "param"),
             "timeStepRatio": float(advection.timeStepRatio),
             "timeStepRatioSource": advection_actual.get("timeStepRatioSource", "solver.timeStepRatio"),
-            "fluxEngine": "CPU_DISK",
+            "fluxEngine": execution["kernel"],
+            "executionProfile": execution,
             "rayTracing": ray_actual,
             "dimension": geometry.dimension,
             "gridDelta": geometry.grid_delta,

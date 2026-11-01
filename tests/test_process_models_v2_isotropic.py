@@ -690,6 +690,13 @@ class IsotropicNativePluginTest(unittest.TestCase):
                 "engine_version",
                 "engine_fingerprint",
                 "adapter",
+                "engine_backend",
+                "engine_kernel",
+                "engine_device",
+                "engine_strategy",
+                "state_backend_id",
+                "state_backend_version",
+                "state_contract",
             },
         )
         self.assertEqual(identity["process_id"], "isotropic")

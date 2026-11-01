@@ -343,6 +343,25 @@ class V2PluginShadowTests(_V2WorkerStepTestBase):
         self.assertEqual(len(calls), 1, calls)
         self.assertEqual(_events_of(ctx.run_dir, "v2-plugin-shadow-skipped"), [])
 
+    def test_gpu_profile_is_skipped_not_downgraded(self) -> None:
+        step = isotropic_step("etch", rate=0.3, duration=1.0)
+        ctx = self._context("flag-on-gpu", step)
+        ctx.step_engines[step["id"]] = "GPU_DISK"
+        before = _top(ctx.domain)
+
+        with _shadow_flag(True):
+            run_process_step(ctx, 1, step)
+
+        # The worker path still runs; v2 must not silently run the same step on
+        # CPU and call it a match.
+        self.assertAlmostEqual(_top(ctx.domain) - before, -0.3, delta=1e-6)
+        skipped = _events_of(ctx.run_dir, "v2-plugin-shadow-skipped")
+        self.assertEqual(len(skipped), 1, skipped)
+        self.assertEqual(skipped[0]["stepId"], step["id"])
+        self.assertIn("GPU_DISK", skipped[0]["reason"])
+        self.assertEqual(_events_of(ctx.run_dir, "v2-plugin-shadow"), [])
+        self.assertFalse((ctx.run_dir / "v2").exists())
+
     def test_material_rate_mode_is_skipped_without_a_bridge_call(self) -> None:
         step = isotropic_step("etch", rate=0.0, duration=1.0)
         step["rateMode"] = "material"

@@ -28,11 +28,13 @@ from process_models.v2.contract import (
     EngineVariant,
     Issue,
     ProcessContext,
+    StateProfile,
     VariantCapabilities,
 )
-from process_models.v2.engine import EngineLease, EngineRequirement
+from process_models.v2.engine import EngineLease, EngineRequirement, ExecutionProfile
 from process_models.v2.engines import viennaps as _engine_helpers
 from process_models.v2.engines.viennaps import (
+    apply_execution_profile,
     configure_advection,
     material_handle,
     material_map,
@@ -69,8 +71,14 @@ class IsotropicNativeVariant(EngineVariant):
         supports_masks=True,
         mutates_input=True,
         determinism="strict",
+        state_profile=StateProfile(allow_new_materials=True),
     )
-    engine = EngineRequirement(kind="native", engine_id="viennaps", min_version="4.6.2")
+    engine = EngineRequirement(
+        kind="native",
+        engine_id="viennaps",
+        min_version="4.6.2",
+        profiles=(ExecutionProfile(backend="cpu", kernel="CPU_DISK"),),
+    )
     implementation_hash: str | None = None
     implementation_files = (("process_models/v2/engines/viennaps.py", getattr(_engine_helpers, "__file__", "")),)
 
@@ -196,7 +204,7 @@ class IsotropicNativeVariant(EngineVariant):
             )
 
         process = ps.Process(domain, model, duration)
-        process.setFluxEngineType(ps.FluxEngineType.CPU_DISK)
+        execution = apply_execution_profile(ps, process, engine.profile)
         advection, advection_actual = configure_advection(
             ps,
             project,
@@ -238,7 +246,8 @@ class IsotropicNativeVariant(EngineVariant):
                 "solver.timeStepRatio",
             ),
             "nativeClass": "ps.IsotropicProcess",
-            "fluxEngineType": "CPU_DISK",
+            "fluxEngineType": execution["kernel"],
+            "executionProfile": execution,
             "dimension": geometry.dimension,
             "gridDelta": geometry.grid_delta,
             "levelSetCount": int(domain.getNumberOfLevelSets()),

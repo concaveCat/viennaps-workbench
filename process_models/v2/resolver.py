@@ -15,16 +15,20 @@ another version, backend, or implementation.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
 
 from .adapters import DefaultStateAdapter
-from .contract import Issue, ProcessContext, ProcessSpec, VariantRegistration
-from .engine import EngineLease, EngineProvider, EngineUnavailableError
+from .contract import Issue, ProcessContext, ProcessSpec, StateProfile, VariantRegistration
+from .engine import ComputePolicy, EngineLease, EngineProvider, EngineUnavailableError
+from .materials import MaterialRegistryError
 from .registry import ProcessRegistry
 from .state import Artifact, OutputSet, ProcessState, StateDelta, StateKind, StepResult
+from .state_backend import StateBackendError
 
 if TYPE_CHECKING:
     from .adapters import StateAdapter
@@ -34,8 +38,10 @@ __all__ = [
     "ExecutionPlan",
     "ExecutionRequest",
     "ExecutionResolutionError",
+    "StateContract",
     "execute_plan",
     "resolve_execution",
+    "resolve_state_contract",
     "run_step",
 ]
 
@@ -59,6 +65,41 @@ class ExecutionRequest:
     state: ProcessState
     expected_process_version: str | None = None
     expected_variant_version: str | None = None
+    compute: ComputePolicy | None = None
+
+
+@dataclass(frozen=True)
+class StateContract:
+    """The resolved state agreement for one execution.
+
+    ``identity()`` is deliberately primitive and JSON-safe so it can be hashed
+    into the plan identity. The contract records the *selected* backend and the
+    resolved conversion/material/persistence policy, not the plugin's raw
+    declaration.
+    """
+
+    backend_id: str
+    backend_version: str
+    dimension: int
+    grid_delta: float
+    conversions: tuple[str, ...] = ()
+    required_materials: tuple[str, ...] = ()
+    persistence: frozenset[StateKind] = frozenset()
+
+    def identity(self) -> dict[str, object]:
+        return {
+            "backend_id": self.backend_id,
+            "backend_version": self.backend_version,
+            "dimension": int(self.dimension),
+            "grid_delta": float(self.grid_delta),
+            "conversions": list(self.conversions),
+            "required_materials": list(self.required_materials),
+            "persistence": sorted(self.persistence),
+        }
+
+    def digest(self) -> str:
+        payload = json.dumps(self.identity(), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -108,6 +149,7 @@ class ExecutionPlan:
     variant: VariantRegistration
     engine: EngineLease
     state_adapter: StateAdapter
+    state_contract: StateContract
     process_version: str
     variant_version: str
     implementation_hash: str
@@ -119,7 +161,8 @@ class ExecutionPlan:
 
         These keys are the replay/caching contract: two plans with the same
         identity ran the same process version through the same implementation
-        on the same engine build, with the same adapter.
+        on the same engine build, with the same execution profile, state
+        backend, state contract, and representation adapter.
         """
         return {
             "process_id": self.process.id,
@@ -131,6 +174,13 @@ class ExecutionPlan:
             "engine_version": self.engine_version,
             "engine_fingerprint": self.engine_fingerprint,
             "adapter": self.state_adapter.id,
+            "engine_backend": self.engine.profile.backend,
+            "engine_kernel": self.engine.profile.kernel or "",
+            "engine_device": self.engine.profile.device or "",
+            "engine_strategy": self.engine.profile.strategy or "",
+            "state_backend_id": self.state_contract.backend_id,
+            "state_backend_version": self.state_contract.backend_version,
+            "state_contract": self.state_contract.digest(),
         }
 
     def identity_json(self) -> dict[str, str]:
@@ -150,6 +200,13 @@ class ExecutionPlan:
             "engineVersion": identity["engine_version"],
             "engineFingerprint": identity["engine_fingerprint"],
             "adapter": identity["adapter"],
+            "engineBackend": identity["engine_backend"],
+            "engineKernel": identity["engine_kernel"],
+            "engineDevice": identity["engine_device"],
+            "engineStrategy": identity["engine_strategy"],
+            "stateBackendId": identity["state_backend_id"],
+            "stateBackendVersion": identity["state_backend_version"],
+            "stateContract": identity["state_contract"],
         }
 
     def run(self) -> ExecutionOutcome:
@@ -208,7 +265,7 @@ def resolve_execution(
         raise ExecutionResolutionError(_format_issues(process.id, variant.variant_id, errors))
 
     try:
-        lease = provider.acquire(variant.engine)
+        lease = provider.acquire(variant.engine, request.compute)
     except EngineUnavailableError as error:
         raise ExecutionResolutionError(
             f"variant {process.id!r}/{variant.variant_id!r} requires engine "
@@ -216,17 +273,92 @@ def resolve_execution(
             f"[{variant.engine.min_version!r}, {variant.engine.max_version!r}]: {error}"
         ) from error
 
+    try:
+        lease.state_backend.validate(request.state)
+    except StateBackendError as error:
+        lease.release()
+        raise ExecutionResolutionError(
+            f"variant {process.id!r}/{variant.variant_id!r} cannot use state backend "
+            f"{lease.state_backend.id!r}: {error}"
+        ) from error
+
+    try:
+        contract = resolve_state_contract(capabilities.state_profile, request.context, request.state, lease)
+    except ExecutionResolutionError:
+        lease.release()
+        raise
+
     return ExecutionPlan(
         request=request,
         process=process,
         variant=variant,
         engine=lease,
         state_adapter=selected_adapter,
+        state_contract=contract,
         process_version=resolved.process_version,
         variant_version=resolved.variant_version,
         implementation_hash=resolved.implementation_hash,
         engine_version=lease.engine_version,
         engine_fingerprint=lease.fingerprint,
+    )
+
+
+def resolve_state_contract(
+    profile: StateProfile | None,
+    context: ProcessContext,
+    state: ProcessState,
+    lease: EngineLease,
+) -> StateContract:
+    """Resolve and validate the variant's state profile against the backend.
+
+    No conversion is executed here. The contract only records which conversion
+    policy the platform may use and rejects a request the backend cannot serve.
+    """
+    backend = lease.state_backend
+    capabilities = backend.capabilities
+    declared = profile or StateProfile()
+    conversions = tuple(declared.conversions)
+    missing_conversions = sorted(set(conversions) - set(capabilities.conversions))
+    if missing_conversions:
+        raise ExecutionResolutionError(
+            f"state backend {backend.id!r} does not provide conversions {missing_conversions!r}; "
+            f"advertised conversions are {sorted(capabilities.conversions)!r}"
+        )
+
+    if declared.required_materials:
+        registry = backend.material_registry
+        if registry is not None:
+            try:
+                registry.require(declared.required_materials)
+            except MaterialRegistryError as error:
+                raise ExecutionResolutionError(
+                    f"state backend {backend.id!r} does not know required materials "
+                    f"{list(declared.required_materials)!r}: {error}"
+                ) from error
+        else:
+            available_materials = set(state.materials.names.values())
+            missing_materials = sorted(set(declared.required_materials) - available_materials)
+            if missing_materials:
+                raise ExecutionResolutionError(
+                    f"process state is missing required materials {missing_materials!r}; "
+                    f"available material names are {sorted(available_materials)!r}"
+                )
+
+    missing_persistence = sorted(set(declared.persistence) - set(capabilities.persistence))
+    if missing_persistence:
+        raise ExecutionResolutionError(
+            f"state backend {backend.id!r} cannot persist {missing_persistence!r}; "
+            f"advertised persistence is {sorted(capabilities.persistence)!r}"
+        )
+
+    return StateContract(
+        backend_id=backend.id,
+        backend_version=backend.version,
+        dimension=context.dimension,
+        grid_delta=context.grid_delta,
+        conversions=conversions,
+        required_materials=declared.required_materials,
+        persistence=declared.persistence,
     )
 
 
@@ -270,6 +402,7 @@ def run_step(
     expected_process_version: str | None = None,
     expected_variant_version: str | None = None,
     adapter: StateAdapter | None = None,
+    compute: ComputePolicy | None = None,
 ) -> ExecutionOutcome:
     """Resolve and execute one step in a single call.
 
@@ -285,6 +418,7 @@ def run_step(
         state=state,
         expected_process_version=expected_process_version,
         expected_variant_version=expected_variant_version,
+        compute=compute,
     )
     return execute_plan(resolve_execution(request, registry, provider, adapter=adapter))
 

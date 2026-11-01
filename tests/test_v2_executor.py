@@ -30,6 +30,7 @@ from process_models.v2.contract import (
 from process_models.v2.engine import (
     EngineCapabilities,
     EngineRequirement,
+    ExecutionProfile,
     StaticEngine,
     StaticEngineProvider,
 )
@@ -49,6 +50,7 @@ from process_models.v2.state import (
     StateDelta,
     StepResult,
 )
+from process_models.v2.state_backend import HandleStateBackend
 from process_models.v2.storage import StateStore
 
 GRID_DELTA = 0.2
@@ -233,7 +235,9 @@ class _FakeLease:
         self.engine_id = "fake"
         self.engine_version = "1.0.0"
         self.kind = "native"
-        self.backend = "cpu"
+        self.profile = ExecutionProfile(backend="cpu", kernel="CPU_DISK")
+        self.backend = self.profile.backend
+        self.state_backend = HandleStateBackend(handle)
         self.fingerprint = name
         self.handle = handle
         self.released = 0
@@ -263,7 +267,8 @@ class _FakeProvider:
             EngineCapabilities(engine_id="fake", version="1.0.0", kind="native", backends=("cpu",)),
         ]
 
-    def acquire(self, requirement: EngineRequirement) -> _FakeLease:
+    def acquire(self, requirement: EngineRequirement, policy: Any = None) -> _FakeLease:
+        del requirement, policy
         name = f"lease{len(self.leases)}"
         lease = _FakeLease(self._handle, self.events, name)
         self.leases.append(lease)

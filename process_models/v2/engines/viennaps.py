@@ -12,10 +12,15 @@ re-export them for existing API/worker callers.
 
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Iterable
+
+from ..materials import MaterialRegistryError
 
 __all__ = [
     "GEO_MASK_MATERIAL_DEFAULT",
+    "ViennaPSMaterialRegistry",
+    "apply_execution_profile",
     "configure_advection",
     "geometry_mask_material_names",
     "material_handle",
@@ -108,6 +113,62 @@ def configure_rays(ps: Any, project: dict[str, Any], seed: int) -> tuple[Any, di
         actual["normalizationTypeValue"] = int(params.normalizationType)
         actual["nativeRayTracingMetadata"] = params.toMetaData()
     return params, actual
+
+
+def apply_execution_profile(ps: Any, process: Any, profile: Any) -> dict[str, Any]:
+    """Apply a resolved execution profile to a native ``ps.Process``.
+
+    The plugin passes the profile it received from the engine lease; it never
+    inspects ``solver.enginePreference`` and never writes a literal kernel. A
+    profile without a kernel leaves the native default untouched (useful for
+    non-flux models and custom engines). An unknown kernel is a hard error.
+    """
+    kernel = getattr(profile, "kernel", None)
+    if kernel is not None:
+        engine_type = getattr(ps.FluxEngineType, str(kernel), None)
+        if engine_type is None:
+            raise RuntimeError(f"installed engine has no FluxEngineType {kernel!r}")
+        process.setFluxEngineType(engine_type)
+    return {
+        "backend": getattr(profile, "backend", None),
+        "kernel": kernel,
+        "device": getattr(profile, "device", None),
+        "strategy": getattr(profile, "strategy", None),
+    }
+
+
+@dataclass(frozen=True)
+class ViennaPSMaterialRegistry:
+    """Material registry backed by the installed ViennaPS module."""
+
+    ps: Any
+
+    def id_for(self, name: str) -> int:
+        material = getattr(self.ps.Material, str(name), None)
+        if material is None:
+            native = self.ps.MaterialRegistry.instance().findMaterial(str(name))
+            material = native
+        if material is None:
+            raise MaterialRegistryError(f"material {name!r} is absent from the installed ViennaPS MaterialRegistry")
+        try:
+            return int(material)
+        except (TypeError, ValueError) as error:
+            raise MaterialRegistryError(f"material {name!r} has no integer native id") from error
+
+    def name_for(self, material_id: int) -> str | None:
+        target = int(material_id)
+        for name in dir(self.ps.Material):
+            if name.startswith("_"):
+                continue
+            try:
+                if int(getattr(self.ps.Material, name)) == target:
+                    return name
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def require(self, names: Iterable[str]) -> tuple[int, ...]:
+        return tuple(self.id_for(name) for name in names)
 
 
 def material_handle(ps: Any, name: str) -> Any:

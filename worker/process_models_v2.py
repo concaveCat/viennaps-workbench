@@ -39,25 +39,58 @@ from typing import Any, Mapping
 from process_models.plugins import load_registry
 from process_models.v2.contract import ProcessContext, ProcessSpec
 from process_models.v2.engine import (
+    ComputePolicy,
     EngineCapabilities,
     StaticEngine,
     StaticEngineProvider,
 )
-from process_models.v2.engines.viennaps import material_map
+from process_models.v2.engines.viennaps import ViennaPSMaterialRegistry, material_map
 from process_models.v2.executor import FlowExecutor, FlowStep
 from process_models.v2.registry import ProcessRegistry
 from process_models.v2.resolver import ExecutionOutcome
 from process_models.v2.state import LevelSetState, MaterialState, ProcessState
+from process_models.v2.state_backend import HandleStateBackend
 from process_models.v2.storage import StateStore
 
 __all__ = [
+    "V2ProfileUnavailable",
     "compare_domains",
+    "compute_policy_for_step",
     "find_v2_process",
     "material_order",
     "run_v2_step",
 ]
 
 DEFAULT_ENGINE_FINGERPRINT = "worker-v2-plugin"
+_CPU_KERNELS = frozenset({"CPU_DISK"})
+
+
+class V2ProfileUnavailable(RuntimeError):
+    """The v2 bridge cannot honour the engine profile resolved for a step.
+
+    The shadow hook catches this and records an auditable skip. It must never
+    silently run the step on a different backend/kernel.
+    """
+
+
+def compute_policy_for_step(ctx: Any, step: Mapping[str, Any]) -> ComputePolicy:
+    """Return the concrete v2 compute policy for one worker step.
+
+    ``ctx.step_engines`` is populated by the worker before steps run. A step
+    without an entry (for example a non-flux model) uses the CPU_DISK pin the
+    current plugins declare. GPU/CPU_TRIANGLE values are returned unchanged so
+    the bridge can reject them explicitly instead of downgrading.
+    """
+    engine = getattr(ctx, "step_engines", {}).get(step["id"])
+    if engine in (None, "not-applicable"):
+        return ComputePolicy(backend="cpu", kernel="CPU_DISK")
+    if engine in {"CPU_DISK", "CPU_TRIANGLE"}:
+        return ComputePolicy(backend="cpu", kernel=str(engine))
+    if engine in {"GPU_DISK", "GPU_TRIANGLE"}:
+        return ComputePolicy(backend="gpu", kernel=str(engine))
+    raise V2ProfileUnavailable(
+        f"step {step['id']!r} resolved to unknown engine {engine!r}; the v2 bridge does not guess"
+    )
 
 
 def material_order(domain: Any) -> tuple[int, ...]:
@@ -98,8 +131,10 @@ def run_v2_step(
     returned.
 
     The native variant mutates its input handle, so the executor checkpoints a
-    copy through ``ps.Domain`` first: ``domain`` is never modified and
-    ``outcome.state.geometry.handle`` is the processed copy.
+    copy through the ViennaPS state backend first: ``domain`` is never modified
+    and ``outcome.state.geometry.handle`` is the processed copy. The bridge
+    advertises only ``CPU_DISK``; a step resolved to a GPU or triangle kernel
+    raises :class:`V2ProfileUnavailable` instead of silently running on CPU.
     """
     if registry is None:
         registry = load_registry()
@@ -109,6 +144,12 @@ def run_v2_step(
     spec, params = resolved
 
     variant_id = registry.default_variant_id(spec.id)
+    policy = compute_policy_for_step(ctx, step)
+    if policy.backend != "cpu" or policy.kernel not in _CPU_KERNELS:
+        raise V2ProfileUnavailable(
+            f"step {step['id']!r} resolved to {policy.backend}/{policy.kernel!r}; "
+            f"the v2 worker bridge only provides {sorted(_CPU_KERNELS)!r}"
+        )
 
     context = ProcessContext(
         dimension=int(ctx.project["dimension"]),
@@ -134,9 +175,16 @@ def run_v2_step(
                     version=ctx.ps_version,
                     kind="native",
                     backends=("cpu",),
+                    kernels=tuple(sorted(_CPU_KERNELS)),
                 ),
                 handle=ctx.ps,
                 fingerprint=ctx.native_engine_fingerprint or DEFAULT_ENGINE_FINGERPRINT,
+                state_backend=HandleStateBackend(
+                    ctx.ps,
+                    id="viennaps",
+                    version=str(ctx.ps_version),
+                    material_registry=ViennaPSMaterialRegistry(ctx.ps),
+                ),
             )
         ]
     )
@@ -150,6 +198,7 @@ def run_v2_step(
                 variant_id=variant_id,
                 params=params,
                 context=context,
+                compute=policy,
             )
         ],
     )

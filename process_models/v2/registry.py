@@ -253,9 +253,36 @@ class ProcessRegistry:
                         implementation_hash=registration.declared_hash
                         or compute_implementation_hash(registration.variant),
                         output_kinds=capabilities.output_kinds,
+                        execution_profiles=tuple(
+                            _execution_profile_label(profile) for profile in registration.engine.profiles
+                        ),
+                        state_profile=_state_profile_descriptor(capabilities.state_profile),
                     )
                 )
         return descriptors
+
+
+def _state_profile_descriptor(profile: object | None) -> dict[str, object] | None:
+    """Return a JSON-safe summary of a variant's declared state profile."""
+    if profile is None:
+        return None
+    return {
+        "conversions": list(getattr(profile, "conversions", ())),
+        "requiredMaterials": list(getattr(profile, "required_materials", ())),
+        "allowNewMaterials": bool(getattr(profile, "allow_new_materials", False)),
+        "persistence": sorted(getattr(profile, "persistence", ())),
+    }
+
+
+def _execution_profile_label(profile: object) -> str:
+    """Return a stable human/API label for one declared execution profile."""
+    backend = str(getattr(profile, "backend"))
+    kernel = getattr(profile, "kernel", None)
+    strategy = getattr(profile, "strategy", None)
+    label = f"{backend}:{kernel}" if kernel else backend
+    if strategy:
+        label = f"{label}:{strategy}"
+    return label
 
 
 def _semver_key(version: str) -> tuple[int, int, int] | None:

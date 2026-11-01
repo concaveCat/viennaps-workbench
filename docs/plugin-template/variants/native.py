@@ -10,7 +10,7 @@ from process_models.v2.contract import (
     ProcessContext,
     VariantCapabilities,
 )
-from process_models.v2.engine import EngineLease, EngineRequirement
+from process_models.v2.engine import EngineLease, EngineRequirement, ExecutionProfile
 from process_models.v2.state import ProcessState, StateDelta, StepResult
 
 __all__ = ["ExampleNativeVariant"]
@@ -33,7 +33,12 @@ class ExampleNativeVariant(EngineVariant):
         mutates_input=False,
         determinism="strict",
     )
-    engine = EngineRequirement(kind="native", engine_id="viennaps", min_version="4.6.2")
+    engine = EngineRequirement(
+        kind="native",
+        engine_id="viennaps",
+        min_version="4.6.2",
+        profiles=(ExecutionProfile(backend="cpu", kernel="CPU_DISK"),),
+    )
     implementation_hash = None  # None: the registry hashes this package's files.
 
     def validate(self, ctx: ProcessContext, params: BaseModel) -> list[Issue]:

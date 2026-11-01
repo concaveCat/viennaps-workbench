@@ -63,9 +63,19 @@ def _run_v2_plugin_shadow(
     caller passes the registry it already loaded for dispatch, so the bridge
     resolves the step without loading and verifying the lock a second time.
     """
-    from worker.process_models_v2 import compare_domains, run_v2_step
+    from worker.process_models_v2 import V2ProfileUnavailable, compare_domains, run_v2_step
 
-    outcome = run_v2_step(ctx, step, shadow_domain, registry=registry)
+    try:
+        outcome = run_v2_step(ctx, step, shadow_domain, registry=registry)
+    except V2ProfileUnavailable as error:
+        ctx.event(
+            {
+                "type": "v2-plugin-shadow-skipped",
+                "stepId": step["id"],
+                "reason": str(error),
+            }
+        )
+        return
     shadow_geometry = getattr(outcome.state, "geometry", None)
     shadow_handle = getattr(shadow_geometry, "handle", None)
     if shadow_handle is None:

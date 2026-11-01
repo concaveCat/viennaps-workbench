@@ -28,8 +28,13 @@ imports and registers but does not run a physics model.
 | `plugin.toml` | Strict manifest: `api = 1`, `id`, `version`, one `module:attr` entrypoint. |
 | `spec.py` | `ProcessSpec(default_variant="native", parse_step=parse_step)`. |
 | `step.py` | Maps a raw worker step to params, `None` for another process, `ValueError` when malformed. |
-| `variants/native.py` | `EngineVariant.execute(state, params, ctx, engine) -> StepResult(delta=StateDelta(...))`. The delta is flow state only; `outputs`, `metadata`, and `warnings` are report data. |
+| `variants/native.py` | `EngineVariant.execute(state, params, ctx, engine) -> StepResult(delta=StateDelta(...))`. Declare supported `EngineRequirement.profiles` (for example CPU_DISK) and use `apply_execution_profile`; do not hard-code a kernel. The delta is flow state only; `outputs`, `metadata`, and `warnings` are report data. |
 | `register.py` | Manifest entrypoint; registers exactly `(process_id, variant)`, and the registry derives ids, capabilities, engine requirement, and implementation hash. |
+
+`VariantCapabilities.state_profile` is optional. Add it only when the variant
+needs conversions, required materials, or replayable state; the resolver turns
+it into a `StateContract` and fails closed if the engine's `StateBackend`
+cannot provide the declared capability.
 
 The implementation hash covers every `.py` file in the installed plugin
 package, so editing any module requires a version bump and a regenerated lock.
