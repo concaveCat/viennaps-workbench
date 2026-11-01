@@ -130,6 +130,8 @@ def _steps() -> list[dict[str, Any]]:
             "lateralMu": 0.0,
             "lateralSigma": 0.005,
         },
+        "maskMaterials": [],
+        "screenMaterials": ["SiO2"],
         "damage": {
             "kind": "hobler",
             "projectedRange": 0.027,
