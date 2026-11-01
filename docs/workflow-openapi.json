@@ -2441,6 +2441,28 @@
         "title": "CsvProcessStepV7",
         "type": "object"
       },
+      "DirectionalMaterialRate": {
+        "additionalProperties": false,
+        "description": "One native ``RateMap`` entry: non-negative directional/isotropic rates.\n\nThe step ``operation`` supplies the native sign (etch negative, deposit\npositive), exactly like the scalar fields. A material that is absent from\nthe table falls back to ``DirectionalStepV5.defaultMaterialRate``.",
+        "properties": {
+          "directional": {
+            "default": 0.0,
+            "ge": 0,
+            "le": 2,
+            "title": "Directional",
+            "type": "number"
+          },
+          "isotropic": {
+            "default": 0.0,
+            "ge": 0,
+            "le": 2,
+            "title": "Isotropic",
+            "type": "number"
+          }
+        },
+        "title": "DirectionalMaterialRate",
+        "type": "object"
+      },
       "DirectionalRateSetV5": {
         "additionalProperties": false,
         "description": "One real ``viennaps.RateSet`` of the native multi-set overload.\n\n``directionalVelocity`` and ``isotropicVelocity`` are non-negative rate\nmagnitudes in um/s, exactly like the step-level scalar fields: the step\n``operation`` selects the native sign (etch negative, deposit positive).\nThe name follows the native RateSet property and is not a signed raw value.",
@@ -2506,6 +2528,16 @@
             "default": true,
             "title": "Calculatevisibility",
             "type": "boolean"
+          },
+          "defaultMaterialRate": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DirectionalMaterialRate"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "depositMaterial": {
             "anyOf": [
@@ -2578,6 +2610,20 @@
               }
             ],
             "title": "Isotropicratemagnitude"
+          },
+          "materialRates": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/DirectionalMaterialRate"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Materialrates"
           },
           "model": {
             "const": "directional",
@@ -10334,6 +10380,35 @@
             "pattern": "^[A-Za-z0-9_-]+$",
             "title": "Id",
             "type": "string"
+          },
+          "isotropicMethod": {
+            "anyOf": [
+              {
+                "enum": [
+                  "auto",
+                  "levelSet",
+                  "geometric"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Isotropicmethod"
+          },
+          "isotropicTimeStepRatio": {
+            "anyOf": [
+              {
+                "ge": 0.05,
+                "le": 0.5,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Isotropictimestepratio"
           },
           "materialRates": {
             "anyOf": [
