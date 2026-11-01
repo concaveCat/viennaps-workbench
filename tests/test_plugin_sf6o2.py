@@ -53,6 +53,7 @@ from process_models.v2.resolver import (
 )
 from process_models.v2.state import LevelSetState, MaterialState, ProcessState, StepResult
 from worker.process_models_v2 import (
+    V2ProfileUnavailable,
     compare_domains,
     find_v2_process,
     material_order,
@@ -637,6 +638,23 @@ class SF6O2PluginTest(unittest.TestCase):
         with self.assertRaises(RuntimeError) as raised:
             run_v2_step(ctx, project["steps"][0], plane_domain(2))
         self.assertIn("solver", str(raised.exception))
+
+    def test_gpu_profile_requires_explicit_opt_in(self) -> None:
+        project = sf6o2_project(2)
+        step = project["steps"][0]
+        ctx = SimpleNamespace(
+            project=project,
+            ps=self.ps,
+            run_dir=self.work_dir / "gpu-opt-in",
+            ps_version=VIENNAPS_VERSION,
+            native_engine_fingerprint=None,
+            step_engines={step["id"]: "GPU_DISK"},
+            selected_gpu_device=None,
+            cuda_readback=None,
+        )
+        with self.assertRaises(V2ProfileUnavailable) as raised:
+            run_v2_step(ctx, step, plane_domain(2))
+        self.assertIn("VIENNAPS_WORKBENCH_V2_PLUGIN_GPU", str(raised.exception))
 
     def test_advanced_only_step_is_not_claimed(self) -> None:
         project = sf6o2_project(2, native_parameters={"advanced": {"ions": {"meanEnergy": 60.0}}})

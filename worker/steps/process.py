@@ -19,11 +19,17 @@ from worker.steps.context import RunContext, simulate_module
 
 V2_PLUGIN_SHADOW_ENV = "VIENNAPS_WORKBENCH_V2_PLUGIN_SHADOW"
 V2_PLUGIN_APPLY_ENV = "VIENNAPS_WORKBENCH_V2_PLUGIN_APPLY"
+V2_PLUGIN_GPU_ENV = "VIENNAPS_WORKBENCH_V2_PLUGIN_GPU"
 
 
 def _v2_plugin_shadow_enabled() -> bool:
     """The plugin shadow hook is strictly opt-in; the default run must not change."""
     return os.environ.get(V2_PLUGIN_SHADOW_ENV) == "1"
+
+
+def _v2_plugin_gpu_enabled() -> bool:
+    """GPU v2 execution is a separate opt-in even when shadow/apply is on."""
+    return os.environ.get(V2_PLUGIN_GPU_ENV) == "1"
 
 
 def _v2_plugin_apply_enabled() -> bool:
@@ -66,7 +72,13 @@ def _run_v2_plugin_shadow(
     from worker.process_models_v2 import V2ProfileUnavailable, compare_domains, run_v2_step
 
     try:
-        outcome = run_v2_step(ctx, step, shadow_domain, registry=registry)
+        outcome = run_v2_step(
+            ctx,
+            step,
+            shadow_domain,
+            registry=registry,
+            allow_gpu=_v2_plugin_gpu_enabled(),
+        )
     except V2ProfileUnavailable as error:
         ctx.event(
             {
@@ -101,8 +113,8 @@ def _run_v2_plugin_shadow(
         return
     # Validation-only apply: from here on the snapshots, native state and
     # replay records describe the v2 domain. The old process/model handles stay
-    # referenced by ProcessStepResult; plugin steps are CPU-only, so there is no
-    # GPU teardown to worry about.
+    # referenced by ProcessStepResult; the worker path still owns this step's
+    # GPU teardown, including when the v2 GPU path ran on the same device.
     ctx.domain = shadow_handle
     ctx.event(
         {

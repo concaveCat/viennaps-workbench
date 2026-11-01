@@ -279,9 +279,16 @@ class InstalledPluginProfileTest(unittest.TestCase):
         from plugins.isotropic import IsotropicNativeVariant
         from plugins.sf6o2 import SF6O2NativeVariant
 
-        expected = (ExecutionProfile(backend="cpu", kernel="CPU_DISK"),)
-        self.assertEqual(IsotropicNativeVariant.engine.profiles, expected)
-        self.assertEqual(SF6O2NativeVariant.engine.profiles, expected)
+        cpu = ExecutionProfile(backend="cpu", kernel="CPU_DISK")
+        self.assertEqual(IsotropicNativeVariant.engine.profiles, (cpu,))
+        self.assertEqual(
+            SF6O2NativeVariant.engine.profiles,
+            (
+                cpu,
+                ExecutionProfile(backend="gpu", kernel="GPU_DISK"),
+                ExecutionProfile(backend="gpu", kernel="GPU_TRIANGLE"),
+            ),
+        )
         self.assertTrue(IsotropicNativeVariant.capabilities.state_profile.allow_new_materials)
         self.assertFalse(SF6O2NativeVariant.capabilities.state_profile.allow_new_materials)
 

@@ -72,7 +72,11 @@ class SF6O2NativeVariant(EngineVariant):
         kind="native",
         engine_id="viennaps",
         min_version="4.6.2",
-        profiles=(ExecutionProfile(backend="cpu", kernel="CPU_DISK"),),
+        profiles=(
+            ExecutionProfile(backend="cpu", kernel="CPU_DISK"),
+            ExecutionProfile(backend="gpu", kernel="GPU_DISK"),
+            ExecutionProfile(backend="gpu", kernel="GPU_TRIANGLE"),
+        ),
     )
     implementation_hash: str | None = None
     implementation_files = (("process_models/v2/engines/viennaps.py", getattr(_engine_helpers, "__file__", "")),)

@@ -78,8 +78,8 @@ def compute_policy_for_step(ctx: Any, step: Mapping[str, Any]) -> ComputePolicy:
 
     ``ctx.step_engines`` is populated by the worker before steps run. A step
     without an entry (for example a non-flux model) uses the CPU_DISK pin the
-    current plugins declare. GPU/CPU_TRIANGLE values are returned unchanged so
-    the bridge can reject them explicitly instead of downgrading.
+    current plugins declare. GPU kernels carry the worker-selected device so
+    the provider can match the exact GPU lease.
     """
     engine = getattr(ctx, "step_engines", {}).get(step["id"])
     if engine in (None, "not-applicable"):
@@ -87,7 +87,9 @@ def compute_policy_for_step(ctx: Any, step: Mapping[str, Any]) -> ComputePolicy:
     if engine in {"CPU_DISK", "CPU_TRIANGLE"}:
         return ComputePolicy(backend="cpu", kernel=str(engine))
     if engine in {"GPU_DISK", "GPU_TRIANGLE"}:
-        return ComputePolicy(backend="gpu", kernel=str(engine))
+        selected = getattr(ctx, "selected_gpu_device", None)
+        device = selected.get("uuid") if isinstance(selected, Mapping) else None
+        return ComputePolicy(backend="gpu", kernel=str(engine), device=device)
     raise V2ProfileUnavailable(
         f"step {step['id']!r} resolved to unknown engine {engine!r}; the v2 bridge does not guess"
     )
@@ -117,7 +119,12 @@ def find_v2_process(
 
 
 def run_v2_step(
-    ctx: Any, step: dict[str, Any], domain: Any, *, registry: ProcessRegistry | None = None
+    ctx: Any,
+    step: dict[str, Any],
+    domain: Any,
+    *,
+    registry: ProcessRegistry | None = None,
+    allow_gpu: bool = False,
 ) -> ExecutionOutcome:
     """Run one worker step through the v2 registry and return its outcome.
 
@@ -132,9 +139,14 @@ def run_v2_step(
 
     The native variant mutates its input handle, so the executor checkpoints a
     copy through the ViennaPS state backend first: ``domain`` is never modified
-    and ``outcome.state.geometry.handle`` is the processed copy. The bridge
-    advertises only ``CPU_DISK``; a step resolved to a GPU or triangle kernel
-    raises :class:`V2ProfileUnavailable` instead of silently running on CPU.
+    and ``outcome.state.geometry.handle`` is the processed copy.
+
+    GPU execution is explicitly opt-in via ``allow_gpu`` (the worker hook sets
+    it from ``VIENNAPS_WORKBENCH_V2_PLUGIN_GPU``). A GPU step requires the
+    worker's selected device and CUDA readback, and ``GPU_TRIANGLE`` is gated by
+    the same capability evidence as the worker path. A step the bridge cannot
+    honour raises :class:`V2ProfileUnavailable` instead of silently running on
+    CPU.
     """
     if registry is None:
         registry = load_registry()
@@ -145,7 +157,30 @@ def run_v2_step(
 
     variant_id = registry.default_variant_id(spec.id)
     policy = compute_policy_for_step(ctx, step)
-    if policy.backend != "cpu" or policy.kernel not in _CPU_KERNELS:
+    if policy.backend == "gpu":
+        if not allow_gpu:
+            raise V2ProfileUnavailable(
+                f"step {step['id']!r} resolved to {policy.backend}/{policy.kernel!r}; "
+                "set VIENNAPS_WORKBENCH_V2_PLUGIN_GPU=1 to enable the v2 GPU execution path"
+            )
+        selected = getattr(ctx, "selected_gpu_device", None)
+        readback = getattr(ctx, "cuda_readback", None)
+        if not isinstance(selected, Mapping) or not isinstance(readback, Mapping):
+            raise V2ProfileUnavailable(
+                f"step {step['id']!r} requires a worker-selected CUDA device and readback for GPU execution"
+            )
+        if selected.get("uuid") != readback.get("uuid"):
+            raise V2ProfileUnavailable(
+                f"step {step['id']!r} CUDA readback UUID {readback.get('uuid')!r} "
+                f"does not match selected device {selected.get('uuid')!r}"
+            )
+        try:
+            from worker.engine_policy import verify_worker_engine_evidence
+
+            verify_worker_engine_evidence(ctx.project, step, str(policy.kernel))
+        except RuntimeError as error:
+            raise V2ProfileUnavailable(str(error)) from error
+    elif policy.kernel not in _CPU_KERNELS:
         raise V2ProfileUnavailable(
             f"step {step['id']!r} resolved to {policy.backend}/{policy.kernel!r}; "
             f"the v2 worker bridge only provides {sorted(_CPU_KERNELS)!r}"
@@ -167,27 +202,44 @@ def run_v2_step(
         ),
         materials=MaterialState(order=order),
     )
-    provider = StaticEngineProvider(
-        [
+    state_backend = HandleStateBackend(
+        ctx.ps,
+        id="viennaps",
+        version=str(ctx.ps_version),
+        material_registry=ViennaPSMaterialRegistry(ctx.ps),
+    )
+    engines = [
+        StaticEngine(
+            capabilities=EngineCapabilities(
+                engine_id="viennaps",
+                version=ctx.ps_version,
+                kind="native",
+                backends=("cpu",),
+                kernels=tuple(sorted(_CPU_KERNELS)),
+            ),
+            handle=ctx.ps,
+            fingerprint=ctx.native_engine_fingerprint or DEFAULT_ENGINE_FINGERPRINT,
+            state_backend=state_backend,
+        )
+    ]
+    selected_device = getattr(ctx, "selected_gpu_device", None)
+    if isinstance(selected_device, Mapping) and selected_device.get("uuid"):
+        engines.append(
             StaticEngine(
                 capabilities=EngineCapabilities(
                     engine_id="viennaps",
                     version=ctx.ps_version,
                     kind="native",
-                    backends=("cpu",),
-                    kernels=tuple(sorted(_CPU_KERNELS)),
+                    backends=("gpu",),
+                    kernels=("GPU_DISK", "GPU_TRIANGLE"),
+                    devices=(str(selected_device["uuid"]),),
                 ),
                 handle=ctx.ps,
                 fingerprint=ctx.native_engine_fingerprint or DEFAULT_ENGINE_FINGERPRINT,
-                state_backend=HandleStateBackend(
-                    ctx.ps,
-                    id="viennaps",
-                    version=str(ctx.ps_version),
-                    material_registry=ViennaPSMaterialRegistry(ctx.ps),
-                ),
+                state_backend=state_backend,
             )
-        ]
-    )
+        )
+    provider = StaticEngineProvider(engines)
     store = StateStore(Path(ctx.run_dir) / "v2" / step["id"])
     flow = FlowExecutor(registry, provider, store).run(
         state,
