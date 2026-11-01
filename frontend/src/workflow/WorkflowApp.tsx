@@ -65,11 +65,19 @@ const EMPTY_SETTINGS_DRAFT: SettingsDraft = {
   solverTimeoutSeconds: '',
 };
 type GdsAsset = { assetId: string; fileName: string };
+type IsotropicMethod = 'auto' | 'levelSet' | 'geometric';
+type DirectionalMaterialRate = { directional: number; isotropic: number };
+/** Isotropic steps use a scalar table; directional steps use the rate pair. */
+type StepMaterialRates = Record<string, number> | Record<string, DirectionalMaterialRate>;
 type ProjectStep = {
   id: string; name: string; model: string; operation?: string; enabled: boolean;
   duration?: number; thickness?: number; rateMagnitude?: number;
   depositMaterial?: string; stickingProbability?: number; sourceExponent?: number;
   rateMode?: string;
+  isotropicMethod?: IsotropicMethod;
+  isotropicTimeStepRatio?: number;
+  materialRates?: StepMaterialRates;
+  defaultMaterialRate?: DirectionalMaterialRate;
   [key: string]: unknown;
 };
 /** One `/api/specialized-models` field hint; the editor only renders label/kind. */
@@ -1009,6 +1017,23 @@ function sanitizeProjectStep(step: ProjectStep, materialNames: string[]): Projec
   // makes the strict DirectionalStepV5 reject an otherwise valid project.
   const hasRateSets = model === 'directional'
     && Array.isArray(next.rateSets) && next.rateSets.length > 0;
+  // The directional material table is the third mode. Like the backend, the
+  // presence of the table is the mode switch, so it wins over a stale array.
+  // `rateMode` is an isotropic/singleParticle field only, so its `material`
+  // value is the discriminator that keeps a scalar isotropic table from being
+  // read as a directional one on a model switch.
+  const hasDirectionalMaterialRates = model === 'directional'
+    && step.rateMode !== 'material'
+    && (step.materialRates != null || step.defaultMaterialRate != null);
+  // Isotropic dispatch fields exist only for isotropic steps. `geometric` has
+  // no level-set time step, and the schema rejects the pair with a material
+  // table, so clean both stale combinations here.
+  if (model !== 'isotropic') {
+    delete next.isotropicMethod;
+    delete next.isotropicTimeStepRatio;
+  } else if (next.isotropicMethod === 'geometric') {
+    delete next.isotropicTimeStepRatio;
+  }
   if (OPERATION_STEP_MODELS.has(model)) {
     if (operation !== 'deposit' && operation !== 'etch') next.operation = 'etch';
   } else if (model !== 'specialized') {
@@ -1025,6 +1050,7 @@ function sanitizeProjectStep(step: ProjectStep, materialNames: string[]): Projec
     delete next.isotropicRateMagnitude;
     delete next.rateMode;
     delete next.materialRates;
+    delete next.defaultMaterialRate;
     delete next.rateSets;
     delete next.depositMaterial;
     delete next.stickingProbability;
@@ -1048,14 +1074,19 @@ function sanitizeProjectStep(step: ProjectStep, materialNames: string[]): Projec
     if (typeof next.stickingProbability !== 'number') next.stickingProbability = 1;
     if (typeof next.sourceExponent !== 'number') next.sourceExponent = 1;
   }
+  // Isotropic now accepts a material table for deposit as well as etch (the
+  // native IsotropicProcess takes the operation sign itself). `geometric`
+  // offsets the whole surface by one radius, so it stays uniform.
+  const materialRateModeAllowed = model === 'isotropic'
+    ? next.isotropicMethod !== 'geometric'
+    : operation === 'etch';
   if (!RATE_MODE_STEP_MODELS.has(model)) {
     delete next.rateMode;
-    delete next.materialRates;
-  } else if (operation !== 'etch') {
-    next.rateMode = 'uniform';
-    delete next.materialRates;
-  } else if (next.rateMode === 'material') {
-    if (!next.materialRates || typeof next.materialRates !== 'object') next.materialRates = {};
+    if (model !== 'directional') delete next.materialRates;
+  } else if (next.rateMode === 'material' && materialRateModeAllowed) {
+    if (!next.materialRates || typeof next.materialRates !== 'object' || Array.isArray(next.materialRates)) {
+      next.materialRates = {};
+    }
   } else {
     next.rateMode = 'uniform';
     delete next.materialRates;
@@ -1064,6 +1095,23 @@ function sanitizeProjectStep(step: ProjectStep, materialNames: string[]): Projec
     delete next.rateMagnitude;
     delete next.directionalRateMagnitude;
     delete next.isotropicRateMagnitude;
+  } else if (model === 'directional' && hasDirectionalMaterialRates) {
+    // Native RateMap material mode: scalar rates are forbidden, but the
+    // direction vector is still required. The table falls back per material to
+    // `defaultMaterialRate` (0 = protected).
+    delete next.rateMagnitude;
+    delete next.directionalRateMagnitude;
+    delete next.isotropicRateMagnitude;
+    if (!isUsableDirection(next.direction)) next.direction = [0, 0, -1];
+    if (!next.materialRates || typeof next.materialRates !== 'object' || Array.isArray(next.materialRates)) {
+      next.materialRates = {};
+    }
+    if (!next.defaultMaterialRate || typeof next.defaultMaterialRate !== 'object' || Array.isArray(next.defaultMaterialRate)) {
+      next.defaultMaterialRate = { directional: 0, isotropic: 0 };
+    }
+    // The native RateMap overload has no visibility switch; the schema only
+    // accepts the default, so a stale `false` must not survive the switch.
+    if (next.calculateVisibility !== true) delete next.calculateVisibility;
   } else if (model === 'directional' && hasRateSets) {
     // Scalar-only fields must be absent, including `direction`.
     delete next.direction;
@@ -1077,14 +1125,23 @@ function sanitizeProjectStep(step: ProjectStep, materialNames: string[]): Projec
     delete next.directionalRateMagnitude;
     delete next.isotropicRateMagnitude;
   }
+  if (model !== 'directional') delete next.defaultMaterialRate;
+  if (model === 'directional' && !hasDirectionalMaterialRates) delete next.materialRates;
   // rateSets belongs to directional only; an empty array is not a mode, so it
   // falls back to the scalar path instead of sending `rateSets: []`.
-  if (model !== 'directional' || !hasRateSets) delete next.rateSets;
+  if (model !== 'directional' || !hasRateSets || hasDirectionalMaterialRates) delete next.rateSets;
   // Model-specific payloads (specialized.nativeParameters, gdsBoolean.gdsMask,
   // planarize.cutoffHeight/stopMaterial/overPolish, removeMaterial.material)
   // are intentionally left untouched: only the shared scalar fields above are
   // normalized.
   return next;
+}
+
+/** A direction is usable when it is three finite numbers and not the zero vector. */
+function isUsableDirection(value: unknown): value is [number, number, number] {
+  if (!Array.isArray(value) || value.length !== 3) return false;
+  if (!value.every(entry => typeof entry === 'number' && Number.isFinite(entry))) return false;
+  return Math.hypot(value[0], value[1], value[2]) > 1e-12;
 }
 
 /**
@@ -1163,6 +1220,30 @@ function parseRateSetsText(text: string): { value: Array<Record<string, unknown>
     }
   }
   return { value: parsed as Array<Record<string, unknown>>, error: '' };
+}
+
+/**
+ * Parse a `materialRates` / `defaultMaterialRate` draft as a plain JSON object.
+ * Only the outer shape is checked: material names and the 0–2 µm/s ranges stay
+ * with the backend schema, so a copy-pasted table is still rejected loudly.
+ */
+function parseMaterialRateJsonText(
+  text: string,
+  label: string,
+  example: string,
+): { value: Record<string, unknown> | null; error: string } {
+  if (!text.trim()) return { value: null, error: `${label} 不能为空，请填写 JSON 对象` };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : '无法解析';
+    return { value: null, error: `JSON 语法错误：${reason}` };
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { value: null, error: `必须是 JSON 对象，例如 ${example}` };
+  }
+  return { value: parsed as Record<string, unknown>, error: '' };
 }
 
 function stepFromLibrary(payload: Record<string, unknown>, name: string): ProjectStep {
@@ -2178,6 +2259,14 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [nativeParametersError, setNativeParametersError] = useState('');
   const [rateSetsText, setRateSetsText] = useState('');
   const [rateSetsError, setRateSetsError] = useState('');
+  // Isotropic material table and the directional material-rate pair are JSON
+  // drafts too: typing stays local until the matching 应用 button parses it.
+  const [isotropicMaterialRatesText, setIsotropicMaterialRatesText] = useState('');
+  const [isotropicMaterialRatesError, setIsotropicMaterialRatesError] = useState('');
+  const [directionalMaterialRatesText, setDirectionalMaterialRatesText] = useState('');
+  const [directionalMaterialRatesError, setDirectionalMaterialRatesError] = useState('');
+  const [defaultMaterialRateText, setDefaultMaterialRateText] = useState('');
+  const [defaultMaterialRateError, setDefaultMaterialRateError] = useState('');
   const [structurePick, setStructurePick] = useState('');
   const [runProgress, setRunProgress] = useState<Record<string, { currentStepId: string; completed: string[] }>>({});
   // Free-form workspace sizing, persisted per browser. The splitter columns are
@@ -3448,6 +3537,40 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const directionalUsesRateSets = selectedStepModel === 'directional'
     && Array.isArray(selectedFlowStep?.rateSets)
     && selectedFlowStep.rateSets.length > 0;
+  const selectedStepRateMode = String(selectedFlowStep?.rateMode ?? 'uniform');
+  // The material table is the third directional mode; it is mutually exclusive
+  // with scalar rates and rateSets (the backend treats its presence as the
+  // mode switch, so the UI reads it the same way).
+  const directionalUsesMaterialRates = selectedStepModel === 'directional'
+    && selectedStepRateMode !== 'material'
+    && (selectedFlowStep?.materialRates != null || selectedFlowStep?.defaultMaterialRate != null);
+  const selectedDirectionalMode = selectedStepModel !== 'directional'
+    ? 'scalar'
+    : directionalUsesMaterialRates ? 'materialRates'
+      : directionalUsesRateSets ? 'rateSets' : 'scalar';
+  const selectedIsotropicMethodValue = selectedFlowStep?.isotropicMethod;
+  const selectedIsotropicMethod: IsotropicMethod = selectedIsotropicMethodValue === 'levelSet'
+    || selectedIsotropicMethodValue === 'geometric'
+    ? selectedIsotropicMethodValue
+    : 'auto';
+  const selectedDefaultMaterialRate = (() => {
+    const row = selectedFlowStep?.defaultMaterialRate;
+    const value = row && typeof row === 'object' && !Array.isArray(row)
+      ? row as Record<string, unknown>
+      : {};
+    const numberOr = (entry: unknown, fallback: number) => (
+      typeof entry === 'number' && Number.isFinite(entry) ? entry : fallback
+    );
+    return {
+      directional: numberOr(value.directional, 0),
+      isotropic: numberOr(value.isotropic, 0),
+    };
+  })();
+  // The step override seeds from the project solver value, like the legacy UI.
+  const solverTimeStepRatio = (() => {
+    const value = project?.solver?.timeStepRatio;
+    return typeof value === 'number' && Number.isFinite(value) ? value : 0.25;
+  })();
   const selectedDirection = (() => {
     const value = selectedFlowStep?.direction;
     return Array.isArray(value) && value.length === 3
@@ -3479,17 +3602,49 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedFlowStepId, selectedStepModel]);
   useEffect(() => {
-    if (selectedStepModel !== 'directional') {
+    if (selectedStepModel !== 'directional' || selectedDirectionalMode !== 'rateSets') {
       setRateSetsText('');
       setRateSetsError('');
       return;
     }
-    setRateSetsText(directionalUsesRateSets
-      ? JSON.stringify(selectedFlowStep?.rateSets, null, 2)
-      : '');
+    setRateSetsText(JSON.stringify(selectedFlowStep?.rateSets, null, 2));
     setRateSetsError('');
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedFlowStepId, selectedStepModel]);
+  }, [selectedFlowStepId, selectedStepModel, selectedDirectionalMode]);
+  useEffect(() => {
+    if (selectedStepModel !== 'isotropic' || selectedStepRateMode !== 'material') {
+      setIsotropicMaterialRatesText('');
+      setIsotropicMaterialRatesError('');
+      return;
+    }
+    const table = selectedFlowStep?.materialRates;
+    setIsotropicMaterialRatesText(JSON.stringify(
+      table && typeof table === 'object' && !Array.isArray(table) ? table : {},
+      null,
+      2,
+    ));
+    setIsotropicMaterialRatesError('');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedFlowStepId, selectedStepModel, selectedStepRateMode]);
+  useEffect(() => {
+    if (selectedStepModel !== 'directional' || selectedDirectionalMode !== 'materialRates') {
+      setDirectionalMaterialRatesText('');
+      setDirectionalMaterialRatesError('');
+      setDefaultMaterialRateText('');
+      setDefaultMaterialRateError('');
+      return;
+    }
+    const table = selectedFlowStep?.materialRates;
+    setDirectionalMaterialRatesText(JSON.stringify(
+      table && typeof table === 'object' && !Array.isArray(table) ? table : {},
+      null,
+      2,
+    ));
+    setDirectionalMaterialRatesError('');
+    setDefaultMaterialRateText(JSON.stringify(selectedDefaultMaterialRate, null, 2));
+    setDefaultMaterialRateError('');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedFlowStepId, selectedStepModel, selectedDirectionalMode]);
   /**
    * A Route is stale when none of its attempts was built from the current
    * Compile. Branch attempts legitimately use derived Compiles, so any matching
@@ -5679,6 +5834,31 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   };
 
   const switchDirectionalMode = (mode: string) => {
+    if (mode === 'materialRates') {
+      // Seed the default pair from the current scalar rates (or the previously
+      // configured default), then let the sanitizer drop scalars/rateSets.
+      const nextDefault: DirectionalMaterialRate = {
+        directional: typeof selectedFlowStep?.directionalRateMagnitude === 'number'
+          ? selectedFlowStep.directionalRateMagnitude
+          : selectedDefaultMaterialRate.directional || 0.02,
+        isotropic: typeof selectedFlowStep?.isotropicRateMagnitude === 'number'
+          ? selectedFlowStep.isotropicRateMagnitude
+          : selectedDefaultMaterialRate.isotropic,
+      };
+      updateSelectedStepWith(draft => {
+        delete draft.rateSets;
+        delete draft.rateMagnitude;
+        delete draft.directionalRateMagnitude;
+        delete draft.isotropicRateMagnitude;
+        delete draft.calculateVisibility;
+        if (!isUsableDirection(draft.direction)) draft.direction = [selectedDirection[0], selectedDirection[1], selectedDirection[2]];
+        if (!draft.materialRates || typeof draft.materialRates !== 'object' || Array.isArray(draft.materialRates)) {
+          draft.materialRates = {};
+        }
+        draft.defaultMaterialRate = nextDefault;
+      });
+      return;
+    }
     if (mode === 'rateSets') {
       const rateSets = [{
         direction: [selectedDirection[0], selectedDirection[1], selectedDirection[2]],
@@ -5693,6 +5873,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         delete draft.directionalRateMagnitude;
         delete draft.isotropicRateMagnitude;
         delete draft.calculateVisibility;
+        delete draft.materialRates;
+        delete draft.defaultMaterialRate;
         draft.rateSets = rateSets;
       });
       setRateSetsText(JSON.stringify(rateSets, null, 2));
@@ -5709,16 +5891,43 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     updateSelectedStepWith(draft => {
       delete draft.rateSets;
       delete draft.calculateVisibility;
+      delete draft.materialRates;
+      delete draft.defaultMaterialRate;
       draft.direction = [firstDirection[0], firstDirection[1], firstDirection[2]];
       draft.directionalRateMagnitude = typeof first?.directionalVelocity === 'number'
         ? first.directionalVelocity
-        : typeof draft.directionalRateMagnitude === 'number' ? draft.directionalRateMagnitude : 0.02;
+        : typeof draft.directionalRateMagnitude === 'number' ? draft.directionalRateMagnitude
+          : selectedDefaultMaterialRate.directional || 0.02;
       draft.isotropicRateMagnitude = typeof first?.isotropicVelocity === 'number'
         ? first.isotropicVelocity
-        : typeof draft.isotropicRateMagnitude === 'number' ? draft.isotropicRateMagnitude : 0;
+        : typeof draft.isotropicRateMagnitude === 'number' ? draft.isotropicRateMagnitude
+          : selectedDefaultMaterialRate.isotropic;
     });
     setRateSetsText('');
     setRateSetsError('');
+  };
+
+  const switchIsotropicMethod = (method: string) => {
+    updateSelectedStepWith(draft => {
+      if (method === 'auto' || method === 'levelSet' || method === 'geometric') {
+        draft.isotropicMethod = method;
+      } else {
+        delete draft.isotropicMethod;
+      }
+      if (method === 'geometric') delete draft.isotropicTimeStepRatio;
+    });
+  };
+
+  const toggleIsotropicTimeStepRatio = (checked: boolean) => {
+    updateSelectedStepWith(draft => {
+      if (checked) {
+        if (typeof draft.isotropicTimeStepRatio !== 'number') {
+          draft.isotropicTimeStepRatio = solverTimeStepRatio;
+        }
+      } else {
+        delete draft.isotropicTimeStepRatio;
+      }
+    });
   };
 
   const applyNativeParametersText = () => {
@@ -5739,6 +5948,49 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     }
     setRateSetsError('');
     updateSelectedStep({ rateSets: value });
+  };
+
+  const applyIsotropicMaterialRatesText = () => {
+    const { value, error } = parseMaterialRateJsonText(
+      isotropicMaterialRatesText, 'materialRates', '{"Si": 0.1, "SiO2": 0}',
+    );
+    if (error || !value) {
+      setIsotropicMaterialRatesError(error || 'materialRates 格式无效');
+      return;
+    }
+    setIsotropicMaterialRatesError('');
+    updateSelectedStepWith(draft => {
+      draft.rateMode = 'material';
+      draft.materialRates = value as Record<string, number>;
+    });
+  };
+
+  const applyDirectionalMaterialRatesText = () => {
+    const { value, error } = parseMaterialRateJsonText(
+      directionalMaterialRatesText, 'materialRates', '{"Si":{"directional":0.3,"isotropic":0.05}}',
+    );
+    if (error || !value) {
+      setDirectionalMaterialRatesError(error || 'materialRates 格式无效');
+      return;
+    }
+    setDirectionalMaterialRatesError('');
+    updateSelectedStepWith(draft => {
+      draft.materialRates = value as Record<string, DirectionalMaterialRate>;
+    });
+  };
+
+  const applyDefaultMaterialRateText = () => {
+    const { value, error } = parseMaterialRateJsonText(
+      defaultMaterialRateText, 'defaultMaterialRate', '{"directional":0,"isotropic":0}',
+    );
+    if (error || !value) {
+      setDefaultMaterialRateError(error || 'defaultMaterialRate 格式无效');
+      return;
+    }
+    setDefaultMaterialRateError('');
+    updateSelectedStepWith(draft => {
+      draft.defaultMaterialRate = value as DirectionalMaterialRate;
+    });
   };
 
   const moveAuthoredStep = (stepId: string, delta: number) => {
@@ -7761,11 +8013,40 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                   {stepSupportsDuration && <label className="spx-field" data-field="duration"><span title="duration">时长（s）</span><input aria-label="步骤时长" type="number" step="0.01" value={Number(selectedFlowStep.duration ?? 0)} onChange={event => updateSelectedStep({ duration: Number(event.target.value) })} /></label>}
                   {stepSupportsRate && <label className="spx-field" data-field="rate"><span title={selectedRateField}>速率（µm/s）</span><input aria-label="步骤速率" type="number" step="0.01" value={selectedRateValue} onChange={event => updateSelectedStep({ [selectedRateField]: Number(event.target.value) })} /></label>}
                   {stepSupportsRateMode && <label className="spx-field" data-field="rateMode"><span title="rateMode">速率模式</span>
-                    <select aria-label="步骤速率模式" value={String(selectedFlowStep.rateMode ?? 'uniform')} disabled={selectedStepOperation !== 'etch'} onChange={event => updateSelectedStep({ rateMode: event.target.value })}>
+                    <select aria-label="步骤速率模式" value={selectedStepModel === 'isotropic' || selectedStepOperation === 'etch' ? selectedStepRateMode : 'uniform'} disabled={selectedStepModel !== 'isotropic' && selectedStepOperation !== 'etch'} onChange={event => updateSelectedStep({ rateMode: event.target.value })}>
                       <option value="uniform">均匀 (uniform)</option>
-                      {selectedStepOperation === 'etch' && <option value="material">按材料 (material)</option>}
+                      {(selectedStepModel === 'isotropic' || selectedStepOperation === 'etch') && <option value="material">按材料 (material)</option>}
                     </select>
                   </label>}
+                  {selectedStepModel === 'isotropic' && <>
+                    <label className="spx-field" data-field="isotropicMethod"><span title="isotropicMethod">各向同性算法</span>
+                      <select aria-label="isotropicMethod 各向同性算法" value={selectedIsotropicMethod} onChange={event => switchIsotropicMethod(event.target.value)}>
+                        <option value="auto">自动 (auto)</option>
+                        <option value="levelSet">Level-set</option>
+                        <option value="geometric">几何偏移 (geometric)</option>
+                      </select>
+                    </label>
+                    {selectedIsotropicMethod !== 'geometric' && <>
+                      <label className="spx-field" data-field="isotropicTimeStepRatio.override"><span title="isotropicTimeStepRatio">覆盖 level-set 时间步比例</span>
+                        <input aria-label="isotropicTimeStepRatio 覆盖 level-set 时间步比例" type="checkbox" checked={typeof selectedFlowStep.isotropicTimeStepRatio === 'number'} onChange={event => toggleIsotropicTimeStepRatio(event.target.checked)} />
+                      </label>
+                      {typeof selectedFlowStep.isotropicTimeStepRatio === 'number' && <label className="spx-field" data-field="isotropicTimeStepRatio"><span title="isotropicTimeStepRatio">level-set 时间步比例</span>
+                        <input aria-label="isotropicTimeStepRatio 数值" type="number" min={0.05} max={0.5} step={0.01} value={selectedFlowStep.isotropicTimeStepRatio} onChange={event => updateSelectedStep({ isotropicTimeStepRatio: Number(event.target.value) })} />
+                      </label>}
+                    </>}
+                    {selectedIsotropicMethod === 'geometric' && <p className="spx-help">几何偏移只支持统一速率（选择它会自动切回 uniform 并删除材料表），且厚度至少一个网格。</p>}
+                    {selectedIsotropicMethod !== 'geometric' && selectedStepRateMode === 'material' && <>
+                      <label className="spx-field" data-field="materialRates"><span title="materialRates">materialRates（JSON 对象）</span>
+                        <textarea aria-label="materialRates 各向同性 JSON" value={isotropicMaterialRatesText} spellCheck={false} onChange={event => setIsotropicMaterialRatesText(event.target.value)} />
+                      </label>
+                      {isotropicMaterialRatesError && <em className="spx-field-error">{isotropicMaterialRatesError}</em>}
+                      <div className="spx-step-form-actions">
+                        <button type="button" className="wf-button" onClick={applyIsotropicMaterialRatesText}>应用</button>
+                        <span className="wf-muted">{'{"Si": 0.1, "SiO2": 0}'}</span>
+                      </div>
+                      <p className="spx-help">0 表示保护；未列出的材料使用“速率（µm/s）”；刻蚀与沉积都按操作符号写入。</p>
+                    </>}
+                  </>}
                   {stepSupportsDepositMaterial && <label className="spx-field" data-field="depositMaterial"><span title="depositMaterial · 只列可沉积材料（排除硬掩膜/光刻胶）">沉积材料</span>
                     <select aria-label="步骤沉积材料" value={String(selectedFlowStep.depositMaterial ?? '')} onChange={event => updateSelectedStep({ depositMaterial: event.target.value || undefined })}>
                       <option value="">—</option>
@@ -7873,12 +8154,13 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                   </>}
                   {selectedStepModel === 'directional' && <>
                     <label className="spx-field" data-field="directionalMode"><span title="mode">速率模式</span>
-                      <select aria-label="定向速率模式" value={directionalUsesRateSets ? 'rateSets' : 'scalar'} onChange={event => switchDirectionalMode(event.target.value)}>
+                      <select aria-label="定向速率模式" value={selectedDirectionalMode} onChange={event => switchDirectionalMode(event.target.value)}>
                         <option value="scalar">标量（direction + 速率）</option>
                         <option value="rateSets">rateSets（多速率组）</option>
+                        <option value="materialRates">materialRates（材料速率表）</option>
                       </select>
                     </label>
-                    {!directionalUsesRateSets && <>
+                    {selectedDirectionalMode !== 'rateSets' && <>
                       <label className="spx-field" data-field="direction.x"><span title="direction[0]">方向 X</span>
                         <input aria-label="定向方向 X" type="number" step={0.01} value={selectedDirection[0]} onChange={event => patchSelectedDirection(0, Number(event.target.value))} />
                       </label>
@@ -7888,14 +8170,16 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                       <label className="spx-field" data-field="direction.z"><span title="direction[2]">方向 Z</span>
                         <input aria-label="定向方向 Z" type="number" step={0.01} value={selectedDirection[2]} onChange={event => patchSelectedDirection(2, Number(event.target.value))} />
                       </label>
-                      <label className="spx-field" data-field="directionalRateMagnitude"><span title="directionalRateMagnitude">定向速率（µm/s）</span>
-                        <input aria-label="定向速率（µm/s）" type="number" min={0} max={2} step={0.01} value={Number(selectedFlowStep.directionalRateMagnitude ?? 0.02)} onChange={event => updateSelectedStep({ directionalRateMagnitude: Number(event.target.value) })} />
-                      </label>
-                      <label className="spx-field" data-field="isotropicRateMagnitude"><span title="isotropicRateMagnitude">各向同性速率（µm/s）</span>
-                        <input aria-label="各向同性速率（µm/s）" type="number" min={0} max={2} step={0.01} value={Number(selectedFlowStep.isotropicRateMagnitude ?? 0)} onChange={event => updateSelectedStep({ isotropicRateMagnitude: Number(event.target.value) })} />
-                      </label>
+                      {selectedDirectionalMode === 'scalar' && <>
+                        <label className="spx-field" data-field="directionalRateMagnitude"><span title="directionalRateMagnitude">定向速率（µm/s）</span>
+                          <input aria-label="定向速率（µm/s）" type="number" min={0} max={2} step={0.01} value={Number(selectedFlowStep.directionalRateMagnitude ?? 0.02)} onChange={event => updateSelectedStep({ directionalRateMagnitude: Number(event.target.value) })} />
+                        </label>
+                        <label className="spx-field" data-field="isotropicRateMagnitude"><span title="isotropicRateMagnitude">各向同性速率（µm/s）</span>
+                          <input aria-label="各向同性速率（µm/s）" type="number" min={0} max={2} step={0.01} value={Number(selectedFlowStep.isotropicRateMagnitude ?? 0)} onChange={event => updateSelectedStep({ isotropicRateMagnitude: Number(event.target.value) })} />
+                        </label>
+                      </>}
                     </>}
-                    {directionalUsesRateSets && <>
+                    {selectedDirectionalMode === 'rateSets' && <>
                       <label className="spx-field" data-field="rateSets"><span title="rateSets">rateSets（JSON 数组）</span>
                         <textarea aria-label="rateSets JSON" value={rateSetsText} spellCheck={false} onChange={event => setRateSetsText(event.target.value)} />
                       </label>
@@ -7904,6 +8188,25 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                         <button type="button" className="wf-button" onClick={applyRateSetsText}>应用</button>
                         <span className="wf-muted">direction 3 个数字；速率 0–2 µm/s</span>
                       </div>
+                    </>}
+                    {selectedDirectionalMode === 'materialRates' && <>
+                      <label className="spx-field" data-field="materialRates"><span title="materialRates">materialRates（JSON 对象）</span>
+                        <textarea aria-label="materialRates 定向材料 JSON" value={directionalMaterialRatesText} spellCheck={false} onChange={event => setDirectionalMaterialRatesText(event.target.value)} />
+                      </label>
+                      {directionalMaterialRatesError && <em className="spx-field-error">{directionalMaterialRatesError}</em>}
+                      <div className="spx-step-form-actions">
+                        <button type="button" className="wf-button" onClick={applyDirectionalMaterialRatesText}>应用</button>
+                        <span className="wf-muted">{'{"Si":{"directional":0.3,"isotropic":0.05}}'}</span>
+                      </div>
+                      <label className="spx-field" data-field="defaultMaterialRate"><span title="defaultMaterialRate">defaultMaterialRate（JSON 对象）</span>
+                        <textarea aria-label="defaultMaterialRate JSON" value={defaultMaterialRateText} spellCheck={false} onChange={event => setDefaultMaterialRateText(event.target.value)} />
+                      </label>
+                      {defaultMaterialRateError && <em className="spx-field-error">{defaultMaterialRateError}</em>}
+                      <div className="spx-step-form-actions">
+                        <button type="button" className="wf-button" onClick={applyDefaultMaterialRateText}>应用</button>
+                        <span className="wf-muted">{'{"directional":0,"isotropic":0}'}</span>
+                      </div>
+                      <p className="spx-help">未列出的材料使用 defaultMaterialRate；0 表示不动；刻蚀/沉积由操作自动决定符号。</p>
                     </>}
                   </>}
                   <div className="spx-step-form-actions" title={selectedFlowStep.id}>
