@@ -383,7 +383,7 @@ S_0 → step_1 → S_1 → step_2 → S_2 → ... → S_n
 | `OutputSet` API / UI | ❌ 只有 Python 契约和 `output_contract_schema()` |
 | conformance harness | ✅ `check_variant()`：解析、校验、`StepResult` 形状、输入不可变、strict determinism |
 | output contract schema | ✅ `output_contract_schema()`，JSON 可序列化，`schemaVersion: 1`；不是完整 JSON Schema 校验器 |
-| generic worker plugin hook | ✅ 默认关闭的 shadow/apply；事件 `v2-plugin-shadow` / `v2-plugin-applied` / `v2-plugin-shadow-skipped`；生产默认路径不变 |
+| generic worker plugin hook | ✅ 默认关闭的 process + geometry shadow/apply；事件 `v2-plugin-shadow` / `v2-plugin-applied` / `v2-plugin-shadow-skipped`；生产默认路径不变 |
 | external engine adapter | ❌ |
 | 原生 geometry replay loader | ❌ `geometry.ref` 已记录；重载需调用方提供 loader |
 | v2 run 接入 backend/API/UI | ❌ |
@@ -399,7 +399,7 @@ S_0 → step_1 → S_1 → step_2 → S_2 → ... → S_n
 - **没有外部引擎 adapter**：`external` 仍只是枚举值，registry/provider 只支持 ViennaPS
   原生路径。
 - **没有 backend 集成**：`FlowExecutor` 是独立运行时组件；worker/正式服务仍走旧路径。
-  worker 侧只有一个通用的、默认关闭的 plugin shadow/apply hook（按
+  worker 侧只有一个通用的、默认关闭的 process/geometry shadow/apply hook（按
   `ProcessSpec.parse_step` 分派，v2 文档 §7.5），没有 isotropic 专用 bridge，也没有生产
   cutover。
 
