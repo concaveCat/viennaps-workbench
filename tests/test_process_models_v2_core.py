@@ -232,8 +232,12 @@ class StateTest(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             MaterialState(order=(-1,))
-        with self.assertRaises(ValueError):
-            MaterialState(order=(0, 0))
+        # Multiple level sets may share one native material ID (two SiO2
+        # depositions); the order is per level-set index, not a set.
+        repeated = MaterialState(order=(10, 30, 30), names={10: "Si", 30: "SiO2"})
+        self.assertEqual(repeated.order, (10, 30, 30))
+        self.assertEqual(repeated.name_for(30), "SiO2")
+        self.assertEqual(repeated.id_for("SiO2"), 30)
         with self.assertRaises(ValueError):
             MaterialState(order=(0,), names={1: "SiO2"})
         with self.assertRaises(ValueError):

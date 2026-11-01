@@ -337,7 +337,7 @@ class VariantCapabilities:
 
 | 类型 | 表示 | 说明 |
 | --- | --- | --- |
-| `MaterialState` | `order: tuple[int, ...]` + `names: Mapping[int, str]` | 原生材料 ID 与显示名；`name_for()` / `id_for()` 双向查 |
+| `MaterialState` | `order: tuple[int, ...]` + `names: Mapping[int, str]` | 原生材料 ID 与显示名；`order` 按 level-set index，**允许同一材料 ID 重复**（例如两次 SiO2 沉积）；`name_for()` / `id_for()` 双向查 |
 | `LevelSetState` | `handle` + `dimension` + `grid_delta` + `material_order` | flow state 的唯一持久表示 |
 | `FieldState` | `data: Mapping[str, Any]` | 阶段 1 占位，没有 cell-set 集成 |
 | `VoxelState` | `grid`（`process_models.voxel.VoxelGrid`）+ `source` | 步骤内视图，默认 `"height-field-v1"` |
@@ -720,7 +720,8 @@ parity 的含义是“**同样的参数、同样的原生调用、同样的 solv
 
 | 项 | 值 |
 | --- | --- |
-| 开关 | `VIENNAPS_WORKBENCH_V2_ISOTROPIC_SHADOW=1`（默认关闭） |
+| 影子开关 | `VIENNAPS_WORKBENCH_V2_ISOTROPIC_SHADOW=1`（默认关闭） |
+| 验证 apply 开关 | `VIENNAPS_WORKBENCH_V2_ISOTROPIC_APPLY=1`（默认关闭；只用于能力验证，不是生产 cutover） |
 | 模型 | 仅 `model: isotropic` |
 | 速率模式 | 仅 `rateMode: uniform` |
 | 分派 | `isotropicMethod` 解析结果必须是 `levelSet`，**不是** `geometric` |
@@ -764,6 +765,12 @@ parity 的含义是“**同样的参数、同样的原生调用、同样的 solv
 - 不一致时**抛错**而不是只写 warning，避免影子差异被当作通过；
 - 影子本身不产生快照、不推进 flow state、不写任何 sink。
 
+**验证 apply 模式**（`...APPLY=1`）在 shadow 比较通过之后，把 `ctx.domain` 替换成
+v2 的 domain，并写一条 `v2-isotropic-applied` 事件。这样后续 snapshot、native
+state、下一步和 replay 都来自 v2，但默认生产路径仍然不设置这个开关。apply 永远以
+shadow 比较为前提，不存在“未比较就 apply”。旧路径仍然会跑一遍以生成现有
+`actualParameters`，所以这是**正确性验证**，不是性能 cutover。
+
 #### 7.5.3 “parity”在这里指什么
 
 | 判定项 | 是否作为相等判据 |
@@ -781,12 +788,10 @@ parity 的含义是“**同样的参数、同样的原生调用、同样的 solv
 
 - 没有 `rateMode: material` 的逐材料速率影子（目前记 skip 事件）；
 - 没有 geometric `SphereDistribution` 影子（目前记 skip 事件）；
-- 没有做生产路径 cutover 后的完整多步 replay；离线 snapshot JSON 与 native state
-  文件哈希已对齐（2D etch/deposit）；
-- 生产路径仍然不执行 v2，`run_isotropic_v2` 只在开关打开时被调用；
-- 已跑现有 isotropic dispatch API/worker 套件（12 项）在开关打开/关闭下都通过，
-  并产生 3 条匹配的 `v2-isotropic-shadow` 事件；但没有做多步 full-flow 的逐字节产物对比；
-- 影子通过不等于可以删除旧路径；cutover 需要单独的验收。
+- **验证 apply 模式**已经跑过 2D 三步 + 3D 两步的完整 API/worker run，并 replay 了
+  2D apply run；默认生产路径仍然不执行 v2，`run_isotropic_v2` 只在显式开关下被调用；
+- 默认生产路径的 snapshot/replay 不变；apply 模式是测试/验证开关，不是 cutover；
+- material/geometric 仍不覆盖；影子通过不等于可以删除旧路径。
 
 #### 7.5.5 怎么跑
 
@@ -815,7 +820,8 @@ hook 决定。
 | 项 | 结果 |
 | --- | --- |
 | `tests.test_worker_v2_isotropic`（bridge 直接对比） | 8 项通过 |
-| `tests.test_worker_v2_isotropic_shadow`（worker 影子 hook + snapshot/state parity） | 12 项通过 |
+| `tests.test_worker_v2_isotropic_shadow`（影子 + apply + snapshot/state parity） | 16 项通过 |
+| `tests.test_v2_isotropic_capability`（API/worker：2D 三步 + replay、3D 两步） | 2 项通过 |
 | `tests.test_isotropic_dispatch`（API/worker，开关关闭） | 12 项通过 |
 | `tests.test_isotropic_dispatch`（API/worker，开关打开） | 12 项通过；3 条 `v2-isotropic-shadow` 匹配，5 条 material-mode skip |
 
@@ -831,8 +837,19 @@ point/cell count 都是 `882/1600`；plan identity 记录 `viennaps 4.7.0`、iso
 - `simulate.save_native_state()` 写出的 `.vpsd` 文件 `stateId`（文件 SHA-256）：**完全相同**。
 
 这两项说明：在相同的输入 domain 上，v2 路径产生的 snapshot 几何和 replay 原生状态文件
-与旧路径一致。它们还没有证明“把生产路径切换成 v2 后，完整多步 run 的 replay 端到端
-等价”；那需要 cutover 验收。
+与旧路径一致。
+
+验证 apply 模式的 API/worker 测试（`tests.test_v2_isotropic_capability`）进一步覆盖：
+
+- 2D 三步 flow（SiO2 沉积 → 刻蚀 → **再次 SiO2 沉积**），baseline vs apply 的每步
+  snapshot JSON（除 run-relative `outputs`）和 native `stateId` 完全相同；
+- apply run 的 replay 成功，replay 的 final snapshot/state 与 apply 和 baseline 都相同；
+- 3D 两步 flow 的 baseline vs apply 同样逐字段一致；
+- 重复材料（level-set material order `[10, 30, 30]`）现在被
+  `MaterialState` 明确支持；voxel adapter 仍要求唯一 material ID（独立限制）。
+
+这证明了“验证开关下的 v2 结果路径 + snapshot + replay”可用；它仍然不是默认生产
+cutover，默认路径不设置 `...APPLY`。
 
 ## 8. 第一个 surrogate：voxel probe
 
@@ -891,7 +908,7 @@ def execute(self, state, params, ctx, engine):   # surrogate 不用 engine，但
 ## 9.1 验证口径（v2.1）
 
 v2.1 只改 API 形状，不改 isotropic/voxel 的物理语义。验证结果是：**v2.1 core/plugins、
-worker bridge/shadow 与保持不变的 v1 测试一起通过下列定向套件（144 项，0 失败）**。
+worker bridge/shadow/apply 与保持不变的 v1 测试一起通过下列定向套件（150 项，0 失败）**。
 
 | 套件 | 覆盖 | 结果 |
 | --- | --- | --- |
@@ -900,8 +917,9 @@ worker bridge/shadow 与保持不变的 v1 测试一起通过下列定向套件�
 | v2 isotropic native | 显式 `engine` 参数下的 parity/rates/masks/3D/identity | 17 项通过 |
 | v2 voxel probe | adapter prepare/commit/guard/determinism | 13 项通过 |
 | worker v2 bridge | 旧 worker 路径 vs `run_isotropic_v2` 的 2D/3D surface digest parity | 8 项通过 |
-| worker v2 shadow | 开关关闭无变化、开关打开匹配、material/geometric skip、snapshot JSON 与 native state hash parity | 12 项通过 |
-| 合计 | v1 + v2.1 + worker 集成 | **144 项通过** |
+| worker v2 shadow/apply | 开关关闭无变化、开关打开匹配、apply 替换 domain、material/geometric skip、snapshot JSON 与 native state hash parity | 16 项通过 |
+| v2 capability validation | API/worker：2D 三步 + replay、3D 两步；baseline vs apply | 2 项通过 |
+| 合计 | v1 + v2.1 + worker 集成 + capability | **150 项通过** |
 
 命令（隔离数据目录，未启动服务）：
 
@@ -911,11 +929,12 @@ VIENNAPS_WORKBENCH_DATA_DIR=$PWD/var/test-v2-final WORKBENCH_PORT=8767 \
   tests.test_process_models_contract tests.test_voxel_adapter \
   tests.test_process_models_voxel_plugin tests.test_process_models_v2_core \
   tests.test_process_models_v2_execution tests.test_process_models_v2_isotropic \
-  tests.test_process_models_v2_voxel
+  tests.test_process_models_v2_voxel tests.test_worker_v2_isotropic \
+  tests.test_worker_v2_isotropic_shadow tests.test_v2_isotropic_capability
 ```
 
-这些测试覆盖的是 v2.1 契约、isotropic 原生路径和 voxel proof，不代表 backend/worker
-已经接入，也不代表 16 个工艺都已迁移。
+这些测试覆盖 v2.1 契约、isotropic 原生路径、voxel proof、worker shadow/apply 和
+2D/3D capability validation；**默认生产路径没有切到 v2**，也不代表 16 个工艺都已迁移。
 
 ## 10. 非目标与开放决策
 

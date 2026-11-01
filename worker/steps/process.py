@@ -18,11 +18,23 @@ from typing import Any
 from worker.steps.context import RunContext, simulate_module
 
 V2_ISOTROPIC_SHADOW_ENV = "VIENNAPS_WORKBENCH_V2_ISOTROPIC_SHADOW"
+V2_ISOTROPIC_APPLY_ENV = "VIENNAPS_WORKBENCH_V2_ISOTROPIC_APPLY"
 
 
 def _v2_isotropic_shadow_enabled() -> bool:
     """The shadow hook is strictly opt-in; the default run must not change."""
     return os.environ.get(V2_ISOTROPIC_SHADOW_ENV) == "1"
+
+
+def _v2_isotropic_apply_enabled() -> bool:
+    """Validation-only apply mode: also strictly opt-in.
+
+    With this flag the v2 domain replaces ``ctx.domain`` after the shadow
+    comparison, so snapshots, native state and replay can be validated against
+    the v2 result. It is *not* a production cutover: the default path is
+    untouched and an apply always implies the shadow comparison.
+    """
+    return os.environ.get(V2_ISOTROPIC_APPLY_ENV) == "1"
 
 
 def _v2_isotropic_shadow_eligible(simulate: Any, project: dict[str, Any], step: dict[str, Any]) -> tuple[bool, str]:
@@ -71,11 +83,30 @@ def _v2_isotropic_shadow_eligible(simulate: Any, project: dict[str, Any], step: 
     return True, f"uniform level-set isotropic {operation} is bridgeable"
 
 
-def _run_v2_isotropic_shadow(ctx: RunContext, step: dict[str, Any], shadow_domain: Any, simulate: Any) -> None:
+@dataclass(frozen=True)
+class _V2IsotropicShadowResult:
+    """Everything the caller needs from a *successful* shadow comparison.
+
+    ``geometry_handle`` is the v2 domain itself; the plan/metadata are the same
+    values written to the ``v2-isotropic-shadow`` event and let the apply mode
+    record them without re-running (or reaching into) the bridge.
+    """
+
+    geometry_handle: Any
+    comparison: dict[str, Any]
+    plan_identity: dict[str, Any]
+    metadata: dict[str, Any]
+
+
+def _run_v2_isotropic_shadow(
+    ctx: RunContext, step: dict[str, Any], shadow_domain: Any, simulate: Any
+) -> _V2IsotropicShadowResult:
     """Run the v2 bridge on a copy and compare it with the worker result.
 
     The event is written before any mismatch is raised so the failed run keeps
     the digests, material maps and plan identity that explain the divergence.
+    The v2 geometry handle is returned only after a match, so the caller can
+    never apply an unvalidated domain.
     """
     from worker.process_models_v2 import compare_isotropic_surfaces, run_isotropic_v2
 
@@ -91,12 +122,13 @@ def _run_v2_isotropic_shadow(ctx: RunContext, step: dict[str, Any], shadow_domai
     if shadow_geometry is None or getattr(shadow_geometry, "handle", None) is None:
         raise RuntimeError(f"v2 isotropic shadow for step {step['id']!r} returned no geometry state")
     comparison = compare_isotropic_surfaces(ctx.domain, shadow_geometry.handle, int(ctx.project["dimension"]))
+    plan_identity = outcome.plan.identity()
     ctx.event(
         {
             "type": "v2-isotropic-shadow",
             "stepId": step["id"],
             **comparison,
-            "v2Plan": outcome.plan.identity(),
+            "v2Plan": plan_identity,
             "v2Metadata": outcome.metadata,
             "v2Warnings": outcome.warnings,
         }
@@ -106,6 +138,12 @@ def _run_v2_isotropic_shadow(ctx: RunContext, step: dict[str, Any], shadow_domai
             f"v2 isotropic shadow for step {step['id']!r} did not match the worker path: "
             + "; ".join(comparison["reasons"])
         )
+    return _V2IsotropicShadowResult(
+        geometry_handle=shadow_geometry.handle,
+        comparison=comparison,
+        plan_identity=plan_identity,
+        metadata=outcome.metadata,
+    )
 
 
 @dataclass
@@ -119,7 +157,8 @@ def run_process_step(ctx: RunContext, index: int, step: dict[str, Any]) -> Proce
     simulate = simulate_module()
     shadow_domain = None
     shadow_skip_reason = None
-    if _v2_isotropic_shadow_enabled():
+    shadow_enabled = _v2_isotropic_shadow_enabled() or _v2_isotropic_apply_enabled()
+    if shadow_enabled:
         eligible, shadow_skip_reason = _v2_isotropic_shadow_eligible(simulate, ctx.project, step)
         if eligible:
             # Deep-copy before the worker path mutates ctx.domain so both
@@ -659,8 +698,25 @@ def run_process_step(ctx: RunContext, index: int, step: dict[str, Any]) -> Proce
                 + (f", and the mask {masks} must not cover the whole exposed surface" if masks else "")
                 + ")"
             )
+    shadow_result = None
     if shadow_domain is not None:
-        _run_v2_isotropic_shadow(ctx, step, shadow_domain, simulate)
+        shadow_result = _run_v2_isotropic_shadow(ctx, step, shadow_domain, simulate)
+    if _v2_isotropic_apply_enabled() and shadow_result is not None:
+        # Validation-only apply: from here on the snapshots, native state and
+        # replay records describe the v2 domain. The old process/model handles
+        # stay referenced by ProcessStepResult; isotropic is CPU-only, so there
+        # is no GPU teardown to worry about.
+        ctx.domain = shadow_result.geometry_handle
+        ctx.event(
+            {
+                "type": "v2-isotropic-applied",
+                "stepId": step["id"],
+                "oldDigest": shadow_result.comparison["oldDigest"],
+                "newDigest": shadow_result.comparison["newDigest"],
+                "v2Plan": shadow_result.plan_identity,
+                "v2Metadata": shadow_result.metadata,
+            }
+        )
     next_gpu_step_pending = any(
         simulate.uses_flux(future)
         and str(

@@ -52,8 +52,12 @@ class StateMissingError(RuntimeError):
 class MaterialState:
     """Native material IDs in level-set order plus optional human names.
 
-    ``order`` may be empty so that field-only steps do not need a material
-    map. ``names`` keys must be a subset of ``order``; names are also unique.
+    ``order`` has one entry per level-set index, so the **same native material
+    ID may appear more than once** (for example two SiO2 depositions). This
+    mirrors the native domain: multiple level sets can share a material ID.
+    ``names`` is keyed by material ID, not by level-set index; names are
+    unique. ``order`` may be empty so that field-only steps do not need a
+    material map.
     """
 
     order: tuple[int, ...] = ()
@@ -63,8 +67,6 @@ class MaterialState:
         order = tuple(int(material_id) for material_id in self.order)
         if any(material_id < 0 for material_id in order):
             raise ValueError(f"material ids must be >= 0, got {order}")
-        if len(set(order)) != len(order):
-            raise ValueError(f"material ids must be unique, got {order}")
 
         names = {int(material_id): name for material_id, name in dict(self.names).items()}
         unknown = sorted(set(names) - set(order))

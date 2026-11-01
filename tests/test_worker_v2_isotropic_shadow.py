@@ -1,17 +1,22 @@
-"""Shadow-hook tests for the v2 isotropic bridge.
+"""Shadow/apply hook tests for the v2 isotropic bridge.
 
-The hook is default-off. These tests pin both sides:
+Both hooks are default-off. These tests pin every side:
 
-* with the env flag unset, ``run_process_step`` behaves exactly as before
-  (no copy, no shadow event, no v2 metadata);
+* with both env flags unset, ``run_process_step`` behaves exactly as before
+  (no copy, no shadow event, no v2 metadata, same domain object);
 * with ``VIENNAPS_WORKBENCH_V2_ISOTROPIC_SHADOW=1``, an eligible uniform
   level-set step runs the bridge on a deep copy and records a
   ``v2-isotropic-shadow`` event whose digests and material map match the
   worker path, while the returned metadata and the worker domain do not
-  change.
+  change;
+* with ``VIENNAPS_WORKBENCH_V2_ISOTROPIC_APPLY=1`` that validated v2 domain
+  becomes ``ctx.domain`` (snapshots/native state/replay then describe the v2
+  result) and a ``v2-isotropic-applied`` event records the digests, plan and
+  metadata. Apply implies shadow; an unvalidated apply does not exist.
 
 Ineligible steps (material rates, geometric/auto-geometric) must record a
-``v2-isotropic-shadow-skipped`` event and never call the bridge.
+``v2-isotropic-shadow-skipped`` event and never call the bridge, with or
+without the apply flag.
 """
 
 from __future__ import annotations
@@ -39,6 +44,7 @@ from tests.test_worker_v2_isotropic import (
 from worker.process_models_v2 import run_isotropic_v2
 from worker.steps.context import RunContext
 from worker.steps.process import (
+    V2_ISOTROPIC_APPLY_ENV,
     V2_ISOTROPIC_SHADOW_ENV,
     _v2_isotropic_shadow_eligible,
     run_process_step,
@@ -79,16 +85,28 @@ def _events_of(run_dir: Path, event_type: str) -> list[dict[str, Any]]:
 
 
 @contextlib.contextmanager
-def _shadow_flag(enabled: bool):
-    """Set or clear only this hook's env flag for the duration of a call."""
+def _v2_flags(*, shadow: bool = False, apply: bool = False):
+    """Set or clear *both* hooks' env flags for the duration of a call."""
     with mock.patch.dict(os.environ, {}, clear=False):
-        os.environ.pop(V2_ISOTROPIC_SHADOW_ENV, None)
-        if enabled:
+        for name in (V2_ISOTROPIC_SHADOW_ENV, V2_ISOTROPIC_APPLY_ENV):
+            os.environ.pop(name, None)
+        if shadow:
             os.environ[V2_ISOTROPIC_SHADOW_ENV] = "1"
+        if apply:
+            os.environ[V2_ISOTROPIC_APPLY_ENV] = "1"
         yield
 
 
-class V2IsotropicShadowTests(unittest.TestCase):
+@contextlib.contextmanager
+def _shadow_flag(enabled: bool):
+    """Set or clear only the shadow flag for the duration of a call."""
+    with _v2_flags(shadow=enabled):
+        yield
+
+
+class _V2WorkerStepTestBase(unittest.TestCase):
+    """Shared fixtures; no tests live here so the base class is not collected."""
+
     def setUp(self) -> None:
         ps.setNumThreads(1)
         ps.Length.setUnit("um")
@@ -151,50 +169,76 @@ class V2IsotropicShadowTests(unittest.TestCase):
         self.assertEqual(plan["engine_version"], str(ps.__version__))
         return shadow
 
+    def _assert_applied_event_matches(self, run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+        """The apply record must carry the validated shadow's digests/plan/metadata."""
+        shadow = self._assert_shadow_matches(run_dir)
+        applied = _events_of(run_dir, "v2-isotropic-applied")
+        self.assertEqual(len(applied), 1, applied)
+        record = applied[0]
+        self.assertEqual(record["stepId"], shadow["stepId"])
+        self.assertEqual(record["oldDigest"], shadow["oldDigest"])
+        self.assertEqual(record["newDigest"], shadow["newDigest"])
+        self.assertEqual(record["oldDigest"], record["newDigest"])
+        self.assertEqual(record["v2Plan"], shadow["v2Plan"])
+        self.assertEqual(record["v2Metadata"], shadow["v2Metadata"])
+        return shadow, record
+
+
+class V2IsotropicShadowTests(_V2WorkerStepTestBase):
     def test_flag_off_keeps_the_default_path(self) -> None:
         step = isotropic_step("etch", rate=0.3, duration=1.0)
         ctx = self._context("flag-off", step)
+        original_domain = ctx.domain
         before = _top(ctx.domain)
 
-        with _shadow_flag(False):
+        with _v2_flags():
             result = run_process_step(ctx, 1, step)
 
+        self.assertIs(ctx.domain, original_domain)
         self.assertAlmostEqual(_top(ctx.domain) - before, -0.3, delta=1e-6)
         self._assert_no_v2_metadata(result.metadata)
         self.assertEqual(_events_of(ctx.run_dir, "v2-isotropic-shadow"), [])
         self.assertEqual(_events_of(ctx.run_dir, "v2-isotropic-shadow-skipped"), [])
+        self.assertEqual(_events_of(ctx.run_dir, "v2-isotropic-applied"), [])
         self.assertEqual(len(_events_of(ctx.run_dir, "step-configured")), 1)
 
     def test_flag_on_etch_shadows_a_copy_and_matches_the_worker(self) -> None:
         step = isotropic_step("etch", rate=0.3, duration=1.0, ratio=0.25)
         ctx = self._context("flag-on-etch", step)
+        original_domain = ctx.domain
         before = _top(ctx.domain)
 
         with _shadow_flag(True):
             result = run_process_step(ctx, 1, step)
 
         # The worker domain moved exactly once; the shadow ran on a copy.
+        self.assertIs(ctx.domain, original_domain)
         self.assertAlmostEqual(_top(ctx.domain) - before, -0.3, delta=1e-6)
         shadow = self._assert_shadow_matches(ctx.run_dir)
         self.assertEqual(simulate.surface_state(ctx.domain, 2)["digest"], shadow["oldDigest"])
         self.assertEqual(shadow["v2Metadata"]["operation"], "etch")
         self._assert_no_v2_metadata(result.metadata)
         self.assertEqual(_events_of(ctx.run_dir, "v2-isotropic-shadow-skipped"), [])
+        # Shadow alone never applies.
+        self.assertEqual(_events_of(ctx.run_dir, "v2-isotropic-applied"), [])
 
     def test_flag_on_deposit_shadows_a_copy_and_matches_the_worker(self) -> None:
         step = isotropic_step("deposit", rate=0.3, duration=1.0)
         ctx = self._context("flag-on-deposit", step)
+        original_domain = ctx.domain
         before = _top(ctx.domain)
 
         with _shadow_flag(True):
             result = run_process_step(ctx, 1, step)
 
+        self.assertIs(ctx.domain, original_domain)
         self.assertAlmostEqual(_top(ctx.domain) - before, 0.3, delta=1e-6)
         shadow = self._assert_shadow_matches(ctx.run_dir)
         self.assertEqual(simulate.surface_state(ctx.domain, 2)["digest"], shadow["oldDigest"])
         self.assertIn(int(ps.Material.SiO2), shadow["newMaterialMap"])
         self.assertEqual(shadow["v2Metadata"]["depositMaterial"], "SiO2")
         self._assert_no_v2_metadata(result.metadata)
+        self.assertEqual(_events_of(ctx.run_dir, "v2-isotropic-applied"), [])
 
     def test_snapshot_geometry_matches_the_worker_path(self) -> None:
         """The v2 domain must produce the same snapshot JSON geometry as the old path."""
@@ -319,6 +363,88 @@ class V2IsotropicShadowTests(unittest.TestCase):
         self.assertEqual(len(skipped), 1, skipped)
         self.assertIn("geometric", skipped[0]["reason"].lower())
         self.assertEqual(_events_of(ctx.run_dir, "v2-isotropic-shadow"), [])
+
+
+class V2IsotropicApplyTests(_V2WorkerStepTestBase):
+    """Validation-only apply: an eligible, matched v2 domain replaces ctx.domain."""
+
+    def test_apply_etch_replaces_the_domain_with_the_v2_domain(self) -> None:
+        step = isotropic_step("etch", rate=0.3, duration=1.0, ratio=0.25)
+        ctx = self._context("apply-etch", step)
+        original_domain = ctx.domain
+        before = _top(ctx.domain)
+
+        with _v2_flags(apply=True):
+            result = run_process_step(ctx, 1, step)
+
+        self.assertIsNot(ctx.domain, original_domain)
+        self.assertAlmostEqual(_top(ctx.domain) - before, -0.3, delta=1e-6)
+        # Apply implies the shadow comparison; the applied record reuses it.
+        shadow, applied = self._assert_applied_event_matches(ctx.run_dir)
+        self.assertEqual(shadow["v2Metadata"]["operation"], "etch")
+        # Snapshots/native state now describe the v2 domain.
+        self.assertEqual(simulate.surface_state(ctx.domain, 2)["digest"], applied["newDigest"])
+        # The returned metadata still comes from the old save_snapshot call.
+        self._assert_no_v2_metadata(result.metadata)
+        self.assertEqual(_events_of(ctx.run_dir, "v2-isotropic-shadow-skipped"), [])
+
+    def test_apply_deposit_keeps_the_deposited_material(self) -> None:
+        step = isotropic_step("deposit", rate=0.3, duration=1.0)
+        ctx = self._context("apply-deposit", step)
+        original_domain = ctx.domain
+        before = _top(ctx.domain)
+
+        with _v2_flags(apply=True):
+            result = run_process_step(ctx, 1, step)
+
+        self.assertIsNot(ctx.domain, original_domain)
+        self.assertAlmostEqual(_top(ctx.domain) - before, 0.3, delta=1e-6)
+        self.assertIn(int(ps.Material.SiO2), simulate.material_map(ctx.domain))
+        shadow, applied = self._assert_applied_event_matches(ctx.run_dir)
+        self.assertEqual(shadow["v2Metadata"]["depositMaterial"], "SiO2")
+        self.assertEqual(simulate.surface_state(ctx.domain, 2)["digest"], applied["newDigest"])
+        self._assert_no_v2_metadata(result.metadata)
+
+    def test_apply_is_refused_for_material_rate_mode(self) -> None:
+        step = isotropic_step("etch", rate=0.0, duration=1.0)
+        step["rateMode"] = "material"
+        step["materialRates"] = {"Si": 0.2}
+        ctx = self._context("apply-material", step)
+        original_domain = ctx.domain
+        before = _top(ctx.domain)
+
+        with _v2_flags(apply=True), mock.patch("worker.process_models_v2.run_isotropic_v2") as bridge:
+            run_process_step(ctx, 1, step)
+
+        bridge.assert_not_called()
+        # The old path mutated its own domain in place; nothing was applied.
+        self.assertIs(ctx.domain, original_domain)
+        self.assertAlmostEqual(_top(ctx.domain) - before, -0.2, delta=1e-6)
+        skipped = _events_of(ctx.run_dir, "v2-isotropic-shadow-skipped")
+        self.assertEqual(len(skipped), 1, skipped)
+        self.assertIn("material", skipped[0]["reason"].lower())
+        self.assertEqual(_events_of(ctx.run_dir, "v2-isotropic-shadow"), [])
+        self.assertEqual(_events_of(ctx.run_dir, "v2-isotropic-applied"), [])
+
+    def test_apply_is_refused_for_geometric_mode(self) -> None:
+        self.assertGreaterEqual(0.3, GRID_DELTA)
+        step = isotropic_step("etch", rate=0.3, duration=1.0)
+        step["isotropicMethod"] = "geometric"
+        ctx = self._context("apply-geometric", step)
+        original_domain = ctx.domain
+        before = _top(ctx.domain)
+
+        with _v2_flags(apply=True), mock.patch("worker.process_models_v2.run_isotropic_v2") as bridge:
+            run_process_step(ctx, 1, step)
+
+        bridge.assert_not_called()
+        self.assertIs(ctx.domain, original_domain)
+        self.assertLess(_top(ctx.domain) - before, -0.1)
+        skipped = _events_of(ctx.run_dir, "v2-isotropic-shadow-skipped")
+        self.assertEqual(len(skipped), 1, skipped)
+        self.assertIn("geometric", skipped[0]["reason"].lower())
+        self.assertEqual(_events_of(ctx.run_dir, "v2-isotropic-shadow"), [])
+        self.assertEqual(_events_of(ctx.run_dir, "v2-isotropic-applied"), [])
 
 
 class V2IsotropicShadowEligibilityTests(unittest.TestCase):

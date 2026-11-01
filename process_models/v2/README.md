@@ -70,25 +70,26 @@ VIENNAPS_WORKBENCH_DATA_DIR=$PWD/var/test-v2 WORKBENCH_PORT=8767 \
   tests.test_process_models_v2_isotropic tests.test_process_models_v2_voxel
 ```
 
-v1 回归测试保持原样，也应在同一轮跑通。本轮已验证 **144 项定向测试通过**
+v1 回归测试保持原样，也应在同一轮跑通。本轮已验证 **150 项定向测试通过**
 （v1 38 + v2.1 core/execution 56 + isotropic 17 + voxel 13 + worker bridge 8 +
-worker shadow 12）；另有 12 项现有 isotropic dispatch API/worker 套件在影子开关
-打开/关闭下都通过。
+worker shadow/apply 16 + capability 2）；另有 12 项现有 isotropic dispatch
+API/worker 套件在影子开关打开/关闭下都通过。
 
 ## Worker shadow validation（v2 isotropic）
 
 切换 worker 之前，先用默认关闭的影子校验证明 v2.1 isotropic 插件复现现有 worker
 路径。这是**已落地**的集成切片，生产执行仍然走旧路径：
 
-- 开关：`VIENNAPS_WORKBENCH_V2_ISOTROPIC_SHADOW=1`，不设则完全不参与，输出不变。
+- 影子开关：`VIENNAPS_WORKBENCH_V2_ISOTROPIC_SHADOW=1`，不设则完全不参与，输出不变。
+- 验证 apply 开关：`VIENNAPS_WORKBENCH_V2_ISOTROPIC_APPLY=1`，只在 shadow 匹配后
+  把 `ctx.domain` 换成 v2 domain；这是能力验证，不是生产 cutover。
 - 范围：`model: isotropic`、`rateMode: uniform`、`isotropicMethod` 解析为
   `levelSet`（不是 geometric）、schema >= 4（实测 5/7）、2D/3D。
 - 机制：旧路径 apply 前深拷贝 domain → 老路径 apply → 在副本上跑
   `worker.process_models_v2.run_isotropic_v2` → 比较 `surface_state` digest 与
   material map → 写 `v2-isotropic-shadow` 事件（两侧 digest + plan identity）→
-  不一致直接抛错。
-- 不覆盖：`rateMode: material`、geometric `SphereDistribution`、快照/replay 切换、
-  完整 flow。
+  一致后可选 apply 替换 domain 并写 `v2-isotropic-applied`；不一致直接抛错。
+- 不覆盖：`rateMode: material`、geometric `SphereDistribution`、默认生产 cutover。
 
 ```bash
 VIENNAPS_WORKBENCH_DATA_DIR=$PWD/var/test-v2-shadow \
@@ -98,15 +99,16 @@ VIENNAPS_WORKBENCH_V2_ISOTROPIC_SHADOW=1 WORKBENCH_PORT=8767 \
 
 bridge 本身的直接测试：`tests.test_worker_v2_isotropic`（不需要开关，也不启动服务）。
 
-验证结果：bridge 8 项、shadow 12 项通过；现有 `tests.test_isotropic_dispatch`
-12 项在开关关闭/打开下都通过，开关打开时有 3 条匹配的 shadow 事件、5 条
-material-mode skip。离线 parity 还验证了 2D etch/deposit 的 snapshot JSON
+验证结果：bridge 8 项、shadow/apply 16 项通过；`tests.test_v2_isotropic_capability`
+2 项通过（2D 三步 + replay、3D 两步，baseline vs apply 的 snapshot/state 完全一致；
+2D 三步包含重复 SiO2 沉积）。现有 `tests.test_isotropic_dispatch` 12 项在开关
+关闭/打开下都通过。离线 parity 还验证了 2D etch/deposit 的 snapshot JSON
 （除 run-relative outputs）与 native state 文件 `stateId` 与旧路径完全一致。
 
 ## 当前限制
 
-- 未切换生产执行路径，不改项目 schema；项目暂时不能引用 v2.1 变体。
-  仅有的 worker 接触点是上面的默认关闭影子校验。
+- 未切换默认生产执行路径，不改项目 schema；项目暂时不能引用 v2.1 变体。
+  仅有的 worker 接触点是上面的默认关闭影子/验证 apply 开关。
 - 没有 warm pool、引擎复用池、并发调度；`StaticEngine.release()` 是 no-op。
 - 没有外部引擎（`external` 只是枚举值），没有自动引擎/变体选择。
 - `FieldState` 只是占位；字段/cell-set 的数值路径未实现，adapter 会显式拒绝。
