@@ -291,17 +291,11 @@ def resolve_execution(
                 # step may omit substrateDepth and inherit the canonical lattice
                 # from the existing snapshot instead of from the raw step.
                 payload = _cellset_payload_from_params(request.params)
-                stored = (
-                    CellSetConfig.from_state(request.state.fields)
-                    if request.state.fields is not None
-                    else None
-                )
+                stored = CellSetConfig.from_state(request.state.fields) if request.state.fields is not None else None
                 if payload is not None:
                     if payload.get("substrateDepth") is None:
                         if stored is None:
-                            raise ExecutionResolutionError(
-                                "the first field step must declare cellSet.substrateDepth"
-                            )
+                            raise ExecutionResolutionError("the first field step must declare cellSet.substrateDepth")
                         payload["substrateDepth"] = stored.substrate_depth
                     try:
                         config = CellSetConfig.from_mapping(payload)
@@ -310,9 +304,7 @@ def resolve_execution(
                 elif stored is not None:
                     config = stored
                 else:
-                    raise ExecutionResolutionError(
-                        "the first field step must declare cellSet.substrateDepth"
-                    )
+                    raise ExecutionResolutionError("the first field step must declare cellSet.substrateDepth")
             selected_adapter = DefaultStateAdapter(
                 cellset_backend=getattr(lease, "cellset_backend", None),
                 context=request.context,
