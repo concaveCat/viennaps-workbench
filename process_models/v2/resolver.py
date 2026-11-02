@@ -19,7 +19,7 @@ import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 
@@ -290,15 +290,29 @@ def resolve_execution(
                 # The canonical parameter model is authoritative. A later field
                 # step may omit substrateDepth and inherit the canonical lattice
                 # from the existing snapshot instead of from the raw step.
-                config = _cellset_config_from_params(request.params)
-                if config is None and request.state.fields is not None:
-                    config = CellSetConfig.from_state(request.state.fields)
-                    if config is None:
-                        raise ExecutionResolutionError(
-                            "existing cell-set state has no recoverable height/substrateDepth config"
-                        )
-                if config is None:
-                    raise ExecutionResolutionError("the first field step must declare cellSet.substrateDepth")
+                payload = _cellset_payload_from_params(request.params)
+                stored = (
+                    CellSetConfig.from_state(request.state.fields)
+                    if request.state.fields is not None
+                    else None
+                )
+                if payload is not None:
+                    if payload.get("substrateDepth") is None:
+                        if stored is None:
+                            raise ExecutionResolutionError(
+                                "the first field step must declare cellSet.substrateDepth"
+                            )
+                        payload["substrateDepth"] = stored.substrate_depth
+                    try:
+                        config = CellSetConfig.from_mapping(payload)
+                    except CellSetBackendError as error:
+                        raise ExecutionResolutionError(str(error)) from error
+                elif stored is not None:
+                    config = stored
+                else:
+                    raise ExecutionResolutionError(
+                        "the first field step must declare cellSet.substrateDepth"
+                    )
             selected_adapter = DefaultStateAdapter(
                 cellset_backend=getattr(lease, "cellset_backend", None),
                 context=request.context,
@@ -477,23 +491,16 @@ def run_step(
     return execute_plan(resolve_execution(request, registry, provider, adapter=adapter))
 
 
-def _cellset_config_from_params(params: BaseModel) -> CellSetConfig | None:
-    """Return the canonical cell-set config carried by a typed params model."""
+def _cellset_payload_from_params(params: BaseModel) -> dict[str, Any] | None:
+    """Return the raw canonical cell-set payload carried by typed params."""
     cell_set = getattr(params, "cellSet", None)
     if cell_set is None:
         return None
     if hasattr(cell_set, "model_dump"):
-        payload = cell_set.model_dump(mode="json", by_alias=True, exclude_none=False)
-    elif isinstance(cell_set, Mapping):
-        payload = dict(cell_set)
-    else:
-        return None
-    if payload.get("substrateDepth") is None:
-        return None
-    try:
-        return CellSetConfig.from_mapping(payload)
-    except CellSetBackendError as error:
-        raise ExecutionResolutionError(str(error)) from error
+        return cell_set.model_dump(mode="json", by_alias=True, exclude_none=False)
+    if isinstance(cell_set, Mapping):
+        return dict(cell_set)
+    return None
 
 
 def _check_geometry_grid(state: ProcessState, context: ProcessContext) -> None:

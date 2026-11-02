@@ -722,6 +722,28 @@ class FieldSequenceTest(unittest.TestCase):
             ).run(loaded, _flow_steps(self.registry, self.project, [self.raw_steps[-1]]))
         self.assertIn("different geometry", str(caught.exception))
 
+    def test_later_field_cannot_change_height_while_omitting_depth(self) -> None:
+        second = dict(self.raw_steps[1])
+        second["cellSet"] = {key: value for key, value in second["cellSet"].items() if key != "substrateDepth"}
+        second["cellSet"]["height"] = 0.3
+        with self.assertRaises(Exception) as caught:
+            FlowExecutor(
+                self.registry,
+                _provider(
+                    _NoCheckpointBackend(
+                        ps,
+                        id="viennaps",
+                        version=str(ps.__version__),
+                        material_registry=ViennaPSMaterialRegistry(ps),
+                    )
+                ),
+                StateStore(self.work_dir / "height-conflict"),
+            ).run(
+                _state(_plane()),
+                _flow_steps(self.registry, self.project, [self.raw_steps[0], second]),
+            )
+        self.assertIn("different config", str(caught.exception))
+
     def test_a_failed_field_step_aborts_the_whole_run(self) -> None:
         bad = dict(self.raw_steps[-1])
         bad["id"] = "analysis_step_bad"
