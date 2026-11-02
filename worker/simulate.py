@@ -2743,7 +2743,7 @@ def save_snapshot(
         "stepName": step_name,
         "stepIndex": step_index,
         "axisMap": {"x": 0, "y": 1, "z": 2} if is3d else {"x": 0, "h": 1, "z": 2},
-        "coordinateUnit": "um",
+        "coordinateUnit": str((requested.get("units") or {}).get("length") or "um"),
         "points": display_points,
         cells_key: display_triangles,
         "cellData": {"materialIds": ids},
@@ -3352,7 +3352,7 @@ def calculate_single_flux(ps: Any, domain: Any, project: dict[str, Any], step: d
         "source": "viennaps.Process.calculateFlux",
         "dimension": int(project["dimension"]),
         "axisMap": {"x": 0, "y": 1, "z": 2} if project["dimension"] == 3 else {"x": 0, "h": 1, "z": 2},
-        "coordinateUnit": "um",
+        "coordinateUnit": str((project.get("units") or {}).get("length") or "um"),
         "fieldUnitPolicy": "native mesh labels do not declare units; nativeUnit is null rather than inferred",
         "meshIdentity": report["meshIdentity"],
         "mesh": {"pointCount": len(report["points"]),
@@ -3430,7 +3430,7 @@ def describe_intermediate_vtp(path: Path, *, step_id: str, run_id: str,
     return {"stepId": step_id, "fileName": relative.as_posix(),
             "url": f"/api/runs/{run_id}/intermediate-outputs/{step_id}/{path.name}",
             "format": "VTP", "pointCount": point_count, "cellCounts": cell_counts,
-            "coordinateUnit": "um", "axisMap": {"x": 0, "y": 1, "z": 2} if project["dimension"] == 3 else {"x": 0, "h": 1, "z": 2},
+            "coordinateUnit": str((project.get("units") or {}).get("length") or "um"), "axisMap": {"x": 0, "y": 1, "z": 2} if project["dimension"] == 3 else {"x": 0, "h": 1, "z": 2},
             "fields": fields, "sizeBytes": path.stat().st_size,
             "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
             "associationPolicy": "native VTP pointData/cellData retained; not projected onto the domain surface"}
@@ -4533,10 +4533,11 @@ def execute(input_path: Path, run_dir: Path) -> None:
         cuda_readback = cuda_runtime_readback(selected_gpu_device)
 
     if project.get("schemaVersion", 1) >= 3:
-        # Schema-3+ project rates and coordinates use the declared um/s unit
-        # system for every native model, not only the dedicated processes.
-        ps.Length.setUnit("um")
-        ps.Time.setUnit("s")
+        # Native ViennaPS is unit-agnostic; the declared project unit labels the
+        # native metadata and the emitted snapshots without rescaling values.
+        units = project.get("units") or {}
+        ps.Length.setUnit(str(units.get("length") or "um"))
+        ps.Time.setUnit(str(units.get("time") or "s"))
 
     ps.setDimension(int(project["dimension"]))
     ps.setNumThreads(int(project["solver"]["cpuThreads"]))

@@ -90,7 +90,7 @@ class ParticleShapeParams(BaseModel):
 
     operation: Literal["etch", "deposit"]
     shape: Literal["box", "sphere"]
-    radius: float | None = Field(default=None, gt=0, le=2)
+    radius: float | None = Field(default=None, gt=0, le=2000)
     halfAxes: Annotated[list[float], Field(min_length=2, max_length=3)] | None = None
     depositMaterial: str | None = Field(default=None, min_length=1, max_length=80)
     maskMaterials: Annotated[list[str], Field(max_length=64)] | None = None

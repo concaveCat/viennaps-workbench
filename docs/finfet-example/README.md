@@ -9,11 +9,11 @@ dispatch, plugin, geometry, state and replay paths.
 | File | Purpose |
 |---|---|
 | `reference/FinFET.py` | verbatim upstream script (SHA-256 `32ec9f2d…`) |
-| `reference/FinFET_um.py` | mechanically unit-scaled native twin (µm frame) |
+| `reference/FinFET_um.py` | µm twin retained for the scale-sensitivity cross-check |
 | `reference/canonical.py` | order-independent surface/volume digest |
 | `reference/run_reference.py` | runs a native script and writes `expected*.json` |
-| `expected.json` | 26 surfaces + final volume from the original nm script |
-| `expected-um.json` | 26 surfaces + final volume from the project-frame twin |
+| `expected.json` | 26 surfaces + final volume from the original nm script (acceptance reference) |
+| `expected-um.json` | µm twin, retained only as the native scale-sensitivity cross-check |
 | `project.json` | equivalent schema-7 workbench project (25 steps) |
 | `mapping.md` | line-by-line source-to-step and unit mapping |
 | `../../tests/acceptance/test_finfet_example.py` | heavy API acceptance test |
@@ -34,18 +34,24 @@ dispatch, plugin, geometry, state and replay paths.
 
 ## Unit frame
 
-The source is in nanometres; the workbench schema is micrometres. Lengths,
-radii, half-axes, cutoffs and rates are multiplied by exactly 0.001; durations
-are unchanged. The domain uses an explicit `domain.bounds` array because the
-centered `xExtent`/`yExtent` constructor always produces an odd number of grid
-points per axis and cannot reproduce the native 128-point y grid.
+The workbench natively supports nanometre schema-7 projects
+(`units.length = "nm"`, `units.rate = "nm/s"`). ViennaPS is unit-agnostic, so
+the project values reach the native constructors unchanged: no ×0.001
+translation is applied to lengths, radii, half-axes, cutoffs or rates.
+`parse_project` installs a unit-aware validation context so the historical
+0.5 µm grid / 40 µm domain / 2 µm feature limits become their exact
+nanometre equivalents without changing any existing µm project. Snapshots and
+native records carry `coordinateUnit = "nm"`.
 
-The original nm run and the µm twin agree on surfaces 0–13 and diverge at
-surface 14 (dummy-gate masked box etch). A direct native µm run reproduces the
-workbench digest exactly, so this is a ViennaPS level-set boolean scale
-sensitivity, not a workbench dispatch bug. The acceptance therefore uses
-`expected-um.json`, while `expected.json` remains the unmodified-script
-evidence. `tests/test_finfet_reference.py` pins the frame relationship.
+The domain still uses an explicit `domain.bounds` array because the centered
+`xExtent`/`yExtent` constructor always produces an odd number of grid points
+per axis and cannot reproduce the native 128-point y grid.
+
+The µm twin (`FinFET_um.py` / `expected-um.json`) is kept only to document a
+measured ViennaPS limitation: the nm and µm native runs agree on surfaces
+0–13 and diverge at surface 14 because level-set mask booleans are not
+exactly scale invariant. The acceptance now compares the workbench directly
+with the original nm `expected.json`.
 
 ## Running
 
@@ -75,21 +81,26 @@ The heavy test is gated by
 
 ## Acceptance evidence
 
-Recorded API acceptance run (project-frame reference):
+Recorded API acceptance run (native nanometre project):
 
-- run id: `bdadcaa795e8f422cc284ff5`
+- run id: `397fe39a3ae0411f247b2150`
 - status: succeeded, 25/25 v2 steps
-- wall time: 1299.9 s (21 m 40 s), CPU only
+- wall time: 1359.4 s (22 m 39 s), CPU only
 - surface 25 digest:
-  `2465419c18cf80ea8abf3099e315c1eb6dae41694c23b7f3772b2d7c862410a5`
-- final volume: 2,074,708 nodes / 12,132,792 tetrahedra, digest
-  `e8320f7196489f55806accd5d9c41982e4b2d365b9c8d6712ebb35a7e98e6a21`
-- replay run id: `332ba71ddd69314e7039f327`
-- replay wall time: 1140.2 s (19 m 0 s); identical request and execution
-  hashes (`e4252a89…`, `705af40d…`)
-- replay final volume file SHA-256 is byte-identical to the first run
-  (`f922a7a6…`), and the acceptance test compares every surface digest and the
-  canonical volume digest before passing.
+  `6c7f348c412c67f7e87ebf093fff87a3554fecce9b4dbf25a30dbb9f1d0c5084`
+- final volume: 2,075,499 nodes / 12,136,389 tetrahedra, digest
+  `b5fab9041115584aa338c6aa56e349049526ec55557b970f26c2e1a0e79e974f`
+- final volume file SHA-256:
+  `a24688213d8fa65b9ff737c73c139648d5a3d3d0703e6f4dbeaa4a1d1e8d9369`
+  (byte-identical to the original native volume)
+- replay run id: `7bb99976ce4cbae02bfaf98c`
+- replay status: succeeded; identical requested/execution hashes
+  (`7fd3b590…`, `68f68978…`) and a byte-identical final volume file
+  (`a2468821…`). The replay wall time was 3347.0 s because the acceptance was
+  intentionally run alongside the regression suite; the first pass took
+  1359.4 s.
+- snapshots report `coordinateUnit = "nm"` and mesh values are not rescaled.
 
-Known differences: the native nm/µm frame divergence at surface 14 described
-above. All other platform behaviour matches digest-for-digest.
+Known differences: none in the native nm frame. The nm/µm native scale
+divergence at surface 14 is retained only as a cross-check, not as the
+acceptance target.

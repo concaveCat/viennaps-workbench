@@ -236,7 +236,7 @@ class ApiIntegrationTests(unittest.IsolatedAsyncioTestCase):
         project["schemaVersion"] = 99
         cases.append(("future schema", project, "schemaVersion"))
         project = default_project()
-        project["units"]["length"] = "nm"
+        project["units"]["length"] = "mm"
         cases.append(("unsupported unit", project, "units.length"))
         project = default_project()
         project["domain"]["gridDelta"] = True

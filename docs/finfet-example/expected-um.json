@@ -11,6 +11,16 @@
     "threads": 1
   },
   "domain": {
+    "coordinateUnit": "um",
+    "bounds": [
+      0.0,
+      0.09,
+      0.0,
+      0.1,
+      0.0,
+      0.07
+    ],
+    "gridDelta": 0.00079,
     "boundsUm": [
       0.0,
       0.09,
@@ -25,8 +35,6 @@
       "reflective",
       "infinite"
     ],
-    "nativeCoordinateUnit": "um",
-    "coordinateUnit": "um",
     "unitScaleNmToUm": 1.0
   },
   "surfaces": [

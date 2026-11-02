@@ -57,7 +57,7 @@ class Snapshot3D(StrictModel):
     stepName:str
     stepIndex:Integer
     axisMap:Axes
-    coordinateUnit:Literal['um']
+    coordinateUnit:Literal['um','nm']
     points:list[Vector3]
     triangles:list[Annotated[list[Integer],Field(min_length=3,max_length=3)]]
     cellData:CellMaterials

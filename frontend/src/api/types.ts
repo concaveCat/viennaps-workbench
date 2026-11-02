@@ -3,7 +3,7 @@ import type { View3D } from '../types3d';
 // Hand-written shapes for the workbench HTTP API. They mirror the JSON the
 // backend emits; keep them in sync with backend/ responses when fields change.
 
-export type Units = { length: 'um'; time: 's'; rate: 'um/s'; angle: 'deg' };
+export type Units = { length: 'um' | 'nm'; time: 's'; rate: 'um/s' | 'nm/s'; angle: 'deg' };
 export type Domain = { gridDelta: number; xExtent: number; xBoundary?: 'reflective' | 'periodic'; yExtent?: number; boundaryXY?: 'reflective' | 'periodic' };
 export type Layer = { id: string; name: string; material: string; thickness: number; role: 'film' | 'mask'; source?: 'gds-mask' };
 export type GDSMaskPattern = { name: string; assetId: string; fileName: string; structure: string; layer: number; datatype: number; unitScale: number; position: [number, number, number]; baseHeight: number; height: number; material: string; retainedRegion: 'inside' | 'outside'; protectsEtch: boolean };

@@ -51,7 +51,7 @@ PY
   echo "== native reference: project-frame micrometre twin =="
   "$PY" docs/finfet-example/reference/run_reference.py \
     --script docs/finfet-example/reference/FinFET_um.py \
-    --unit-scale 1.0 \
+    --coordinate-unit um \
     --output-dir "$REFERENCE_DIR/um" \
     --expected "$REFERENCE_DIR/um/expected.json"
   "$PY" - "$REFERENCE_DIR/um/expected.json" docs/finfet-example/expected-um.json <<'PY'

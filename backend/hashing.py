@@ -123,7 +123,7 @@ def requested_input(project: Project | ProjectV3 | ProjectV4 | ProjectV5 | Proje
         steps.append(item)
     result = {
         "dimension": project.dimension,
-        "units": {"length": "um", "time": "s", "rate": "um/s", "angle": "deg"},
+        "units": project.units.model_dump(mode="json"),
         "domain": project.domain.model_dump(mode="json", exclude_none=True),
         "geometry": geometry,
         "steps": steps,

@@ -936,7 +936,7 @@
             "anyOf": [
               {
                 "gt": 0,
-                "le": 40,
+                "le": 40000,
                 "type": "number"
               },
               {
@@ -951,7 +951,7 @@
           },
           "height": {
             "gt": 0,
-            "le": 100,
+            "le": 100000,
             "title": "Height",
             "type": "number"
           },
@@ -984,7 +984,7 @@
           },
           "width": {
             "gt": 0,
-            "le": 40,
+            "le": 40000,
             "title": "Width",
             "type": "number"
           }
@@ -2540,7 +2540,7 @@
       },
       "DirectionalRateSetV5": {
         "additionalProperties": false,
-        "description": "One real ``viennaps.RateSet`` of the native multi-set overload.\n\n``directionalVelocity`` and ``isotropicVelocity`` are non-negative rate\nmagnitudes in um/s, exactly like the step-level scalar fields: the step\n``operation`` selects the native sign (etch negative, deposit positive).\nThe name follows the native RateSet property and is not a signed raw value.",
+        "description": "One real ``viennaps.RateSet`` of the native multi-set overload.\n\n``directionalVelocity`` and ``isotropicVelocity`` are non-negative rate\nmagnitudes in the declared rate unit, exactly like the step-level scalar fields: the step\n``operation`` selects the native sign (etch negative, deposit positive).\nThe name follows the native RateSet property and is not a signed raw value.",
         "properties": {
           "calculateVisibility": {
             "default": true,
@@ -2886,7 +2886,7 @@
         "properties": {
           "gridDelta": {
             "gt": 0,
-            "le": 0.5,
+            "le": 500,
             "title": "Griddelta",
             "type": "number"
           },
@@ -2900,7 +2900,7 @@
           },
           "xExtent": {
             "ge": 1,
-            "le": 40,
+            "le": 40000,
             "title": "Xextent",
             "type": "number"
           }
@@ -2942,19 +2942,19 @@
           },
           "gridDelta": {
             "gt": 0,
-            "le": 0.5,
+            "le": 500,
             "title": "Griddelta",
             "type": "number"
           },
           "xExtent": {
             "ge": 0.01,
-            "le": 40,
+            "le": 40000,
             "title": "Xextent",
             "type": "number"
           },
           "yExtent": {
             "ge": 0.01,
-            "le": 40,
+            "le": 40000,
             "title": "Yextent",
             "type": "number"
           }
@@ -5074,7 +5074,7 @@
       },
       "InsertBoxStepV7": {
         "additionalProperties": false,
-        "description": "Insert a native ``viennals.Box`` level set as a new material.\n\nReproduces the FinFET script's double-patterning mask::\n\n    box = ps.LevelSet(domain.getGrid())\n    ps.MakeGeometry(box, ps.Box(min, max)).apply()\n    domain.insertNextLevelSetAsMaterial(box, material)\n\n``min``/``max`` are absolute project coordinates in um. The box is inserted\nabove the current top level set, so the material order grows by one.",
+        "description": "Insert a native ``viennals.Box`` level set as a new material.\n\nReproduces the FinFET script's double-patterning mask::\n\n    box = ps.LevelSet(domain.getGrid())\n    ps.MakeGeometry(box, ps.Box(min, max)).apply()\n    domain.insertNextLevelSetAsMaterial(box, material)\n\n``min``/``max`` are absolute project coordinates in the declared length unit. The box is inserted\nabove the current top level set, so the material order grows by one.",
         "properties": {
           "enabled": {
             "title": "Enabled",
@@ -8054,7 +8054,7 @@
             "anyOf": [
               {
                 "gt": 0,
-                "le": 1,
+                "le": 1000,
                 "type": "number"
               },
               {
@@ -8162,7 +8162,7 @@
               {
                 "items": {
                   "gt": 0,
-                  "le": 2,
+                  "le": 2000,
                   "type": "number"
                 },
                 "maxItems": 3,
@@ -8237,7 +8237,7 @@
             "anyOf": [
               {
                 "gt": 0,
-                "le": 2,
+                "le": 2000,
                 "type": "number"
               },
               {
@@ -11072,6 +11072,7 @@
       },
       "Units": {
         "additionalProperties": false,
+        "description": "Schema-7 native units; nanometres and micrometres are both first-class.",
         "properties": {
           "angle": {
             "const": "deg",
@@ -11079,12 +11080,18 @@
             "type": "string"
           },
           "length": {
-            "const": "um",
+            "enum": [
+              "um",
+              "nm"
+            ],
             "title": "Length",
             "type": "string"
           },
           "rate": {
-            "const": "um/s",
+            "enum": [
+              "um/s",
+              "nm/s"
+            ],
             "title": "Rate",
             "type": "string"
           },
@@ -11095,10 +11102,10 @@
           }
         },
         "required": [
-          "length",
           "time",
-          "rate",
-          "angle"
+          "angle",
+          "length",
+          "rate"
         ],
         "title": "Units",
         "type": "object"

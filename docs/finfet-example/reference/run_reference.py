@@ -42,11 +42,9 @@ from canonical import surface_digest, volume_digest  # noqa: E402
 
 SURFACE_RE = re.compile(r"FinFET_(\d+)\.vtp$")
 
-#: The source script is authored in nanometres; the workbench project uses
-#: micrometres. ``--unit-scale`` selects the coordinate multiplier; the
-#: mechanically scaled ``FinFET_um.py`` twin already uses micrometres and
-#: passes 1.0.
-UNIT_SCALE = 0.001
+#: Coordinates are recorded in the script's own native unit. The caller states
+#: that unit with ``--coordinate-unit`` so the expected document can describe
+#: the exact frame without rescaling any mesh.
 
 
 def sha256_file(path: Path) -> str:
@@ -102,7 +100,7 @@ def read_volume(path: Path) -> dict[str, Any]:
     reader.setFileName(str(path))
     reader.setMesh(mesh)
     reader.apply()
-    nodes = [[float(value) * UNIT_SCALE for value in point] for point in mesh.getNodes()]
+    nodes = [[float(value) for value in point] for point in mesh.getNodes()]
     tetras = mesh.getTetras()
     hexas = mesh.getHexas()
     if tetras and hexas:
@@ -127,7 +125,8 @@ def read_volume(path: Path) -> dict[str, Any]:
     }
 
 
-def run(script: Path, output_dir: Path, keep_meshes: bool) -> tuple[dict[str, Any], float]:
+def run(script: Path, output_dir: Path, keep_meshes: bool,
+        coordinate_unit: str = "nm") -> tuple[dict[str, Any], float]:
     if output_dir.exists():
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True)
@@ -149,7 +148,7 @@ def run(script: Path, output_dir: Path, keep_meshes: bool) -> tuple[dict[str, An
             raise RuntimeError(f"unexpected surface filename {filename!r}")
         index = int(match.group(1))
         mesh = domain.getSurfaceMesh(addInterfaces=True, sharpCorners=False, minNodeDistanceFactor=0.01)
-        points = [[float(value) * UNIT_SCALE for value in point] for point in mesh.getNodes()]
+        points = [[float(value) for value in point] for point in mesh.getNodes()]
         triangles = mesh.getTriangles()
         material_ids = scalar_cell_data(mesh, "MaterialIds")
         order = material_map(domain)
@@ -229,12 +228,14 @@ def run(script: Path, output_dir: Path, keep_meshes: bool) -> tuple[dict[str, An
             "threads": 1,
         },
         "domain": {
+            "coordinateUnit": coordinate_unit,
+            "bounds": ([0.0, 90.0, 0.0, 100.0, 0.0, 70.0] if coordinate_unit == "nm"
+                       else [0.0, 0.09, 0.0, 0.1, 0.0, 0.07]),
+            "gridDelta": 0.79 if coordinate_unit == "nm" else 0.00079,
             "boundsUm": [0.0, 0.09, 0.0, 0.1, 0.0, 0.07],
             "gridDeltaUm": 0.00079,
             "boundaries": ["reflective", "reflective", "infinite"],
-            "nativeCoordinateUnit": "nm" if UNIT_SCALE == 0.001 else "um",
-            "coordinateUnit": "um",
-            "unitScaleNmToUm": UNIT_SCALE,
+            "unitScaleNmToUm": 0.001 if coordinate_unit == "nm" else 1.0,
         },
         "surfaces": surfaces,
         "volume": volumes[0],
@@ -249,17 +250,14 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, default=root / "var" / "finfet-reference")
     parser.add_argument("--expected", type=Path, default=None)
     parser.add_argument("--keep-meshes", action="store_true", help="keep the 26 VTP files and the final VTU")
-    parser.add_argument("--unit-scale", type=float, default=0.001,
-                        help="coordinate multiplier from the script frame to um (default 0.001)")
+    parser.add_argument("--coordinate-unit", choices=("nm", "um"), default="nm",
+                        help="native unit of the script (default nm)")
     args = parser.parse_args()
-    global UNIT_SCALE
-    if not args.unit_scale > 0:
-        parser.error("--unit-scale must be positive")
-    UNIT_SCALE = float(args.unit_scale)
 
     ps.Logger.setLogLevel(ps.LogLevel.ERROR)
     ps.setNumThreads(1)
-    expected, elapsed = run(args.script.resolve(), args.output_dir.resolve(), args.keep_meshes)
+    expected, elapsed = run(args.script.resolve(), args.output_dir.resolve(), args.keep_meshes,
+                            args.coordinate_unit)
     text = json.dumps(expected, indent=2, sort_keys=False, allow_nan=False) + "\n"
     target = args.expected.resolve() if args.expected is not None else args.output_dir / "expected.json"
     target.parent.mkdir(parents=True, exist_ok=True)

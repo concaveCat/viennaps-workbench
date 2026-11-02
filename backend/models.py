@@ -65,25 +65,52 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, validate_assignment=True)
 
 
-class Units(StrictModel):
-    length: Literal["um"]
+class _UnitsBase(StrictModel):
     time: Literal["s"]
-    rate: Literal["um/s"]
     angle: Literal["deg"]
 
 
-# Minimum lateral 3D domain size in um. A domain must hold real structure
-# (a 22 nm FinFET cell is 0.48 x 0.50 um), so the historical 1 um floor was an
-# arbitrary UI limit, not a native requirement. The FinFET acceptance example
-# uses a 0.09 x 0.10 um cell. 0.01 um still rejects a degenerate or
-# zero-sized domain, and ``Domain3D`` additionally requires two grid intervals
-# per axis below.
+class Units(_UnitsBase):
+    """Schema-7 native units; nanometres and micrometres are both first-class."""
+
+    length: Literal["um", "nm"]
+    rate: Literal["um/s", "nm/s"]
+
+    @model_validator(mode="after")
+    def paired_length_and_rate(self) -> "Units":
+        if (self.length == "nm") != (self.rate == "nm/s"):
+            raise ValueError("units.length and units.rate must use the same length unit")
+        return self
+
+    @property
+    def length_units_per_um(self) -> float:
+        """Return native length units per micrometre (1 for um, 1000 for nm)."""
+        return 1000.0 if self.length == "nm" else 1.0
+
+    @property
+    def length_unit(self) -> str:
+        return self.length
+
+
+class UnitsLegacy(_UnitsBase):
+    """Schemas 1-6 are frozen in the historical micrometre frame."""
+
+    length: Literal["um"]
+    rate: Literal["um/s"]
+
+
+# Minimum lateral 3D domain size in the declared length unit. A domain must
+# hold real structure (a 22 nm FinFET cell is 0.48 x 0.50 um), so the
+# historical 1 um floor was an arbitrary UI limit, not a native requirement.
+# The FinFET acceptance example uses a 90 x 100 nm cell in a nanometre project.
+# 0.01 still rejects a degenerate or zero-sized domain, and ``Domain3D``
+# additionally requires two grid intervals per axis.
 MIN_DOMAIN_EXTENT_3D = 0.01
 
 
 class Domain(StrictModel):
-    gridDelta: Annotated[Number, Field(gt=0, le=0.5)]
-    xExtent: Annotated[Number, Field(ge=1, le=40)]
+    gridDelta: Annotated[Number, Field(gt=0, le=500)]
+    xExtent: Annotated[Number, Field(ge=1, le=40000)]
     xBoundary: Literal["reflective", "periodic"]
 
 
@@ -226,7 +253,7 @@ class ProjectV1(StrictModel):
     schemaVersion: Literal[1]
     name: Annotated[str, Field(min_length=1, max_length=80)]
     dimension: Literal[2]
-    units: Units
+    units: UnitsLegacy
     domain: Domain
     geometry: Geometry
     steps: list[Step]
@@ -242,9 +269,9 @@ class ProjectV1(StrictModel):
 
 
 class Domain3D(StrictModel):
-    gridDelta: Annotated[Number, Field(gt=0, le=0.5)]
-    xExtent: Annotated[Number, Field(ge=MIN_DOMAIN_EXTENT_3D, le=40)]
-    yExtent: Annotated[Number, Field(ge=MIN_DOMAIN_EXTENT_3D, le=40)]
+    gridDelta: Annotated[Number, Field(gt=0, le=500)]
+    xExtent: Annotated[Number, Field(ge=MIN_DOMAIN_EXTENT_3D, le=40000)]
+    yExtent: Annotated[Number, Field(ge=MIN_DOMAIN_EXTENT_3D, le=40000)]
     boundaryXY: Literal["reflective", "periodic"]
     #: Optional absolute native bounds ``[xmin, xmax, ymin, ymax, zmin, zmax]``.
     #: The centered ``xExtent``/``yExtent`` constructor used by the UI cannot
@@ -286,8 +313,8 @@ class Domain3D(StrictModel):
                     raise ValueError(f"bounds {label} span {span:g} must equal {label}Extent {extent:g}")
                 if span < minimum:
                     raise ValueError(f"bounds {label} span must be at least two grid intervals ({minimum:g} um)")
-                if span > 40.0:
-                    raise ValueError(f"bounds {label} span must stay within 40 um")
+                if span > 40000.0:
+                    raise ValueError(f"bounds {label} span must stay within the application domain limit")
             if abs(zmin) / float(self.gridDelta) > 1_000_000 or abs(zmax) / float(self.gridDelta) > 1_000_000:
                 raise ValueError("bounds z coordinates exceed the application coordinate budget")
         return self
@@ -380,7 +407,7 @@ class ProjectV2(StrictModel):
     schemaVersion: Literal[2]
     name: Annotated[str, Field(min_length=1, max_length=80)]
     dimension: Literal[3]
-    units: Units
+    units: UnitsLegacy
     domain: Domain3D
     geometry: Annotated[Union[PlaneGeometry, TrenchGeometry, HoleGeometry], Field(discriminator="kind")]
     steps: list[Step]
@@ -409,7 +436,7 @@ class ProjectV3(StrictModel):
     schemaVersion: Literal[3]
     name: Annotated[str, Field(min_length=1, max_length=80)]
     dimension: Literal[2, 3]
-    units: Units
+    units: UnitsLegacy
     domain: Domain | Domain3D
     geometry: dict
     steps: list[dict]
@@ -910,7 +937,7 @@ class ProjectV4(StrictModel):
     schemaVersion: Literal[4]
     name: Annotated[str, Field(min_length=1, max_length=80)]
     dimension: Literal[2, 3]
-    units: Units
+    units: UnitsLegacy
     domain: Domain | Domain3D
     geometry: dict
     steps: list[StepV4]
@@ -969,7 +996,7 @@ class DirectionalRateSetV5(StrictModel):
     """One real ``viennaps.RateSet`` of the native multi-set overload.
 
     ``directionalVelocity`` and ``isotropicVelocity`` are non-negative rate
-    magnitudes in um/s, exactly like the step-level scalar fields: the step
+    magnitudes in the declared rate unit, exactly like the step-level scalar fields: the step
     ``operation`` selects the native sign (etch negative, deposit positive).
     The name follows the native RateSet property and is not a signed raw value.
     """
@@ -1146,9 +1173,9 @@ class BooleanStepV5(StrictModel):
     booleanOperation: Literal["union", "intersection", "difference"]
     # Position is [x,h,0] in 2D and [x,y,z] in 3D; z is vertical in 3D.
     position: Vector3
-    width: Annotated[Number, Field(gt=0, le=40)]
-    height: Annotated[Number, Field(gt=0, le=100)]
-    depth: Annotated[Number, Field(gt=0, le=40)] | None = None
+    width: Annotated[Number, Field(gt=0, le=40000)]
+    height: Annotated[Number, Field(gt=0, le=100000)]
+    depth: Annotated[Number, Field(gt=0, le=40000)] | None = None
     angle: Annotated[Number, Field(ge=-45, le=45)] = 0.0
     applyToAll: bool = True
 
@@ -1440,7 +1467,7 @@ class CsvProcessStepV7(StrictModel):
         return self
 
 
-ShapeAxis = Annotated[Number, Field(gt=0, le=2)]
+ShapeAxis = Annotated[Number, Field(gt=0, le=2000)]
 
 
 class ParticleShapeStepV7(StrictModel):
@@ -1923,7 +1950,7 @@ class InsertBoxStepV7(StrictModel):
         ps.MakeGeometry(box, ps.Box(min, max)).apply()
         domain.insertNextLevelSetAsMaterial(box, material)
 
-    ``min``/``max`` are absolute project coordinates in um. The box is inserted
+    ``min``/``max`` are absolute project coordinates in the declared length unit. The box is inserted
     above the current top level set, so the material order grows by one.
     """
 
@@ -1985,7 +2012,7 @@ class DomainStateRef(StrictModel):
         return self
 
 
-def project_structure_hash(dimension: int, units: Units, domain: Domain | Domain3D, geometry: dict) -> str:
+def project_structure_hash(dimension: int, units: Units | UnitsLegacy, domain: Domain | Domain3D, geometry: dict) -> str:
     payload = {"dimension": dimension, "units": units.model_dump(mode="json"),
                "domain": domain.model_dump(mode="json", exclude_none=True), "geometry": geometry}
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
@@ -1996,7 +2023,7 @@ class ProjectV6(StrictModel):
     schemaVersion: Literal[6]
     name: Annotated[str, Field(min_length=1, max_length=80)]
     dimension: Literal[2, 3]
-    units: Units
+    units: UnitsLegacy
     domain: Domain | Domain3D
     geometry: dict
     steps: list[StepV5]
@@ -2013,6 +2040,8 @@ class ProjectV6(StrictModel):
 
     @model_validator(mode="after")
     def version6_shape(self):
+        if self.schemaVersion != 7 and self.units.length == "nm":
+            raise ValueError("nanometre projects require schemaVersion 7")
         if self.dimension == 2 and (self.view is None or self.view3D is not None or not isinstance(self.domain, Domain)):
             raise ValueError("2D schemaVersion 6 requires 2D domain and view only")
         if self.dimension == 3 and (self.view3D is None or self.view is not None or not isinstance(self.domain, Domain3D)):
@@ -2133,7 +2162,7 @@ class OutputSettingsV7(StrictModel):
     volumeMesh: bool = False
     #: Native ``Domain.saveVolumeMesh`` wrapping-layer epsilon. Omitted keeps
     #: the historical 0.01 um and stays out of the canonical request hash.
-    volumeMeshDelta: Annotated[Number, Field(gt=0, le=1)] | None = None
+    volumeMeshDelta: Annotated[Number, Field(gt=0, le=1000)] | None = None
     nativeMetadata: bool = False
     cellSet: CellSetOutputV7 | None = None
 
@@ -2142,6 +2171,7 @@ class ProjectV7(ProjectV6):
     """Schema 7 is the unified extension point for advanced native capabilities."""
 
     schemaVersion: Literal[7]
+    units: Units
     solver: SolverV7
     steps: list[StepV7]
     outputSettings: OutputSettingsV7 | None = None
@@ -2245,6 +2275,36 @@ class ProjectV7(ProjectV6):
         if (self.outputSettings is not None and self.outputSettings.volumeMeshDelta is not None
                 and not self.outputSettings.volumeMesh):
             raise ValueError("outputSettings.volumeMeshDelta requires outputSettings.volumeMesh=true")
+        if self.units.length == "um":
+            # Field maxima are expressed in nanometres so a single schema can
+            # admit both frames. Micrometre projects keep their historical
+            # limits (and error surface) through this unit-aware check.
+            delta = float(self.domain.gridDelta)
+            if delta > 0.5:
+                raise ValueError("domain.gridDelta must be <= 0.5 um for a micrometre project")
+            if float(self.domain.xExtent) > 40:
+                raise ValueError("domain.xExtent must be <= 40 um for a micrometre project")
+            if self.dimension == 3 and float(self.domain.yExtent) > 40:
+                raise ValueError("domain.yExtent must be <= 40 um for a micrometre project")
+            bounds = getattr(self.domain, "bounds", None)
+            if bounds is not None:
+                xmin, xmax, ymin, ymax, _zmin, _zmax = (float(value) for value in bounds)
+                if xmax - xmin > 40 or ymax - ymin > 40:
+                    raise ValueError("domain.bounds span must stay within 40 um for a micrometre project")
+            for index, step in enumerate(self.steps):
+                if isinstance(step, ParticleShapeStepV7):
+                    axes = [float(value) for value in (step.halfAxes or [])]
+                    if step.radius is not None:
+                        axes.append(float(step.radius))
+                    if any(value > 2 for value in axes):
+                        raise ValueError(f"steps[{index}]: particleShape magnitude must be <= 2 um for a micrometre project")
+                if isinstance(step, BooleanStepV5):
+                    if float(step.width) > 40 or float(step.height) > 100 or (
+                            step.depth is not None and float(step.depth) > 40):
+                        raise ValueError(f"steps[{index}]: boolean dimensions exceed the micrometre project limits")
+            if (self.outputSettings is not None and self.outputSettings.volumeMeshDelta is not None
+                    and float(self.outputSettings.volumeMeshDelta) > 1):
+                raise ValueError("outputSettings.volumeMeshDelta must be <= 1 um for a micrometre project")
         cell_set = self.outputSettings.cellSet if self.outputSettings is not None else None
         if cell_set is not None and cell_set.enabled:
             delta = float(self.domain.gridDelta)
@@ -2323,7 +2383,7 @@ class ProjectV5(StrictModel):
     schemaVersion: Literal[5]
     name: Annotated[str, Field(min_length=1, max_length=80)]
     dimension: Literal[2, 3]
-    units: Units
+    units: UnitsLegacy
     domain: Domain | Domain3D
     geometry: dict
     steps: list[StepV5]

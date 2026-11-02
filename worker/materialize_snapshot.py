@@ -41,8 +41,9 @@ def materialize(input_path: Path, run_dir: Path, step_id: str) -> dict[str, Any]
         raise RuntimeError(f"native state for step {step_id!r} is missing")
 
     if project.get("schemaVersion", 1) >= 3:
-        ps.Length.setUnit("um")
-        ps.Time.setUnit("s")
+        units = project.get("units") or {}
+        ps.Length.setUnit(str(units.get("length") or "um"))
+        ps.Time.setUnit(str(units.get("time") or "s"))
     ps.setDimension(int(project["dimension"]))
     ps.setNumThreads(int(project["solver"]["cpuThreads"]))
     sim.configure_native_materials(ps, config.get("customMaterials", []))

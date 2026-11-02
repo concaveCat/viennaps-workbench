@@ -3,28 +3,28 @@
   "name": "FinFET.py parity fixture",
   "dimension": 3,
   "units": {
-    "length": "um",
+    "length": "nm",
     "time": "s",
-    "rate": "um/s",
+    "rate": "nm/s",
     "angle": "deg"
   },
   "domain": {
-    "gridDelta": 0.00079,
-    "xExtent": 0.09,
-    "yExtent": 0.1,
+    "gridDelta": 0.79,
+    "xExtent": 90.0,
+    "yExtent": 100.0,
     "boundaryXY": "reflective",
     "bounds": [
       0.0,
-      0.09,
+      90.0,
       0.0,
-      0.1,
+      100.0,
       0.0,
-      0.07
+      70.0
     ]
   },
   "geometry": {
     "kind": "plane",
-    "height": 0.07,
+    "height": 70.0,
     "substrateMaterial": "Si"
   },
   "steps": [
@@ -34,14 +34,14 @@
       "enabled": true,
       "model": "insertBox",
       "min": [
-        0.03,
-        -0.01,
-        0.0699
+        30.0,
+        -10.0,
+        69.9
       ],
       "max": [
-        0.06,
-        0.11,
-        0.09
+        60.0,
+        110.0,
+        90.0
       ],
       "material": "Mask"
     },
@@ -52,7 +52,7 @@
       "operation": "deposit",
       "model": "particleShape",
       "shape": "sphere",
-      "radius": 0.004,
+      "radius": 4.0,
       "depositMaterial": "Metal"
     },
     {
@@ -63,9 +63,9 @@
       "model": "particleShape",
       "shape": "box",
       "halfAxes": [
-        0.00079,
-        0.00079,
-        0.006
+        0.79,
+        0.79,
+        6.0
       ],
       "maskMaterials": [
         "Si"
@@ -92,8 +92,8 @@
       "duration": 90.0,
       "materialRates": {
         "Si": {
-          "directional": 0.001,
-          "isotropic": 0.0001
+          "directional": 1.0,
+          "isotropic": 0.1
         }
       },
       "rateSigns": "native"
@@ -111,7 +111,7 @@
       "operation": "deposit",
       "model": "particleShape",
       "shape": "sphere",
-      "radius": 0.035,
+      "radius": 35.0,
       "depositMaterial": "SiO2"
     },
     {
@@ -119,7 +119,7 @@
       "name": "STI CMP 80 nm",
       "enabled": true,
       "model": "planarize",
-      "cutoffHeight": 0.08
+      "cutoffHeight": 80.0
     },
     {
       "id": "step_sti_etch",
@@ -128,7 +128,7 @@
       "operation": "etch",
       "model": "particleShape",
       "shape": "sphere",
-      "radius": 0.035,
+      "radius": 35.0,
       "maskMaterials": [
         "Si"
       ]
@@ -140,7 +140,7 @@
       "operation": "deposit",
       "model": "particleShape",
       "shape": "sphere",
-      "radius": 0.002,
+      "radius": 2.0,
       "depositMaterial": "HfO2"
     },
     {
@@ -150,7 +150,7 @@
       "operation": "deposit",
       "model": "particleShape",
       "shape": "sphere",
-      "radius": 0.104,
+      "radius": 104.0,
       "depositMaterial": "PolySi"
     },
     {
@@ -158,7 +158,7 @@
       "name": "Gate CMP 150 nm",
       "enabled": true,
       "model": "planarize",
-      "cutoffHeight": 0.15
+      "cutoffHeight": 150.0
     },
     {
       "id": "step_gate_mask",
@@ -166,14 +166,14 @@
       "enabled": true,
       "model": "insertBox",
       "min": [
-        -0.01,
-        0.03,
-        0.145
+        -10.0,
+        30.0,
+        145.0
       ],
       "max": [
-        0.1,
-        0.07,
-        0.175
+        100.0,
+        70.0,
+        175.0
       ],
       "material": "Mask"
     },
@@ -185,9 +185,9 @@
       "model": "particleShape",
       "shape": "box",
       "halfAxes": [
-        0.00079,
-        0.00079,
-        0.11
+        0.79,
+        0.79,
+        110.0
       ],
       "maskMaterials": [
         "Mask",
@@ -208,7 +208,7 @@
       "operation": "deposit",
       "model": "particleShape",
       "shape": "sphere",
-      "radius": 0.01,
+      "radius": 10.0,
       "depositMaterial": "Si3N4"
     },
     {
@@ -219,9 +219,9 @@
       "model": "particleShape",
       "shape": "box",
       "halfAxes": [
-        0.00079,
-        0.00079,
-        0.05
+        0.79,
+        0.79,
+        50.0
       ],
       "maskMaterials": [
         "Si3N4"
@@ -238,7 +238,7 @@
       "duration": 5.0,
       "rateMode": "material",
       "materialRates": {
-        "Si": 0.001
+        "Si": 1.0
       },
       "advection": {
         "spatialScheme": "LAX_FRIEDRICHS_2ND_ORDER"
@@ -255,8 +255,8 @@
       "depositMaterial": "SiGe",
       "nativeParameters": {
         "materialRates": {
-          "Si": 0.002,
-          "SiGe": 0.002
+          "Si": 2.0,
+          "SiGe": 2.0
         },
         "rate111": 0.5,
         "rate100": 1.0
@@ -273,7 +273,7 @@
       "operation": "deposit",
       "model": "particleShape",
       "shape": "sphere",
-      "radius": 0.05,
+      "radius": 50.0,
       "depositMaterial": "Dielectric"
     },
     {
@@ -281,7 +281,7 @@
       "name": "ILD CMP 90 nm",
       "enabled": true,
       "model": "planarize",
-      "cutoffHeight": 0.09
+      "cutoffHeight": 90.0
     },
     {
       "id": "step_poly_remove",
@@ -297,7 +297,7 @@
       "operation": "deposit",
       "model": "particleShape",
       "shape": "sphere",
-      "radius": 0.004,
+      "radius": 4.0,
       "depositMaterial": "TiN"
     },
     {
@@ -307,7 +307,7 @@
       "operation": "deposit",
       "model": "particleShape",
       "shape": "sphere",
-      "radius": 0.04,
+      "radius": 40.0,
       "depositMaterial": "PolySi"
     },
     {
@@ -315,7 +315,7 @@
       "name": "Replacement gate CMP 90 nm",
       "enabled": true,
       "model": "planarize",
-      "cutoffHeight": 0.09
+      "cutoffHeight": 90.0
     }
   ],
   "solver": {

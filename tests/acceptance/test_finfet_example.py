@@ -1,9 +1,9 @@
 """Heavy FinFET.py acceptance run (opt-in).
 
 Set ``VIENNAPS_WORKBENCH_RUN_FINFET_ACCEPTANCE=1`` to execute the 25-step
-schema-7 fixture through the API, compare all 26 surface checkpoints and the
-final volume mesh with the native reference, then replay the run and compare
-the final states again.
+nanometre schema-7 fixture through the API, compare all 26 surface checkpoints
+and the final volume mesh with the original native nm reference, then replay
+the run and compare the final states again.
 
 The default fast suite never imports or runs this module's test class because
 the native reference is committed as ``expected.json`` and the full workbench
@@ -41,14 +41,14 @@ TERMINAL = {"succeeded", "failed", "cancelled", "timed_out", "interrupted"}
 
 
 def reference_path() -> Path:
-    frame = os.environ.get(REFERENCE_FRAME_ENV, "um").strip().lower()
-    if frame == "um":
-        return EXPECTED_UM
+    frame = os.environ.get(REFERENCE_FRAME_ENV, "nm").strip().lower()
     if frame == "nm":
-        # The nanometre frame is kept as source evidence. It is not the
-        # workbench's declared unit frame; see docs/finfet-example/README.md.
         return EXPECTED_NM
-    raise RuntimeError(f"{REFERENCE_FRAME_ENV} must be 'um' or 'nm', got {frame!r}")
+    if frame == "um":
+        # The micrometre twin is retained to document the native scale
+        # sensitivity; the project itself is authored in nanometres.
+        return EXPECTED_UM
+    raise RuntimeError(f"{REFERENCE_FRAME_ENV} must be 'nm' or 'um', got {frame!r}")
 
 
 def load_fixture() -> tuple[dict[str, Any], dict[str, Any]]:

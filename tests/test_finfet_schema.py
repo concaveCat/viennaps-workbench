@@ -21,15 +21,10 @@ def project_payload() -> dict:
 
 class FinFETDomainTest(unittest.TestCase):
     def test_native_absolute_bounds_are_accepted_and_serialized(self) -> None:
-        domain = Domain3D(
-            gridDelta=0.00079,
-            xExtent=0.09,
-            yExtent=0.1,
-            boundaryXY="reflective",
-            bounds=[0.0, 0.09, 0.0, 0.1, 0.0, 0.07],
-        )
-        dumped = domain.model_dump(mode="json", exclude_none=True)
-        self.assertEqual(dumped["bounds"], [0.0, 0.09, 0.0, 0.1, 0.0, 0.07])
+        parsed = ProjectV7.model_validate(project_payload())
+        self.assertIsInstance(parsed.domain, Domain3D)
+        dumped = parsed.domain.model_dump(mode="json", exclude_none=True)
+        self.assertEqual(dumped["bounds"], [0.0, 90.0, 0.0, 100.0, 0.0, 70.0])
 
     def test_unset_bounds_stay_out_of_serialization(self) -> None:
         domain = Domain3D(gridDelta=0.01, xExtent=0.5, yExtent=0.5, boundaryXY="reflective")
@@ -54,9 +49,11 @@ class FinFETDomainTest(unittest.TestCase):
     def test_finfet_scale_domain_passes_validation(self) -> None:
         parsed, warnings = validate_project(project_payload(), kind="simulate")
         self.assertEqual(parsed.schemaVersion, 7)
-        self.assertEqual(parsed.domain.xExtent, 0.09)
-        self.assertEqual(parsed.domain.yExtent, 0.1)
-        self.assertEqual(parsed.domain.gridDelta, 0.00079)
+        self.assertEqual(parsed.domain.xExtent, 90.0)
+        self.assertEqual(parsed.domain.yExtent, 100.0)
+        self.assertEqual(parsed.domain.gridDelta, 0.79)
+        self.assertEqual(parsed.units.length, "nm")
+        self.assertEqual(parsed.units.rate, "nm/s")
         self.assertEqual(len(parsed.steps), 25)
         self.assertTrue(warnings)  # particleShape warns by design
 
@@ -105,7 +102,7 @@ class FinFETStepSchemaTest(unittest.TestCase):
         payload["steps"] = [{
             "id": "step_fin_release", "name": "fin release", "enabled": True,
             "operation": "etch", "model": "isotropic", "rateMagnitude": 0.0,
-            "duration": 5.0, "rateMode": "material", "materialRates": {"Si": 0.001},
+            "duration": 5.0, "rateMode": "material", "materialRates": {"Si": 1.0},
             "advection": {"spatialScheme": "LAX_FRIEDRICHS_2ND_ORDER"},
         }]
         parsed, _ = validate_project(payload, kind="simulate")

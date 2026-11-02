@@ -7,13 +7,12 @@ The acceptance fixture keeps the upstream script verbatim at
 canonical checkpoint after every `saveSurfaceMesh`, plus the final
 `saveVolumeMesh`.
 
-`reference/FinFET_um.py` is the mechanically unit-scaled twin: every length,
+`reference/FinFET_um.py` is a mechanically unit-scaled twin: every length,
 radius, half-axis, cutoff and rate is the original value × 0.001, while
 durations and the orientation multipliers `rate111`/`rate100` are unchanged.
-It runs natively in the project's micrometre frame. `expected.json` records
-the original nanometre run and `expected-um.json` records this twin. The
-workbench acceptance uses `expected-um.json` because the workbench schema is
-micrometre-only; see the unit-frame note below.
+It is retained only as a cross-check for the native scale sensitivity
+documented at the end of this file. The acceptance fixture itself runs in the
+original nanometre frame.
 
 The workbench project is `project.json` (25 enabled steps). It is not a new
 script executor: every operation is a schema-7 step dispatched through the
@@ -21,23 +20,28 @@ normal v2 process/geometry registry.
 
 ## Unit contract
 
-The source is authored in nanometres. The workbench schema is exclusively
-micrometres (`units.length = "um"`, `units.rate = "um/s"`), so:
+Schema 7 declares its native length unit in `units`:
 
-| Source quantity | Source unit | Project value | Rule |
-|---|---|---|---|
-| `bounds` | nm | `[0, 0.09, 0, 0.1, 0, 0.07]` | × 0.001 |
-| `gridDelta` | nm | `0.00079` | × 0.001 |
-| box / plane heights | nm | µm | × 0.001 |
-| sphere radius / box half-axes | nm | µm | × 0.001 |
-| `Planarize` cutoff | nm | µm | × 0.001 |
-| directional / isotropic / epitaxy rate | nm/s | µm/s | × 0.001 |
-| `duration` | s | s | unchanged |
-| `saveVolumeMesh(..., 0.05)` | native length | `volumeMeshDelta = 0.05` | µm |
+```json
+{"length": "nm", "time": "s", "rate": "nm/s", "angle": "deg"}
+```
 
-The unit-rate probe in Phase A confirmed the native rate is length/time: at
-the same duration, scaling every geometric length and every rate by 0.001
-scales the measured displacement by exactly 0.001 (ratio 1000.0 in 2D and 3D).
+ViennaPS is unit-agnostic: the values reach the native constructors unchanged.
+The workbench therefore does **not** rescale the source. Nanometre projects
+are validated with the same physical limits as micrometre projects through a
+unit-aware validation context, and snapshots/records carry
+`coordinateUnit = "nm"`.
+
+| Source quantity | Project value | Rule |
+|---|---|---|
+| `bounds` | `[0, 90, 0, 100, 0, 70]` | unchanged (nm) |
+| `gridDelta` | `0.79` | unchanged (nm) |
+| box / plane heights | nm | unchanged |
+| sphere radius / box half-axes | nm | unchanged |
+| `Planarize` cutoff | nm | unchanged |
+| directional / isotropic / epitaxy rate | nm/s | unchanged |
+| `duration` | s | unchanged |
+| `saveVolumeMesh(..., 0.05)` | `volumeMeshDelta = 0.05` | unchanged (nm) |
 
 The source domain uses absolute bounds and a 90 × 100 nm window. The native
 grid rounding is asymmetric (`floor(min/delta)`, `ceil(max/delta)`), so the
@@ -52,7 +56,7 @@ Surface indices refer to `FinFET_<n>.vtp`; surface 0 is the initial plane.
 
 | Surface | Source lines | Native operation | Project step |
 |---|---|---|---|
-| 0 | 25–27 | `MakePlane(domain, 70, Si)` | initial `geometry.kind = "plane"`, `height = 0.07` |
+| 0 | 25–27 | `MakePlane(domain, 70, Si)` | initial `geometry.kind = "plane"`, `height = 70` |
 | 1 | 29–35 | `LevelSet` + `MakeGeometry(Box)` + `insertNextLevelSetAsMaterial(Mask)` | `step_dp_mask` (`insertBox`) |
 | 2 | 37–44 | `duplicateTopLevelSet(Metal)` + `SphereDistribution(4)` | `step_dp_metal` (`particleShape`, `depositMaterial = Metal`) |
 | 3 | 46–53 | `BoxDistribution([-δ, -δ, -6])` + mask `Si` | `step_dp_etch` (`particleShape` box etch, `maskMaterials = [Si]`) |
@@ -60,11 +64,11 @@ Surface indices refer to `FinFET_<n>.vtp`; surface 0 is the initial plane.
 | 5 | 59–68 | `DirectionalProcess([0,0,-1], {Si: [1.0, 0.1]})`, duration 90 | `step_si_pattern` (`directional`, material table, `rateSigns = native`) |
 | 6 | 70–72 | `removeTopLevelSet()` | `step_metal_strip` (`removeTopLevelSet`) |
 | 7 | 74–81 | `duplicateTopLevelSet(SiO2)` + `SphereDistribution(35)` | `step_sti_dep` (`particleShape`, `depositMaterial = SiO2`) |
-| 8 | 83–85 | `Planarize(80)` | `step_sti_cmp` (`planarize`, `cutoffHeight = 0.08`) |
+| 8 | 83–85 | `Planarize(80)` | `step_sti_cmp` (`planarize`, `cutoffHeight = 80`) |
 | 9 | 87–93 | `SphereDistribution(-35)` + mask `Si` | `step_sti_etch` (`particleShape` sphere etch) |
 | 10 | 95–102 | `duplicateTopLevelSet(HfO2)` + `SphereDistribution(2)` | `step_hfo2_dep` |
 | 11 | 104–110 | `duplicateTopLevelSet(PolySi)` + `SphereDistribution(104)` | `step_poly_dep` |
-| 12 | 112–114 | `Planarize(150)` | `step_gate_cmp` (`cutoffHeight = 0.15`) |
+| 12 | 112–114 | `Planarize(150)` | `step_gate_cmp` (`cutoffHeight = 150`) |
 | 13 | 116–122 | box mask `[-10,30,145]..[100,70,175]` | `step_gate_mask` (`insertBox`) |
 | 14 | 124–133 | `BoxDistribution([-δ, -δ, -110])`, masks `Mask, Si, SiO2` | `step_gate_etch` (`particleShape` box etch, explicit masks) |
 | 15 | 135–137 | `removeTopLevelSet()` | `step_gate_unmask` |
@@ -73,11 +77,11 @@ Surface indices refer to `FinFET_<n>.vtp`; surface 0 is the initial plane.
 | 18 | 159–169 | `IsotropicProcess(rate=0)` + `setMaterialRate(Si, -1)`, spatial `LAX_FRIEDRICHS_2ND_ORDER`, 5 s | `step_fin_release` (`isotropic`, `rateMode = material`, step `advection`) |
 | 19 | 171–184 | `SelectiveEpitaxy`, `setMaterialRate(Si/SiGe, 2)`, spatial `STENCIL_LOCAL_LAX_FRIEDRICHS_1ST_ORDER`, `maxDissipation = 100`, 14 s | `step_sd_epi` (`specialized:selectiveEpitaxy`, step `advection.maxDissipation`) |
 | 20 | 186–193 | `duplicateTopLevelSet(Dielectric)` + `SphereDistribution(50)` | `step_ild_dep` |
-| 21 | 195–197 | `Planarize(90)` | `step_ild_cmp` (`cutoffHeight = 0.09`) |
+| 21 | 195–197 | `Planarize(90)` | `step_ild_cmp` (`cutoffHeight = 90`) |
 | 22 | 199–201 | `removeMaterial(PolySi)` | `step_poly_remove` |
 | 23 | 203–210 | `duplicateTopLevelSet(TiN)` + `SphereDistribution(4)` | `step_tin_dep` |
 | 24 | 212–218 | `duplicateTopLevelSet(PolySi)` + `SphereDistribution(40)` | `step_rmg_poly` |
-| 25 | 220–222 | `Planarize(90)` | `step_rmg_cmp` (`cutoffHeight = 0.09`) |
+| 25 | 220–222 | `Planarize(90)` | `step_rmg_cmp` (`cutoffHeight = 90`) |
 | volume | 224 | `saveVolumeMesh("FinFET_Final", 0.05)` | `outputSettings.volumeMesh = true`, `volumeMeshDelta = 0.05` |
 
 ## Rate-sign note
@@ -88,9 +92,8 @@ operation-signed pair. `FinFET.py` passes `{Si: [1.0, 0.1]}` with
 −z while the positive isotropic component grows the surface. The workbench's
 historical `operation` sign convention flips the isotropic component for an
 etch, so this fixture sets `rateSigns = "native"` to pass both values to the
-native constructor unchanged. The project records the translated magnitudes
-0.001 and 0.0001 µm/s; the reference runner records the same native rates
-scaled by 0.001.
+native constructor unchanged. The project records the native magnitudes 1.0 and 0.1 nm/s
+unchanged.
 
 ## Solver contract
 
@@ -110,27 +113,19 @@ scaled by 0.001.
 - native material ID per level-set index (order) and per triangle;
 - a canonical SHA-256 over rounded point coordinates, triangles and material
   IDs (translation/rotation of vertex lists and row order do not matter);
-- bounds in µm.
+- bounds in nm.
 
 The final volume records node/cell counts, tetrahedral cell type, material
-distribution and its canonical digest. Coordinates are converted from nm to
-µm before hashing, matching the workbench frame exactly (the probe on the
-initial plane produced byte-identical canonical point sets).
+distribution and its canonical digest. The original script and the workbench
+both record nanometres, so no coordinate conversion is applied.
 
-## Unit-frame note (measured native limitation)
+## Unit-frame cross-check
 
-The two native runs are identical in operation order and are exact unit
-scalings of one another, but they diverge at surface 14, the dummy-gate
-pattern. Surfaces 0–13 are byte-identical after nm→µm conversion; from the
-masked `BoxDistribution` onward the installed ViennaPS geometric strategy
-builds its mask with level-set boolean operations whose branch decisions are
-not exactly scale invariant. A direct native run in µm reproduces the
-workbench surface 14 digest exactly (`6f2858b9…`), while the direct native nm
-run reproduces `expected.json` exactly (`cbc70e36…`). The platform is
-therefore faithful to the project frame; the remaining difference is a
-ViennaPS scale sensitivity, not a dispatch or geometry-engine bug.
-
-The FinFET acceptance test compares the workbench with the project-frame
-reference (`expected-um.json`). `expected.json` stays committed as the
-unmodified-script evidence and the first 14 checkpoints are verified to agree
-in `tests/test_finfet_reference.py`.
+`expected.json` (nm) is the acceptance reference. `expected-um.json` and
+`FinFET_um.py` remain committed only to document a measured native
+limitation: the two native runs agree on surfaces 0–13 and diverge at surface
+14 because ViennaPS's level-set mask booleans are not exactly scale
+invariant. Now that the project runs natively in nm, the workbench matches
+`expected.json` directly and no scaled reference is needed for acceptance.
+`tests/test_finfet_reference.py` pins the relationship between the two native
+frames.
