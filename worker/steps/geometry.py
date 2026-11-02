@@ -20,28 +20,6 @@ def _v2_plugin_apply_enabled() -> bool:
     return os.environ.get(V2_PLUGIN_APPLY_ENV) == "1"
 
 
-def _geometry_assets(ctx: RunContext, step: dict[str, Any]) -> Mapping[str, Any] | None:
-    """Supply the verified GDS operand builder for one geometry step."""
-    if step.get("model") != "gdsBoolean":
-        return None
-    from worker import simulate
-
-    def build(ps: Any, domain: Any, project: dict[str, Any], raw_step: dict[str, Any], context: Any) -> Any:
-        del context
-        # Keep the shadow's filtered GDS/JSON artifacts separate from the
-        # worker path's own step-id files.
-        return simulate._gds_boolean_operand(
-            ps,
-            domain,
-            project,
-            {**raw_step, "id": f"{raw_step['id']}-v2"},
-            config=ctx.config,
-            run_dir=ctx.run_dir,
-        )
-
-    return {"gdsBooleanOperand": build}
-
-
 def _run_v2_geometry_shadow(
     ctx: RunContext,
     step: dict[str, Any],
@@ -104,6 +82,21 @@ def _run_v2_geometry_shadow(
 
 def run_geometry_step(ctx: RunContext, index: int, step: dict[str, Any]) -> dict[str, Any]:
     simulate = simulate_module()
+    if os.environ.get("VIENNAPS_WORKBENCH_V2_EXECUTION") == "1":
+        from process_models.execution import load_execution_registry, resolve_dispatch
+        from worker.v2_execution import run_v2_claimed_step
+
+        registry = load_execution_registry()
+        decision = resolve_dispatch(ctx.project, step, registry=registry)
+        if decision.kind == "invalid":
+            raise RuntimeError(
+                f"v2 execution rejected geometry step {step['id']!r}: {decision.error or decision.reason}"
+            )
+        if decision.kind == "geometry":
+            return run_v2_claimed_step(ctx, index, step, decision, registry)
+        if decision.kind in ("process", "field"):
+            raise RuntimeError(f"step {step['id']!r} was dispatched as {decision.kind} but reached run_geometry_step")
+        ctx.event({"type": "v2-execution-fallback", "stepId": step["id"], "reason": decision.reason})
     shadow_domain = None
     v2_registry = None
     if _v2_plugin_shadow_enabled() or _v2_plugin_apply_enabled():
@@ -130,7 +123,9 @@ def run_geometry_step(ctx: RunContext, index: int, step: dict[str, Any]) -> dict
         ctx.ps, ctx.domain, ctx.project, step, previous_tops=previous_tops, config=ctx.config, run_dir=ctx.run_dir
     )
     if shadow_domain is not None:
-        _run_v2_geometry_shadow(ctx, step, shadow_domain, v2_registry, previous_tops, _geometry_assets(ctx, step))
+        from worker.v2_execution import geometry_assets
+
+        _run_v2_geometry_shadow(ctx, step, shadow_domain, v2_registry, previous_tops, geometry_assets(ctx, step))
     ctx.event(
         {
             "type": "step-configured",
@@ -156,4 +151,8 @@ def run_geometry_step(ctx: RunContext, index: int, step: dict[str, Any]) -> dict
     )
     metadata["nativeState"] = ctx.save_native_state(ctx.domain, step["id"])
     ctx.actual_execution.append({"stepId": step["id"], "engine": "not-applicable", "seed": None})
+    if os.environ.get("VIENNAPS_WORKBENCH_V2_EXECUTION") == "1":
+        from worker.v2_state import WorkerV2State
+
+        WorkerV2State.invalidate(ctx)
     return metadata

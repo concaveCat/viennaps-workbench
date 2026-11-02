@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from worker.steps.context import RunContext, simulate_module
@@ -12,6 +13,37 @@ def run_cell_set_step(ctx: RunContext, index: int, step: dict[str, Any]) -> dict
     # sets; the surface snapshot is the unchanged Domain and the real
     # output is the native DenseCellSet plus its compact summary.
     from backend.implant_models import numeric_guard_messages
+
+    if os.environ.get("VIENNAPS_WORKBENCH_V2_EXECUTION") == "1":
+        from process_models.execution import load_execution_registry
+        from process_models.v2.dispatch import dispatch_step
+        from worker.v2_execution import run_v2_claimed_step
+
+        registry = load_execution_registry()
+        decision = dispatch_step(registry, ctx.project, step)
+        if decision.kind == "invalid":
+            raise RuntimeError(f"v2 execution rejected field step {step['id']!r}: {decision.error or decision.reason}")
+        if decision.kind == "field":
+            if ctx.field_state.get("v2FieldInvalidated"):
+                raise RuntimeError(
+                    f"field step {step['id']!r} cannot reuse the v2 cell set: a legacy or fallback "
+                    "step mutated the geometry after the field sequence; this version does not remap"
+                )
+            next_step = ctx.actual_steps[index] if index < len(ctx.actual_steps) else None
+            next_is_field = next_step is not None and next_step.get("model") in {"implant", "anneal", "analysis"}
+            metadata = run_v2_claimed_step(
+                ctx,
+                index,
+                step,
+                decision,
+                registry,
+                field_sequence_end=not next_is_field,
+            )
+            ctx.field_state.pop("v2FieldInvalidated", None)
+            return metadata
+        if decision.kind in ("process", "geometry"):
+            raise RuntimeError(f"step {step['id']!r} was dispatched as {decision.kind} but reached run_cell_set_step")
+        ctx.event({"type": "v2-execution-fallback", "stepId": step["id"], "reason": decision.reason})
 
     simulate = simulate_module()
     guard_messages = numeric_guard_messages(
@@ -61,4 +93,10 @@ def run_cell_set_step(ctx: RunContext, index: int, step: dict[str, Any]) -> dict
     )
     metadata["nativeState"] = ctx.save_native_state(ctx.domain, step["id"])
     ctx.actual_execution.append({"stepId": step["id"], "engine": "not-applicable", "seed": None})
+    if os.environ.get("VIENNAPS_WORKBENCH_V2_EXECUTION") == "1":
+        # The legacy field path owns its own native cell set; a v2 state from
+        # an earlier claimed step is no longer authoritative.
+        from worker.v2_state import WorkerV2State
+
+        WorkerV2State.invalidate(ctx)
     return metadata

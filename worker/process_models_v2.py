@@ -130,6 +130,8 @@ def run_v2_step(
     allow_gpu: bool = False,
     previous_tops: Mapping[str, Any] | None = None,
     assets: Mapping[str, Any] | None = None,
+    state: ProcessState | None = None,
+    field_sequence_end: bool = True,
 ) -> ExecutionOutcome:
     """Run one worker step through the v2 registry and return its outcome.
 
@@ -214,15 +216,16 @@ def run_v2_step(
         assets=run_assets,
         previous_tops=previous_tops or {},
     )
-    order = material_order(domain)
-    state = ProcessState(
-        geometry=LevelSetState(
-            handle=domain,
-            dimension=context.dimension,
-            grid_delta=context.grid_delta,
-        ),
-        materials=MaterialState(order=order),
-    )
+    if state is None:
+        order = material_order(domain)
+        state = ProcessState(
+            geometry=LevelSetState(
+                handle=domain,
+                dimension=context.dimension,
+                grid_delta=context.grid_delta,
+            ),
+            materials=MaterialState(order=order),
+        )
     state_backend = HandleStateBackend(
         ctx.ps,
         id="viennaps",
@@ -277,6 +280,7 @@ def run_v2_step(
                 compute=policy,
             )
         ],
+        field_sequence_end=field_sequence_end,
     )
     return flow.outcomes[-1]
 

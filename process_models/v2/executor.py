@@ -161,11 +161,20 @@ class FlowExecutor:
         """Return the state store this executor writes to."""
         return self._store
 
-    def run(self, initial_state: ProcessState, steps: Sequence[FlowStep]) -> FlowRun:
+    def run(
+        self,
+        initial_state: ProcessState,
+        steps: Sequence[FlowStep],
+        *,
+        field_sequence_end: bool | None = None,
+    ) -> FlowRun:
         """Execute ``steps`` from ``initial_state`` and persist every result.
 
         Duplicate or empty step ids are rejected up front, before anything is
-        written to disk.
+        written to disk. ``field_sequence_end`` is for the worker bridge's
+        one-step calls: it states whether this field step closes the sequence.
+        Multi-step callers let the executor derive boundaries from adjacent
+        execution kinds.
         """
         ordered = tuple(steps)
         _check_steps(ordered)
@@ -180,6 +189,8 @@ class FlowExecutor:
             plan = self._resolve(step, state)
             is_field = plan.process.execution_kind == "field"
             sequence_end = is_field and (index + 1 == len(ordered) or kinds[index + 1] != "field")
+            if is_field and field_sequence_end is not None and len(ordered) == 1:
+                sequence_end = bool(field_sequence_end)
             try:
                 outcome = execute_plan(plan)
                 if is_field:

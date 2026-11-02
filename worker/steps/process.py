@@ -137,6 +137,22 @@ class ProcessStepResult:
 
 def run_process_step(ctx: RunContext, index: int, step: dict[str, Any]) -> ProcessStepResult:
     simulate = simulate_module()
+    if os.environ.get("VIENNAPS_WORKBENCH_V2_EXECUTION") == "1":
+        from process_models.execution import load_execution_registry
+        from process_models.v2.dispatch import dispatch_step
+        from worker.v2_execution import run_v2_claimed_step
+
+        registry = load_execution_registry()
+        decision = dispatch_step(registry, ctx.project, step)
+        if decision.kind == "invalid":
+            raise RuntimeError(
+                f"v2 execution rejected process step {step['id']!r}: {decision.error or decision.reason}"
+            )
+        if decision.kind == "process":
+            return ProcessStepResult(metadata=run_v2_claimed_step(ctx, index, step, decision, registry))
+        if decision.kind in ("field", "geometry"):
+            raise RuntimeError(f"step {step['id']!r} was dispatched as {decision.kind} but reached run_process_step")
+        ctx.event({"type": "v2-execution-fallback", "stepId": step["id"], "reason": decision.reason})
     shadow_domain = None
     v2_registry = None
     if _v2_plugin_shadow_enabled() or _v2_plugin_apply_enabled():
@@ -850,4 +866,8 @@ def run_process_step(ctx: RunContext, index: int, step: dict[str, Any]) -> Proce
         execution_record["executionStrategy"] = simulate.GPU_MULTIPARTICLE_NATIVE_STRATEGY
     ctx.actual_execution.append(execution_record)
 
+    if os.environ.get("VIENNAPS_WORKBENCH_V2_EXECUTION") == "1":
+        from worker.v2_state import WorkerV2State
+
+        WorkerV2State.invalidate(ctx)
     return ProcessStepResult(metadata=metadata, process=process, model=model)

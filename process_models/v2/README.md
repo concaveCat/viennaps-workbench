@@ -247,6 +247,8 @@ bridge 本身的直接测试：`tests.test_worker_v2_isotropic`（不需要开�
 - replay 需要的插件版本没装是硬错误，不会用邻近/最新版本顶替。
 - 当前 `plugins/` 注册 23 个 built-in 工艺插件（20 个 level-set 工艺 + `implant` /
   `anneal` / `analysis` 三个 field 插件，完整列表见 `docs/plugin-architecture.md` 状态行）；
+  `VIENNAPS_WORKBENCH_V2_EXECUTION=1` 可在 worker 内启用 process/field/geometry 的 v2
+  执行路径（默认仍走旧路径，便于逐段对比）；
   `voxel_probe` 是树内 proof 插件，没有 manifest，不在 `plugins/` 与 lock 里。
   GeometryEngine 的 operation 是 core 内置 spec，不占用 `plugins/`。
 

@@ -27,7 +27,7 @@ from .adapters import DefaultStateAdapter
 from .cellset import CellSetBackendError, CellSetConfig
 from .contract import Issue, ProcessContext, ProcessSpec, StateProfile, VariantRegistration
 from .engine import ComputePolicy, EngineLease, EngineProvider, EngineUnavailableError
-from .materials import MaterialRegistryError
+from .materials import MaterialRegistryError, missing_material_names
 from .registry import ProcessRegistry
 from .state import Artifact, OutputSet, ProcessState, StateDelta, StateKind, StepResult
 from .state_backend import StateBackendError
@@ -313,6 +313,14 @@ def resolve_execution(
                 )
 
         lease.state_backend.validate(request.state)
+        material_registry = lease.state_backend.material_registry
+        if material_registry is not None:
+            missing = missing_material_names(request.params, material_registry)
+            if missing:
+                raise ExecutionResolutionError(
+                    f"variant {process.id!r}/{variant.variant_id!r} references materials "
+                    f"{list(missing)!r} that are absent from the engine's material registry"
+                )
     except StateBackendError as error:
         lease.release()
         raise ExecutionResolutionError(

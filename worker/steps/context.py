@@ -67,6 +67,9 @@ class RunContext:
     field_state: dict[str, Any]
     actual_execution: list[dict[str, Any]]
     intermediate_outputs: list[dict[str, Any]]
+    #: Persistent v2 state used by the opt-in execution path. The legacy
+    #: worker path leaves this None and rebuilds from the live Domain.
+    v2_state: Any | None = None
 
     def event(self, data: dict[str, Any]) -> None:
         simulate_module().event(self.run_dir, data)

@@ -23,7 +23,9 @@
 步骤派发先做一次**纯判定**：`process_models/execution.py` 加载锁定插件并注册内置
 geometry specs，`dispatch_step()` 返回 `process` / `field` / `geometry` / `legacy` /
 `invalid`。没有 spec 认领是显式 `legacy`；解析失败或歧义是 `invalid`，不允许静默回退。
-`ModelDescriptor.execution_kind` 让 API/UI 能区分三类 step。
+`ModelDescriptor.execution_kind` 让 API/UI 能区分三类 step。resolver 在引擎租约建立后还会从
+typed params 的 `material` / `*Materials` / `depositMaterial` 等字段收集材料名，并用
+native material registry 做早期校验；缺失材料在执行前失败，而不是到 native constructor 才失败。
 
 ## 2. 插件包布局
 
@@ -389,6 +391,7 @@ S_0 → step_1 → S_1 → step_2 → S_2 → ... → S_n
 | conformance harness | ✅ `check_variant()`：解析、校验、`StepResult` 形状、输入不可变、strict determinism |
 | output contract schema | ✅ `output_contract_schema()`，JSON 可序列化，`schemaVersion: 1`；不是完整 JSON Schema 校验器 |
 | generic worker plugin hook | ✅ 默认关闭的 process + geometry shadow/apply；事件 `v2-plugin-shadow` / `v2-plugin-applied` / `v2-plugin-shadow-skipped`；生产默认路径不变 |
+| opt-in v2 execution | ✅ `VIENNAPS_WORKBENCH_V2_EXECUTION=1`：process/field/geometry 按 dispatch 走 v2，`WorkerV2State` 跨 step 保留 geometry/materials/cell-set；legacy fallback 会失效 field 历史并 fail closed |
 | external engine adapter | ❌ |
 | 原生 geometry replay loader | ❌ `geometry.ref` 已记录；重载需调用方提供 loader |
 | v2 run 接入 backend/API/UI | ❌ |
