@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 
 from pydantic import BaseModel
 
 from process_models.execution import load_execution_registry, resolve_dispatch
+from process_models.v2.catalog import execution_catalog
 from process_models.v2.contract import ProcessSpec
 from process_models.v2.dispatch import dispatch_step
 from process_models.v2.registry import ProcessRegistry
@@ -81,6 +83,17 @@ class DispatchTest(unittest.TestCase):
         self.assertIn("planarize", ids)
         self.assertIn("gdsBoolean", ids)
         self.assertGreaterEqual(len(ids), 28)
+
+    def test_execution_catalog_is_json_safe_and_kind_aware(self) -> None:
+        catalog = execution_catalog(self.registry)
+        payload = json.loads(json.dumps(catalog, allow_nan=False))
+        self.assertEqual(payload["schemaVersion"], 1)
+        self.assertGreaterEqual(len(payload["steps"]), 28)
+        by_id = {step["id"]: step for step in payload["steps"]}
+        self.assertEqual(by_id["planarize"]["executionKind"], "geometry")
+        self.assertEqual(by_id["implant"]["executionKind"], "field")
+        self.assertEqual(by_id["isotropic"]["executionKind"], "process")
+        self.assertNotIn("parse_step", json.dumps(by_id))
 
     def test_descriptor_exposes_execution_kind(self) -> None:
         by_id = {descriptor.id: descriptor for descriptor in self.registry.list_processes()}

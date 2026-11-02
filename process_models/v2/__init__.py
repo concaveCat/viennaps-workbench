@@ -32,6 +32,7 @@ Python modules, paths, or callables.
 from __future__ import annotations
 
 from .adapters import DefaultStateAdapter, StateAdapter
+from .catalog import execution_catalog, variant_catalog
 from .cellset import (
     CELLSET_CONVERSION,
     CellSetBackend,
@@ -216,10 +217,12 @@ __all__ = [
     "check_variant",
     "compute_implementation_hash",
     "dispatch_step",
+    "execution_catalog",
     "execute_plan",
     "output_contract_schema",
     "register_geometry",
     "resolve_execution",
     "run_step",
+    "variant_catalog",
     "version_satisfies",
 ]
