@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
+from dataclasses import asdict
 from typing import Any
 
 from process_models.v2.dispatch import DispatchDecision
@@ -111,7 +112,12 @@ def run_v2_claimed_step(
         requested=ctx.project,
         step=step,
         previous_tops=previous_tops,
-        extra={"v2Plan": plan.identity(), "v2Metadata": outcome.metadata},
+        extra={
+            "v2Plan": plan.identity(),
+            "v2Metadata": outcome.metadata,
+            "v2Outputs": asdict(outcome.outputs),
+            **({"cellSetProcess": outcome.metadata} if decision.kind == "field" else {}),
+        },
     )
     metadata["nativeState"] = ctx.save_native_state(ctx.domain, step["id"])
     return metadata
