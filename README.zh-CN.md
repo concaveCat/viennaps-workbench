@@ -35,8 +35,11 @@ ViennaLS 5.8.5 环境保留用于回放、历史运行以及 4.7.0 绑定缺失�
 - 二维：平面与沟槽，支持侧壁倾角、掩膜高度与掩膜倾角。
 - 三维：平面、沟槽与圆孔结构、Fin 挤出、带顶层开口的多层薄膜堆叠，以及 GDS
   版图导入（层到材料的映射与周期边界修复）。
-- 13 种内置材料（`Si`、`SiO2`、`Si3N4`、`PolySi`、`SiGe`、`Al2O3`、`HfO2`、
-  `TiN`、`W`、`Cu`、`PMMA`、`Mask`、`SiN`）和自定义材料，薄膜/掩膜角色可独立设置。
+- 15 种内置材料（`Si`、`SiO2`、`Si3N4`、`PolySi`、`SiGe`、`Al2O3`、`HfO2`、
+  `TiN`、`W`、`Cu`、`PMMA`、`Mask`、`SiN`、`Metal`、`Dielectric`）和自定义材料，
+  薄膜/掩膜角色可独立设置。
+- schema 7 工程原生支持 µm 与 nm 两种长度单位；编辑器可在两者间切换，按比例换算
+  长度与速率，时长、角度、方向向量保持不变。
 - 运行前可预览二维/三维结构，并显示材料图例。
 
 **工艺配方**
@@ -55,7 +58,12 @@ ViennaLS 5.8.5 环境保留用于回放、历史运行以及 4.7.0 绑定缺失�
   几何上支持 2D/3D，GDS 输入因缺少可界定的垂直范围仍被拒绝。
 - 可选原生控制：选择性外延的 `nvFactors`、四个等离子体模型的
   `coverageTolerance`，以及 `advanced` 等离子体参数对象。
-- 定向速率模型与选择性对照。
+- 定向速率模型与选择性对照，并支持从原生脚本翻译时使用的原生速率符号模式。
+- 几何步骤：planarize（显式高度或测量停止材料）、boolean / GDS boolean、
+  insertBox、removeTopLevelSet、removeMaterial，以及支持显式/`allExcept` 掩膜
+  和可选沉积材料的 particleShape。
+- 步级 advection 覆盖（`spatialScheme`、`temporalScheme`、`timeStepRatio`、
+  `maxDissipation`）。
 - 步骤可启用/禁用、重排，并逐项设置原生参数。
 
 **执行**
@@ -65,6 +73,9 @@ ViennaLS 5.8.5 环境保留用于回放、历史运行以及 4.7.0 绑定缺失�
 - 引擎偏好 `auto` / `cpu` / `gpu`；显式选择 GPU 不会静默回退到 CPU。
   GPU 设备可通过稳定 UUID 固定。
 - 实时状态、每步引擎/种子记录、可复现的输入哈希。
+- 可选的 v2 执行注册表（`VIENNAPS_WORKBENCH_V2_EXECUTION=1`），按
+  process / field / geometry 分发，逐步骤记录 plan/outputs/state，已认领步骤不会
+  静默回退旧路径。
 
 **结果**
 
@@ -72,7 +83,10 @@ ViennaLS 5.8.5 环境保留用于回放、历史运行以及 4.7.0 绑定缺失�
 - 表面通量、原生中间输出、CSV/PNG 导出。
 - 按步骤下载产物 ZIP。
 - 重放项目导入/导出、连续算包、项目保存与重新打开。
-- 运行历史在服务重启后仍可读取。
+- 运行历史在服务重启后仍可读取，并支持
+  `?run=<run-id>#legacy` 直接打开运行记录与 v2 plan/output/state。
+- 原生 FinFET.py 验收 fixture：等价 schema-7 工程、原始 nm 参考与 µm twin
+  的 surface/volume digest（`docs/finfet-example/`）。
 
 ## 架构
 

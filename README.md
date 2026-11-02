@@ -39,9 +39,13 @@ data on the local disk, and never calls an external API. Verified against
 - 3D: plane, trench and hole structures, fin extrusion, stacked films with a
   top-level opening, and GDS layout import (layer-to-material mapping, periodic
   repair).
-- 13 built-in materials (`Si`, `SiO2`, `Si3N4`, `PolySi`, `SiGe`, `Al2O3`, `HfO2`,
-  `TiN`, `W`, `Cu`, `PMMA`, `Mask`, `SiN`) plus user-defined materials, each with
-  an independent film/mask role.
+- 15 built-in materials (`Si`, `SiO2`, `Si3N4`, `PolySi`, `SiGe`, `Al2O3`, `HfO2`,
+  `TiN`, `W`, `Cu`, `PMMA`, `Mask`, `SiN`, `Metal`, `Dielectric`) plus
+  user-defined materials, each with an independent film/mask role.
+- Native project units in both micrometres and nanometres. Schema 7 projects
+  declare their frame in `units`; the editors can switch an existing project
+  between `µm` and `nm`, rescaling lengths and rates without touching durations,
+  angles or direction vectors.
 - 2D/3D preview before a run, including material legends.
 
 **Recipes**
@@ -66,7 +70,15 @@ data on the local disk, and never calls an external API. Verified against
   are rejected because the native radius needs a bounded vertical span.
 - Optional native controls: `nvFactors` on selective epitaxy, `coverageTolerance`
   on the four plasma models, and the `advanced` plasma parameter object.
-- Directional rate model and selectivity comparisons.
+- Directional rate model and selectivity comparisons, including a native
+  rate-sign mode for tables translated from a native script.
+- Geometry steps shared by both editors: planarize (explicit or measured stop
+  material), boolean / GDS boolean, insertBox, removeTopLevelSet,
+  removeMaterial, and particleShape box/sphere offsets with explicit or
+  `allExcept` masks and optional deposition material.
+- Per-step advection overrides (`spatialScheme`, `temporalScheme`,
+  `timeStepRatio`, `maxDissipation`) for processes that do not use the project
+  default.
 - Per-step enable/disable, reordering, and per-step native parameters.
 
 **Execution**
@@ -76,6 +88,9 @@ data on the local disk, and never calls an external API. Verified against
 - Engine preference `auto` / `cpu` / `gpu`; explicit GPU never falls back to CPU
   silently. GPU devices can be pinned by stable UUID.
 - Live status, per-step engine/seed records, and reproducible input hashes.
+- Opt-in v2 execution registry (`VIENNAPS_WORKBENCH_V2_EXECUTION=1`) with
+  process / field / geometry dispatch, per-step plan / outputs / state records,
+  and no silent legacy fallback for claimed steps.
 
 **Results**
 
@@ -83,7 +98,10 @@ data on the local disk, and never calls an external API. Verified against
 - Surface flux maps, intermediate native outputs, CSV/PNG export.
 - Artifact ZIP download per step.
 - Replay-project export/import, continuation packages, and project save/open.
-- Run history that survives restarts.
+- Run history that survives restarts, including a direct
+  `?run=<run-id>#legacy` inspector link with the v2 plan/output/state records.
+- Native FinFET.py acceptance fixture: an equivalent schema-7 project plus
+  original nm and µm-twin reference digests (`docs/finfet-example/`).
 
 ## Architecture
 
@@ -294,7 +312,17 @@ WORKBENCH_GPU_TEST=1 .venv/bin/python -m unittest discover -s tests -v
 
 # Frontend type check and production build.
 cd frontend && npm run typecheck && npm run build
+
+# Heavy FinFET.py acceptance (native reference + workbench + replay).
+scripts/accept-finfet-example.sh
+
+# Reuse the committed reference digests and run only workbench + replay.
+scripts/accept-finfet-example.sh --skip-reference
 ```
+
+The FinFET fixture covers 25 schema-7 steps and 26 surface checkpoints. The
+workbench matches the original nanometre `expected.json` surface and final
+volume digests; the µm twin remains as a native scale-sensitivity cross-check.
 
 If the workbench service is already running against `./var`, the suite aborts in
 milliseconds with `another ViennaPS Workbench server already holds the
@@ -340,6 +368,8 @@ var/            runtime data (ignored by git)
 - `docs/ACCEPTANCE_STAGE*.md` — stage-by-stage acceptance reports.
 - `docs/performance-profile-20261029.md` — GPU/CPU timing breakdown.
 - `docs/compatibility.md` — pinned environment and native failure notes.
+- `docs/finfet-example/` — native FinFET.py reference, schema-7 project,
+  mapping, expected surface/volume digests and the replay acceptance test.
 
 Large acceptance evidence (`docs/*-evidence/`) is intentionally not versioned;
 the three capability matrices required at runtime are the exception.
