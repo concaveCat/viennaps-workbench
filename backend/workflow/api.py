@@ -4,30 +4,30 @@ from __future__ import annotations
 
 import math
 import uuid
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request, Response
-from datetime import datetime, timezone
-
 from pydantic import Field, ValidationError, field_serializer, model_validator
 
 from .. import snapshots, storage
 from ..models import ProjectV7, StepV7, StrictModel
-from .metrology import MeasurementResultV1, MetrologyRecipeV1, MetricDefinitionV1, SnapshotPayloadV1, snapshot_content_hash
 from .adoption import adopt_project, first_route
 from .analysis import (
     build_report,
     candidate_view,
-    compare_snapshots as compare_analysis_snapshots,
     experiment_csv,
     load_snapshot,
     process_window,
     snapshot_summary,
 )
-from .calibration import create_dataset, run_fit
+from .analysis import (
+    compare_snapshots as compare_analysis_snapshots,
+)
 from .branches import create_branch
+from .calibration import create_dataset, run_fit
 from .decisions import (
     MeasurementDecisionRequestV1,
     MeasurementDecisionV1,
@@ -38,7 +38,8 @@ from .decisions import (
     list_workflow_runs,
     replay_measurement_decision,
 )
-from .equivalence import ComparisonProtocolV1, EquivalenceResultV1, compare_snapshots as compare_equivalence_snapshots
+from .equivalence import ComparisonProtocolV1, EquivalenceResultV1
+from .equivalence import compare_snapshots as compare_equivalence_snapshots
 from .execution import execute_segment
 from .experiments import (
     apply_experiment_retention,
@@ -66,6 +67,13 @@ from .library_items import (
     create_library_item,
     update_library_item,
 )
+from .metrology import (
+    MeasurementResultV1,
+    MetricDefinitionV1,
+    MetrologyRecipeV1,
+    SnapshotPayloadV1,
+    snapshot_content_hash,
+)
 from .models import CompileDiffV1, CompiledWorkflowV1, GeometryBindingV1
 from .modules import (
     ExpandedFlowV1,
@@ -77,9 +85,8 @@ from .modules import (
 from .project_state import ProjectWorkflowStateV1
 from .provenance import ProvenanceVerificationV1, VerificationRecordV1
 from .routes import AttemptV1, RoutePlanV1, SegmentRefV1, SegmentReuseV1, SegmentV1
-from .templates import FlowTemplateV1, resolve_template
 from .store import WorkflowConflict, WorkflowError, WorkflowNotFound, WorkflowStore, WorkflowValidation
-
+from .templates import FlowTemplateV1, resolve_template
 
 router = APIRouter(prefix="/api/v1/workflow", tags=["workflow"])
 
@@ -2009,3 +2016,12 @@ async def cancel_segment(segment_id: str, request: Request) -> SegmentV1:
             supervisor.cancel(segment.runId)
             return segment
     return _call(lambda: store.update_segment_status(segment_id, "cancelled"))
+
+
+@router.get("/execution-catalog", response_model=dict)
+def execution_catalog_endpoint() -> dict:
+    """Return the locked process/field/geometry catalog for UI consumers."""
+    from process_models.execution import load_execution_registry
+    from process_models.v2.catalog import execution_catalog
+
+    return execution_catalog(load_execution_registry())
