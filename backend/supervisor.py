@@ -22,6 +22,7 @@ from .native_build import configured_runtime
 # ``ReplayMismatch``/``now_iso`` from ``backend.supervisor``.
 from .planning import ReplayMismatch, now_iso, plan_run, requested_input_hash_from_dict  # noqa: F401
 from .runtime_limits import max_log_bytes, max_log_mib, rss_limit_mib
+from .v2_records import read_v2_steps
 
 ROOT = storage.ROOT
 PYTHON = ROOT / ".venv" / "bin" / "python"
@@ -621,6 +622,7 @@ class Supervisor:
             },
             "snapshots": manifest.get("snapshots", []),
             "actualExecution": manifest.get("actualExecution", []),
+            "v2Steps": read_v2_steps(run_dir),
             "completedAt": manifest.get("finishedAt"),
         }
 

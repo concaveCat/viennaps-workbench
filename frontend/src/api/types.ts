@@ -68,6 +68,12 @@ export type SnapshotRow = { stepId: string; name: string; stepIndex: number; sna
 export type RunSummary = { runId: string; kind: string; status: string; createdAt?: string; finishedAt?: string; requestedInputHash?: string; failureReason?: string };
 export type RunTermination = { reason?: string | null; returnCode?: number | null; rssLimitMiB?: number | null; peakObservedRssBytes?: number | null };
 export type IntermediateOutputRef = { stepId: string; fileName: string; url: string; format: string; pointCount: number | null; cellCounts: Record<string, number>; coordinateUnit: string | null; axisMap: Record<string, number> | null; fields: { name: string; association: 'pointData' | 'cellData'; components: number; tuples: number; nativeType?: string | null; nativeUnit: string | null; unitStatus?: string }[]; sizeBytes: number; sha256: string; associationPolicy?: string };
+export type V2StepRecord = {
+  stepId: string;
+  plan: Record<string, unknown> | null;
+  outputs: Record<string, unknown> | null;
+  state: Record<string, unknown> | null;
+};
 export type RunInfo = {
   runId: string; kind: string; status: string; currentStepId: string | null; completedStepIds: string[]; startedAt?: string | null;
   elapsedSeconds: number; requestedInputHash: string; executionHash?: string; failureReason?: string | null; termination?: RunTermination | null; stepTotal?: number;
@@ -76,6 +82,7 @@ export type RunInfo = {
   actualExecution?: { stepId: string; model?: string; operation?: string; noOp?: boolean; actualEngine?: string; actualSeed?: number | null; actualRate?: number | null; actualParameters?: Record<string, unknown> }[];
   fluxResult?: { fileName: string; vtk: string; meshIdentity: string; pointCount: number; fieldCount: number; fieldNames: string[]; actualEngine: string; actualSeed: number };
   intermediateOutputs?: IntermediateOutputRef[];
+  v2Steps?: V2StepRecord[];
 };
 export type FluxField = { name: string; association: 'pointData' | 'cellData'; components: 1 | 3; tuples: number; nativeUnit: string | null; unitStatus: string };
 export type FluxResult = {

@@ -284,6 +284,7 @@ export default function App() {
   const multiParticleActual = selectedExecution?.model === 'multiParticle' ? selectedExecution.actualParameters ?? {} : null;
   const specializedActual = selectedExecution?.model === 'specialized' ? selectedExecution.actualParameters ?? {} : null;
   const geometryActual = selectedExecution && ['removeMaterial', 'planarize', 'boolean', 'gdsBoolean'].includes(selectedExecution.model ?? '') ? selectedExecution.actualParameters ?? {} : null;
+  const selectedV2 = displayInfo?.v2Steps?.find(item => item.stepId === selectedSnapshot?.stepId);
   const measuredChange = selectedSnapshot?.measuredRemoval
     ? { kind: 'removal' as const, record: selectedSnapshot.measuredRemoval }
     : selectedSnapshot?.measuredAdded ? { kind: 'addition' as const, record: selectedSnapshot.measuredAdded } : null;
@@ -298,9 +299,9 @@ export default function App() {
     if (displayInfo?.kind === 'flux') { setDockTab('flux'); setDockOpen(true); }
     else if ((displayInfo?.intermediateOutputs?.length ?? 0) > 0) { setDockTab('intermediate'); setDockOpen(true); }
     else if ((selectedSnapshot?.outputs?.length ?? 0) > 0) { setDockTab('artifacts'); setDockOpen(true); }
-    else if (directionalActual || multiParticleActual || specializedActual || geometryActual || hasMeasuredChange) { setDockTab('native'); setDockOpen(true); }
+    else if (directionalActual || multiParticleActual || specializedActual || geometryActual || selectedV2 || hasMeasuredChange) { setDockTab('native'); setDockOpen(true); }
     else if (visibleLog) { setDockTab('log'); setDockOpen(true); }
-  }, [displayInfo?.kind, displayInfo?.intermediateOutputs?.length, selectedSnapshot?.outputs?.length, directionalActual, multiParticleActual, specializedActual, geometryActual, hasMeasuredChange, visibleLog]);
+  }, [displayInfo?.kind, displayInfo?.intermediateOutputs?.length, selectedSnapshot?.outputs?.length, directionalActual, multiParticleActual, specializedActual, geometryActual, selectedV2, hasMeasuredChange, visibleLog]);
 
   useEffect(() => {
     const sequence = ++validationSequence.current;
@@ -1803,7 +1804,7 @@ export default function App() {
         <div className={`dock-shell ${dockOpen ? 'expanded' : 'collapsed'}`}>
           <div className="dock-header">
             <button type="button" className="dock-toggle" aria-expanded={dockOpen} onClick={() => setDockOpen(value => !value)}>{dockOpen ? '▾' : '▸'} 日志</button>
-            <Dock tab={dockTab} onChange={tab => { setDockTab(tab); setDockOpen(true); }} counts={{ log: runInfo ? 1 : 0, flux: displayFlux?.fields.length ?? 0, intermediate: displayInfo?.intermediateOutputs?.length ?? 0, native: directionalActual || multiParticleActual || specializedActual || geometryActual || hasMeasuredChange ? 1 : 0, artifacts: selectedSnapshot?.outputs?.length ?? 0 }} />
+            <Dock tab={dockTab} onChange={tab => { setDockTab(tab); setDockOpen(true); }} counts={{ log: runInfo ? 1 : 0, flux: displayFlux?.fields.length ?? 0, intermediate: displayInfo?.intermediateOutputs?.length ?? 0, native: directionalActual || multiParticleActual || specializedActual || geometryActual || selectedV2 || hasMeasuredChange ? 1 : 0, artifacts: selectedSnapshot?.outputs?.length ?? 0 }} />
           </div>
           {dockOpen && <div className="dock-scroll">
         <div id="dock-flux" className="dock-block">
@@ -1870,6 +1871,12 @@ export default function App() {
             ? <span>材质感知 CMP：停止材料 {String(geometryActual.stopMaterial)} · 顶面 {String(geometryActual.stopHeightMethod ?? 'area-weighted-p90')} {formatMicron(Number(geometryActual.measuredStopTopHeight))} − 过抛光 {formatMicron(Number(geometryActual.overPolish))} → 有效截断高度 {formatMicron(Number(geometryActual.cutoffHeight))}（中位面 {formatMicron(Number(geometryActual.stopMaterialMedianTopHeight))}，最高面 {formatMicron(Number(geometryActual.stopMaterialHighestTopHeight))}，上表面积 {Number(geometryActual.stopMaterialUpFacingArea ?? 0).toFixed(4)} µm²）。原生 <code>Planarize</code> 仍是全局高度切割，不模拟横向选择比。</span>
             : null}
           <pre>{JSON.stringify(geometryActual, null, 2)}</pre>
+        </div>}
+        {selectedV2 && <div className="directional-history">
+          <strong>v2 执行记录 · {String(selectedV2.plan?.processId ?? selectedV2.stepId)}</strong>
+          <span>process {String(selectedV2.plan?.processVersion ?? '—')} · variant {String(selectedV2.plan?.variantId ?? '—')} · engine {String(selectedV2.plan?.engineId ?? '—')} {String(selectedV2.plan?.engineKernel ?? '')}</span>
+          {selectedV2.state && <span>fields {selectedV2.state.hasFields ? (selectedV2.state.fieldsPersisted ? '已持久化' : '仅内存/边界省略') : '无'} · materials {Array.isArray((selectedV2.state.materials as { order?: unknown[] } | null)?.order) ? ((selectedV2.state.materials as { order?: unknown[] }).order ?? []).length : '—'}</span>}
+          <pre>{JSON.stringify({ plan: selectedV2.plan, outputs: selectedV2.outputs, state: selectedV2.state }, null, 2)}</pre>
         </div>}
         {measuredChange && <div className="directional-history measured-change">
           <strong>实测材料变化 · {measuredChange.kind === 'removal' ? '去除' : '增加'}（{measuredChange.record.material}）</strong>

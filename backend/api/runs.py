@@ -692,6 +692,14 @@ def _archive_entries(run_dir: Path, manifest: dict[str, Any]) -> list[tuple[str,
             candidates.append((f"assets/{csv_asset_id}.csv", source))
     if (run_dir / "domain-state.vpsd").is_file():
         candidates.append(("domain-state.vpsd", run_dir / "domain-state.vpsd"))
+    v2_root = run_dir / "v2"
+    if v2_root.is_dir():
+        for path in sorted(v2_root.rglob("*")):
+            if not path.is_file() or path.is_symlink():
+                continue
+            if path.name not in {"plan.json", "outputs.json", "state.json"}:
+                continue
+            candidates.append((path.relative_to(run_dir).as_posix(), path))
     flux_result = manifest.get("fluxResult")
     if isinstance(flux_result, dict):
         for key in ("fileName", "vtk"):
@@ -783,3 +791,15 @@ async def run_download(run_id: str):
         raise HTTPException(status_code=409, detail=exc.detail()) from exc
     except (FileNotFoundError, OSError, ValueError) as exc:
         raise HTTPException(status_code=404, detail="run not found") from exc
+
+
+@router.get("/api/runs/{run_id}/v2")
+async def run_v2_get(run_id: str) -> dict:
+    """Return the v2 plan/output/state records for one run, if present."""
+    from ..v2_records import V2_RECORDS_VERSION, read_v2_steps
+
+    return {
+        "schemaVersion": V2_RECORDS_VERSION,
+        "runId": run_id,
+        "steps": read_v2_steps(storage.run_path(run_id)),
+    }
