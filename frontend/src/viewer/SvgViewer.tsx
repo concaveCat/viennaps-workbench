@@ -38,6 +38,7 @@ export function SvgViewer({ current, compare, view, onViewChange, svgRef, catalo
   const worldX = (x: number) => size.width / 2 + (x - centerX) * scale;
   const worldY = (h: number) => size.height / 2 - (h - centerH) * scale;
   const delta = current?.gridDelta ?? compare?.gridDelta ?? 0.1;
+  const coordinateUnit = current?.coordinateUnit === 'nm' || compare?.coordinateUnit === 'nm' ? 'nm' : 'µm';
   const ids = useMemo(() => [...new Set([...(current?.cellData.materialIds ?? []), ...(compare?.cellData.materialIds ?? [])])].sort((a, b) => a - b), [current, compare]);
   const rawGridCount = Math.ceil((bounds.maxX - bounds.minX) / delta) + Math.ceil((bounds.maxH - bounds.minH) / delta);
   const gridEvery = Math.max(1, Math.ceil(rawGridCount / 260));
@@ -61,7 +62,7 @@ export function SvgViewer({ current, compare, view, onViewChange, svgRef, catalo
     const power = 10 ** Math.floor(Math.log10(Math.max(micrometers, 0.001)));
     const normalized = micrometers / power;
     const chosen = (normalized >= 5 ? 5 : normalized >= 2 ? 2 : 1) * power;
-    return { length: chosen * scale, label: `${Number(chosen.toPrecision(3))} µm` };
+    return { length: chosen * scale, label: `${Number(chosen.toPrecision(3))} ${coordinateUnit}` };
   };
   const bar = getScaleBar();
   const left = 70; const right = size.width - 24; const top = 26; const bottom = size.height - 62;
@@ -82,8 +83,8 @@ export function SvgViewer({ current, compare, view, onViewChange, svgRef, catalo
         {compare && ids.map(id => <path key={`compare-${id}`} d={comparePaths.get(id) ?? ''} stroke={colorFor(id)} strokeWidth="2.2" strokeDasharray="7 4" opacity="0.48" strokeLinejoin="round" vectorEffect="non-scaling-stroke" />)}
         {ids.map(id => <path key={`current-${id}`} d={currentPaths.get(id) ?? ''} stroke={colorFor(id)} strokeWidth="2.4" strokeLinejoin="round" strokeLinecap="round" vectorEffect="non-scaling-stroke" />)}
       </g>
-      <text className="axis-label" x={right - 3} y={Math.min(bottom - 4, worldY(0) - 8)} textAnchor="end">h (µm)</text>
-      <text className="axis-label" x={right - 4} y={bottom + 34} textAnchor="end">x (µm)</text>
+      <text className="axis-label" x={right - 3} y={Math.min(bottom - 4, worldY(0) - 8)} textAnchor="end">h ({coordinateUnit})</text>
+      <text className="axis-label" x={right - 4} y={bottom + 34} textAnchor="end">x ({coordinateUnit})</text>
       <line className="scale-bar" x1={left + 12} y1={bottom + 14} x2={left + 12 + bar.length} y2={bottom + 14} />
       <line className="scale-bar" x1={left + 12} y1={bottom + 9} x2={left + 12} y2={bottom + 19} />
       <line className="scale-bar" x1={left + 12 + bar.length} y1={bottom + 9} x2={left + 12 + bar.length} y2={bottom + 19} />
@@ -93,6 +94,6 @@ export function SvgViewer({ current, compare, view, onViewChange, svgRef, catalo
       {ids.map(id => <span key={id}><i style={{ background: colorFor(id) }} />{axisNames[String(id)]?.name ?? catalog.find(item => item.id === id)?.name ?? `Material ${id}`}</span>)}
       {compare && <span><i className="legend-dashed" />对比结果</span>}
     </div>}
-    {current && <div className="viewer-grid-note">{view.showGrid ? `网格辅助线：${gridEvery} 格一条（Δ=${delta} µm）` : `计算网格间距 Δ=${delta} µm`}</div>}
+    {current && <div className="viewer-grid-note">{view.showGrid ? `网格辅助线：${gridEvery} 格一条（Δ=${delta} ${coordinateUnit}）` : `计算网格间距 Δ=${delta} ${coordinateUnit}`}</div>}
   </div>;
 }

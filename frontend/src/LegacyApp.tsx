@@ -26,6 +26,7 @@ import { DeleteMaterialDialog } from './components/DeleteMaterialDialog';
 import { MaterialPropertyInspector } from './components/MaterialPropertyInspector';
 import { NumericField, SelectField } from './components/fields';
 import { SvgViewer } from './viewer/SvgViewer';
+import { convertProjectUnits, lengthUnitLabel, lengthUnitsPerUm, rateUnitLabel, type LengthUnit } from './project/units';
 import { api, effectiveArtifactCapBytes, formatArtifactCapMiB, prettyError, saveBlob } from './api/client';
 import type { AdvectionSettings, CsvRateAsset, DirectionalMaterialRate, Domain, FluxResult, GDSGeometry, GDSMaskPattern, Geometry, GpuCapabilityRow, GpuProfileFailure, Layer, MaterialCatalogItem, OutputSettings, ParticleSpecies, Project, RayTracingSettings, RunInfo, Solver, StackGeometry, Step } from './api/types';
 import { gdsAssetIdFromProject, gdsLayerIds, gdsMaskPairs, gdsPairs } from './lib/gds';
@@ -61,6 +62,10 @@ function newStepId(): string { return `step_${crypto.randomUUID().replaceAll('-'
 
 export default function App() {
   const [project, setProject] = useState<Project>(() => structuredClone(defaultProject));
+  const projectUnits: LengthUnit = project.units?.length === 'nm' ? 'nm' : 'um';
+  const lengthUnit = lengthUnitLabel(projectUnits);
+  const rateUnit = rateUnitLabel(projectUnits);
+  const unitsPerUm = lengthUnitsPerUm(projectUnits);
   const [projectId, setProjectId] = useState<string | null>(null);
   const [savedProjectJson, setSavedProjectJson] = useState<string | null>(null);
   const [savedSelection, setSavedSelection] = useState('');
@@ -122,6 +127,14 @@ export default function App() {
     if (previous.schemaVersion < 3 && (JSON.stringify(previous.geometry) !== JSON.stringify(next.geometry) || JSON.stringify(previous.steps) !== JSON.stringify(next.steps))) return { ...next, schemaVersion: Math.max(3, next.schemaVersion) as Project["schemaVersion"], solver: { ...next.solver, enginePreference: 'cpu' }, ...(next.dimension === 3 ? { view3D: { ...next.view3D!, visibleMaterialIds: materials.map(m => m.id) } } : {}) };
     return next;
   }), [materials]);
+
+  const changeProjectUnits = (target: LengthUnit) => {
+    if (projectUnits === target) return;
+    const result = convertProjectUnits(project as unknown as Record<string, unknown>, target);
+    if (result.blockedReason) { setNotice(result.blockedReason); return; }
+    setProject(result.project as unknown as Project);
+    setNotice(`长度单位已切换为 ${lengthUnitLabel(target)}；长度与速率已按比例换算。`);
+  };
 
   const fetchRunInfo = useCallback(async (runId: string, cursor = 0) => {
     return api<RunInfo>(`/api/runs/${runId}?cursor=${cursor}`);
@@ -1302,7 +1315,7 @@ export default function App() {
     <input ref={csvInputRef} data-testid="csv-asset-input" type="file" accept=".csv,text/csv" hidden onChange={event => { const file = event.target.files?.[0]; if (file) void uploadCsvFile(file, csvUploadMode); }} />
     <TopBar>
       <header className="topbar topbar-shell">
-        <div className="brand-block"><div className="brand-mark">V<span>PS</span></div><div className="brand-copy"><strong>ViennaPS 工艺工作台</strong><span>二维 / 三维本机仿真 · µm · s</span></div></div>
+        <div className="brand-block"><div className="brand-mark">V<span>PS</span></div><div className="brand-copy"><strong>ViennaPS 工艺工作台</strong><span>二维 / 三维本机仿真 · {lengthUnit} · s</span></div></div>
         <div className="topbar-project"><span className="muted-label">项目</span><input value={project.name} aria-label="项目名称" onChange={event => updateProject(previous => ({ ...previous, name: event.target.value }))} /><span className="save-state">{!projectId ? '未保存' : savedProjectJson === JSON.stringify(project) ? '已保存' : '有未保存修改'}</span></div>
         <nav className="toolbar" aria-label="项目操作">
           <Menu label="项目">
@@ -1374,9 +1387,12 @@ export default function App() {
             <details><summary>兼容性要求</summary><p>新工艺从该原生 Domain 状态开始。网格、边界、材料映射及 ViennaPS/ViennaLS 版本需匹配；修改结构参数后将无法运行。</p></details>
           </div>}
           <div className="field-grid one-column">
-            <NumericField label="网格间距" unit="µm" value={project.domain.gridDelta} max={0.5} onChange={value => updateProject(previous => ({ ...previous, domain: { ...previous.domain, gridDelta: value } }))} />
-            <NumericField label="x 横向总宽度" unit="µm" value={project.domain.xExtent} min={project.dimension === 3 ? minThreeDExtent(project.domain.gridDelta) : 1} max={40} step="0.1" hint={project.dimension === 3 ? '至少 2 个网格间距' : undefined} onChange={value => updateProject(previous => ({ ...previous, domain: { ...previous.domain, xExtent: value } }))} />
-            {project.dimension === 3 && <NumericField label="y 横向总宽度" unit="µm" value={project.domain.yExtent ?? 6} min={minThreeDExtent(project.domain.gridDelta)} max={40} step=".2" hint="至少 2 个网格间距" onChange={value => updateProject(previous => ({ ...previous, domain: { ...previous.domain, yExtent: value } }))} />}
+            <div className="field-grid two-column">
+              <SelectField label="长度单位" value={projectUnits} options={[{ value: 'um', label: 'µm' }, { value: 'nm', label: 'nm' }]} onChange={value => changeProjectUnits(value as LengthUnit)} />
+            </div>
+            <NumericField label="网格间距" unit={lengthUnit} value={project.domain.gridDelta} max={0.5 * unitsPerUm} step={String(0.001 * unitsPerUm)} onChange={value => updateProject(previous => ({ ...previous, domain: { ...previous.domain, gridDelta: value } }))} />
+            <NumericField label="x 横向总宽度" unit={lengthUnit} value={project.domain.xExtent} min={project.dimension === 3 ? minThreeDExtent(project.domain.gridDelta) : unitsPerUm} max={40 * unitsPerUm} step={String(0.1 * unitsPerUm)} hint={project.dimension === 3 ? '至少 2 个网格间距' : undefined} onChange={value => updateProject(previous => ({ ...previous, domain: { ...previous.domain, xExtent: value } }))} />
+            {project.dimension === 3 && <NumericField label="y 横向总宽度" unit={lengthUnit} value={project.domain.yExtent ?? 6} min={minThreeDExtent(project.domain.gridDelta)} max={40 * unitsPerUm} step={String(.2 * unitsPerUm)} hint="至少 2 个网格间距" onChange={value => updateProject(previous => ({ ...previous, domain: { ...previous.domain, yExtent: value } }))} />}
             <SelectField label="横向边界" value={project.dimension === 3 ? project.domain.boundaryXY ?? 'reflective' : project.domain.xBoundary ?? 'reflective'} options={[{ value: 'reflective', label: '反射' }, { value: 'periodic', label: '周期' }]} onChange={value => updateProject(previous => ({ ...previous, domain: previous.dimension === 3 ? { ...previous.domain, boundaryXY: value as 'reflective' | 'periodic' } : { ...previous.domain, xBoundary: value as Domain['xBoundary'] } }))} />
           </div>
           <div className="structure-select">
@@ -1503,12 +1519,12 @@ export default function App() {
           </div>
           {project.geometry.kind === 'stack' ? <div className="field-grid one-column geometry-fields">
             <SelectField label="基底材料" value={project.geometry.substrateMaterial} options={materials.map(m => ({ value: m.name, label: m.name }))} onChange={value => updateProject(previous => previous.geometry.kind === 'stack' ? { ...previous, geometry: { ...previous.geometry, substrateMaterial: value } } : previous)} />
-            <NumericField label="基底表面高度" unit="µm" value={project.geometry.baseHeight} onChange={value => updateProject(previous => previous.geometry.kind === 'stack' ? { ...previous, geometry: { ...previous.geometry, baseHeight: value } } : previous)} />
+            <NumericField label="基底表面高度" unit={lengthUnit} value={project.geometry.baseHeight} onChange={value => updateProject(previous => previous.geometry.kind === 'stack' ? { ...previous, geometry: { ...previous.geometry, baseHeight: value } } : previous)} />
             {project.geometry.layers.map((layer, index) => layer.source === 'gds-mask' && project.geometry.kind === 'stack' && project.geometry.gdsMask ? <div className="layer-card gds-mask-card" key={layer.id}>
               <div className="section-heading gds-mask-section-heading"><div className="gds-mask-heading-copy"><span className="field-label">第 {index + 1} 层 · {layer.name}</span><span className="gds-mask-heading-hint">GDS 掩膜 · 顶层图案直接使用此版图图形</span></div><button type="button" className="button danger-quiet" onClick={() => removeLayer(layer.id)}>移除</button></div>
               <label className="field"><span className="field-label">掩膜名称</span><input type="text" maxLength={80} value={layer.name} onChange={event => editLayer(layer.id, { name: event.target.value })} /></label>
               <SelectField label="掩膜材料" value={layer.material} options={materials.map(item => ({ value: item.name, label: item.name }))} onChange={value => editLayer(layer.id, { material: value })} />
-              <NumericField label="掩膜厚度" unit="µm" value={layer.thickness} min={2 * project.domain.gridDelta} max={100} step=".05" onChange={value => editLayer(layer.id, { thickness: value })} />
+              <NumericField label="掩膜厚度" unit={lengthUnit} value={layer.thickness} min={2 * project.domain.gridDelta} max={100} step=".05" onChange={value => editLayer(layer.id, { thickness: value })} />
               {gdsAsset && <>
                 <SelectField label="版图结构" value={project.geometry.gdsMask.structure} options={gdsAsset.structures.filter(item => gdsMaskPairs(gdsAsset, item.name).length > 0).map(item => ({ value: item.name, label: item.name }))} onChange={value => {
                   const pair = gdsMaskPairs(gdsAsset, value)[0]; if (!pair) return;
@@ -1517,22 +1533,22 @@ export default function App() {
                 <SelectField label="GDS 掩膜图层 / datatype" value={`${project.geometry.gdsMask.layer}/${project.geometry.gdsMask.datatype}`} options={gdsMaskPairs(gdsAsset, project.geometry.gdsMask.structure).map(([gdsLayer, datatype]) => ({ value: `${gdsLayer}/${datatype}`, label: `Layer ${gdsLayer} · datatype ${datatype}` }))} onChange={value => { const [gdsLayer, datatype] = value.split('/').map(Number); editStackGdsMask(mask => ({ ...mask, layer: gdsLayer, datatype })); }} />
                 <NumericField label="版图尺寸比例" value={project.geometry.gdsMask.unitScale} min={.000001} max={1_000_000} step="0.1" onChange={value => editStackGdsMask(mask => ({ ...mask, unitScale: value }))} />
                 <SelectField label="保留图形区域" value={project.geometry.gdsMask.retainedRegion} options={[{ value: 'inside', label: 'GDS 图形内部' }, { value: 'outside', label: 'GDS 图形外部' }]} onChange={value => editStackGdsMask(mask => ({ ...mask, retainedRegion: value as 'inside' | 'outside' }))} />
-                <NumericField label="GDS X 偏移" unit="µm" value={project.geometry.gdsMask.position[0]} min={-40} max={40} step="0.05" onChange={value => editStackGdsMask(mask => { const position: [number, number, number] = [...mask.position]; position[0] = value; return { ...mask, position }; })} />
-                <NumericField label="GDS Y 偏移" unit="µm" value={project.geometry.gdsMask.position[1]} min={-40} max={40} step="0.05" onChange={value => editStackGdsMask(mask => { const position: [number, number, number] = [...mask.position]; position[1] = value; return { ...mask, position }; })} />
+                <NumericField label="GDS X 偏移" unit={lengthUnit} value={project.geometry.gdsMask.position[0]} min={-40} max={40} step="0.05" onChange={value => editStackGdsMask(mask => { const position: [number, number, number] = [...mask.position]; position[0] = value; return { ...mask, position }; })} />
+                <NumericField label="GDS Y 偏移" unit={lengthUnit} value={project.geometry.gdsMask.position[1]} min={-40} max={40} step="0.05" onChange={value => editStackGdsMask(mask => { const position: [number, number, number] = [...mask.position]; position[1] = value; return { ...mask, position }; })} />
                 <label className="visibility-option"><input type="checkbox" checked={project.geometry.gdsMask.protectsEtch} onChange={event => editStackGdsMask(mask => ({ ...mask, protectsEtch: event.target.checked }))} /><span><strong>保护掩膜材料</strong><small>关闭后，掩膜材料按工艺步骤中的材料速率参与刻蚀。</small></span></label>
                 <div className="inline-note">来源：{project.geometry.gdsMask.fileName} · {project.geometry.gdsMask.layer}/{project.geometry.gdsMask.datatype}。掩膜底面自动贴合其下方多层的顶部。</div>
               </>}
             </div> : <div className="layer-card" key={layer.id}>
               <label className="field"><span className="field-label">第 {index + 1} 层名称</span><input type="text" value={layer.name} onChange={event => editLayer(layer.id, { name: event.target.value })} /></label>
               <SelectField label="材料" value={layer.material} options={materials.map(m => ({ value: m.name, label: m.name }))} onChange={value => editLayer(layer.id, { material: value })} />
-              <NumericField label="厚度" unit="µm" value={layer.thickness} min={.01} max={100} step=".05" onChange={value => editLayer(layer.id, { thickness: value })} />
+              <NumericField label="厚度" unit={lengthUnit} value={layer.thickness} min={.01} max={100} step=".05" onChange={value => editLayer(layer.id, { thickness: value })} />
               <SelectField label="角色" value={layer.role} options={[{ value: 'film', label: '薄膜' }, { value: 'mask', label: '掩膜' }]} onChange={value => editLayer(layer.id, { role: value as Layer['role'] })} />
               <div className="layer-actions"><button className="button" disabled={index === 0} onClick={() => moveLayer(layer.id, -1)}>↑</button><button className="button" disabled={index === layerCount - 1} onClick={() => moveLayer(layer.id, 1)}>↓</button><button className="button" onClick={() => copyLayer(layer.id)}>复制</button><button className="button danger-quiet" onClick={() => removeLayer(layer.id)}>删除</button></div>
             </div>)}
             <button className="button" disabled={project.geometry.layers.length >= 16} onClick={addLayer}>＋ 添加层</button>
             <SelectField label="顶层图案" value={project.geometry.pattern.kind} options={project.geometry.gdsMask ? [{ value: 'gds', label: 'GDS 掩膜图案' }] : [{ value: 'none', label: '无' }, { value: 'trench', label: '沟槽' }, ...(project.dimension === 3 ? [{ value: 'hole', label: '圆孔' }] : [])]} hint={project.geometry.gdsMask ? '由上方 GDS 掩膜层提供图案。' : undefined} onChange={value => updateProject(previous => { if (previous.geometry.kind !== 'stack' || previous.geometry.gdsMask) return previous; const pattern: StackGeometry['pattern'] = value === 'trench' ? { kind: 'trench', width: 2, taperAngle: 0 } : value === 'hole' && previous.dimension === 3 ? { kind: 'hole', radius: 1, taperAngle: 0 } : { kind: 'none' }; return { ...previous, geometry: { ...previous.geometry, pattern } }; })} />
-            {project.geometry.pattern.kind === 'trench' && <NumericField label="沟槽宽度" unit="µm" value={project.geometry.pattern.width} min={.05} onChange={value => updatePattern({ width: value })} />}
-            {project.geometry.pattern.kind === 'hole' && <NumericField label="孔半径" unit="µm" value={project.geometry.pattern.radius} min={.05} onChange={value => updatePattern({ radius: value })} />}
+            {project.geometry.pattern.kind === 'trench' && <NumericField label="沟槽宽度" unit={lengthUnit} value={project.geometry.pattern.width} min={.05} onChange={value => updatePattern({ width: value })} />}
+            {project.geometry.pattern.kind === 'hole' && <NumericField label="孔半径" unit={lengthUnit} value={project.geometry.pattern.radius} min={.05} onChange={value => updatePattern({ radius: value })} />}
             {(project.geometry.pattern.kind === 'trench' || project.geometry.pattern.kind === 'hole') && <NumericField label="图案锥角" unit="°" value={project.geometry.pattern.taperAngle} min={-45} max={45} onChange={value => updatePattern({ taperAngle: value })} />}
             {project.geometry.gdsMask && <div className="inline-note">当前为 GDS 图形转移模式。运行前可先用“生成结构预览”检查掩膜、膜层和基底的相对位置。</div>}
           </div> : project.geometry.kind === 'gds' ? <div className="field-grid one-column geometry-fields gds-fields">
@@ -1566,8 +1582,8 @@ export default function App() {
                   {mapping && <>
                     <SelectField label={`图层 ${layerId} 的材料`} value={mapping.material} options={materials.map(item => ({ value: item.name, label: item.name }))} onChange={value => editGdsGeometry(current => ({ ...current, layers: current.layers.map(item => item.layer === layerId ? { ...item, material: value } : item) }))} />
                     {project.dimension === 3 && <>
-                      <NumericField label={`图层 ${layerId} 底面高度`} unit="µm" value={mapping.baseHeight ?? 0} step="0.05" onChange={value => editGdsGeometry(current => ({ ...current, layers: current.layers.map(item => item.layer === layerId ? { ...item, baseHeight: value } : item) }))} />
-                      <NumericField label={`图层 ${layerId} 厚度`} unit="µm" value={mapping.height ?? Math.max(0.5, 2 * project.domain.gridDelta)} min={2 * project.domain.gridDelta} step="0.05" onChange={value => editGdsGeometry(current => ({ ...current, layers: current.layers.map(item => item.layer === layerId ? { ...item, height: value } : item) }))} />
+                      <NumericField label={`图层 ${layerId} 底面高度`} unit={lengthUnit} value={mapping.baseHeight ?? 0} step="0.05" onChange={value => editGdsGeometry(current => ({ ...current, layers: current.layers.map(item => item.layer === layerId ? { ...item, baseHeight: value } : item) }))} />
+                      <NumericField label={`图层 ${layerId} 厚度`} unit={lengthUnit} value={mapping.height ?? Math.max(0.5, 2 * project.domain.gridDelta)} min={2 * project.domain.gridDelta} step="0.05" onChange={value => editGdsGeometry(current => ({ ...current, layers: current.layers.map(item => item.layer === layerId ? { ...item, height: value } : item) }))} />
                       <label className="visibility-option"><input type="checkbox" aria-label={`GDS 图层 ${layerId} 是掩膜`} checked={mapping.mask ?? false} onChange={event => editGdsGeometry(current => ({ ...current, layers: current.layers.map(item => item.layer === layerId ? { ...item, mask: event.target.checked } : item) }))} /><span><strong>作为掩膜材料</strong><small>图层厚度由上方高度设置。</small></span></label>
                     </>}
                   </>}
@@ -1583,17 +1599,17 @@ export default function App() {
           </div> : project.geometry.kind === 'fin' ? <div className="field-grid one-column geometry-fields">
             <SelectField label="Fin 材料" value={project.geometry.substrateMaterial} options={materials.map(item => ({ value: item.name, label: item.name }))} onChange={value => updateProject(previous => previous.geometry.kind === 'fin' ? { ...previous, geometry: { ...previous.geometry, substrateMaterial: value } } : previous)} />
             <SelectField label="Fin 构造方式" value={project.geometry.construction ?? 'native'} options={[{ value: 'boolean', label: 'ViennaPS 布尔几何（推荐）' }, { value: 'native', label: '原生 MakeFin（旧项目兼容）' }]} onChange={value => updateProject(previous => previous.geometry.kind === 'fin' ? { ...previous, geometry: { ...previous.geometry, construction: value as 'native' | 'boolean' } } : previous)} />
-            <NumericField label="Fin 宽度" unit="µm" value={project.geometry.width} min={2 * project.domain.gridDelta} max={40} step="0.05" onChange={value => updateProject(previous => previous.geometry.kind === 'fin' ? { ...previous, geometry: { ...previous.geometry, width: value } } : previous)} />
-            <NumericField label="Fin 高度" unit="µm" value={project.geometry.height} min={2 * project.domain.gridDelta} max={100} step="0.05" onChange={value => updateProject(previous => previous.geometry.kind === 'fin' ? { ...previous, geometry: { ...previous.geometry, height: value } } : previous)} />
+            <NumericField label="Fin 宽度" unit={lengthUnit} value={project.geometry.width} min={2 * project.domain.gridDelta} max={40} step="0.05" onChange={value => updateProject(previous => previous.geometry.kind === 'fin' ? { ...previous, geometry: { ...previous.geometry, width: value } } : previous)} />
+            <NumericField label="Fin 高度" unit={lengthUnit} value={project.geometry.height} min={2 * project.domain.gridDelta} max={100} step="0.05" onChange={value => updateProject(previous => previous.geometry.kind === 'fin' ? { ...previous, geometry: { ...previous.geometry, height: value } } : previous)} />
             <NumericField label="Fin 锥角" unit="°" value={project.geometry.taperAngle} min={-45} max={45} step="1" onChange={value => updateProject(previous => previous.geometry.kind === 'fin' ? { ...previous, geometry: { ...previous.geometry, taperAngle: value } } : previous)} />
             <SelectField label="掩膜材料" value={project.geometry.maskMaterial} options={materials.map(item => ({ value: item.name, label: item.name }))} onChange={value => updateProject(previous => previous.geometry.kind === 'fin' ? { ...previous, geometry: { ...previous.geometry, maskMaterial: value } } : previous)} />
-            <NumericField label="掩膜厚度" unit="µm" value={project.geometry.maskHeight} min={0} max={20} step="0.05" onChange={value => updateProject(previous => previous.geometry.kind === 'fin' ? { ...previous, geometry: { ...previous.geometry, maskHeight: value } } : previous)} />
+            <NumericField label="掩膜厚度" unit={lengthUnit} value={project.geometry.maskHeight} min={0} max={20} step="0.05" onChange={value => updateProject(previous => previous.geometry.kind === 'fin' ? { ...previous, geometry: { ...previous.geometry, maskHeight: value } } : previous)} />
             {project.geometry.maskHeight > 0 && <NumericField label="掩膜锥角" unit="°" value={project.geometry.maskTaperAngle} min={-45} max={45} step="1" onChange={value => updateProject(previous => previous.geometry.kind === 'fin' ? { ...previous, geometry: { ...previous.geometry, maskTaperAngle: value } } : previous)} />}
             {project.dimension === 3 && <>
               <label className="visibility-option"><input type="checkbox" aria-label="使用 ViennaPS Fin 挤出" checked={!!project.geometry.extrusion} onChange={event => updateProject(previous => previous.geometry.kind === 'fin' ? { ...previous, geometry: { ...previous.geometry, extrusion: event.target.checked ? { extent: [-1, 1], axis: 1 } : undefined } } : previous)} /><span><strong>用原生 Extrude 沿 y 方向挤出 2D Fin</strong><small>关闭时直接调用 d3.MakeFin；打开时调用 d2.MakeFin + ViennaPS Extrude。</small></span></label>
               {project.geometry.extrusion && <>
-                <NumericField label="挤出 y 最小位置" unit="µm" value={project.geometry.extrusion.extent[0]} min={-(project.domain.yExtent ?? 6)/2} max={(project.domain.yExtent ?? 6)/2} step="0.05" onChange={value => updateProject(previous => previous.geometry.kind === 'fin' && previous.geometry.extrusion ? { ...previous, geometry: { ...previous.geometry, extrusion: { ...previous.geometry.extrusion, extent: [value, previous.geometry.extrusion.extent[1]] } } } : previous)} />
-                <NumericField label="挤出 y 最大位置" unit="µm" value={project.geometry.extrusion.extent[1]} min={-(project.domain.yExtent ?? 6)/2} max={(project.domain.yExtent ?? 6)/2} step="0.05" onChange={value => updateProject(previous => previous.geometry.kind === 'fin' && previous.geometry.extrusion ? { ...previous, geometry: { ...previous.geometry, extrusion: { ...previous.geometry.extrusion, extent: [previous.geometry.extrusion.extent[0], value] } } } : previous)} />
+                <NumericField label="挤出 y 最小位置" unit={lengthUnit} value={project.geometry.extrusion.extent[0]} min={-(project.domain.yExtent ?? 6)/2} max={(project.domain.yExtent ?? 6)/2} step="0.05" onChange={value => updateProject(previous => previous.geometry.kind === 'fin' && previous.geometry.extrusion ? { ...previous, geometry: { ...previous.geometry, extrusion: { ...previous.geometry.extrusion, extent: [value, previous.geometry.extrusion.extent[1]] } } } : previous)} />
+                <NumericField label="挤出 y 最大位置" unit={lengthUnit} value={project.geometry.extrusion.extent[1]} min={-(project.domain.yExtent ?? 6)/2} max={(project.domain.yExtent ?? 6)/2} step="0.05" onChange={value => updateProject(previous => previous.geometry.kind === 'fin' && previous.geometry.extrusion ? { ...previous, geometry: { ...previous.geometry, extrusion: { ...previous.geometry.extrusion, extent: [previous.geometry.extrusion.extent[0], value] } } } : previous)} />
               </>}
             </>}
             {finFallbackModels.length > 0 || masked3DFinFallbackModels.length > 0 || finExtrusionFallbackModels.length > 0
@@ -1606,16 +1622,16 @@ export default function App() {
           </div> : project.geometry.kind !== 'plane' ? <div className="field-grid one-column geometry-fields">
             <SelectField label="基底材料" value={project.geometry.substrateMaterial} options={materials.map(m => ({ value: m.name, label: m.name }))} onChange={value => updateProject(previous => previous.geometry.kind !== 'stack' ? { ...previous, geometry: { ...previous.geometry, substrateMaterial: value } } : previous)} />
             <SelectField label="掩膜材料" value={project.geometry.maskMaterial ?? 'Mask'} options={materials.map(m => ({ value: m.name, label: m.name }))} onChange={value => updateProject(previous => previous.geometry.kind === 'trench' || previous.geometry.kind === 'hole' ? { ...previous, geometry: { ...previous.geometry, maskMaterial: value } } : previous)} />
-            {project.geometry.kind === 'trench' && <NumericField label="沟槽宽度" unit="µm" value={project.geometry.width} min={0.05} max={40} step="0.05" onChange={value => updateProject(previous => previous.geometry.kind === 'trench' ? { ...previous, geometry: { ...previous.geometry, width: value } } : previous)} />}
-            {project.geometry.kind === 'hole' && <NumericField label="孔半径" unit="µm" value={project.geometry.radius} min={.05} step=".05" onChange={value => updateProject(previous => previous.geometry.kind === 'hole' ? { ...previous, geometry: { ...previous.geometry, radius: value } } : previous)} />}
+            {project.geometry.kind === 'trench' && <NumericField label="沟槽宽度" unit={lengthUnit} value={project.geometry.width} min={0.05} max={40} step="0.05" onChange={value => updateProject(previous => previous.geometry.kind === 'trench' ? { ...previous, geometry: { ...previous.geometry, width: value } } : previous)} />}
+            {project.geometry.kind === 'hole' && <NumericField label="孔半径" unit={lengthUnit} value={project.geometry.radius} min={.05} step=".05" onChange={value => updateProject(previous => previous.geometry.kind === 'hole' ? { ...previous, geometry: { ...previous.geometry, radius: value } } : previous)} />}
 
-            <NumericField label="深度" unit="µm" value={project.geometry.depth} min={0.05} max={100} step="0.05" onChange={value => updateProject(previous => previous.geometry.kind !== 'plane' ? { ...previous, geometry: { ...previous.geometry, depth: value } } : previous)} />
+            <NumericField label="深度" unit={lengthUnit} value={project.geometry.depth} min={0.05} max={100} step="0.05" onChange={value => updateProject(previous => previous.geometry.kind !== 'plane' ? { ...previous, geometry: { ...previous.geometry, depth: value } } : previous)} />
             <NumericField label="锥角" unit="°" value={project.geometry.taperAngle} min={-45} max={45} step="1" hint="正值表示底部收窄" onChange={value => updateProject(previous => previous.geometry.kind !== 'plane' ? { ...previous, geometry: { ...previous.geometry, taperAngle: value } } : previous)} />
-            <NumericField label="掩膜厚度" unit="µm" value={project.geometry.maskHeight} min={0} max={20} step="0.05" hint="0 表示不建立掩膜" onChange={value => updateProject(previous => previous.geometry.kind !== 'plane' ? { ...previous, geometry: { ...previous.geometry, maskHeight: value } } : previous)} />
+            <NumericField label="掩膜厚度" unit={lengthUnit} value={project.geometry.maskHeight} min={0} max={20} step="0.05" hint="0 表示不建立掩膜" onChange={value => updateProject(previous => previous.geometry.kind !== 'plane' ? { ...previous, geometry: { ...previous.geometry, maskHeight: value } } : previous)} />
             {project.geometry.maskHeight > 0 && <NumericField label="掩膜锥角" unit="°" value={project.geometry.maskTaperAngle} min={-45} max={45} step="1" onChange={value => updateProject(previous => previous.geometry.kind !== 'plane' ? { ...previous, geometry: { ...previous.geometry, maskTaperAngle: value } } : previous)} />}
-          </div> : <div className="field-grid one-column geometry-fields"><SelectField label="基底材料" value={project.geometry.substrateMaterial} options={materials.map(m => ({ value: m.name, label: m.name }))} onChange={value => updateProject(previous => previous.geometry.kind === 'plane' ? { ...previous, geometry: { ...previous.geometry, substrateMaterial: value } } : previous)} /><NumericField label="平面高度" unit="µm" value={project.geometry.height} step="0.05" onChange={value => updateProject(previous => previous.geometry.kind === 'plane' ? { ...previous, geometry: { ...previous.geometry, height: value } } : previous)} /></div>}
+          </div> : <div className="field-grid one-column geometry-fields"><SelectField label="基底材料" value={project.geometry.substrateMaterial} options={materials.map(m => ({ value: m.name, label: m.name }))} onChange={value => updateProject(previous => previous.geometry.kind === 'plane' ? { ...previous, geometry: { ...previous.geometry, substrateMaterial: value } } : previous)} /><NumericField label="平面高度" unit={lengthUnit} value={project.geometry.height} step="0.05" onChange={value => updateProject(previous => previous.geometry.kind === 'plane' ? { ...previous, geometry: { ...previous.geometry, height: value } } : previous)} /></div>}
           {project.dimension === 3 && project.schemaVersion === 7 && (project.geometry.kind === 'fin' || project.geometry.kind === 'gds') && <div className="field-grid one-column geometry-fields">
-            <NumericField label="真实切片位置 y" unit="µm" value={slicePosition} min={-(project.domain.yExtent ?? 6)/2} max={(project.domain.yExtent ?? 6)/2} step="0.05" onChange={setSlicePosition} />
+            <NumericField label="真实切片位置 y" unit={lengthUnit} value={slicePosition} min={-(project.domain.yExtent ?? 6)/2} max={(project.domain.yExtent ?? 6)/2} step="0.05" onChange={setSlicePosition} />
             <button className="button" disabled={loading || health !== 'ready' || active} onClick={() => void startNativeSlice()}>运行 ViennaPS Slice 并生成 2D 网格</button>
             <details className="compact-help"><summary>切片说明</summary><p>从 3D Domain 生成真实几何切片，并保存为独立 2D 快照。查看器裁剪不会生成几何。</p></details>
           </div>}
@@ -1780,7 +1796,7 @@ export default function App() {
         </div>
         <div className="viewer-meta">
           <span className="meta-item"><i className="meta-dot" />{selectedSnapshot ? `${selectedSnapshot.mesh.pointCount.toLocaleString()} 点 · ${(selectedSnapshot.mesh.triangleCount ?? selectedSnapshot.mesh.lineCount ?? 0).toLocaleString()} ${displayDimension === 3 ? '三角面' : '界面段'}` : '二维网格界面'}</span>
-          <span className="meta-item">坐标：{displayDimension === 3 ? 'x / y / z' : 'x / h'} · µm</span>
+          <span className="meta-item">坐标：{displayDimension === 3 ? 'x / y / z' : 'x / h'} · {lengthUnit}</span>
           <span className={`meta-item engine-chip ${engineTone(runEngines)}`} title={runEngineTitle}>本次运行引擎 {runEngine}</span>
           {selectedExecution && <span className="meta-item engine-chip step" title="所选步骤在 RunInfo.actualExecution 中记录的 actualEngine">本步 {selectedStepEngine ?? '不适用'}</span>}
           {selectedExecutionGpu?.uuid && <span className="meta-item" title={`CUDA Runtime 设备/同步回读：${selectedExecutionGpu.pciBusId ?? '未知'}；nvidia-smi 进程清单：${selectedExecutionGpu.process?.processListed ? '已列出 worker' : '未列出 worker'}`}>
@@ -1788,11 +1804,11 @@ export default function App() {
             {selectedExecutionGpu.afterProcessApply?.readbackStatus === 'verified' ? ' · CUDA 已同步核验' : ''}
             {selectedExecutionGpu.process?.processListStatus === 'not-observed' ? ' · 系统未列出进程' : ''}
           </span>}
-          {selectedSnapshot && <span className="meta-item">网格 Δ={selectedSnapshot.gridDelta} µm</span>}
+          {selectedSnapshot && <span className="meta-item">网格 Δ={selectedSnapshot.gridDelta} {lengthUnit}</span>}
           {measuredChange && <span className="meta-item measured-change-chip">
             {measuredChange.kind === 'removal' ? '实测去除' : '实测增加'} {measuredChange.record.material} {formatThickness(measuredChange.kind === 'removal' ? measuredChange.record.removedThickness : measuredChange.record.addedThickness)}
           </span>}
-          {selectedSnapshot?.sliceReadback && <div className="inline-note">原生操作：{selectedSnapshot.sliceReadback.nativeOperation}，y 法向位置 {selectedSnapshot.sliceReadback.position} µm；输出是 2D 几何网格，未使用查看器裁剪。</div>}
+          {selectedSnapshot?.sliceReadback && <div className="inline-note">原生操作：{selectedSnapshot.sliceReadback.nativeOperation}，y 法向位置 {selectedSnapshot.sliceReadback.position} {lengthUnit}；输出是 2D 几何网格，未使用查看器裁剪。</div>}
           {selectedSnapshot?.geometryReadback && <details className="solver-advanced"><summary>ViennaPS 初始几何原生回读</summary><pre>{JSON.stringify(selectedSnapshot.geometryReadback, null, 2)}</pre></details>}
           {selectedSnapshot?.noOp && <span className="tag no-op-tag">零速率 no-op</span>}
           {isStale && <span className="tag stale-tag">对应其他输入配置</span>}
@@ -1850,7 +1866,7 @@ export default function App() {
         {directionalActual && <div className="directional-history">
           <strong>DirectionalProcess 原生参数 · 历史记录</strong>
           <span>方向：{Array.isArray(directionalActual.requestedDirection) ? `[${directionalActual.requestedDirection.join(', ')}]` : '—'} → 单位向量 {Array.isArray(directionalActual.nativeUnitDirection) ? `[${directionalActual.nativeUnitDirection.join(', ')}]` : '—'}</span>
-          <span>原生定向速度：{String(directionalActual.nativeDirectionalVelocity ?? '—')} µm/s · 原生各向同性速度：{String(directionalActual.nativeIsotropicVelocity ?? '—')} µm/s</span>
+          <span>原生定向速度：{String(directionalActual.nativeDirectionalVelocity ?? '—')} {rateUnit} · 原生各向同性速度：{String(directionalActual.nativeIsotropicVelocity ?? '—')} {rateUnit}</span>
           <span>遮挡可见性：{String(directionalActual.calculateVisibility ?? '未计算')} · 掩膜材料：{Array.isArray(directionalActual.maskMaterials) ? directionalActual.maskMaterials.join(', ') || '无' : '—'}</span>
           <span>射线数 / 随机种子：不适用 · 运行引擎：{selectedExecution?.actualEngine ?? 'not-applicable'}</span>
           {selectedExecution?.noOp && <span>零速率步骤：未调用 ViennaPS Process，结果沿用前一步网格。</span>}
@@ -1992,8 +2008,8 @@ export default function App() {
                         })} />;
                       })}
                     </div>
-                    <NumericField label="速率表 offset x" unit="µm" value={offset[0]} min={-1000000} max={1000000} step="0.05" hint="原生在 coordinate+offset 处查表" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, offset: [value, (step.offset ?? [0, 0])[1]] }))} />
-                    {project.dimension === 3 && <NumericField label="速率表 offset y" unit="µm" value={offset[1]} min={-1000000} max={1000000} step="0.05" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, offset: [(step.offset ?? [0, 0])[0], value] }))} />}
+                    <NumericField label="速率表 offset x" unit={lengthUnit} value={offset[0]} min={-1000000} max={1000000} step="0.05" hint="原生在 coordinate+offset 处查表" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, offset: [value, (step.offset ?? [0, 0])[1]] }))} />
+                    {project.dimension === 3 && <NumericField label="速率表 offset y" unit={lengthUnit} value={offset[1]} min={-1000000} max={1000000} step="0.05" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, offset: [(step.offset ?? [0, 0])[0], value] }))} />}
                     <NumericField label="各向同性分量" value={selectedStepObject.isotropicComponent ?? 0} min={0} max={100} step="0.01" hint="原生 isotropicComponent；沿法向的速率倍数" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, isotropicComponent: value }))} />
                     <NumericField label="定向分量" value={selectedStepObject.directionalComponent ?? 1} min={0} max={100} step="0.01" hint="原生 directionalComponent；沿方向向量的速率倍数" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, directionalComponent: value }))} />
                     <label className="visibility-option">
@@ -2025,16 +2041,16 @@ export default function App() {
                   return <>
                     <SelectField label="速率输入模式" value={materialMode ? 'material' : 'scalar'} options={[{ value: 'scalar', label: '标量速率' }, { value: 'material', label: '材料速率表' }]} onChange={value => setDirectionalRateMode(selectedStepObject.id, value as 'scalar' | 'material')} hint="材料速率表与标量速率、遮挡可见性互斥" />
                     {materialMode ? <>
-                      <div className="rate-profile-note">每种材料分别给出定向与各向同性分量（µm/s，0–2）。未列出的材料使用默认速率，0 表示不动。原生 RateMap 没有遮挡可见性开关，因此材料模式不写 calculateVisibility。</div>
-                      <NumericField label="默认定向速率" unit="µm/s" value={defaultRate.directional} min={0} max={2} step="0.01" hint="未列出材料的定向分量；0 表示保护" onChange={value => setDirectionalDefaultMaterialRate(selectedStepObject.id, { directional: value })} />
-                      <NumericField label="默认各向同性速率" unit="µm/s" value={defaultRate.isotropic} min={0} max={2} step="0.01" hint="未列出材料的各向同性分量；0 表示不添加" onChange={value => setDirectionalDefaultMaterialRate(selectedStepObject.id, { isotropic: value })} />
+                      <div className="rate-profile-note">每种材料分别给出定向与各向同性分量（{rateUnit}，0–2）。未列出的材料使用默认速率，0 表示不动。原生 RateMap 没有遮挡可见性开关，因此材料模式不写 calculateVisibility。</div>
+                      <NumericField label="默认定向速率" unit={rateUnit} value={defaultRate.directional} min={0} max={2} step="0.01" hint="未列出材料的定向分量；0 表示保护" onChange={value => setDirectionalDefaultMaterialRate(selectedStepObject.id, { directional: value })} />
+                      <NumericField label="默认各向同性速率" unit={rateUnit} value={defaultRate.isotropic} min={0} max={2} step="0.01" hint="未列出材料的各向同性分量；0 表示不添加" onChange={value => setDirectionalDefaultMaterialRate(selectedStepObject.id, { isotropic: value })} />
                       <div className="rate-table" role="table" aria-label="定向材料速率表">
-                        <div className="rate-table-head" role="row"><span>材料 / 定向 / 各向同性</span><span>µm/s</span><span /></div>
+                        <div className="rate-table-head" role="row"><span>材料 / 定向 / 各向同性</span><span>{rateUnit}</span><span /></div>
                         {Object.entries(table).sort(([a], [b]) => a.localeCompare(b)).map(([materialName, row]) => <div className="rate-row" role="row" key={materialName}>
                           <div>
                             <strong>{materialName}</strong>
-                            <NumericField label={`${materialName} 定向速率`} unit="µm/s" value={row.directional ?? 0} min={0} max={2} step="0.01" onChange={value => setDirectionalMaterialRate(selectedStepObject.id, materialName, { directional: value })} />
-                            <NumericField label={`${materialName} 各向同性速率`} unit="µm/s" value={row.isotropic ?? 0} min={0} max={2} step="0.01" onChange={value => setDirectionalMaterialRate(selectedStepObject.id, materialName, { isotropic: value })} />
+                            <NumericField label={`${materialName} 定向速率`} unit={rateUnit} value={row.directional ?? 0} min={0} max={2} step="0.01" onChange={value => setDirectionalMaterialRate(selectedStepObject.id, materialName, { directional: value })} />
+                            <NumericField label={`${materialName} 各向同性速率`} unit={rateUnit} value={row.isotropic ?? 0} min={0} max={2} step="0.01" onChange={value => setDirectionalMaterialRate(selectedStepObject.id, materialName, { isotropic: value })} />
                           </div>
                           <span className="rate-ratio">{(row.directional ?? 0) === 0 && (row.isotropic ?? 0) === 0 ? '0 · 不动' : `${row.directional ?? 0} / ${row.isotropic ?? 0}`}</span>
                           <button className="icon-button" type="button" aria-label={`移除 ${materialName} 定向速率行`} title="移除材料行" onClick={() => removeDirectionalMaterialRate(selectedStepObject.id, materialName)}>×</button>
@@ -2042,8 +2058,8 @@ export default function App() {
                         <div className="rate-add"><select aria-label="新增定向材料速率行" value={directionalRateRowMaterial} onChange={event => setDirectionalRateRowMaterial(event.target.value)}><option value="">选择材料…</option>{materials.filter(m => !Object.hasOwn(table, m.name)).map(m => <option key={m.name} value={m.name}>{m.name}</option>)}</select><button className="button" disabled={!directionalRateRowMaterial} onClick={() => addDirectionalMaterialRate(selectedStepObject.id, directionalRateRowMaterial)}>＋ 添加材料行</button></div>
                       </div>
                     </> : <>
-                      <NumericField label="定向速率大小" unit="µm/s" value={selectedStepObject.directionalRateMagnitude ?? 0} min={0} max={2} step="0.01" hint="刻蚀/沉积操作自动应用原生符号" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, directionalRateMagnitude: value }))} />
-                      <NumericField label="各向同性速率分量" unit="µm/s" value={selectedStepObject.isotropicRateMagnitude ?? 0} min={0} max={2} step="0.01" hint="与定向分量叠加；0 表示不添加该分量" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, isotropicRateMagnitude: value }))} />
+                      <NumericField label="定向速率大小" unit={rateUnit} value={selectedStepObject.directionalRateMagnitude ?? 0} min={0} max={2} step="0.01" hint="刻蚀/沉积操作自动应用原生符号" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, directionalRateMagnitude: value }))} />
+                      <NumericField label="各向同性速率分量" unit={rateUnit} value={selectedStepObject.isotropicRateMagnitude ?? 0} min={0} max={2} step="0.01" hint="与定向分量叠加；0 表示不添加该分量" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, isotropicRateMagnitude: value }))} />
                       <label className={`visibility-option ${(selectedStepObject.directionalRateMagnitude ?? 0) === 0 ? 'disabled' : ''}`}>
                         <input type="checkbox" aria-label="计算方向可见性" checked={selectedStepObject.calculateVisibility ?? true} disabled={(selectedStepObject.directionalRateMagnitude ?? 0) === 0}
                           onChange={event => editStep(selectedStepObject.id, step => ({ ...step, calculateVisibility: event.target.checked }))} />
@@ -2148,9 +2164,9 @@ export default function App() {
                 {selectedStepObject.isotropicTimeStepRatio !== undefined && <NumericField label="level-set 时间步比例" value={selectedStepObject.isotropicTimeStepRatio} min={0.05} max={0.5} step="0.01" hint="范围 0.05–0.5；0.5 更快，但需要自行验证稳定性" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, isotropicTimeStepRatio: value }))} />}
               </>}
               {materialRateModeAvailable(selectedStepObject) && <SelectField label="速率模式" value={selectedStepObject.rateMode ?? 'uniform'} options={[{ value: 'uniform', label: '统一速率' }, { value: 'material', label: '按材料设置' }]} onChange={value => setRateMode(selectedStepObject.id, value as 'uniform' | 'material')} hint={selectedStepObject.operation === 'deposit' ? '沉积与刻蚀都可用材料表；未列出的材料使用“速率大小”' : '可为每种材料分别指定刻蚀速率'} />}
-              <NumericField label={materialRateModeActive(selectedStepObject) ? '未列出材料默认速率' : '速率大小'} unit="µm/s" value={selectedStepObject.rateMagnitude ?? 0} min={0} max={2} step="0.01" hint={materialRateModeActive(selectedStepObject) ? '材料表中的显式值优先；未列出的材料使用此值，0 表示保护' : "刻蚀传入负速率，沉积传入正速率"} onChange={value => materialRateModeActive(selectedStepObject) ? editRateProfile(selectedStepObject.id, step => ({ ...step, rateMagnitude: value, rateMode: 'material' })) : editStep(selectedStepObject.id, step => ({ ...step, rateMagnitude: value }))} />
+              <NumericField label={materialRateModeActive(selectedStepObject) ? '未列出材料默认速率' : '速率大小'} unit={rateUnit} value={selectedStepObject.rateMagnitude ?? 0} min={0} max={2} step="0.01" hint={materialRateModeActive(selectedStepObject) ? '材料表中的显式值优先；未列出的材料使用此值，0 表示保护' : "刻蚀传入负速率，沉积传入正速率"} onChange={value => materialRateModeActive(selectedStepObject) ? editRateProfile(selectedStepObject.id, step => ({ ...step, rateMagnitude: value, rateMode: 'material' })) : editStep(selectedStepObject.id, step => ({ ...step, rateMagnitude: value }))} />
               {materialRateModeActive(selectedStepObject) && <>
-                <div className="rate-profile-note">表格中的速率优先；未列出的材料使用默认速率。0 µm/s 表示保护。掩膜也按此表执行，同一种材料的所有区域共用速率。</div>
+                <div className="rate-profile-note">表格中的速率优先；未列出的材料使用默认速率。0 {rateUnit} 表示保护。掩膜也按此表执行，同一种材料的所有区域共用速率。</div>
                 <SelectField label="选择性参考材料" value={selectedStepObject.selectivityReference ?? ''} options={[{ value: '', label: '不显示参考比值' }, ...materials.map(m => ({ value: m.name, label: m.name }))]} onChange={value => setSelectivityReference(selectedStepObject.id, value)} hint="仅显示参考比值，不改变仿真" />
                 <div className="rate-table" role="table" aria-label={selectedStepObject.operation === 'etch' ? '材料相关刻蚀速率' : '材料相关沉积速率'}>
                   <div className="rate-table-head" role="row"><span>材料 / 速率</span><span>参考速率 ÷ 本材料</span><span /></div>
@@ -2158,7 +2174,7 @@ export default function App() {
                     const referenceRate = scalarMaterialRates(selectedStepObject)[selectedStepObject.selectivityReference ?? ''] ?? selectedStepObject.rateMagnitude ?? 0;
                     const ratio = rate === 0 ? referenceRate === 0 ? '— · 0/0 未定义' : '∞ · 保护' : `${(referenceRate / rate).toPrecision(4)}×`;
                     return <div className="rate-row" role="row" key={materialName}>
-                      <div><strong>{materialName}</strong>{rate === 0 && <small className="protected-mark">0 · 保护</small>}<NumericField label={selectedStepObject.operation === 'etch' ? '刻蚀速率' : '沉积速率'} unit="µm/s" value={rate} min={0} max={2} step=".01" onChange={value => setMaterialRate(selectedStepObject.id, materialName, value)} /></div>
+                      <div><strong>{materialName}</strong>{rate === 0 && <small className="protected-mark">0 · 保护</small>}<NumericField label={selectedStepObject.operation === 'etch' ? '刻蚀速率' : '沉积速率'} unit={rateUnit} value={rate} min={0} max={2} step=".01" onChange={value => setMaterialRate(selectedStepObject.id, materialName, value)} /></div>
                       <span className="rate-ratio">{selectedStepObject.selectivityReference ? ratio : '—'}</span>
                       <button className="icon-button" type="button" aria-label={`移除 ${materialName} 速率覆盖`} title="移除覆盖" onClick={() => removeMaterialRate(selectedStepObject.id, materialName)}>×</button>
                     </div>;
@@ -2184,22 +2200,22 @@ export default function App() {
                     return next;
                   })} hint="按材料停止时，运行阶段用该材料上表面的面积加权 90 分位高度推导截断高度" />
                   {!selectedStepObject.stopMaterial
-                    ? <NumericField label="平坦化截断高度" unit="µm" value={selectedStepObject.cutoffHeight ?? 0} min={-100} max={100} step="0.05" hint="调用 ViennaPS Planarize(domain, cutoffHeight)" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, cutoffHeight: value }))} />
-                    : <NumericField label="过抛光量" unit="µm" value={selectedStepObject.overPolish ?? 0} min={0} max={100} step="0.005" hint="有效截断高度 = 该材料上表面面积加权 90 分位高度 − 过抛光量" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, overPolish: value }))} />}
+                    ? <NumericField label="平坦化截断高度" unit={lengthUnit} value={selectedStepObject.cutoffHeight ?? 0} min={-100} max={100} step="0.05" hint="调用 ViennaPS Planarize(domain, cutoffHeight)" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, cutoffHeight: value }))} />
+                    : <NumericField label="过抛光量" unit={lengthUnit} value={selectedStepObject.overPolish ?? 0} min={0} max={100} step="0.005" hint="有效截断高度 = 该材料上表面面积加权 90 分位高度 − 过抛光量" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, overPolish: value }))} />}
                   {selectedStepObject.stopMaterial && <div className="inline-note">材质感知 CMP：原生 <code>Planarize</code> 只接受一个高度，因此按“{selectedStepObject.stopMaterial}”上表面在运行时的<b>面积加权 90 分位（p90）</b>高度推导该高度，再调用原生平坦化。用 p90 而不是中位数：双峰停止面（例如 22 nm FinFET 的 STI 0.036 与 ILD 0.095）中位数会选到更大的下方平台，p90 选上方平台；只有上方平台占比 ≤10% 时才会选中下方，窄而高的毛刺不影响结果。它仍是一刀切的全局高度，不模拟横向选择比，多级且无主导上方平台时会被过切或欠切。实测值、方法与有效截断高度会写入该步结果。</div>}
                 </>}
                 {selectedStepObject.model === 'boolean' && <>
                   <SelectField label="布尔操作" value={selectedStepObject.booleanOperation ?? 'difference'} options={[{ value: 'union', label: '并集 · UNION' }, { value: 'intersection', label: '交集 · INTERSECT' }, { value: 'difference', label: '差集 · RELATIVE_COMPLEMENT' }]} onChange={value => editStep(selectedStepObject.id, step => ({ ...step, booleanOperation: value as Step['booleanOperation'] }))} />
                   <div className="inline-note">ViennaPS 使用真实盒体 stencil。位置是盒体底面坐标，宽度沿 x；二维高度沿 h，三维高度沿 z、深度沿 y。</div>
-                  {(project.dimension === 2 ? [{ index: 0, label: '盒体 x 位置', unit: 'µm' }, { index: 1, label: '盒体 h 起始位置', unit: 'µm' }] : [{ index: 0, label: '盒体 x 位置', unit: 'µm' }, { index: 1, label: '盒体 y 位置', unit: 'µm' }, { index: 2, label: '盒体 z 起始位置', unit: 'µm' }]).map(axis => <NumericField key={axis.label} label={axis.label} unit={axis.unit} value={(selectedStepObject.position ?? [0, 0, 0])[axis.index]} min={-40} max={40} step="0.05" onChange={value => editStep(selectedStepObject.id, step => {
+                  {(project.dimension === 2 ? [{ index: 0, label: '盒体 x 位置', unit: lengthUnit }, { index: 1, label: '盒体 h 起始位置', unit: lengthUnit }] : [{ index: 0, label: '盒体 x 位置', unit: lengthUnit }, { index: 1, label: '盒体 y 位置', unit: lengthUnit }, { index: 2, label: '盒体 z 起始位置', unit: lengthUnit }]).map(axis => <NumericField key={axis.label} label={axis.label} unit={axis.unit} value={(selectedStepObject.position ?? [0, 0, 0])[axis.index]} min={-40} max={40} step="0.05" onChange={value => editStep(selectedStepObject.id, step => {
                     const position: [number, number, number] = [...(step.position ?? [0, 0, 0])];
                     position[axis.index] = value;
                     if (project.dimension === 2) position[2] = 0;
                     return { ...step, position };
                   })} />)}
-                  <NumericField label="盒体宽度（x）" unit="µm" value={selectedStepObject.width ?? 1} min={project.domain.gridDelta * 2} max={40} step="0.05" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, width: value }))} />
-                  <NumericField label={project.dimension === 2 ? '盒体高度（h）' : '盒体高度（z）'} unit="µm" value={selectedStepObject.height ?? 0.8} min={project.domain.gridDelta * 2} max={100} step="0.05" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, height: value }))} />
-                  {project.dimension === 3 && <NumericField label="盒体深度（y）" unit="µm" value={selectedStepObject.depth ?? 1} min={project.domain.gridDelta * 2} max={40} step="0.05" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, depth: value }))} />}
+                  <NumericField label="盒体宽度（x）" unit={lengthUnit} value={selectedStepObject.width ?? 1} min={project.domain.gridDelta * 2} max={40} step="0.05" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, width: value }))} />
+                  <NumericField label={project.dimension === 2 ? '盒体高度（h）' : '盒体高度（z）'} unit={lengthUnit} value={selectedStepObject.height ?? 0.8} min={project.domain.gridDelta * 2} max={100} step="0.05" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, height: value }))} />
+                  {project.dimension === 3 && <NumericField label="盒体深度（y）" unit={lengthUnit} value={selectedStepObject.depth ?? 1} min={project.domain.gridDelta * 2} max={40} step="0.05" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, depth: value }))} />}
                   <NumericField label="盒体旋转角" unit="°" value={selectedStepObject.angle ?? 0} min={-45} max={45} step="1" onChange={value => editStep(selectedStepObject.id, step => ({ ...step, angle: value }))} />
                   <label className="visibility-option"><input type="checkbox" aria-label="布尔操作应用到所有材料界面" checked={selectedStepObject.applyToAll ?? true} onChange={event => editStep(selectedStepObject.id, step => ({ ...step, applyToAll: event.target.checked }))} /><span><strong>应用到所有材料界面</strong><small>传入 ViennaPS Domain.applyBooleanOperation 的 applyToAll 参数</small></span></label>
                 </>}
@@ -2213,8 +2229,8 @@ export default function App() {
                       {gdsAsset && gdsMaskPairs(gdsAsset, project.geometry.structure).length === 0 && <div className="inline-note">该结构没有闭合的多边形图层，无法作为布尔掩膜。</div>}
                       {gdsAsset && gdsMaskPairs(gdsAsset, project.geometry.structure).length > 0 && <SelectField label="掩膜图层 / datatype" value={`${selectedStepObject.gdsMask?.layer ?? 0}/${selectedStepObject.gdsMask?.datatype ?? 0}`} options={gdsMaskPairs(gdsAsset, project.geometry.structure).map(([gdsLayer, datatype]) => ({ value: `${gdsLayer}/${datatype}`, label: `Layer ${gdsLayer} · datatype ${datatype}` }))} onChange={value => { const [gdsLayer, datatype] = value.split('/').map(Number); editStep(selectedStepObject.id, step => ({ ...step, gdsMask: { ...(step.gdsMask ?? { layer: gdsLayer, datatype, unitScale: 1, position: [0, 0, 0], baseHeight: 0, height: Math.max(2 * project.domain.gridDelta, 0.5), retainedRegion: 'inside' }), layer: gdsLayer, datatype } })); }} />}
                       <SelectField label="保留区域" value={selectedStepObject.gdsMask?.retainedRegion ?? 'inside'} options={[{ value: 'inside', label: '保留多边形内部（正向掩膜）' }, { value: 'outside', label: '保留多边形外部（反向掩膜）' }]} onChange={value => editStep(selectedStepObject.id, step => step.gdsMask ? { ...step, gdsMask: { ...step.gdsMask, retainedRegion: value as 'inside' | 'outside' } } : step)} hint="保留区域决定掩膜体覆盖多边形内部还是外部；差集使用反向掩膜会移除几乎全部材料" />
-                      <NumericField label="掩膜底面高度（z）" unit="µm" value={selectedStepObject.gdsMask?.baseHeight ?? 0} min={0} max={100} step="0.01" hint="相对版图 z 框架；与版图图层底面配合可只切上层材料（必须 ≥ 0）" onChange={value => editStep(selectedStepObject.id, step => step.gdsMask ? { ...step, gdsMask: { ...step.gdsMask, baseHeight: value } } : step)} />
-                      <NumericField label="掩膜厚度（z）" unit="µm" value={selectedStepObject.gdsMask?.height ?? Math.max(2 * project.domain.gridDelta, 0.5)} min={2 * project.domain.gridDelta} max={100} step="0.01" hint={`至少两个网格间距（${(2 * project.domain.gridDelta).toFixed(4)} µm）`} onChange={value => editStep(selectedStepObject.id, step => step.gdsMask ? { ...step, gdsMask: { ...step.gdsMask, height: value } } : step)} />
+                      <NumericField label="掩膜底面高度（z）" unit={lengthUnit} value={selectedStepObject.gdsMask?.baseHeight ?? 0} min={0} max={100} step="0.01" hint="相对版图 z 框架；与版图图层底面配合可只切上层材料（必须 ≥ 0）" onChange={value => editStep(selectedStepObject.id, step => step.gdsMask ? { ...step, gdsMask: { ...step.gdsMask, baseHeight: value } } : step)} />
+                      <NumericField label="掩膜厚度（z）" unit={lengthUnit} value={selectedStepObject.gdsMask?.height ?? Math.max(2 * project.domain.gridDelta, 0.5)} min={2 * project.domain.gridDelta} max={100} step="0.01" hint={`至少两个网格间距（${(2 * project.domain.gridDelta).toFixed(4)} µm）`} onChange={value => editStep(selectedStepObject.id, step => step.gdsMask ? { ...step, gdsMask: { ...step.gdsMask, height: value } } : step)} />
                       {[{ index: 0, label: '掩膜 x 偏移', unit: 'µm' }, { index: 1, label: '掩膜 y 偏移', unit: 'µm' }, { index: 2, label: '掩膜 z 偏移', unit: 'µm' }].map(axis => <NumericField key={axis.label} label={axis.label} unit={axis.unit} value={(selectedStepObject.gdsMask?.position ?? [0, 0, 0])[axis.index]} min={-40} max={40} step="0.01" onChange={value => editStep(selectedStepObject.id, step => {
                         const mask = step.gdsMask; if (!mask) return step;
                         const position: [number, number, number] = [...mask.position]; position[axis.index] = value;

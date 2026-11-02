@@ -346,6 +346,7 @@ export default function WorkflowViewer3D({
   }, [showStats, dimension, state, reportStats]);
 
   const ready = state.status === 'ready' ? state.mesh : null;
+  const coordinateUnit = ready?.coordinateUnit === 'nm' ? 'nm' : 'µm';
   const counts = useMemo(() => {
     if (!ready) return null;
     if (ready.dimension === 3) {
@@ -504,17 +505,17 @@ export default function WorkflowViewer3D({
                   ))}
                 </select>
                 <input
-                  aria-label="截面位置（µm）"
+                  aria-label={`截面位置（${coordinateUnit}）`}
                   type="range"
                   min={clipLow}
                   max={clipLow === clipHigh ? clipLow + 1e-6 : clipHigh}
                   step={(clipHigh - clipLow) / 500 || 1e-6}
                   value={clip.position}
-                  title={`${clip.axis.toUpperCase()} = ${clip.position.toFixed(3)} µm`}
+                  title={`${clip.axis.toUpperCase()} = ${clip.position.toFixed(3)} ${coordinateUnit}`}
                   onChange={(event) => setClip({ ...clip, position: Number(event.target.value) })}
                 />
-                <output className="wb-viewer3d__clip-value">{`${clip.axis.toUpperCase()} = ${clip.position.toFixed(3)} µm`}</output>
-                <span className="wb-viewer3d__clip-range">{`${clipLow.toFixed(3)} … ${clipHigh.toFixed(3)} µm`}</span>
+                <output className="wb-viewer3d__clip-value">{`${clip.axis.toUpperCase()} = ${clip.position.toFixed(3)} ${coordinateUnit}`}</output>
+                <span className="wb-viewer3d__clip-range">{`${clipLow.toFixed(3)} … ${clipHigh.toFixed(3)} ${coordinateUnit}`}</span>
                 <select
                   aria-label="截面保留侧"
                   value={clip.keep}
@@ -583,7 +584,7 @@ export default function WorkflowViewer3D({
           const nice = niceLength(viewScale * 72);
           return (
             <div className="wb-viewer3d__scalebar" aria-label="比例尺" data-length={nice}>
-              <span className="wb-viewer3d__scalebar-label">{`${formatLength(nice)} µm`}</span>
+              <span className="wb-viewer3d__scalebar-label">{`${formatLength(nice)} ${coordinateUnit}`}</span>
               <span className="wb-viewer3d__scalebar-bar" style={{ width: `${Math.max(10, nice / viewScale)}px` }} />
             </div>
           );
@@ -634,12 +635,12 @@ export default function WorkflowViewer3D({
             <span>点 {numberFormat.format(ready.pointCount)}</span>
             {dimension === 3 && (
               <span className="wb-viewer3d__status-extent">
-                {`X 范围 ${formatLength(ready.bounds[3] - ready.bounds[0])} µm · Y 范围 ${formatLength(ready.bounds[4] - ready.bounds[1])} µm · Z 范围 ${formatLength(ready.bounds[5] - ready.bounds[2])} µm`}
+                {`X 范围 ${formatLength(ready.bounds[3] - ready.bounds[0])} ${coordinateUnit} · Y 范围 ${formatLength(ready.bounds[4] - ready.bounds[1])} ${coordinateUnit} · Z 范围 ${formatLength(ready.bounds[5] - ready.bounds[2])} ${coordinateUnit}`}
               </span>
             )}
             {dimension === 3 && marker && (
               <span className="wb-viewer3d__status-marker">
-                {`测量位置：${marker.axis === 'x' ? 'X' : marker.axis === 'z' ? '高度' : 'Y'} = ${formatLength(marker.value)} µm`}
+                {`测量位置：${marker.axis === 'x' ? 'X' : marker.axis === 'z' ? '高度' : 'Y'} = ${formatLength(marker.value)} ${coordinateUnit}`}
               </span>
             )}
             {(showStats || DEBUG_FPS) && dimension === 3 && (

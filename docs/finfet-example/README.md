@@ -53,6 +53,26 @@ measured ViennaPS limitation: the nm and µm native runs agree on surfaces
 exactly scale invariant. The acceptance now compares the workbench directly
 with the original nm `expected.json`.
 
+## Frontend unit switch
+
+Both editors expose a project length-unit selector:
+
+- WorkflowApp: `01 结构 / 编辑参数 · 计算域 / 网格` → `长度单位`
+- LegacyApp: structure panel → `长度单位`
+
+Switching µm→nm (or back) rewrites the project document losslessly: domain,
+geometry, step lengths/rates, `volumeMeshDelta`, ray-tracing disk radius and
+3D camera/clip positions are scaled by 1000 or 0.001; durations, angles,
+direction vectors and orientation multipliers stay unchanged. The unit labels,
+domain ranges, viewer axes, scale bar and step summaries follow the declared
+unit.
+
+The editor refuses the switch (and keeps the original project) when the
+document embeds a frame that cannot be rescaled safely: GDS/Clip geometry,
+CSV rate-grid assets, non-selective specialized models, implant/anneal/
+analysis/multi-particle steps, or a `continuationState`. Those payloads carry
+micrometre-native assets or model-specific units outside the schema.
+
 ## Running
 
 Fast checks (no heavy simulation):

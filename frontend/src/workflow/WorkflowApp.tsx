@@ -3,6 +3,7 @@ import type { CSSProperties, PointerEvent as ReactPointerEvent } from 'react';
 import './workflow.css';
 import { SAMPLE_EXAMPLES } from './samples';
 import { executionCompileBasis } from './fingerprint';
+import { convertProjectUnits, lengthUnitLabel, lengthUnitsPerUm, rateUnitLabel, type LengthUnit } from '../project/units';
 import {
   coverageStepNames,
   enabledCoverageSteps,
@@ -1284,7 +1285,7 @@ const BOOLEAN_OPERATION_LABELS: Record<string, string> = {
  * Short, capability-aware description of a geometry-only step for the 02 step
  * table: the parameters the backend actually reads, not just the model name.
  */
-function geometryStepSummary(step: ProjectStep): string {
+function geometryStepSummary(step: ProjectStep, unitLabel = 'µm'): string {
   const model = String(step.model ?? '');
   const format = (value: unknown) => (typeof value === 'number' ? String(value) : String(value ?? ''));
   switch (model) {
@@ -1298,12 +1299,12 @@ function geometryStepSummary(step: ProjectStep): string {
     }
     case 'planarize': {
       if (step.stopMaterial) {
-        const overPolish = typeof step.overPolish === 'number' ? ` · 过抛 ${format(step.overPolish)} µm` : '';
+        const overPolish = typeof step.overPolish === 'number' ? ` · 过抛 ${format(step.overPolish)} ${unitLabel}` : '';
         return `停在 ${String(step.stopMaterial)}${overPolish}`;
       }
       return step.cutoffHeight === undefined || step.cutoffHeight === null
         ? '未设置切削高度'
-        : `切削 ${format(step.cutoffHeight)} µm`;
+        : `切削 ${format(step.cutoffHeight)} ${unitLabel}`;
     }
     case 'removeMaterial':
       return step.material ? `移除 ${String(step.material)}` : '未选择材料';
@@ -1317,8 +1318,8 @@ function geometryStepSummary(step: ProjectStep): string {
       return [step.fileName, step.interpolationMode].filter(Boolean).map(String).join(' · ') || 'CSV 速率表';
     case 'particleShape':
       return step.shape === 'sphere'
-        ? `球 · r=${format(step.radius)} µm`
-        : `盒 · ${Array.isArray(step.halfAxes) ? (step.halfAxes as unknown[]).map(format).join(' × ') : '?'} µm`;
+        ? `球 · r=${format(step.radius)} ${unitLabel}`
+        : `盒 · ${Array.isArray(step.halfAxes) ? (step.halfAxes as unknown[]).map(format).join(' × ') : '?'} ${unitLabel}`;
     default:
       return '';
   }
@@ -2292,7 +2293,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   const [clipNotice, setClipNotice] = useState('');
   const [draft, setDraft] = useState({
     name: 'New Project', dimension: 2 as 2 | 3, geometry: 'plane' as 'plane' | 'trench' | 'hole' | 'fin',
-    source: 'parametric' as 'parametric' | 'layout',
+    source: 'parametric' as 'parametric' | 'layout', unit: 'um' as LengthUnit,
     gridDelta: 0.2, xExtent: 4, yExtent: 4,
     width: 1, depth: 2, radius: 1, finHeight: 1.2, height: 0,
     taperAngle: 0, maskHeight: 0,
@@ -2360,17 +2361,23 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     const gridDelta = Number(domain.gridDelta);
     const xExtent = Number(domain.xExtent);
     const is3D = project.dimension === 3;
-    // Same floors as backend Domain (2D) / Domain3D (3D).
-    const minExtent = is3D ? MIN_DOMAIN_EXTENT_3D : MIN_DOMAIN_EXTENT_2D;
-    if (!Number.isFinite(gridDelta) || gridDelta <= 0 || gridDelta > 0.5) errors['domain.gridDelta'] = 'gridDelta 必须 > 0 且 ≤ 0.5 µm';
-    if (!Number.isFinite(xExtent) || xExtent < minExtent || xExtent > MAX_DOMAIN_EXTENT) errors['domain.xExtent'] = `xExtent 必须在 ${minExtent}–${MAX_DOMAIN_EXTENT} µm`;
+    const unit = (project.units as { length?: string } | undefined)?.length === 'nm' ? 'nm' as LengthUnit : 'um' as LengthUnit;
+    const unitLabel = lengthUnitLabel(unit);
+    const perUm = lengthUnitsPerUm(unit);
+    // Same floors as backend Domain (2D) / Domain3D (3D), expressed in the
+    // project's declared native unit.
+    const minExtent = (is3D ? MIN_DOMAIN_EXTENT_3D : MIN_DOMAIN_EXTENT_2D) * perUm;
+    const maxExtent = MAX_DOMAIN_EXTENT * perUm;
+    const maxGridDelta = 0.5 * perUm;
+    if (!Number.isFinite(gridDelta) || gridDelta <= 0 || gridDelta > maxGridDelta) errors['domain.gridDelta'] = `gridDelta 必须 > 0 且 ≤ ${maxGridDelta} ${unitLabel}`;
+    if (!Number.isFinite(xExtent) || xExtent < minExtent || xExtent > maxExtent) errors['domain.xExtent'] = `xExtent 必须在 ${minExtent}–${maxExtent} ${unitLabel}`;
     if (is3D) {
       const yExtent = Number(domain.yExtent);
-      if (!Number.isFinite(yExtent) || yExtent < minExtent || yExtent > MAX_DOMAIN_EXTENT) errors['domain.yExtent'] = `yExtent 必须在 ${minExtent}–${MAX_DOMAIN_EXTENT} µm`;
+      if (!Number.isFinite(yExtent) || yExtent < minExtent || yExtent > maxExtent) errors['domain.yExtent'] = `yExtent 必须在 ${minExtent}–${maxExtent} ${unitLabel}`;
       if (Number.isFinite(gridDelta) && gridDelta > 0) {
         const minimum = 2 * gridDelta;
-        if (xExtent < minimum) errors['domain.xExtent'] = `3D xExtent 至少为 2×gridDelta（${minimum} µm）`;
-        if (yExtent < minimum) errors['domain.yExtent'] = `3D yExtent 至少为 2×gridDelta（${minimum} µm）`;
+        if (xExtent < minimum) errors['domain.xExtent'] = `3D xExtent 至少为 2×gridDelta（${minimum} ${unitLabel}）`;
+        if (yExtent < minimum) errors['domain.yExtent'] = `3D yExtent 至少为 2×gridDelta（${minimum} ${unitLabel}）`;
       }
     }
     const kind = String(geometry.kind ?? '');
@@ -2380,18 +2387,18 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
         : kind === 'fin' ? [['width', '宽度'], ['height', '高度']] : [];
     for (const [key, label] of positiveFields) {
       const value = Number(geometry[key]);
-      if (!Number.isFinite(value) || value <= 0) errors[`geometry.${key}`] = `${label}必须 > 0 µm`;
+      if (!Number.isFinite(value) || value <= 0) errors[`geometry.${key}`] = `${label}必须 > 0 ${unitLabel}`;
     }
     if (['trench', 'hole', 'fin'].includes(kind)) {
       const taper = Number(geometry.taperAngle ?? 0);
       if (!Number.isFinite(taper) || taper < -45 || taper > 45) errors['geometry.taperAngle'] = 'taperAngle 必须在 -45–45°';
       const maskHeight = Number(geometry.maskHeight ?? 0);
-      if (!Number.isFinite(maskHeight) || maskHeight < 0) errors['geometry.maskHeight'] = 'maskHeight 必须 ≥ 0 µm';
+      if (!Number.isFinite(maskHeight) || maskHeight < 0) errors['geometry.maskHeight'] = `maskHeight 必须 ≥ 0 ${unitLabel}`;
     }
     if (kind === 'fin' && Number.isFinite(gridDelta) && gridDelta > 0) {
       const minimum = 2 * gridDelta;
-      if (Number(geometry.width) < minimum) errors['geometry.width'] = `Fin 宽度至少为 2×gridDelta（${minimum} µm）`;
-      if (Number(geometry.height) < minimum) errors['geometry.height'] = `Fin 高度至少为 2×gridDelta（${minimum} µm）`;
+      if (Number(geometry.width) < minimum) errors['geometry.width'] = `Fin 宽度至少为 2×gridDelta（${minimum} ${unitLabel}）`;
+      if (Number(geometry.height) < minimum) errors['geometry.height'] = `Fin 高度至少为 2×gridDelta（${minimum} ${unitLabel}）`;
     }
     const rays = Number(solver.raysPerPoint);
     if (!Number.isInteger(rays) || rays < 16 || rays > 4096) errors['solver.raysPerPoint'] = 'raysPerPoint 必须是 16–4096 的整数';
@@ -4196,6 +4203,28 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setDraft(previous => ({ ...previous, [key]: value }));
   };
 
+  const changeDraftUnits = (unit: LengthUnit) => {
+    if (unit === draft.unit) return;
+    if (unit === 'nm' && draft.source === 'layout') {
+      setError('GDS / Layout 工程目前只能使用 µm；请改用参数化几何或保持 µm。');
+      return;
+    }
+    const factor = lengthUnitsPerUm(unit) / lengthUnitsPerUm(draft.unit);
+    setDraft(previous => ({
+      ...previous,
+      unit,
+      gridDelta: previous.gridDelta * factor,
+      xExtent: previous.xExtent * factor,
+      yExtent: previous.yExtent * factor,
+      width: previous.width * factor,
+      depth: previous.depth * factor,
+      radius: previous.radius * factor,
+      finHeight: previous.finHeight * factor,
+      height: previous.height * factor,
+      maskHeight: previous.maskHeight * factor,
+    }));
+  };
+
   /**
    * Gallery starter. A GDS sample (e.g. finfet22-bare-wafer) must reopen its
    * layout binding exactly like an imported project: the sample cannot upload
@@ -4257,7 +4286,26 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   };
 
   const chooseDraftSource = (source: 'parametric' | 'layout') => {
-    setDraft(prev => ({ ...prev, source }));
+    // GDS/Layout coordinates stay in the asset's micrometre frame; selecting
+    // a layout therefore returns the draft to µm and rescales its fields.
+    setDraft(prev => {
+      if (source !== 'layout' || prev.unit !== 'nm') return { ...prev, source };
+      const factor = 0.001;
+      return {
+        ...prev,
+        source,
+        unit: 'um' as LengthUnit,
+        gridDelta: prev.gridDelta * factor,
+        xExtent: prev.xExtent * factor,
+        yExtent: prev.yExtent * factor,
+        width: prev.width * factor,
+        depth: prev.depth * factor,
+        radius: prev.radius * factor,
+        finHeight: prev.finHeight * factor,
+        height: prev.height * factor,
+        maskHeight: prev.maskHeight * factor,
+      };
+    });
   };
 
   /**
@@ -4308,7 +4356,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
       : null;
     const projectPayload: ProjectDoc = {
       schemaVersion: 7, name, dimension,
-      units: { length: 'um', time: 's', rate: 'um/s', angle: 'deg' },
+      units: { length: draft.unit, time: 's', rate: draft.unit === 'nm' ? 'nm/s' : 'um/s', angle: 'deg' },
       domain: is3d
         ? { gridDelta, xExtent, yExtent, boundaryXY: 'reflective' }
         : { gridDelta, xExtent, xBoundary: 'reflective' },
@@ -5731,6 +5779,18 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     setCompileStale(true);
   };
 
+  const changeProjectUnits = (target: LengthUnit) => {
+    if (!project || projectUnits === target) return;
+    const result = convertProjectUnits(project as Record<string, unknown>, target);
+    if (result.blockedReason) {
+      setProjectNotice(result.blockedReason);
+      return;
+    }
+    setProject(result.project as typeof project);
+    setCompileStale(true);
+    setProjectNotice(`长度单位已切换为 ${lengthUnitLabel(target)}；所有长度与速率已按比例换算。`);
+  };
+
   const applyMaterialToProject = (material: string): string => {
     if (!project) return '';
     const geometry = { ...(project.geometry ?? {}) } as Record<string, unknown>;
@@ -7128,6 +7188,10 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
   );
 
   const currentSection = ZONES.find(item => item.id === zone) ?? ZONES[0];
+  const projectUnits: LengthUnit = (project?.units as { length?: string } | undefined)?.length === 'nm' ? 'nm' : 'um';
+  const lengthUnit = lengthUnitLabel(projectUnits);
+  const rateUnit = rateUnitLabel(projectUnits);
+  const unitsPerUm = lengthUnitsPerUm(projectUnits);
   const projectDomain = (project?.domain ?? {}) as Record<string, unknown>;
   const projectGeometry = (project?.geometry ?? {}) as Record<string, unknown>;
   const projectSolver = (project?.solver ?? {}) as Record<string, unknown>;
@@ -7156,10 +7220,12 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
     // real floor so the spinner/validation cannot re-impose the old 1 µm rule.
     const min = key === 'gridDelta'
       ? 0
-      : project?.dimension === 3 ? MIN_DOMAIN_EXTENT_3D : MIN_DOMAIN_EXTENT_2D;
+      : (project?.dimension === 3 ? MIN_DOMAIN_EXTENT_3D : MIN_DOMAIN_EXTENT_2D) * unitsPerUm;
+    const max = (key === 'gridDelta' ? 0.5 : MAX_DOMAIN_EXTENT) * unitsPerUm;
+    const nativeStep = Number(step) * unitsPerUm;
     return <label className={`spx-field${error ? ' invalid' : ''}`} key={key}>
       <span title={title ?? key}>{label}</span>
-      <input aria-label={`工程 ${key}`} type="number" min={min} max={key === 'gridDelta' ? 0.5 : MAX_DOMAIN_EXTENT} step={step} value={String(projectDomain[key] ?? '')}
+      <input aria-label={`工程 ${key}`} type="number" min={min} max={max} step={nativeStep} value={String(projectDomain[key] ?? '')}
         aria-invalid={!!error}
         onChange={event => updateProjectDomain({ [key]: Number(event.target.value) })} />
       {error && <em className="spx-field-error">{error}</em>}
@@ -7564,22 +7630,22 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                     >{kind === 'plane' ? 'Plane' : kind === 'trench' ? 'Trench' : kind === 'hole' ? 'Hole' : 'Fin'}</button>)}
                   </div>
                   <div className="spx-field-grid">
-                    {draft.geometry === 'plane' && <label className="spx-field"><span title="height">平面高度 (µm)</span><input aria-label="新工程高度" type="number" value={draft.height} onChange={event => setDraftField('height', Number(event.target.value))} /></label>}
+                    {draft.geometry === 'plane' && <label className="spx-field"><span title="height">{`平面高度 (${lengthUnitLabel(draft.unit)})`}</span><input aria-label="新工程高度" type="number" value={draft.height} onChange={event => setDraftField('height', Number(event.target.value))} /></label>}
                     {draft.geometry === 'trench' && <>
-                      <label className="spx-field"><span title="width">沟槽宽度 (µm)</span><input aria-label="新工程 Trench 宽度" type="number" value={draft.width} onChange={event => setDraftField('width', Number(event.target.value))} /></label>
-                      <label className="spx-field"><span title="depth">沟槽深度 (µm)</span><input aria-label="新工程 Trench 深度" type="number" value={draft.depth} onChange={event => setDraftField('depth', Number(event.target.value))} /></label>
+                      <label className="spx-field"><span title="width">{`沟槽宽度 (${lengthUnitLabel(draft.unit)})`}</span><input aria-label="新工程 Trench 宽度" type="number" value={draft.width} onChange={event => setDraftField('width', Number(event.target.value))} /></label>
+                      <label className="spx-field"><span title="depth">{`沟槽深度 (${lengthUnitLabel(draft.unit)})`}</span><input aria-label="新工程 Trench 深度" type="number" value={draft.depth} onChange={event => setDraftField('depth', Number(event.target.value))} /></label>
                     </>}
                     {draft.geometry === 'hole' && <>
-                      <label className="spx-field"><span title="radius">孔半径 (µm)</span><input aria-label="新工程孔半径" type="number" value={draft.radius} onChange={event => setDraftField('radius', Number(event.target.value))} /></label>
-                      <label className="spx-field"><span title="depth">孔深度 (µm)</span><input aria-label="新工程孔深度" type="number" value={draft.depth} onChange={event => setDraftField('depth', Number(event.target.value))} /></label>
+                      <label className="spx-field"><span title="radius">{`孔半径 (${lengthUnitLabel(draft.unit)})`}</span><input aria-label="新工程孔半径" type="number" value={draft.radius} onChange={event => setDraftField('radius', Number(event.target.value))} /></label>
+                      <label className="spx-field"><span title="depth">{`孔深度 (${lengthUnitLabel(draft.unit)})`}</span><input aria-label="新工程孔深度" type="number" value={draft.depth} onChange={event => setDraftField('depth', Number(event.target.value))} /></label>
                     </>}
                     {draft.geometry === 'fin' && <>
-                      <label className="spx-field"><span title="width">Fin 宽度 (µm)</span><input aria-label="新工程 Fin 宽度" type="number" value={draft.width} onChange={event => setDraftField('width', Number(event.target.value))} /></label>
-                      <label className="spx-field"><span title="finHeight">Fin 高度 (µm)</span><input aria-label="新工程 Fin 高度" type="number" value={draft.finHeight} onChange={event => setDraftField('finHeight', Number(event.target.value))} /></label>
+                      <label className="spx-field"><span title="width">{`Fin 宽度 (${lengthUnitLabel(draft.unit)})`}</span><input aria-label="新工程 Fin 宽度" type="number" value={draft.width} onChange={event => setDraftField('width', Number(event.target.value))} /></label>
+                      <label className="spx-field"><span title="finHeight">{`Fin 高度 (${lengthUnitLabel(draft.unit)})`}</span><input aria-label="新工程 Fin 高度" type="number" value={draft.finHeight} onChange={event => setDraftField('finHeight', Number(event.target.value))} /></label>
                     </>}
                     {draft.geometry !== 'plane' && <>
                       <label className="spx-field"><span title="taperAngle">侧壁角 (deg)</span><input aria-label="新工程 taper" type="number" value={draft.taperAngle} onChange={event => setDraftField('taperAngle', Number(event.target.value))} /></label>
-                      <label className="spx-field"><span title="maskHeight">掩膜高度 (µm)</span><input aria-label="新工程 maskHeight" type="number" value={draft.maskHeight} onChange={event => setDraftField('maskHeight', Number(event.target.value))} /></label>
+                      <label className="spx-field"><span title="maskHeight">{`掩膜高度 (${lengthUnitLabel(draft.unit)})`}</span><input aria-label="新工程 maskHeight" type="number" value={draft.maskHeight} onChange={event => setDraftField('maskHeight', Number(event.target.value))} /></label>
                     </>}
                   </div>
                 </>}
@@ -7591,9 +7657,15 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
               <section className="spx-field-group">
                 <div className="spx-group-title" title="Domain &amp; Grid">计算域与网格</div>
                 <div className="spx-field-grid">
-                  <label className="spx-field"><span title="gridDelta">网格步长 (µm)</span><input aria-label="新工程 gridDelta" type="number" value={draft.gridDelta} onChange={event => setDraftField('gridDelta', Number(event.target.value))} /></label>
-                  <label className="spx-field"><span title="xExtent">X 范围 (µm)</span><input aria-label="新工程 xExtent" type="number" value={draft.xExtent} onChange={event => setDraftField('xExtent', Number(event.target.value))} /></label>
-                  {draft.dimension === 3 && <label className="spx-field"><span title="yExtent">Y 范围 (µm)</span><input aria-label="新工程 yExtent" type="number" value={draft.yExtent} onChange={event => setDraftField('yExtent', Number(event.target.value))} /></label>}
+                  <label className="spx-field"><span>长度单位</span>
+                    <select aria-label="新工程长度单位" value={draft.unit} onChange={event => changeDraftUnits(event.target.value as LengthUnit)}>
+                      <option value="um">µm</option>
+                      <option value="nm">nm</option>
+                    </select>
+                  </label>
+                  <label className="spx-field"><span title="gridDelta">{`网格步长 (${lengthUnitLabel(draft.unit)})`}</span><input aria-label="新工程 gridDelta" type="number" value={draft.gridDelta} onChange={event => setDraftField('gridDelta', Number(event.target.value))} /></label>
+                  <label className="spx-field"><span title="xExtent">{`X 范围 (${lengthUnitLabel(draft.unit)})`}</span><input aria-label="新工程 xExtent" type="number" value={draft.xExtent} onChange={event => setDraftField('xExtent', Number(event.target.value))} /></label>
+                  {draft.dimension === 3 && <label className="spx-field"><span title="yExtent">{`Y 范围 (${lengthUnitLabel(draft.unit)})`}</span><input aria-label="新工程 yExtent" type="number" value={draft.yExtent} onChange={event => setDraftField('yExtent', Number(event.target.value))} /></label>}
                 </div>
               </section>
 
@@ -7721,9 +7793,16 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                     <button type="button" className={project.dimension === 3 ? 'active' : ''} onClick={() => changeProjectDimension(3)}>3D</button>
                   </div>
                 </div>
-                {renderDomainField('网格步长 (µm)', 'gridDelta', '0.001', 'gridDelta')}
-                {renderDomainField('X 范围 (µm)', 'xExtent', '0.1', 'xExtent')}
-                {project.dimension === 3 && renderDomainField('Y 范围 (µm)', 'yExtent', '0.1', 'yExtent')}
+                <label className="spx-field"><span>长度单位</span>
+                  <select aria-label="工程长度单位" value={projectUnits}
+                    onChange={event => changeProjectUnits(event.target.value as LengthUnit)}>
+                    <option value="um">µm</option>
+                    <option value="nm">nm</option>
+                  </select>
+                </label>
+                {renderDomainField(`网格步长 (${lengthUnit})`, 'gridDelta', '0.001', 'gridDelta')}
+                {renderDomainField(`X 范围 (${lengthUnit})`, 'xExtent', '0.1', 'xExtent')}
+                {project.dimension === 3 && renderDomainField(`Y 范围 (${lengthUnit})`, 'yExtent', '0.1', 'yExtent')}
                 <label className="spx-field"><span>{project.dimension === 3 ? '边界 XY' : '边界 X'}</span>
                   <select aria-label="工程边界类型"
                     value={String((project.dimension === 3 ? projectDomain.boundaryXY : projectDomain.xBoundary) ?? 'reflective')}
@@ -7749,22 +7828,22 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                     >{kind === 'plane' ? 'Plane' : kind === 'trench' ? 'Trench' : kind === 'hole' ? 'Hole' : 'Fin'}</button>)}
                   </div>
                   <div className="spx-field-grid">
-                    {projectGeometryKind === 'plane' && renderGeometryField('平面高度 (µm)', 'height')}
+                    {projectGeometryKind === 'plane' && renderGeometryField(`平面高度 (${lengthUnit})`, 'height')}
                     {projectGeometryKind === 'trench' && <>
-                      {renderGeometryField('沟槽宽度 (µm)', 'width')}
-                      {renderGeometryField('沟槽深度 (µm)', 'depth')}
+                      {renderGeometryField(`沟槽宽度 (${lengthUnit})`, 'width')}
+                      {renderGeometryField(`沟槽深度 (${lengthUnit})`, 'depth')}
                     </>}
                     {projectGeometryKind === 'hole' && <>
-                      {renderGeometryField('孔半径 (µm)', 'radius')}
-                      {renderGeometryField('孔深度 (µm)', 'depth')}
+                      {renderGeometryField(`孔半径 (${lengthUnit})`, 'radius')}
+                      {renderGeometryField(`孔深度 (${lengthUnit})`, 'depth')}
                     </>}
                     {projectGeometryKind === 'fin' && <>
-                      {renderGeometryField('Fin 宽度 (µm)', 'width')}
-                      {renderGeometryField('Fin 高度 (µm)', 'height')}
+                      {renderGeometryField(`Fin 宽度 (${lengthUnit})`, 'width')}
+                      {renderGeometryField(`Fin 高度 (${lengthUnit})`, 'height')}
                     </>}
                     {['trench', 'hole', 'fin'].includes(projectGeometryKind) && <>
                       {renderGeometryField('侧壁角 (deg)', 'taperAngle')}
-                      {renderGeometryField('掩膜高度 (µm)', 'maskHeight')}
+                      {renderGeometryField(`掩膜高度 (${lengthUnit})`, 'maskHeight')}
                     </>}
                   </div>
                 </>}
@@ -7949,13 +8028,13 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                         const rate = step.model === 'directional'
                           ? Number(step.directionalRateMagnitude ?? 0)
                           : Number(step.rateMagnitude ?? 0);
-                        const rateText = RATE_STEP_MODELS.has(step.model) ? `${rate} µm/s` : '—';
+                        const rateText = RATE_STEP_MODELS.has(step.model) ? `${rate} ${rateUnit}` : '—';
                         const modelLabel = STEP_LABELS[step.model] ?? step.model;
                         const operationLabel = step.operation === 'deposit' ? '沉积' : step.operation === 'etch' ? '刻蚀' : (step.operation ?? '');
                         // Geometry steps carry their capability in model fields
                         // (mask layer, cutoff, material, native model), not in a
                         // rate/duration, so the model cell names them.
-                        const capability = geometryStepSummary(step);
+                        const capability = geometryStepSummary(step, lengthUnit);
                         return <tr key={step.id}
                           draggable
                           className={`${selectedFlowStepId === step.id ? 'selected' : ''}${materialTarget && step.depositMaterial === materialTarget.material ? ' material-match' : ''}`}
@@ -8011,7 +8090,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                     </select>
                   </label>
                   {stepSupportsDuration && <label className="spx-field" data-field="duration"><span title="duration">时长（s）</span><input aria-label="步骤时长" type="number" step="0.01" value={Number(selectedFlowStep.duration ?? 0)} onChange={event => updateSelectedStep({ duration: Number(event.target.value) })} /></label>}
-                  {stepSupportsRate && <label className="spx-field" data-field="rate"><span title={selectedRateField}>速率（µm/s）</span><input aria-label="步骤速率" type="number" step="0.01" value={selectedRateValue} onChange={event => updateSelectedStep({ [selectedRateField]: Number(event.target.value) })} /></label>}
+                  {stepSupportsRate && <label className="spx-field" data-field="rate"><span title={selectedRateField}>速率（{rateUnit}）</span><input aria-label="步骤速率" type="number" step="0.01" value={selectedRateValue} onChange={event => updateSelectedStep({ [selectedRateField]: Number(event.target.value) })} /></label>}
                   {stepSupportsRateMode && <label className="spx-field" data-field="rateMode"><span title="rateMode">速率模式</span>
                     <select aria-label="步骤速率模式" value={selectedStepModel === 'isotropic' || selectedStepOperation === 'etch' ? selectedStepRateMode : 'uniform'} disabled={selectedStepModel !== 'isotropic' && selectedStepOperation !== 'etch'} onChange={event => updateSelectedStep({ rateMode: event.target.value })}>
                       <option value="uniform">均匀 (uniform)</option>
@@ -8044,7 +8123,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                         <button type="button" className="wf-button" onClick={applyIsotropicMaterialRatesText}>应用</button>
                         <span className="wf-muted">{'{"Si": 0.1, "SiO2": 0}'}</span>
                       </div>
-                      <p className="spx-help">0 表示保护；未列出的材料使用“速率（µm/s）”；刻蚀与沉积都按操作符号写入。</p>
+                      <p className="spx-help">0 表示保护；未列出的材料使用“速率（{rateUnit}）”；刻蚀与沉积都按操作符号写入。</p>
                     </>}
                   </>}
                   {stepSupportsDepositMaterial && <label className="spx-field" data-field="depositMaterial"><span title="depositMaterial · 只列可沉积材料（排除硬掩膜/光刻胶）">沉积材料</span>
@@ -8107,8 +8186,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                         <option value="stopMaterial">停在材料 (stopMaterial)</option>
                       </select>
                     </label>
-                    {!planarizeUsesStopMaterial && <label className="spx-field" data-field="cutoffHeight"><span title="cutoffHeight">截止高度 cutoffHeight（µm）</span>
-                      <input aria-label="平坦化截止高度（µm）" type="number" step={0.01} value={typeof selectedFlowStep.cutoffHeight === 'number' ? selectedFlowStep.cutoffHeight : 0} onChange={event => updateSelectedStep({ cutoffHeight: Number(event.target.value) })} />
+                    {!planarizeUsesStopMaterial && <label className="spx-field" data-field="cutoffHeight"><span title="cutoffHeight">截止高度 cutoffHeight（{lengthUnit}）</span>
+                      <input aria-label={`平坦化截止高度（${lengthUnit}）`} type="number" step={0.01} value={typeof selectedFlowStep.cutoffHeight === 'number' ? selectedFlowStep.cutoffHeight : 0} onChange={event => updateSelectedStep({ cutoffHeight: Number(event.target.value) })} />
                     </label>}
                     {planarizeUsesStopMaterial && <>
                       <label className="spx-field" data-field="stopMaterial"><span title="stopMaterial">停止材料 stopMaterial</span>
@@ -8117,8 +8196,8 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                           {materialCatalog.map(row => <option key={row.name} value={row.name}>{row.name} · {row.category ?? 'Generic'}</option>)}
                         </select>
                       </label>
-                      <label className="spx-field" data-field="overPolish"><span title="overPolish">过抛光 overPolish（µm）</span>
-                        <input aria-label="平坦化过抛光 overPolish（µm）" type="number" min={0} max={100} step={0.01} value={typeof selectedFlowStep.overPolish === 'number' ? selectedFlowStep.overPolish : 0} onChange={event => updateSelectedStep({ overPolish: Number(event.target.value) })} />
+                      <label className="spx-field" data-field="overPolish"><span title="overPolish">过抛光 overPolish（{lengthUnit}）</span>
+                        <input aria-label={`平坦化过抛光 overPolish（${lengthUnit}）`} type="number" min={0} max={100} step={0.01} value={typeof selectedFlowStep.overPolish === 'number' ? selectedFlowStep.overPolish : 0} onChange={event => updateSelectedStep({ overPolish: Number(event.target.value) })} />
                       </label>
                     </>}
                   </>}
@@ -8171,11 +8250,11 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                         <input aria-label="定向方向 Z" type="number" step={0.01} value={selectedDirection[2]} onChange={event => patchSelectedDirection(2, Number(event.target.value))} />
                       </label>
                       {selectedDirectionalMode === 'scalar' && <>
-                        <label className="spx-field" data-field="directionalRateMagnitude"><span title="directionalRateMagnitude">定向速率（µm/s）</span>
-                          <input aria-label="定向速率（µm/s）" type="number" min={0} max={2} step={0.01} value={Number(selectedFlowStep.directionalRateMagnitude ?? 0.02)} onChange={event => updateSelectedStep({ directionalRateMagnitude: Number(event.target.value) })} />
+                        <label className="spx-field" data-field="directionalRateMagnitude"><span title="directionalRateMagnitude">定向速率（{rateUnit}）</span>
+                          <input aria-label={`定向速率（${rateUnit}）`} type="number" min={0} max={2} step={0.01} value={Number(selectedFlowStep.directionalRateMagnitude ?? 0.02)} onChange={event => updateSelectedStep({ directionalRateMagnitude: Number(event.target.value) })} />
                         </label>
-                        <label className="spx-field" data-field="isotropicRateMagnitude"><span title="isotropicRateMagnitude">各向同性速率（µm/s）</span>
-                          <input aria-label="各向同性速率（µm/s）" type="number" min={0} max={2} step={0.01} value={Number(selectedFlowStep.isotropicRateMagnitude ?? 0)} onChange={event => updateSelectedStep({ isotropicRateMagnitude: Number(event.target.value) })} />
+                        <label className="spx-field" data-field="isotropicRateMagnitude"><span title="isotropicRateMagnitude">各向同性速率（{rateUnit}）</span>
+                          <input aria-label={`各向同性速率（${rateUnit}）`} type="number" min={0} max={2} step={0.01} value={Number(selectedFlowStep.isotropicRateMagnitude ?? 0)} onChange={event => updateSelectedStep({ isotropicRateMagnitude: Number(event.target.value) })} />
                         </label>
                       </>}
                     </>}
@@ -8186,7 +8265,7 @@ export default function WorkflowApp({ onOpenLegacy }: { onOpenLegacy?: () => voi
                       {rateSetsError && <em className="spx-field-error">{rateSetsError}</em>}
                       <div className="spx-step-form-actions">
                         <button type="button" className="wf-button" onClick={applyRateSetsText}>应用</button>
-                        <span className="wf-muted">direction 3 个数字；速率 0–2 µm/s</span>
+                        <span className="wf-muted">direction 3 个数字；速率 0–2 {rateUnit}</span>
                       </div>
                     </>}
                     {selectedDirectionalMode === 'materialRates' && <>
