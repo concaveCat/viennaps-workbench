@@ -7,8 +7,10 @@ A raw worker step is untyped JSON: it carries ``model``, ``operation``,
 :class:`~plugins.isotropic.params.IsotropicParams` when a step belongs to this
 process and ``None`` when it does not. Malformed fields raise ``ValueError``.
 
-Only uniform level-set isotropic steps are covered. ``rateMode="material"``
-uses the worker's material-rate table conventions, and ``isotropicMethod``
+Both uniform and per-material level-set isotropic steps are covered. In
+``rateMode="material"`` the table is authoritative and ``rateMagnitude`` may be
+zero, matching the native ``IsotropicProcess(rate=0)`` plus
+``setMaterialRate(material, signed_rate)`` pattern. ``isotropicMethod``
 ``auto``/``geometric`` dispatches to a different native process; mapping them
 here would silently run a different simulation, so they return ``None`` and
 the caller keeps its own path.
@@ -40,7 +42,8 @@ def parse_step(project: Mapping[str, Any], step: Mapping[str, Any]) -> Isotropic
         return None
     if step.get("operation") not in _OPERATIONS:
         return None
-    if str(step.get("rateMode", "uniform")) != "uniform":
+    rate_mode = str(step.get("rateMode", "uniform"))
+    if rate_mode not in ("uniform", "material"):
         return None
     if step.get("isotropicMethod") not in _SUPPORTED_METHODS:
         return None
@@ -55,13 +58,17 @@ def parse_step(project: Mapping[str, Any], step: Mapping[str, Any]) -> Isotropic
         "rateMagnitude": float(rate_magnitude),
         "duration": float(duration),
         "depositMaterial": str(step.get("depositMaterial") or "SiO2"),
-        "rateMode": "uniform",
+        "rateMode": rate_mode,
         "materialRates": dict(step.get("materialRates") or {}),
-        # The plugin derives geometry masks from the project; an explicit
-        # worker list here would diverge from the native path.
+        # The plugin derives geometry masks from the project in uniform mode;
+        # material mode ignores masks entirely. An explicit worker list here
+        # would diverge from the native path.
         "maskMaterials": [],
     }
     ratio = step.get("isotropicTimeStepRatio")
     if ratio is not None:
         values["isotropicTimeStepRatio"] = float(ratio)
+    advection = step.get("advection")
+    if advection is not None:
+        values["advection"] = dict(advection)
     return IsotropicParams(**values)

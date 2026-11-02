@@ -22,6 +22,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from process_models.v2.options import AdvectionOverride
+
 __all__ = [
     "DirectionalMaterialRate",
     "DirectionalParams",
@@ -96,8 +98,8 @@ class DirectionalMaterialRate(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    directional: float = Field(default=0.0, ge=0.0, le=_MAXIMUM_RATE)
-    isotropic: float = Field(default=0.0, ge=0.0, le=_MAXIMUM_RATE)
+    directional: float = Field(default=0.0, ge=-_MAXIMUM_RATE, le=_MAXIMUM_RATE)
+    isotropic: float = Field(default=0.0, ge=-_MAXIMUM_RATE, le=_MAXIMUM_RATE)
 
     @field_validator("directional", "isotropic")
     @classmethod
@@ -125,6 +127,8 @@ class DirectionalParams(BaseModel):
     rateSets: list[DirectionalRateSet] | None = Field(default=None, min_length=1, max_length=_MAXIMUM_RATE_SETS)
     materialRates: dict[str, DirectionalMaterialRate] | None = None
     defaultMaterialRate: DirectionalMaterialRate | None = None
+    rateSigns: Literal["operation", "native"] | None = None
+    advection: AdvectionOverride | None = None
     depositMaterial: str | None = Field(default=None, min_length=1, max_length=_MAXIMUM_MATERIAL_NAME)
 
     @field_validator("duration")
@@ -162,6 +166,8 @@ class DirectionalParams(BaseModel):
     def _validate_mode(self) -> "DirectionalParams":
         scalar_fields = ("direction", "directionalRateMagnitude", "isotropicRateMagnitude")
         material_mode = self.materialRates is not None or self.defaultMaterialRate is not None
+        if self.rateSigns is not None and not material_mode:
+            raise ValueError("rateSigns applies only to materialRates mode")
         if material_mode:
             if any(name in self.model_fields_set for name in scalar_fields[1:]):
                 raise ValueError(
@@ -178,9 +184,19 @@ class DirectionalParams(BaseModel):
                     "instead of materializing it (or leave it true)"
                 )
             table = self.materialRates or {}
+            if self.rateSigns != "native":
+                negative = sorted(name for name, row in table.items() if row.directional < 0.0 or row.isotropic < 0.0)
+                if self.defaultMaterialRate is not None and (
+                    self.defaultMaterialRate.directional < 0.0 or self.defaultMaterialRate.isotropic < 0.0
+                ):
+                    negative.append("defaultMaterialRate")
+                if negative:
+                    raise ValueError(
+                        "material rates must be non-negative unless rateSigns='native': " + ", ".join(negative)
+                    )
             default = self.defaultMaterialRate
-            effective = any(row.directional > 0.0 or row.isotropic > 0.0 for row in table.values()) or (
-                default is not None and (default.directional > 0.0 or default.isotropic > 0.0)
+            effective = any(row.directional != 0.0 or row.isotropic != 0.0 for row in table.values()) or (
+                default is not None and (default.directional != 0.0 or default.isotropic != 0.0)
             )
             if not effective:
                 raise ValueError("material rate mode requires at least one nonzero directional or isotropic rate")

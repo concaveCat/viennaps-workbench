@@ -47,7 +47,7 @@ def adopt_project(
         "name": f"{validated.name} · geometry",
         "dimension": validated.dimension,
         "units": validated.units.model_dump(mode="json"),
-        "domain": validated.domain.model_dump(mode="json"),
+        "domain": validated.domain.model_dump(mode="json", exclude_none=True),
         "geometry": validated.geometry,
         "geometrySource": geometry_source,
         "materialDefinitions": material_definitions,

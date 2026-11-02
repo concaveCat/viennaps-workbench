@@ -1,0 +1,388 @@
+{
+  "schemaVersion": 7,
+  "name": "FinFET.py parity fixture",
+  "dimension": 3,
+  "units": {
+    "length": "um",
+    "time": "s",
+    "rate": "um/s",
+    "angle": "deg"
+  },
+  "domain": {
+    "gridDelta": 0.00079,
+    "xExtent": 0.09,
+    "yExtent": 0.1,
+    "boundaryXY": "reflective",
+    "bounds": [
+      0.0,
+      0.09,
+      0.0,
+      0.1,
+      0.0,
+      0.07
+    ]
+  },
+  "geometry": {
+    "kind": "plane",
+    "height": 0.07,
+    "substrateMaterial": "Si"
+  },
+  "steps": [
+    {
+      "id": "step_dp_mask",
+      "name": "DP mask box",
+      "enabled": true,
+      "model": "insertBox",
+      "min": [
+        0.03,
+        -0.01,
+        0.0699
+      ],
+      "max": [
+        0.06,
+        0.11,
+        0.09
+      ],
+      "material": "Mask"
+    },
+    {
+      "id": "step_dp_metal",
+      "name": "DP metal deposition",
+      "enabled": true,
+      "operation": "deposit",
+      "model": "particleShape",
+      "shape": "sphere",
+      "radius": 0.004,
+      "depositMaterial": "Metal"
+    },
+    {
+      "id": "step_dp_etch",
+      "name": "DP pattern etch",
+      "enabled": true,
+      "operation": "etch",
+      "model": "particleShape",
+      "shape": "box",
+      "halfAxes": [
+        0.00079,
+        0.00079,
+        0.006
+      ],
+      "maskMaterials": [
+        "Si"
+      ]
+    },
+    {
+      "id": "step_dp_unmask",
+      "name": "Remove DP mask",
+      "enabled": true,
+      "model": "removeMaterial",
+      "material": "Mask"
+    },
+    {
+      "id": "step_si_pattern",
+      "name": "Si patterning directional",
+      "enabled": true,
+      "operation": "etch",
+      "model": "directional",
+      "direction": [
+        0.0,
+        0.0,
+        -1.0
+      ],
+      "duration": 90.0,
+      "materialRates": {
+        "Si": {
+          "directional": 0.001,
+          "isotropic": 0.0001
+        }
+      },
+      "rateSigns": "native"
+    },
+    {
+      "id": "step_metal_strip",
+      "name": "Strip DP metal",
+      "enabled": true,
+      "model": "removeTopLevelSet"
+    },
+    {
+      "id": "step_sti_dep",
+      "name": "STI deposition",
+      "enabled": true,
+      "operation": "deposit",
+      "model": "particleShape",
+      "shape": "sphere",
+      "radius": 0.035,
+      "depositMaterial": "SiO2"
+    },
+    {
+      "id": "step_sti_cmp",
+      "name": "STI CMP 80 nm",
+      "enabled": true,
+      "model": "planarize",
+      "cutoffHeight": 0.08
+    },
+    {
+      "id": "step_sti_etch",
+      "name": "STI patterning etch",
+      "enabled": true,
+      "operation": "etch",
+      "model": "particleShape",
+      "shape": "sphere",
+      "radius": 0.035,
+      "maskMaterials": [
+        "Si"
+      ]
+    },
+    {
+      "id": "step_hfo2_dep",
+      "name": "Gate HfO2 deposition",
+      "enabled": true,
+      "operation": "deposit",
+      "model": "particleShape",
+      "shape": "sphere",
+      "radius": 0.002,
+      "depositMaterial": "HfO2"
+    },
+    {
+      "id": "step_poly_dep",
+      "name": "Gate PolySi deposition",
+      "enabled": true,
+      "operation": "deposit",
+      "model": "particleShape",
+      "shape": "sphere",
+      "radius": 0.104,
+      "depositMaterial": "PolySi"
+    },
+    {
+      "id": "step_gate_cmp",
+      "name": "Gate CMP 150 nm",
+      "enabled": true,
+      "model": "planarize",
+      "cutoffHeight": 0.15
+    },
+    {
+      "id": "step_gate_mask",
+      "name": "Dummy gate mask box",
+      "enabled": true,
+      "model": "insertBox",
+      "min": [
+        -0.01,
+        0.03,
+        0.145
+      ],
+      "max": [
+        0.1,
+        0.07,
+        0.175
+      ],
+      "material": "Mask"
+    },
+    {
+      "id": "step_gate_etch",
+      "name": "Dummy gate patterning",
+      "enabled": true,
+      "operation": "etch",
+      "model": "particleShape",
+      "shape": "box",
+      "halfAxes": [
+        0.00079,
+        0.00079,
+        0.11
+      ],
+      "maskMaterials": [
+        "Mask",
+        "Si",
+        "SiO2"
+      ]
+    },
+    {
+      "id": "step_gate_unmask",
+      "name": "Remove dummy gate mask",
+      "enabled": true,
+      "model": "removeTopLevelSet"
+    },
+    {
+      "id": "step_spacer_dep",
+      "name": "Spacer Si3N4 deposition",
+      "enabled": true,
+      "operation": "deposit",
+      "model": "particleShape",
+      "shape": "sphere",
+      "radius": 0.01,
+      "depositMaterial": "Si3N4"
+    },
+    {
+      "id": "step_spacer_etch",
+      "name": "Spacer etch (all except Si3N4)",
+      "enabled": true,
+      "operation": "etch",
+      "model": "particleShape",
+      "shape": "box",
+      "halfAxes": [
+        0.00079,
+        0.00079,
+        0.05
+      ],
+      "maskMaterials": [
+        "Si3N4"
+      ],
+      "maskMode": "allExcept"
+    },
+    {
+      "id": "step_fin_release",
+      "name": "Fin release isotropic",
+      "enabled": true,
+      "operation": "etch",
+      "model": "isotropic",
+      "rateMagnitude": 0.0,
+      "duration": 5.0,
+      "rateMode": "material",
+      "materialRates": {
+        "Si": 0.001
+      },
+      "advection": {
+        "spatialScheme": "LAX_FRIEDRICHS_2ND_ORDER"
+      }
+    },
+    {
+      "id": "step_sd_epi",
+      "name": "S/D selective epitaxy",
+      "enabled": true,
+      "operation": "deposit",
+      "model": "specialized",
+      "nativeModel": "selectiveEpitaxy",
+      "duration": 14.0,
+      "depositMaterial": "SiGe",
+      "nativeParameters": {
+        "materialRates": {
+          "Si": 0.002,
+          "SiGe": 0.002
+        },
+        "rate111": 0.5,
+        "rate100": 1.0
+      },
+      "advection": {
+        "spatialScheme": "STENCIL_LOCAL_LAX_FRIEDRICHS_1ST_ORDER",
+        "maxDissipation": 100.0
+      }
+    },
+    {
+      "id": "step_ild_dep",
+      "name": "ILD dielectric deposition",
+      "enabled": true,
+      "operation": "deposit",
+      "model": "particleShape",
+      "shape": "sphere",
+      "radius": 0.05,
+      "depositMaterial": "Dielectric"
+    },
+    {
+      "id": "step_ild_cmp",
+      "name": "ILD CMP 90 nm",
+      "enabled": true,
+      "model": "planarize",
+      "cutoffHeight": 0.09
+    },
+    {
+      "id": "step_poly_remove",
+      "name": "Remove dummy PolySi",
+      "enabled": true,
+      "model": "removeMaterial",
+      "material": "PolySi"
+    },
+    {
+      "id": "step_tin_dep",
+      "name": "Replacement gate TiN",
+      "enabled": true,
+      "operation": "deposit",
+      "model": "particleShape",
+      "shape": "sphere",
+      "radius": 0.004,
+      "depositMaterial": "TiN"
+    },
+    {
+      "id": "step_rmg_poly",
+      "name": "Replacement gate PolySi",
+      "enabled": true,
+      "operation": "deposit",
+      "model": "particleShape",
+      "shape": "sphere",
+      "radius": 0.04,
+      "depositMaterial": "PolySi"
+    },
+    {
+      "id": "step_rmg_cmp",
+      "name": "Replacement gate CMP 90 nm",
+      "enabled": true,
+      "model": "planarize",
+      "cutoffHeight": 0.09
+    }
+  ],
+  "solver": {
+    "timeStepRatio": 0.4999,
+    "raysPerPoint": 32,
+    "cpuThreads": 1,
+    "random": {
+      "mode": "fixed",
+      "seed": 271828
+    },
+    "enginePreference": "cpu",
+    "timeoutSeconds": 3600,
+    "advection": {
+      "spatialScheme": "ENGQUIST_OSHER_1ST_ORDER",
+      "temporalScheme": "FORWARD_EULER",
+      "adaptiveTimeStepping": false,
+      "adaptiveTimeStepSubdivisions": 20,
+      "calculateIntermediateVelocities": false,
+      "checkDissipation": true,
+      "dissipationAlpha": 1.0,
+      "ignoreVoids": false,
+      "velocityOutput": false
+    },
+    "rayTracing": {
+      "diskRadius": 0.0,
+      "ignoreFluxBoundaries": false,
+      "maxBoundaryHits": 1000,
+      "maxReflections": 4294967295,
+      "minNodeDistanceFactor": 0.05,
+      "normalizationType": "SOURCE",
+      "smoothingNeighbors": 1
+    }
+  },
+  "view3D": {
+    "projection": "parallel",
+    "camera": null,
+    "displayMode": "surface",
+    "visibleMaterialIds": [
+      10,
+      30,
+      32,
+      11,
+      0,
+      16,
+      13,
+      4,
+      79
+    ],
+    "opacityByMaterial": {},
+    "clip": {
+      "enabled": false,
+      "axis": "x",
+      "position": 0.0,
+      "keep": "positive"
+    },
+    "section": {
+      "enabled": false,
+      "axis": "y",
+      "position": 0.0
+    }
+  },
+  "outputSettings": {
+    "levelSets": false,
+    "levelSetMeshes": false,
+    "surfaceMeshVtk": false,
+    "volumeMesh": true,
+    "volumeMeshDelta": 0.05,
+    "nativeMetadata": false
+  }
+}

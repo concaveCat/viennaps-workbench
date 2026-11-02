@@ -124,7 +124,7 @@ def requested_input(project: Project | ProjectV3 | ProjectV4 | ProjectV5 | Proje
     result = {
         "dimension": project.dimension,
         "units": {"length": "um", "time": "s", "rate": "um/s", "angle": "deg"},
-        "domain": project.domain.model_dump(mode="json"),
+        "domain": project.domain.model_dump(mode="json", exclude_none=True),
         "geometry": geometry,
         "steps": steps,
         "solver": _applicable_solver(project),

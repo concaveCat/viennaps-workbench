@@ -31,6 +31,7 @@ from ..state import (
 from .params import (
     BooleanParams,
     GdsBooleanParams,
+    InsertBoxParams,
     ParticleShapeParams,
     PlanarizeParams,
     RemoveMaterialParams,
@@ -47,8 +48,18 @@ class GeometryEngine:
     """Native ViennaPS geometry operations on one level-set domain."""
 
     id = "viennaps-geometry"
-    version = "1.0.0"
-    capabilities = frozenset({"planarize", "particleShape", "boolean", "gdsBoolean", "removeMaterial"})
+    version = "1.1.0"
+    capabilities = frozenset(
+        {
+            "planarize",
+            "particleShape",
+            "boolean",
+            "gdsBoolean",
+            "removeMaterial",
+            "insertBox",
+            "removeTopLevelSet",
+        }
+    )
 
     def validate(self, operation: str, ctx: ProcessContext, params: Any) -> list[Issue]:
         """Return semantic issues the per-operation parameters cannot express."""
@@ -62,6 +73,8 @@ class GeometryEngine:
             return self._validate_boolean(ctx, params)
         if operation == "gdsBoolean":
             return self._validate_gds_boolean(ctx, params)
+        if operation == "insertBox":
+            return self._validate_insert_box(ctx, params)
         return []
 
     def execute(
@@ -79,22 +92,33 @@ class GeometryEngine:
         domain = geometry.handle
         ps = engine.handle
         warnings: list[str] = []
+        inserted_id: int | None = None
+        inserted_name: str | None = None
         if operation == "planarize":
             metadata = self._planarize(ps, domain, ctx, params)
         elif operation == "particleShape":
             metadata, warnings = self._particle_shape(ps, domain, state, ctx, params)
+            if metadata.get("depositMaterialId") is not None:
+                inserted_id = int(metadata["depositMaterialId"])
+                inserted_name = str(metadata["depositMaterial"])
         elif operation == "boolean":
             metadata = self._boolean(ps, domain, ctx, params)
         elif operation == "gdsBoolean":
             metadata = self._gds_boolean(ps, domain, ctx, params)
+        elif operation == "insertBox":
+            metadata = self._insert_box(ps, domain, params)
+            inserted_id = int(metadata["materialId"])
+            inserted_name = params.material
+        elif operation == "removeTopLevelSet":
+            metadata = self._remove_top_level_set(domain)
         else:
             metadata = self._remove_material(ps, domain, params)
 
         order = tuple(material_map(domain))
-        materials = MaterialState(
-            order=order,
-            names={material_id: name for material_id, name in state.materials.names.items() if material_id in order},
-        )
+        names = {material_id: name for material_id, name in state.materials.names.items() if material_id in order}
+        if inserted_id is not None and inserted_name is not None and inserted_id in order:
+            names[inserted_id] = inserted_name
+        materials = MaterialState(order=order, names=names)
         metadata.update(
             {
                 "dimension": int(geometry.dimension),
@@ -165,7 +189,7 @@ class GeometryEngine:
                     )
                 )
         if params.operation == "deposit":
-            masks = self._requested_masks(ctx)
+            masks = list(params.maskMaterials) if params.maskMaterials is not None else self._requested_masks(ctx)
             if masks:
                 issues.append(
                     Issue(
@@ -174,6 +198,25 @@ class GeometryEngine:
                             "masked particleShape deposition is not supported: ViennaPS 4.6.2/4.7.0 "
                             f"SIGSEGV on a non-empty mask with positive geometric advection (mask materials {masks})"
                         ),
+                    )
+                )
+        return issues
+
+    def _validate_insert_box(self, ctx: ProcessContext, params: InsertBoxParams) -> list[Issue]:
+        issues: list[Issue] = []
+        minimum = float(ctx.grid_delta)
+        for name in ("min", "max"):
+            for index, value in enumerate(getattr(params, name)):
+                if abs(float(value)) / minimum > 1_000_000:
+                    issues.append(
+                        Issue(path=f"{name}[{index}]", message="insertBox coordinate exceeds the application budget")
+                    )
+        for index, (low, high) in enumerate(zip(params.min, params.max)):
+            if abs(float(high) - float(low)) < minimum - 1e-12:
+                issues.append(
+                    Issue(
+                        path=f"max[{index}]",
+                        message=f"insertBox axis {index} must span at least one grid interval ({minimum})",
                     )
                 )
         return issues
@@ -292,7 +335,23 @@ class GeometryEngine:
         del state
         dimension = int(ctx.dimension)
         sign = -1.0 if params.operation == "etch" else 1.0
-        requested_masks = self._requested_masks(ctx)
+        deposit_handle = None
+        if sign > 0.0 and params.depositMaterial is not None:
+            deposit_handle = material_handle(ps, params.depositMaterial)
+            domain.duplicateTopLevelSet(deposit_handle)
+        if params.maskMaterials is not None:
+            if params.maskMode == "allExcept":
+                excluded = set(params.maskMaterials)
+                registry = ps.MaterialRegistry.instance()
+                requested_masks: list[str] = []
+                for handle in domain.getMaterialsInDomain():
+                    name = registry.getName(handle)
+                    if name not in excluded and name not in requested_masks:
+                        requested_masks.append(name)
+            else:
+                requested_masks = list(params.maskMaterials)
+        else:
+            requested_masks = self._requested_masks(ctx)
         applied_masks: list[tuple[str, Any]] = []
         omitted_masks: list[str] = []
         warnings: list[str] = []
@@ -354,13 +413,21 @@ class GeometryEngine:
             "surfaceSignatureAfter": after,
             "levelSetPointCountsBefore": before_counts,
             "nativeMask": {
-                "mode": "material" if applied_masks else "none",
+                "mode": ("allExcept" if params.maskMode == "allExcept" else "material")
+                if applied_masks or params.maskMaterials is not None
+                else "none",
                 "applied": bool(applied_masks),
                 "materials": [name for name, _ in applied_masks],
+                "requestedMaterials": list(requested_masks),
+                "maskMode": params.maskMode or "explicit",
                 "omittedMaterials": omitted_masks,
             },
             "nativeDurationIgnored": True,
         }
+        if params.depositMaterial is not None:
+            metadata["depositMaterial"] = params.depositMaterial
+            metadata["depositMaterialId"] = int(deposit_handle) if deposit_handle is not None else None
+            metadata["duplicateTopLevelSet"] = deposit_handle is not None
         if params.shape == "box":
             metadata["halfAxes"] = [float(value) for value in params.halfAxes or ()]
             metadata["nativeSignedHalfAxesUm"] = [sign * value for value in (params.halfAxes or ())]
@@ -481,6 +548,42 @@ class GeometryEngine:
             "geometryOperation": "removeMaterial",
             "material": params.material,
             "materialId": int(handle),
+        }
+
+    @staticmethod
+    def _insert_box(ps: Any, domain: Any, params: InsertBoxParams) -> dict[str, Any]:
+        handle = material_handle(ps, params.material)
+        before = int(domain.getNumberOfLevelSets())
+        box = ps.LevelSet(domain.getGrid())
+        ps.MakeGeometry(
+            box, ps.Box([float(value) for value in params.min], [float(value) for value in params.max])
+        ).apply()
+        domain.insertNextLevelSetAsMaterial(box, handle)
+        return {
+            "geometryOperation": "insertBox",
+            "min": [float(value) for value in params.min],
+            "max": [float(value) for value in params.max],
+            "material": params.material,
+            "materialId": int(handle),
+            "levelSetCountBefore": before,
+            "levelSetCountAfter": int(domain.getNumberOfLevelSets()),
+            "boxPointCount": int(box.getNumberOfPoints()),
+        }
+
+    @staticmethod
+    def _remove_top_level_set(domain: Any) -> dict[str, Any]:
+        before = int(domain.getNumberOfLevelSets())
+        if before <= 1:
+            raise GeometryEngineError(
+                "removeTopLevelSet would remove the only level set; the domain would have no material surface"
+            )
+        removed_id = int(domain.getMaterialMap().getMaterialIdAtIdx(before - 1))
+        domain.removeTopLevelSet()
+        return {
+            "geometryOperation": "removeTopLevelSet",
+            "removedMaterialId": removed_id,
+            "levelSetCountBefore": before,
+            "levelSetCountAfter": int(domain.getNumberOfLevelSets()),
         }
 
 

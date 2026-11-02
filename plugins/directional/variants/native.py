@@ -157,7 +157,7 @@ class DirectionalNativeVariant(EngineVariant):
 
         process = ps.Process(domain, model, float(params.duration))
         execution = apply_execution_profile(ps, process, engine.profile)
-        advection, advection_actual = configure_advection(ps, project)
+        advection, advection_actual = configure_advection(ps, project, override=getattr(params, "advection", None))
         process.setParameters(advection)
         process.apply()
 
@@ -180,6 +180,7 @@ class DirectionalNativeVariant(EngineVariant):
             {
                 "timeStepRatio": float(advection.timeStepRatio),
                 "timeStepRatioSource": advection_actual.get("timeStepRatioSource", "solver.timeStepRatio"),
+                "advectionOverride": advection_actual.get("overrideFields", []),
                 "fluxEngine": execution["kernel"],
                 "executionProfile": execution,
                 "dimension": geometry.dimension,
@@ -313,8 +314,12 @@ class DirectionalNativeVariant(EngineVariant):
         requested_direction = list(params.direction or [])
         unit_direction = params.unit_direction()
         etch = params.operation == "etch"
+        native_signs = params.rateSigns == "native"
         directional_sign = 1.0 if etch else -1.0
         isotropic_sign = -1.0 if etch else 1.0
+        if native_signs:
+            directional_sign = 1.0
+            isotropic_sign = 1.0
 
         native_rates: dict[Any, tuple[float, float]] = {}
         rows: list[dict[str, Any]] = []
@@ -371,6 +376,7 @@ class DirectionalNativeVariant(EngineVariant):
                 "nativeDefaultIsotropicRate": native_default_isotropic,
                 "directionalSign": directional_sign,
                 "isotropicSign": isotropic_sign,
+                "rateSigns": params.rateSigns or "operation",
                 "masks": "material rate map only; unlisted materials use the default rate",
                 "visibility": "not-applicable: native material map has no visibility control",
                 "calculateVisibility": "not-applicable: native material map has no visibility control",

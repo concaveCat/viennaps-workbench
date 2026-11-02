@@ -231,12 +231,21 @@ class FindProcessTests(_BridgeTestBase):
 
         self.assertIsNone(find_v2_process(plane_project(2), step))
 
-    def test_material_rate_mode_has_no_process(self) -> None:
+    def test_material_rate_mode_is_claimed_by_the_isotropic_process(self) -> None:
         step = isotropic_step("etch", rate=0.0)
         step["rateMode"] = "material"
         step["materialRates"] = {"Si": 0.2}
 
-        self.assertIsNone(find_v2_process(plane_project(2), step))
+        spec = find_v2_process(plane_project(2), step)
+        self.assertIsNotNone(spec)
+        assert spec is not None
+        self.assertEqual(spec.id, "isotropic")
+        params = parse_step(plane_project(2), step)
+        self.assertIsNotNone(params)
+        assert params is not None
+        self.assertEqual(params.rateMode, "material")
+        self.assertEqual(params.rateMagnitude, 0.0)
+        self.assertEqual(params.materialRates, {"Si": 0.2})
 
     def test_find_v2_process_accepts_a_caller_registry(self) -> None:
         registry = load_registry()
@@ -271,9 +280,6 @@ class ParseStepTests(_BridgeTestBase):
         self.assertEqual(without_ratio.operation, "etch")
 
     def test_unsupported_steps_return_none(self) -> None:
-        material = isotropic_step("etch")
-        material["rateMode"] = "material"
-        material["materialRates"] = {"Si": 0.2}
         geometric = isotropic_step("etch")
         geometric["isotropicMethod"] = "geometric"
         directional = isotropic_step("etch")
@@ -282,7 +288,6 @@ class ParseStepTests(_BridgeTestBase):
         unknown_operation["operation"] = "melt"
 
         for label, step in (
-            ("material", material),
             ("geometric", geometric),
             ("directional", directional),
             ("operation", unknown_operation),

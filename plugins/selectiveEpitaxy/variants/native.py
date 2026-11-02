@@ -145,7 +145,7 @@ class SelectiveEpitaxyNativeVariant(EngineVariant):
         process = ps.Process(domain, model, float(params.duration))
         execution = apply_execution_profile(ps, process, engine.profile)
 
-        advection, advection_actual = configure_advection(ps, project)
+        advection, advection_actual = configure_advection(ps, project, override=getattr(params, "advection", None))
         process.setParameters(advection)
 
         process.apply()
@@ -175,6 +175,8 @@ class SelectiveEpitaxyNativeVariant(EngineVariant):
             "duration": float(params.duration),
             "timeStepRatio": float(advection.timeStepRatio),
             "timeStepRatioSource": advection_actual.get("timeStepRatioSource", "solver.timeStepRatio"),
+            "advectionOverride": advection_actual.get("overrideFields", []),
+            "maxDissipation": advection_actual.get("maxDissipation"),
             "fluxEngine": execution["kernel"],
             "executionProfile": execution,
             "dimension": geometry.dimension,

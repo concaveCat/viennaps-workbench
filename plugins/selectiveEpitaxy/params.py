@@ -29,6 +29,8 @@ from typing import Any, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from process_models.v2.options import AdvectionOverride
+
 __all__ = [
     "FLAT_FIELDS",
     "OPTIONAL_FIELDS",
@@ -113,6 +115,7 @@ class SelectiveEpitaxyParams(BaseModel):
     rate111: float = Field(default=_DEFAULTS["rate111"], ge=0.0, le=_MAXIMUM)
     rate100: float = Field(default=_DEFAULTS["rate100"], ge=0.0, le=_MAXIMUM)
     nvFactors: list[float] | None = None
+    advection: AdvectionOverride | None = None
 
     @field_validator("duration", "rate111", "rate100", mode="before")
     @classmethod

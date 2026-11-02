@@ -273,9 +273,19 @@ class InTreePluginTests(unittest.TestCase):
         self.assertEqual(params.operation, "etch")
         self.assertEqual(params.rateMagnitude, 0.2)
 
+        material = isotropic_step("etch", rate=0.0, duration=0.5)
+        material["rateMode"] = "material"
+        material["materialRates"] = {"Si": 0.2}
+        material_params = parse_step(plane_project(2), material)
+        self.assertIsNotNone(material_params)
+        assert material_params is not None
+        self.assertEqual(material_params.rateMode, "material")
+        self.assertEqual(material_params.rateMagnitude, 0.0)
+        material_resolved = registry.resolve_step(plane_project(2), material)
+        self.assertIsNotNone(material_resolved)
+
         unsupported = isotropic_step("etch", rate=0.2, duration=0.5)
-        unsupported["rateMode"] = "material"
-        unsupported["materialRates"] = {"Si": 0.2}
+        unsupported["isotropicMethod"] = "geometric"
         self.assertIsNone(parse_step(plane_project(2), unsupported))
         self.assertIsNone(registry.resolve_step(plane_project(2), unsupported))
 

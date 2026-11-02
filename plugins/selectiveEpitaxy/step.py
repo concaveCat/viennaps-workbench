@@ -86,4 +86,10 @@ def parse_step(project: Mapping[str, Any], step: Mapping[str, Any]) -> Selective
     if "nvFactors" in raw:
         values["nvFactors"] = nv_factors(raw["nvFactors"], "nativeParameters.nvFactors")
 
+    advection = step.get("advection")
+    if advection is not None:
+        if not isinstance(advection, Mapping):
+            raise ValueError("selectiveEpitaxy advection must be a JSON object or null")
+        values["advection"] = dict(advection)
+
     return SelectiveEpitaxyParams(**values)

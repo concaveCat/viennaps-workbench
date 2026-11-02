@@ -861,6 +861,29 @@ def _validate_materials(project: ProjectV3 | ProjectV4 | ProjectV5 | ProjectV6 |
                 issues.append(FieldIssue(f"steps[{i}].selectivityReference",f"unknown reference material {reference!r}"))
         if is_geometry_step(step) and step_value(step,"model")=="removeMaterial" and step_value(step,"material") not in names:
             issues.append(FieldIssue(f"steps[{i}].material",f"unknown or unavailable material {step_value(step,'material')!r}"))
+        if is_geometry_step(step) and step_value(step,"model")=="insertBox":
+            box_material = step_value(step,"material")
+            if box_material not in names:
+                issues.append(FieldIssue(f"steps[{i}].material",f"unknown or unavailable material {box_material!r}; choose a material from /api/materials"))
+        if step_value(step,"model")=="particleShape":
+            deposit = step_value(step,"depositMaterial")
+            if deposit is not None and deposit not in names:
+                issues.append(FieldIssue(
+                    f"steps[{i}].depositMaterial",
+                    f"unknown or unavailable material {deposit!r}; choose a material from /api/materials"))
+            masks = step_value(step,"maskMaterials")
+            if masks is not None:
+                mask_mode = step_value(step,"maskMode") or "explicit"
+                for mask_index, name in enumerate(masks):
+                    if name not in names:
+                        issues.append(FieldIssue(
+                            f"steps[{i}].maskMaterials[{mask_index}]",
+                            f"unknown or unavailable material {name!r}; choose a material from /api/materials"))
+                    elif mask_mode == "explicit" and name not in available_names:
+                        issues.append(FieldIssue(
+                            f"steps[{i}].maskMaterials[{mask_index}]",
+                            f"material {name!r} is not present when this step runs; an explicit particleShape "
+                            "mask must come from the initial geometry or an earlier enabled deposition"))
         if is_geometry_step(step) and step_value(step,"model")=="planarize":
             cutoff_height = step_value(step,"cutoffHeight")
             stop_material = step_value(step,"stopMaterial")
@@ -945,6 +968,12 @@ def _materials_available_by_step(project: Any) -> list[tuple[set[str], set[str]]
         per_step.append((set(executed), set(planned)))
         if step_value(step, "operation") == "deposit":
             name = step_value(step, "depositMaterial")
+            if isinstance(name, str) and name:
+                planned.add(name)
+                if step_value(step, "enabled"):
+                    executed.add(name)
+        elif step_value(step, "model") == "insertBox":
+            name = step_value(step, "material")
             if isinstance(name, str) and name:
                 planned.add(name)
                 if step_value(step, "enabled"):

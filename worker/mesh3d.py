@@ -12,6 +12,9 @@ def configure_material_catalog(rows):
 def make_domain(ps, requested):
     d=requested['domain']
     b=ps.BoundaryType.REFLECTIVE_BOUNDARY if d['boundaryXY']=='reflective' else ps.BoundaryType.PERIODIC_BOUNDARY
+    if d.get('bounds') is not None:
+        bounds=[float(value) for value in d['bounds']]
+        return ps.Domain(bounds,[b,b,ps.BoundaryType.INFINITE_BOUNDARY],float(d['gridDelta']))
     return ps.Domain(float(d['gridDelta']),float(d['xExtent']),float(d['yExtent']),b)
 
 

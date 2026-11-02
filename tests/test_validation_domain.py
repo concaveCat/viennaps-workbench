@@ -183,7 +183,7 @@ class DomainBranchErrors(unittest.TestCase):
                              "boundaryXY": "reflective"}
         parsed = parse_project(copy.deepcopy(project))
         self.assertIsInstance(parsed.domain, Domain3D)
-        self.assertEqual(parsed.model_dump(mode="json")["domain"],
+        self.assertEqual(parsed.model_dump(mode="json", exclude_none=True)["domain"],
                          {"gridDelta": 0.004, "xExtent": 0.48, "yExtent": 0.5,
                           "boundaryXY": "reflective"})
 

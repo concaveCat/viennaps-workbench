@@ -120,6 +120,81 @@
         "title": "AdoptProjectResponse",
         "type": "object"
       },
+      "AdvectionOverride": {
+        "additionalProperties": false,
+        "description": "One step's native ``AdvectionParameters`` overrides.\n\n``maxDissipation`` is the static\n``StencilLocalLaxFriedrichsScalar.setMaxDissipation`` value. It is only\nmeaningful when the effective spatial scheme is\n``STENCIL_LOCAL_LAX_FRIEDRICHS_1ST_ORDER``; the variant checks the effective\nscheme (step override or project default) before applying it.",
+        "properties": {
+          "maxDissipation": {
+            "anyOf": [
+              {
+                "maximum": 1000000.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Maxdissipation"
+          },
+          "spatialScheme": {
+            "anyOf": [
+              {
+                "enum": [
+                  "ENGQUIST_OSHER_1ST_ORDER",
+                  "ENGQUIST_OSHER_2ND_ORDER",
+                  "LAX_FRIEDRICHS_1ST_ORDER",
+                  "LAX_FRIEDRICHS_2ND_ORDER",
+                  "LOCAL_LAX_FRIEDRICHS_ANALYTICAL_1ST_ORDER",
+                  "LOCAL_LOCAL_LAX_FRIEDRICHS_1ST_ORDER",
+                  "LOCAL_LOCAL_LAX_FRIEDRICHS_2ND_ORDER",
+                  "LOCAL_LAX_FRIEDRICHS_1ST_ORDER",
+                  "LOCAL_LAX_FRIEDRICHS_2ND_ORDER",
+                  "STENCIL_LOCAL_LAX_FRIEDRICHS_1ST_ORDER",
+                  "WENO_3RD_ORDER",
+                  "WENO_5TH_ORDER"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Spatialscheme"
+          },
+          "temporalScheme": {
+            "anyOf": [
+              {
+                "enum": [
+                  "FORWARD_EULER",
+                  "RUNGE_KUTTA_2ND_ORDER",
+                  "RUNGE_KUTTA_3RD_ORDER"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Temporalscheme"
+          },
+          "timeStepRatio": {
+            "anyOf": [
+              {
+                "maximum": 0.5,
+                "minimum": 0.05,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timestepratio"
+          }
+        },
+        "title": "AdvectionOverride",
+        "type": "object"
+      },
       "AdvectionSettingsV7": {
         "additionalProperties": false,
         "properties": {
@@ -2443,18 +2518,18 @@
       },
       "DirectionalMaterialRate": {
         "additionalProperties": false,
-        "description": "One native ``RateMap`` entry: non-negative directional/isotropic rates.\n\nThe step ``operation`` supplies the native sign (etch negative, deposit\npositive), exactly like the scalar fields. A material that is absent from\nthe table falls back to ``DirectionalStepV5.defaultMaterialRate``.",
+        "description": "One native ``RateMap`` entry.\n\nIn the default ``rateSigns=\"operation\"`` mode both values are non-negative\nrequested magnitudes and the step ``operation`` supplies the native sign.\n``rateSigns=\"native\"`` passes the values verbatim, which is required to\ntranslate a native script such as the FinFET example that mixes a positive\ndirectional etch rate with a positive isotropic growth rate. A material\nabsent from the table falls back to ``DirectionalStepV5.defaultMaterialRate``.",
         "properties": {
           "directional": {
             "default": 0.0,
-            "ge": 0,
+            "ge": -2,
             "le": 2,
             "title": "Directional",
             "type": "number"
           },
           "isotropic": {
             "default": 0.0,
-            "ge": 0,
+            "ge": -2,
             "le": 2,
             "title": "Isotropic",
             "type": "number"
@@ -2524,6 +2599,16 @@
       "DirectionalStepV5": {
         "additionalProperties": false,
         "properties": {
+          "advection": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AdvectionOverride"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "calculateVisibility": {
             "default": true,
             "title": "Calculatevisibility",
@@ -2659,6 +2744,21 @@
               }
             ],
             "title": "Ratesets"
+          },
+          "rateSigns": {
+            "anyOf": [
+              {
+                "enum": [
+                  "operation",
+                  "native"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ratesigns"
           }
         },
         "required": [
@@ -2824,6 +2924,22 @@
             "title": "Boundaryxy",
             "type": "string"
           },
+          "bounds": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "number"
+                },
+                "maxItems": 6,
+                "minItems": 6,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bounds"
+          },
           "gridDelta": {
             "gt": 0,
             "le": 0.5,
@@ -2831,13 +2947,13 @@
             "type": "number"
           },
           "xExtent": {
-            "ge": 0.1,
+            "ge": 0.01,
             "le": 40,
             "title": "Xextent",
             "type": "number"
           },
           "yExtent": {
-            "ge": 0.1,
+            "ge": 0.01,
             "le": 40,
             "title": "Yextent",
             "type": "number"
@@ -4954,6 +5070,69 @@
           }
         },
         "title": "ImplicitSolverOptionsV7",
+        "type": "object"
+      },
+      "InsertBoxStepV7": {
+        "additionalProperties": false,
+        "description": "Insert a native ``viennals.Box`` level set as a new material.\n\nReproduces the FinFET script's double-patterning mask::\n\n    box = ps.LevelSet(domain.getGrid())\n    ps.MakeGeometry(box, ps.Box(min, max)).apply()\n    domain.insertNextLevelSetAsMaterial(box, material)\n\n``min``/``max`` are absolute project coordinates in um. The box is inserted\nabove the current top level set, so the material order grows by one.",
+        "properties": {
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "id": {
+            "maxLength": 64,
+            "minLength": 8,
+            "pattern": "^[A-Za-z0-9_-]+$",
+            "title": "Id",
+            "type": "string"
+          },
+          "material": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Material",
+            "type": "string"
+          },
+          "max": {
+            "items": {
+              "type": "number"
+            },
+            "maxItems": 3,
+            "minItems": 3,
+            "title": "Max",
+            "type": "array"
+          },
+          "min": {
+            "items": {
+              "type": "number"
+            },
+            "maxItems": 3,
+            "minItems": 3,
+            "title": "Min",
+            "type": "array"
+          },
+          "model": {
+            "const": "insertBox",
+            "title": "Model",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "enabled",
+          "model",
+          "min",
+          "max",
+          "material"
+        ],
+        "title": "InsertBoxStepV7",
         "type": "object"
       },
       "IonParticleV7": {
@@ -7870,6 +8049,19 @@
             "default": false,
             "title": "Volumemesh",
             "type": "boolean"
+          },
+          "volumeMeshDelta": {
+            "anyOf": [
+              {
+                "gt": 0,
+                "le": 1,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Volumemeshdelta"
           }
         },
         "title": "OutputSettingsV7",
@@ -7946,8 +8138,21 @@
       },
       "ParticleShapeStepV7": {
         "additionalProperties": false,
-        "description": "Native ``BoxDistribution`` / ``SphereDistribution`` geometry offset.\n\nThese are ViennaLS geometric-advection distributions, not velocity models:\n``ps.Process(domain, model, duration)`` ignores the duration and moves the\nexposed surface by exactly one radius / half-axis set. A masked *etch*\nthrough ``addMaskMaterial`` is the officially supported native combination\nand uses the project's geometry mask materials; a masked *deposition*\nSIGSEGVs in 2D and 3D on 4.6.2 and 4.7.0, so depositions stay maskless and\nthe run record lists the omitted mask materials. ``operation`` only selects\nthe sign (deposit grows, etch erodes); individual half-axes are positive\nmagnitudes.",
+        "description": "Native ``BoxDistribution`` / ``SphereDistribution`` geometry offset.\n\nThese are ViennaLS geometric-advection distributions, not velocity models:\n``ps.Process(domain, model, duration)`` ignores the duration and moves the\nexposed surface by exactly one radius / half-axis set. A masked *etch*\nthrough ``addMaskMaterial`` is the officially supported native combination.\nA masked *deposition* SIGSEGVs in 2D and 3D on 4.6.2 and 4.7.0, so\ndepositions stay maskless and validation rejects an explicit mask request.\n\n``depositMaterial`` reproduces the native ``duplicateTopLevelSet(material)``\nthat precedes a geometric deposition in the FinFET example. Omitted keeps\nthe historical \"move the current top level set only\" behaviour. Omitted\nexplicit ``maskMaterials`` keep deriving the mask from the project geometry;\n``maskMode=\"allExcept\"`` reproduces ``getMaterialsInDomain()`` minus the\nlisted materials (the native spacer etch).",
         "properties": {
+          "depositMaterial": {
+            "anyOf": [
+              {
+                "maxLength": 80,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Depositmaterial"
+          },
           "enabled": {
             "title": "Enabled",
             "type": "boolean"
@@ -7976,6 +8181,38 @@
             "pattern": "^[A-Za-z0-9_-]+$",
             "title": "Id",
             "type": "string"
+          },
+          "maskMaterials": {
+            "anyOf": [
+              {
+                "items": {
+                  "maxLength": 80,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "maxItems": 64,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Maskmaterials"
+          },
+          "maskMode": {
+            "anyOf": [
+              {
+                "enum": [
+                  "explicit",
+                  "allExcept"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Maskmode"
           },
           "model": {
             "const": "particleShape",
@@ -8395,11 +8632,13 @@
                   "directional": "#/components/schemas/DirectionalStepV5",
                   "gdsBoolean": "#/components/schemas/GdsBooleanStepV7",
                   "implant": "#/components/schemas/ImplantStepV7",
+                  "insertBox": "#/components/schemas/InsertBoxStepV7",
                   "isotropic": "#/components/schemas/StepV4",
                   "multiParticle": "#/components/schemas/MultiParticleStepV7",
                   "particleShape": "#/components/schemas/ParticleShapeStepV7",
                   "planarize": "#/components/schemas/PlanarizeStepV5",
                   "removeMaterial": "#/components/schemas/RemoveMaterialStepV5",
+                  "removeTopLevelSet": "#/components/schemas/RemoveTopLevelSetStepV7",
                   "singleParticle": "#/components/schemas/StepV4",
                   "specialized": "#/components/schemas/SpecializedStepV7"
                 },
@@ -8444,6 +8683,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/AnalysisStepV7"
+                },
+                {
+                  "$ref": "#/components/schemas/InsertBoxStepV7"
+                },
+                {
+                  "$ref": "#/components/schemas/RemoveTopLevelSetStepV7"
                 }
               ]
             },
@@ -8882,6 +9127,42 @@
           "material"
         ],
         "title": "RemoveMaterialStepV5",
+        "type": "object"
+      },
+      "RemoveTopLevelSetStepV7": {
+        "additionalProperties": false,
+        "description": "Remove the last native level set (``domain.removeTopLevelSet()``).",
+        "properties": {
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "id": {
+            "maxLength": 64,
+            "minLength": 8,
+            "pattern": "^[A-Za-z0-9_-]+$",
+            "title": "Id",
+            "type": "string"
+          },
+          "model": {
+            "const": "removeTopLevelSet",
+            "title": "Model",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "enabled",
+          "model"
+        ],
+        "title": "RemoveTopLevelSetStepV7",
         "type": "object"
       },
       "ReportRequest": {
@@ -10155,6 +10436,16 @@
               }
             ]
           },
+          "advection": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AdvectionOverride"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "depositMaterial": {
             "anyOf": [
               {
@@ -10353,6 +10644,16 @@
       "StepV4": {
         "additionalProperties": false,
         "properties": {
+          "advection": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AdvectionOverride"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "depositMaterial": {
             "anyOf": [
               {
@@ -12433,6 +12734,48 @@
         "summary": "Snapshot Get"
       }
     },
+    "/api/runs/{run_id}/v2": {
+      "get": {
+        "description": "Return the v2 plan/output/state records for one run, if present.",
+        "operationId": "run_v2_get_api_runs__run_id__v2_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Run V2 Get Api Runs  Run Id  V2 Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Run V2 Get"
+      }
+    },
     "/api/settings": {
       "get": {
         "description": "Return persistent limits, storage usage, and installed engine versions.",
@@ -13736,6 +14079,30 @@
           }
         },
         "summary": "Get Equivalence",
+        "tags": [
+          "workflow"
+        ]
+      }
+    },
+    "/api/v1/workflow/execution-catalog": {
+      "get": {
+        "description": "Return the locked process/field/geometry catalog for UI consumers.",
+        "operationId": "execution_catalog_endpoint_api_v1_workflow_execution_catalog_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Execution Catalog Endpoint Api V1 Workflow Execution Catalog Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Execution Catalog Endpoint",
         "tags": [
           "workflow"
         ]

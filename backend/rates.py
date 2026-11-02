@@ -6,7 +6,10 @@ from typing import Any
 
 from process_models.v2.engines.viennaps import signed_rates as signed_rates
 
-GEOMETRY_MODELS = {"removeMaterial", "planarize", "boolean", "gdsBoolean", "particleShape"}
+GEOMETRY_MODELS = {
+    "removeMaterial", "planarize", "boolean", "gdsBoolean", "particleShape",
+    "insertBox", "removeTopLevelSet",
+}
 
 
 def value(step: Any, key: str, default: Any = None) -> Any:
@@ -38,14 +41,14 @@ def has_motion(step: Any) -> bool:
             # default row, so both the table and the default contribute motion.
             table = material_rates or {}
             if any(
-                float(value(row, "directional", 0.0)) > 0.0
-                or float(value(row, "isotropic", 0.0)) > 0.0
+                float(value(row, "directional", 0.0)) != 0.0
+                or float(value(row, "isotropic", 0.0)) != 0.0
                 for row in table.values()
             ):
                 return True
             return (
-                float(value(default_material_rate, "directional", 0.0)) > 0.0
-                or float(value(default_material_rate, "isotropic", 0.0)) > 0.0
+                float(value(default_material_rate, "directional", 0.0)) != 0.0
+                or float(value(default_material_rate, "isotropic", 0.0)) != 0.0
             )
         rate_sets = value(step, "rateSets")
         if rate_sets is not None:

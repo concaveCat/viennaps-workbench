@@ -9,6 +9,7 @@ import json
 from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationError, field_validator, model_validator
+from process_models.v2.options import AdvectionOverride
 from .materials import MaterialDefinition
 from .implant_models import reserved_label_error
 from .runtime_limits import MAX_CELL_SET_CELLS, available_cpu_threads
@@ -73,10 +74,11 @@ class Units(StrictModel):
 
 # Minimum lateral 3D domain size in um. A domain must hold real structure
 # (a 22 nm FinFET cell is 0.48 x 0.50 um), so the historical 1 um floor was an
-# arbitrary UI limit, not a native requirement. 0.1 um still rejects a
-# degenerate or zero-sized domain, and ``Domain3D`` additionally requires two
-# grid intervals per axis below.
-MIN_DOMAIN_EXTENT_3D = 0.1
+# arbitrary UI limit, not a native requirement. The FinFET acceptance example
+# uses a 0.09 x 0.10 um cell. 0.01 um still rejects a degenerate or
+# zero-sized domain, and ``Domain3D`` additionally requires two grid intervals
+# per axis below.
+MIN_DOMAIN_EXTENT_3D = 0.01
 
 
 class Domain(StrictModel):
@@ -244,6 +246,24 @@ class Domain3D(StrictModel):
     xExtent: Annotated[Number, Field(ge=MIN_DOMAIN_EXTENT_3D, le=40)]
     yExtent: Annotated[Number, Field(ge=MIN_DOMAIN_EXTENT_3D, le=40)]
     boundaryXY: Literal["reflective", "periodic"]
+    #: Optional absolute native bounds ``[xmin, xmax, ymin, ymax, zmin, zmax]``.
+    #: The centered ``xExtent``/``yExtent`` constructor used by the UI cannot
+    #: reproduce a native script whose bounds start at a non-centered origin:
+    #: it always creates an odd number of grid points per axis. The FinFET
+    #: acceptance fixture uses this field to reproduce the original
+    #: ``ps.Domain(bounds, ...)`` grid exactly. Omitted keeps the historical
+    #: centered domain byte-for-byte (and out of the request hash).
+    bounds: Annotated[list[Number], Field(min_length=6, max_length=6)] | None = None
+
+    @field_validator("xExtent", "yExtent")
+    @classmethod
+    def extent_spans_two_cells(cls, value: float, info: Any) -> float:
+        delta = info.data.get("gridDelta")
+        if delta is not None and float(value) < 2.0 * float(delta):
+            raise ValueError(
+                f"must span at least two grid intervals ({2.0 * float(delta):g} um for "
+                f"gridDelta={float(delta):g})")
+        return value
 
     @model_validator(mode="after")
     def lateral_extent_spans_two_cells(self) -> "Domain3D":
@@ -254,6 +274,22 @@ class Domain3D(StrictModel):
         if smallest < minimum:
             raise ValueError(f"xExtent and yExtent must span at least two grid intervals "
                              f"({minimum:g} um for gridDelta={float(self.gridDelta):g})")
+        if self.bounds is not None:
+            xmin, xmax, ymin, ymax, zmin, zmax = (float(value) for value in self.bounds)
+            if not xmax > xmin or not ymax > ymin or not zmax > zmin:
+                raise ValueError("bounds must be ordered [xmin, xmax, ymin, ymax, zmin, zmax]")
+            for label, span, extent in (
+                ("x", xmax - xmin, float(self.xExtent)),
+                ("y", ymax - ymin, float(self.yExtent)),
+            ):
+                if abs(span - extent) > 1e-9:
+                    raise ValueError(f"bounds {label} span {span:g} must equal {label}Extent {extent:g}")
+                if span < minimum:
+                    raise ValueError(f"bounds {label} span must be at least two grid intervals ({minimum:g} um)")
+                if span > 40.0:
+                    raise ValueError(f"bounds {label} span must stay within 40 um")
+            if abs(zmin) / float(self.gridDelta) > 1_000_000 or abs(zmax) / float(self.gridDelta) > 1_000_000:
+                raise ValueError("bounds z coordinates exceed the application coordinate budget")
         return self
 
 
@@ -834,6 +870,9 @@ class StepV4(StrictModel):
     # geometric safety rules; validation only has to admit it.
     isotropicMethod: Literal["auto", "levelSet", "geometric"] | None = None
     isotropicTimeStepRatio: Annotated[Number, Field(ge=0.05, le=0.5)] | None = None
+    #: Optional native advection override for this step. Omitted keeps the
+    #: project solver default (and stays out of the canonical request hash).
+    advection: AdvectionOverride | None = None
 
     @model_validator(mode="after")
     def validate_rate_and_model_fields(self):
@@ -847,6 +886,14 @@ class StepV4(StrictModel):
             raise ValueError("particle parameters apply only to singleParticle")
         if self.model != "isotropic" and ({"isotropicMethod", "isotropicTimeStepRatio"} & self.model_fields_set):
             raise ValueError("isotropicMethod and isotropicTimeStepRatio apply only to isotropic steps")
+        if self.model != "isotropic" and self.advection is not None:
+            raise ValueError("advection override applies only to isotropic steps in this schema")
+        if self.advection is not None and self.isotropicTimeStepRatio is not None:
+            requested = self.advection.timeStepRatio
+            if requested is not None and abs(float(requested) - float(self.isotropicTimeStepRatio)) > 1e-12:
+                raise ValueError(
+                    "advection.timeStepRatio and isotropicTimeStepRatio disagree; "
+                    "set only one step-level ratio")
         if self.isotropicMethod == "geometric" and self.rateMode == "material":
             # A geometric advection cannot carry a per-material rate table: it
             # offsets the whole exposed surface by one uniform radius.
@@ -947,15 +994,18 @@ class DirectionalRateSetV5(StrictModel):
 
 
 class DirectionalMaterialRate(StrictModel):
-    """One native ``RateMap`` entry: non-negative directional/isotropic rates.
+    """One native ``RateMap`` entry.
 
-    The step ``operation`` supplies the native sign (etch negative, deposit
-    positive), exactly like the scalar fields. A material that is absent from
-    the table falls back to ``DirectionalStepV5.defaultMaterialRate``.
+    In the default ``rateSigns="operation"`` mode both values are non-negative
+    requested magnitudes and the step ``operation`` supplies the native sign.
+    ``rateSigns="native"`` passes the values verbatim, which is required to
+    translate a native script such as the FinFET example that mixes a positive
+    directional etch rate with a positive isotropic growth rate. A material
+    absent from the table falls back to ``DirectionalStepV5.defaultMaterialRate``.
     """
 
-    directional: Annotated[Number, Field(ge=0, le=2)] = 0.0
-    isotropic: Annotated[Number, Field(ge=0, le=2)] = 0.0
+    directional: Annotated[Number, Field(ge=-2, le=2)] = 0.0
+    isotropic: Annotated[Number, Field(ge=-2, le=2)] = 0.0
 
 
 class DirectionalStepV5(StrictModel):
@@ -979,8 +1029,12 @@ class DirectionalStepV5(StrictModel):
     # absent table never enters the canonical request hash.
     materialRates: dict[str, DirectionalMaterialRate] | None = None
     defaultMaterialRate: DirectionalMaterialRate | None = None
+    #: ``native`` passes the table to the native constructor unchanged. Omitted
+    #: keeps the historical operation-sign mapping and stays out of the hash.
+    rateSigns: Literal["operation", "native"] | None = None
     duration: Annotated[Number, Field(ge=0.01, le=600)]
     depositMaterial: str | None = None
+    advection: AdvectionOverride | None = None
 
     @model_validator(mode="after")
     def validate_directional_fields(self):
@@ -989,6 +1043,8 @@ class DirectionalStepV5(StrictModel):
         # like an omitted field so clients that always serialize the key keep
         # the historical scalar/rateSets behaviour.
         material_mode = self.materialRates is not None or self.defaultMaterialRate is not None
+        if self.rateSigns is not None and not material_mode:
+            raise ValueError("rateSigns applies only to materialRates mode")
         if material_mode:
             table = self.materialRates or {}
             if "directionalRateMagnitude" in self.model_fields_set or "isotropicRateMagnitude" in self.model_fields_set:
@@ -1005,11 +1061,24 @@ class DirectionalStepV5(StrictModel):
                 raise ValueError(
                     "material rate mode has no native visibility control; omit calculateVisibility "
                     "instead of materializing it (or leave it true)")
+            if self.rateSigns != "native":
+                negative = sorted(
+                    name for name, row in table.items()
+                    if float(row.directional) < 0.0 or float(row.isotropic) < 0.0)
+                if self.defaultMaterialRate is not None and (
+                    float(self.defaultMaterialRate.directional) < 0.0
+                    or float(self.defaultMaterialRate.isotropic) < 0.0
+                ):
+                    negative.append("defaultMaterialRate")
+                if negative:
+                    raise ValueError(
+                        "material rates must be non-negative unless rateSigns='native': "
+                        + ", ".join(negative))
             default = self.defaultMaterialRate
             effective = any(
-                float(row.directional) > 0.0 or float(row.isotropic) > 0.0 for row in table.values()
+                float(row.directional) != 0.0 or float(row.isotropic) != 0.0 for row in table.values()
             ) or (default is not None
-                  and (float(default.directional) > 0.0 or float(default.isotropic) > 0.0))
+                  and (float(default.directional) != 0.0 or float(default.isotropic) != 0.0))
             if not effective:
                 raise ValueError(
                     "material rate mode requires at least one nonzero directional or isotropic rate")
@@ -1235,6 +1304,10 @@ class SpecializedStepV7(StrictModel):
     nativeParameters: dict[str, Any]
     surfaceDiffusion: SurfaceDiffusionV7 | None = None
     advancedOxidation: OxidationAdvancedV7 | None = None
+    #: Step-level native advection override. Only selective epitaxy needs it
+    #: today (the FinFET example's stencil-local scheme); the other specialized
+    #: models keep the project default.
+    advection: AdvectionOverride | None = None
 
     @model_validator(mode="after")
     def check_specialized_shape(self):
@@ -1244,6 +1317,8 @@ class SpecializedStepV7(StrictModel):
             raise ValueError(f"unknown installed ViennaPS specialized model {self.nativeModel!r}")
         if self.operation != spec["operation"]:
             raise ValueError(f"{self.nativeModel} requires operation={spec['operation']!r}")
+        if self.advection is not None and self.nativeModel != "selectiveEpitaxy":
+            raise ValueError("advection override is only available for specialized:selectiveEpitaxy")
         if self.nativeModel == "oxidation":
             if self.duration is not None:
                 raise ValueError("oxidation duration comes from nativeParameters.timeHours; omit duration")
@@ -1374,12 +1449,16 @@ class ParticleShapeStepV7(StrictModel):
     These are ViennaLS geometric-advection distributions, not velocity models:
     ``ps.Process(domain, model, duration)`` ignores the duration and moves the
     exposed surface by exactly one radius / half-axis set. A masked *etch*
-    through ``addMaskMaterial`` is the officially supported native combination
-    and uses the project's geometry mask materials; a masked *deposition*
-    SIGSEGVs in 2D and 3D on 4.6.2 and 4.7.0, so depositions stay maskless and
-    the run record lists the omitted mask materials. ``operation`` only selects
-    the sign (deposit grows, etch erodes); individual half-axes are positive
-    magnitudes.
+    through ``addMaskMaterial`` is the officially supported native combination.
+    A masked *deposition* SIGSEGVs in 2D and 3D on 4.6.2 and 4.7.0, so
+    depositions stay maskless and validation rejects an explicit mask request.
+
+    ``depositMaterial`` reproduces the native ``duplicateTopLevelSet(material)``
+    that precedes a geometric deposition in the FinFET example. Omitted keeps
+    the historical "move the current top level set only" behaviour. Omitted
+    explicit ``maskMaterials`` keep deriving the mask from the project geometry;
+    ``maskMode="allExcept"`` reproduces ``getMaterialsInDomain()`` minus the
+    listed materials (the native spacer etch).
     """
 
     id: Annotated[str, Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")]
@@ -1390,6 +1469,9 @@ class ParticleShapeStepV7(StrictModel):
     shape: Literal["box", "sphere"]
     radius: ShapeAxis | None = None
     halfAxes: Annotated[list[ShapeAxis], Field(min_length=2, max_length=3)] | None = None
+    depositMaterial: Annotated[str, Field(min_length=1, max_length=80)] | None = None
+    maskMaterials: Annotated[list[Annotated[str, Field(min_length=1, max_length=80)]], Field(max_length=64)] | None = None
+    maskMode: Literal["explicit", "allExcept"] | None = None
 
     @model_validator(mode="after")
     def check_shape_parameters(self) -> "ParticleShapeStepV7":
@@ -1403,6 +1485,19 @@ class ParticleShapeStepV7(StrictModel):
                 raise ValueError("box particleShape requires halfAxes")
             if self.radius is not None:
                 raise ValueError("radius applies only to shape=sphere")
+        if self.operation == "etch" and self.depositMaterial is not None:
+            raise ValueError("depositMaterial applies only to deposit particleShape steps")
+        if self.maskMaterials is not None:
+            if any(not name.strip() for name in self.maskMaterials):
+                raise ValueError("maskMaterials entries must be non-empty material names")
+            if len(set(self.maskMaterials)) != len(self.maskMaterials):
+                raise ValueError("maskMaterials must not contain duplicate material names")
+        if self.maskMode is not None and self.maskMaterials is None:
+            raise ValueError("maskMode requires an explicit maskMaterials list")
+        if self.operation == "deposit" and (self.maskMaterials is not None or self.maskMode is not None):
+            raise ValueError(
+                "particleShape.maskMaterials/maskMode are not supported for deposition: "
+                "ViennaPS 4.6.2/4.7.0 SIGSEGV on a non-empty mask with positive geometric advection")
         return self
 
 
@@ -1819,8 +1914,46 @@ class AnalysisStepV7(StrictModel):
         return self
 
 
+class InsertBoxStepV7(StrictModel):
+    """Insert a native ``viennals.Box`` level set as a new material.
+
+    Reproduces the FinFET script's double-patterning mask::
+
+        box = ps.LevelSet(domain.getGrid())
+        ps.MakeGeometry(box, ps.Box(min, max)).apply()
+        domain.insertNextLevelSetAsMaterial(box, material)
+
+    ``min``/``max`` are absolute project coordinates in um. The box is inserted
+    above the current top level set, so the material order grows by one.
+    """
+
+    id: Annotated[str, Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")]
+    name: Annotated[str, Field(min_length=1, max_length=80)]
+    enabled: bool
+    model: Literal["insertBox"]
+    min: Vector3
+    max: Vector3
+    material: Annotated[str, Field(min_length=1, max_length=80)]
+
+    @model_validator(mode="after")
+    def check_box(self) -> "InsertBoxStepV7":
+        if any(float(high) <= float(low) for low, high in zip(self.min, self.max)):
+            raise ValueError("insertBox requires min < max on every axis")
+        return self
+
+
+class RemoveTopLevelSetStepV7(StrictModel):
+    """Remove the last native level set (``domain.removeTopLevelSet()``)."""
+
+    id: Annotated[str, Field(min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")]
+    name: Annotated[str, Field(min_length=1, max_length=80)]
+    enabled: bool
+    model: Literal["removeTopLevelSet"]
+
+
 StepV7 = Annotated[Union[StepV5, MultiParticleStepV7, SpecializedStepV7, GdsBooleanStepV7, CsvProcessStepV7,
-                         ParticleShapeStepV7, ImplantStepV7, AnnealStepV7, AnalysisStepV7],
+                         ParticleShapeStepV7, ImplantStepV7, AnnealStepV7, AnalysisStepV7,
+                         InsertBoxStepV7, RemoveTopLevelSetStepV7],
                    Field(discriminator="model")]
 
 
@@ -1854,7 +1987,7 @@ class DomainStateRef(StrictModel):
 
 def project_structure_hash(dimension: int, units: Units, domain: Domain | Domain3D, geometry: dict) -> str:
     payload = {"dimension": dimension, "units": units.model_dump(mode="json"),
-               "domain": domain.model_dump(mode="json"), "geometry": geometry}
+               "domain": domain.model_dump(mode="json", exclude_none=True), "geometry": geometry}
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
 
@@ -1890,6 +2023,12 @@ class ProjectV6(StrictModel):
         normalized_geometry = geometry.model_dump(mode="json", exclude_none=True)
         validate_geometry_native_flags(normalized_geometry, self.dimension,
                                        _project_boundary_name(self.domain))
+        if getattr(self.domain, "bounds", None) is not None and normalized_geometry.get("kind") != "plane":
+            # Absolute native bounds are a deliberate escape hatch for the
+            # plane-based FinFET fixture. The built-in/GDS geometry validators
+            # reason in the centered [-extent/2, extent/2] frame, so accepting
+            # bounds with them would validate the wrong coordinate frame.
+            raise ValueError("domain.bounds is currently supported only with plane geometry")
         object.__setattr__(self, "geometry", normalized_geometry)
         ids = [step.id for step in self.steps]
         if len(ids) != len(set(ids)):
@@ -1992,6 +2131,9 @@ class OutputSettingsV7(StrictModel):
     levelSetMeshes: bool = False
     surfaceMeshVtk: bool = False
     volumeMesh: bool = False
+    #: Native ``Domain.saveVolumeMesh`` wrapping-layer epsilon. Omitted keeps
+    #: the historical 0.01 um and stays out of the canonical request hash.
+    volumeMeshDelta: Annotated[Number, Field(gt=0, le=1)] | None = None
     nativeMetadata: bool = False
     cellSet: CellSetOutputV7 | None = None
 
@@ -2094,8 +2236,15 @@ class ProjectV7(ProjectV6):
                 raise ValueError(f"steps[{index}].gdsMask.baseHeight exceeds the application coordinate budget")
             if any(abs(float(value)) / delta > 1_000_000 for value in mask.position):
                 raise ValueError(f"steps[{index}].gdsMask.position exceeds the application coordinate budget")
+        for index, step in enumerate(self.steps):
+            if isinstance(step, InsertBoxStepV7):
+                if any(abs(float(value)) / delta > 1_000_000 for value in (*step.min, *step.max)):
+                    raise ValueError(f"steps[{index}].insertBox coordinates exceed the application coordinate budget")
         if self.dimension == 2 and self.outputSettings is not None and self.outputSettings.volumeMesh:
             raise ValueError("native volume mesh output is only available for 3D projects")
+        if (self.outputSettings is not None and self.outputSettings.volumeMeshDelta is not None
+                and not self.outputSettings.volumeMesh):
+            raise ValueError("outputSettings.volumeMeshDelta requires outputSettings.volumeMesh=true")
         cell_set = self.outputSettings.cellSet if self.outputSettings is not None else None
         if cell_set is not None and cell_set.enabled:
             delta = float(self.domain.gridDelta)

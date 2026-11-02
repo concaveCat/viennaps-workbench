@@ -209,6 +209,7 @@ class IsotropicNativeVariant(EngineVariant):
             ps,
             project,
             time_step_ratio=time_step_ratio,
+            override=getattr(params, "advection", None),
         )
         process.setParameters(advection)
         process.apply()
@@ -245,6 +246,7 @@ class IsotropicNativeVariant(EngineVariant):
                 "timeStepRatioSource",
                 "solver.timeStepRatio",
             ),
+            "advectionOverride": advection_actual.get("overrideFields", []),
             "nativeClass": "ps.IsotropicProcess",
             "fluxEngineType": execution["kernel"],
             "executionProfile": execution,

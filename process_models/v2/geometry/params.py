@@ -17,12 +17,40 @@ __all__ = [
     "BooleanParams",
     "GdsBooleanMaskParams",
     "GdsBooleanParams",
+    "InsertBoxParams",
     "ParticleShapeParams",
     "PlanarizeParams",
     "RemoveMaterialParams",
+    "RemoveTopLevelSetParams",
 ]
 
 _CONFIG = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+
+
+class InsertBoxParams(BaseModel):
+    """One native ``LevelSet`` + ``MakeGeometry(Box)`` insertion.
+
+    ``min``/``max`` are absolute project coordinates. The new level set is
+    inserted as ``material`` above the current top level set.
+    """
+
+    model_config = _CONFIG
+
+    min: Annotated[list[float], Field(min_length=3, max_length=3)]
+    max: Annotated[list[float], Field(min_length=3, max_length=3)]
+    material: str = Field(min_length=1, max_length=80)
+
+    @model_validator(mode="after")
+    def check_box(self) -> "InsertBoxParams":
+        if any(high <= low for low, high in zip(self.min, self.max)):
+            raise ValueError("insertBox requires min < max on every axis")
+        return self
+
+
+class RemoveTopLevelSetParams(BaseModel):
+    """One ``domain.removeTopLevelSet()`` call with no parameters."""
+
+    model_config = _CONFIG
 
 
 class PlanarizeParams(BaseModel):
@@ -50,7 +78,13 @@ class PlanarizeParams(BaseModel):
 
 
 class ParticleShapeParams(BaseModel):
-    """One native ``BoxDistribution`` / ``SphereDistribution`` displacement."""
+    """One native ``BoxDistribution`` / ``SphereDistribution`` displacement.
+
+    ``depositMaterial`` reproduces ``duplicateTopLevelSet`` before a positive
+    geometric offset. ``maskMaterials`` overrides the project's geometry mask
+    derivation; ``maskMode="allExcept"`` expands the domain's current materials
+    minus that list, matching the native FinFET spacer etch.
+    """
 
     model_config = _CONFIG
 
@@ -58,6 +92,9 @@ class ParticleShapeParams(BaseModel):
     shape: Literal["box", "sphere"]
     radius: float | None = Field(default=None, gt=0, le=2)
     halfAxes: Annotated[list[float], Field(min_length=2, max_length=3)] | None = None
+    depositMaterial: str | None = Field(default=None, min_length=1, max_length=80)
+    maskMaterials: Annotated[list[str], Field(max_length=64)] | None = None
+    maskMode: Literal["explicit", "allExcept"] | None = None
 
     @model_validator(mode="after")
     def check_shape_parameters(self) -> "ParticleShapeParams":
@@ -71,6 +108,20 @@ class ParticleShapeParams(BaseModel):
                 raise ValueError("box particleShape requires halfAxes")
             if self.radius is not None:
                 raise ValueError("radius applies only to shape=sphere")
+        if self.operation == "etch" and self.depositMaterial is not None:
+            raise ValueError("depositMaterial applies only to deposit particleShape steps")
+        if self.maskMaterials is not None:
+            if any(not name.strip() for name in self.maskMaterials):
+                raise ValueError("maskMaterials entries must be non-empty material names")
+            if len(set(self.maskMaterials)) != len(self.maskMaterials):
+                raise ValueError("maskMaterials must not contain duplicate material names")
+        if self.maskMode is not None and self.maskMaterials is None:
+            raise ValueError("maskMode requires an explicit maskMaterials list")
+        if self.operation == "deposit" and (self.maskMaterials is not None or self.maskMode is not None):
+            raise ValueError(
+                "masked particleShape deposition is not supported: ViennaPS 4.6.2/4.7.0 "
+                "SIGSEGV on a non-empty mask with positive geometric advection"
+            )
         return self
 
 

@@ -36,6 +36,8 @@ _ALLOWED_KEYS = frozenset(
         "rateSets",
         "materialRates",
         "defaultMaterialRate",
+        "rateSigns",
+        "advection",
         "depositMaterial",
     }
 )
@@ -179,6 +181,16 @@ def parse_step(project: Mapping[str, Any], step: Mapping[str, Any]) -> Direction
         values["defaultMaterialRate"] = (
             None if raw_default is None else _material_rate(raw_default, "defaultMaterialRate")
         )
+    if "rateSigns" in step:
+        raw_signs = step["rateSigns"]
+        if raw_signs is not None and raw_signs not in ("operation", "native"):
+            raise ValueError("rateSigns must be 'operation', 'native' or null")
+        values["rateSigns"] = raw_signs
+    if "advection" in step:
+        raw_advection = step["advection"]
+        if raw_advection is not None and not isinstance(raw_advection, Mapping):
+            raise ValueError("advection must be a JSON object or null")
+        values["advection"] = None if raw_advection is None else dict(raw_advection)
     if "depositMaterial" in step:
         raw_deposit = step["depositMaterial"]
         if raw_deposit is not None and (not isinstance(raw_deposit, str) or not raw_deposit):

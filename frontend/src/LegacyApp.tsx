@@ -54,7 +54,7 @@ const NATIVE_MAKEFIN_SIGSEGV_MODELS = new Set(['sf6o2', 'hbro2', 'sf6c4f8', 'neu
 // 0.48 x 0.50 um, so the old 1 um 3D floor blocked real layouts. The 2D domain
 // keeps its 1 um contract. Domain3D also requires at least two grid intervals
 // per lateral axis, so the UI floor follows gridDelta.
-const MIN_DOMAIN_EXTENT_3D = 0.1;
+const MIN_DOMAIN_EXTENT_3D = 0.01;
 const minThreeDExtent = (gridDelta: number) => Math.max(MIN_DOMAIN_EXTENT_3D, 2 * gridDelta);
 
 function newStepId(): string { return `step_${crypto.randomUUID().replaceAll('-', '').slice(0, 24)}`; }

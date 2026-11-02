@@ -125,6 +125,8 @@ CATALOG_MATERIAL_NAMES: tuple[str, ...] = (
     "W",
     "Cu",
     "PMMA",
+    "Metal",
+    "Dielectric",
 )
 
 POLYMER_MATERIAL = "Polymer"

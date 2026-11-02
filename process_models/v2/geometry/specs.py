@@ -12,25 +12,31 @@ from ..contract import ProcessSpec
 from .params import (
     BooleanParams,
     GdsBooleanParams,
+    InsertBoxParams,
     ParticleShapeParams,
     PlanarizeParams,
     RemoveMaterialParams,
+    RemoveTopLevelSetParams,
 )
 from .step import (
     parse_boolean,
     parse_gds_boolean,
+    parse_insert_box,
     parse_particle_shape,
     parse_planarize,
     parse_remove_material,
+    parse_remove_top_level_set,
 )
 
 __all__ = [
     "BooleanProcessSpec",
     "GdsBooleanProcessSpec",
     "GeometryProcessSpecs",
+    "InsertBoxProcessSpec",
     "ParticleShapeProcessSpec",
     "PlanarizeProcessSpec",
     "RemoveMaterialProcessSpec",
+    "RemoveTopLevelSetProcessSpec",
 ]
 
 PlanarizeProcessSpec = ProcessSpec(
@@ -113,10 +119,40 @@ RemoveMaterialProcessSpec = ProcessSpec(
     parse_step=parse_remove_material,
 )
 
+InsertBoxProcessSpec = ProcessSpec(
+    id="insertBox",
+    version="1.0.0",
+    label="Insert a native box level set as a material",
+    params_model=InsertBoxParams,
+    dimensions=(3,),
+    operations=("geometry",),
+    description=(
+        "Native ps.LevelSet + ps.MakeGeometry(ps.Box(min, max)) + domain.insertNextLevelSetAsMaterial(box, material)."
+    ),
+    default_variant="native",
+    execution_kind="geometry",
+    parse_step=parse_insert_box,
+)
+
+RemoveTopLevelSetProcessSpec = ProcessSpec(
+    id="removeTopLevelSet",
+    version="1.0.0",
+    label="Remove the top native level set",
+    params_model=RemoveTopLevelSetParams,
+    dimensions=(2, 3),
+    operations=("geometry",),
+    description="Native domain.removeTopLevelSet().",
+    default_variant="native",
+    execution_kind="geometry",
+    parse_step=parse_remove_top_level_set,
+)
+
 GeometryProcessSpecs = (
     PlanarizeProcessSpec,
     ParticleShapeProcessSpec,
     BooleanProcessSpec,
     GdsBooleanProcessSpec,
     RemoveMaterialProcessSpec,
+    InsertBoxProcessSpec,
+    RemoveTopLevelSetProcessSpec,
 )

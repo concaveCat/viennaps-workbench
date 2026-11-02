@@ -14,25 +14,31 @@ from .params import (
     BooleanParams,
     GdsBooleanMaskParams,
     GdsBooleanParams,
+    InsertBoxParams,
     ParticleShapeParams,
     PlanarizeParams,
     RemoveMaterialParams,
+    RemoveTopLevelSetParams,
 )
 from .register import register_geometry
 from .specs import (
     BooleanProcessSpec,
     GdsBooleanProcessSpec,
     GeometryProcessSpecs,
+    InsertBoxProcessSpec,
     ParticleShapeProcessSpec,
     PlanarizeProcessSpec,
     RemoveMaterialProcessSpec,
+    RemoveTopLevelSetProcessSpec,
 )
 from .step import (
     parse_boolean,
     parse_gds_boolean,
+    parse_insert_box,
     parse_particle_shape,
     parse_planarize,
     parse_remove_material,
+    parse_remove_top_level_set,
 )
 from .variants import GeometryVariant
 
@@ -46,16 +52,22 @@ __all__ = [
     "GeometryEngineError",
     "GeometryProcessSpecs",
     "GeometryVariant",
+    "InsertBoxParams",
+    "InsertBoxProcessSpec",
     "ParticleShapeParams",
     "ParticleShapeProcessSpec",
     "PlanarizeParams",
     "PlanarizeProcessSpec",
     "RemoveMaterialParams",
     "RemoveMaterialProcessSpec",
+    "RemoveTopLevelSetParams",
+    "RemoveTopLevelSetProcessSpec",
     "parse_boolean",
     "parse_gds_boolean",
+    "parse_insert_box",
     "parse_particle_shape",
     "parse_planarize",
     "parse_remove_material",
+    "parse_remove_top_level_set",
     "register_geometry",
 ]

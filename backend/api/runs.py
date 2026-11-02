@@ -644,7 +644,7 @@ async def continuation_project_get(run_id: str, step_id: str) -> dict[str, Any]:
             "name": f"{original.name[:72]} · 新工艺" if len(original.name) <= 72 else f"{original.name[:72]}新工艺",
             "dimension": original.dimension,
             "units": original.units.model_dump(mode="json"),
-            "domain": original.domain.model_dump(mode="json"),
+            "domain": original.domain.model_dump(mode="json", exclude_none=True),
             "geometry": geometry,
             "steps": [],
             "solver": solver,

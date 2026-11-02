@@ -977,12 +977,12 @@ const DEPOSIT_STEP_MODELS = new Set(['isotropic', 'singleParticle', 'directional
 // operations, and particleShape/implant/anneal/analysis carry their own time
 // fields — a stray `duration` makes the strict model reject the project.
 const DURATION_STEP_MODELS = new Set(['isotropic', 'singleParticle', 'directional', 'multiParticle', 'specialized', 'csvProcess']);
-const GEOMETRY_ONLY_STEP_MODELS = new Set(['gdsBoolean', 'planarize', 'removeMaterial', 'boolean']);
+const GEOMETRY_ONLY_STEP_MODELS = new Set(['gdsBoolean', 'planarize', 'removeMaterial', 'boolean', 'insertBox', 'removeTopLevelSet']);
 // Backend ProjectV7 domain floors. Domain.xExtent uses the historical 1 um
-// floor; Domain3D.x/yExtent use MIN_DOMAIN_EXTENT_3D (0.1) plus a two-cell
+// floor; Domain3D.x/yExtent use MIN_DOMAIN_EXTENT_3D (0.01) plus a two-cell
 // minimum. The form mirrors them so a backend-valid project can always save.
 const MIN_DOMAIN_EXTENT_2D = 1;
-const MIN_DOMAIN_EXTENT_3D = 0.1;
+const MIN_DOMAIN_EXTENT_3D = 0.01;
 const MAX_DOMAIN_EXTENT = 40;
 
 /**

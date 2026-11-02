@@ -12,6 +12,7 @@ re-export them for existing API/worker callers.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -205,14 +206,24 @@ def protected_material_names(project: dict[str, Any], step: dict[str, Any] | Non
 
 
 def configure_advection(
-    ps: Any, project: dict[str, Any], time_step_ratio: float | None = None
+    ps: Any,
+    project: dict[str, Any],
+    time_step_ratio: float | None = None,
+    override: Any | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Build the step's native AdvectionParameters.
 
     ``time_step_ratio`` is the step-level ``isotropicTimeStepRatio`` override.
-    It is applied to a freshly configured parameter object (never to the
-    saved project's solver defaults) and recorded under ``timeStepRatio`` so a
-    run remains auditable.
+    ``override`` is an optional :class:`process_models.v2.options.AdvectionOverride`
+    (or a mapping with the same fields). It is applied after the project
+    defaults to a freshly configured parameter object, never to the saved
+    project's solver block, and every applied value is recorded so a run stays
+    auditable.
+
+    ``maxDissipation`` is the native static
+    ``StencilLocalLaxFriedrichsScalar.setMaxDissipation`` value. It is only
+    meaningful for the stencil-local first-order scheme, so this helper rejects
+    it when neither the step nor the project selects that scheme.
     """
     params = ps.AdvectionParameters()
     params.timeStepRatio = float(project["solver"]["timeStepRatio"])
@@ -222,10 +233,11 @@ def configure_advection(
         actual["timeStepRatio"] = float(params.timeStepRatio)
         actual["solverTimeStepRatio"] = float(project["solver"]["timeStepRatio"])
         actual["timeStepRatioSource"] = "step.isotropicTimeStepRatio"
+    project_advection = None
     if project["schemaVersion"] >= 7:
-        requested = project["solver"]["advection"]
-        params.spatialScheme = getattr(ps.ls.SpatialSchemeEnum, requested["spatialScheme"])
-        params.temporalScheme = getattr(ps.ls.TemporalSchemeEnum, requested["temporalScheme"])
+        project_advection = project["solver"]["advection"]
+        params.spatialScheme = getattr(ps.ls.SpatialSchemeEnum, project_advection["spatialScheme"])
+        params.temporalScheme = getattr(ps.ls.TemporalSchemeEnum, project_advection["temporalScheme"])
         for name in (
             "adaptiveTimeStepping",
             "adaptiveTimeStepSubdivisions",
@@ -235,7 +247,7 @@ def configure_advection(
             "ignoreVoids",
             "velocityOutput",
         ):
-            setattr(params, name, requested[name])
+            setattr(params, name, project_advection[name])
         actual.update(
             {
                 name: getattr(params, name)
@@ -254,5 +266,55 @@ def configure_advection(
         actual["spatialSchemeValue"] = int(params.spatialScheme)
         actual["temporalScheme"] = params.temporalScheme.name
         actual["temporalSchemeValue"] = int(params.temporalScheme)
+        actual["nativeAdvectionMetadata"] = params.toMetaData()
+    if override is not None:
+
+        def field(name: str) -> Any:
+            if isinstance(override, Mapping):
+                return override.get(name)
+            return getattr(override, name, None)
+
+        requested_spatial = field("spatialScheme")
+        requested_temporal = field("temporalScheme")
+        requested_ratio = field("timeStepRatio")
+        max_dissipation = field("maxDissipation")
+        if requested_spatial is not None:
+            params.spatialScheme = getattr(ps.ls.SpatialSchemeEnum, str(requested_spatial))
+            actual["spatialScheme"] = params.spatialScheme.name
+            actual["spatialSchemeValue"] = int(params.spatialScheme)
+            actual["spatialSchemeSource"] = "step.advection"
+        if requested_temporal is not None:
+            params.temporalScheme = getattr(ps.ls.TemporalSchemeEnum, str(requested_temporal))
+            actual["temporalScheme"] = params.temporalScheme.name
+            actual["temporalSchemeValue"] = int(params.temporalScheme)
+            actual["temporalSchemeSource"] = "step.advection"
+        if requested_ratio is not None:
+            params.timeStepRatio = float(requested_ratio)
+            actual["timeStepRatio"] = float(params.timeStepRatio)
+            actual["solverTimeStepRatio"] = float(project["solver"]["timeStepRatio"])
+            actual["timeStepRatioSource"] = "step.advection.timeStepRatio"
+        actual["overrideApplied"] = True
+        actual["overrideFields"] = sorted(
+            name
+            for name in ("spatialScheme", "temporalScheme", "timeStepRatio", "maxDissipation")
+            if field(name) is not None
+        )
+        if max_dissipation is not None:
+            effective_scheme = (
+                str(requested_spatial)
+                if requested_spatial is not None
+                else str(project_advection["spatialScheme"])
+                if project_advection is not None
+                else ""
+            )
+            if effective_scheme != "STENCIL_LOCAL_LAX_FRIEDRICHS_1ST_ORDER":
+                raise ValueError(
+                    "advection.maxDissipation requires spatialScheme="
+                    "STENCIL_LOCAL_LAX_FRIEDRICHS_1ST_ORDER (step or project); "
+                    f"effective scheme is {effective_scheme or 'native-default'!r}"
+                )
+            ps.StencilLocalLaxFriedrichsScalar.setMaxDissipation(float(max_dissipation))
+            actual["maxDissipation"] = float(max_dissipation)
+            actual["maxDissipationSource"] = "step.advection.staticStencilLocalLaxFriedrichs"
         actual["nativeAdvectionMetadata"] = params.toMetaData()
     return params, actual

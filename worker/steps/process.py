@@ -500,6 +500,7 @@ def run_process_step(ctx: RunContext, index: int, step: dict[str, Any]) -> Proce
         time_step_ratio=(
             None if geometric_isotropic or isotropic_dispatch is None else step.get("isotropicTimeStepRatio")
         ),
+        override=None if geometric_isotropic else step.get("advection"),
     )
     if isotropic_dispatch is not None:
         if geometric_isotropic:

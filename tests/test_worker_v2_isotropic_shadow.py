@@ -362,23 +362,25 @@ class V2PluginShadowTests(_V2WorkerStepTestBase):
         self.assertEqual(_events_of(ctx.run_dir, "v2-plugin-shadow"), [])
         self.assertFalse((ctx.run_dir / "v2").exists())
 
-    def test_material_rate_mode_is_skipped_without_a_bridge_call(self) -> None:
+    def test_material_rate_mode_shadows_a_copy_and_matches_the_worker(self) -> None:
         step = isotropic_step("etch", rate=0.0, duration=1.0)
         step["rateMode"] = "material"
         step["materialRates"] = {"Si": 0.2}
         ctx = self._context("flag-on-material", step)
+        original_domain = ctx.domain
         before = _top(ctx.domain)
 
-        with _shadow_flag(True), mock.patch("worker.process_models_v2.run_v2_step") as bridge:
-            run_process_step(ctx, 1, step)
+        with _shadow_flag(True):
+            result = run_process_step(ctx, 1, step)
 
-        bridge.assert_not_called()
+        self.assertIs(ctx.domain, original_domain)
         self.assertAlmostEqual(_top(ctx.domain) - before, -0.2, delta=1e-6)
-        skipped = _events_of(ctx.run_dir, "v2-plugin-shadow-skipped")
-        self.assertEqual(len(skipped), 1, skipped)
-        self.assertEqual(skipped[0]["stepId"], step["id"])
-        self.assertIn("material", skipped[0]["reason"].lower())
-        self.assertEqual(_events_of(ctx.run_dir, "v2-plugin-shadow"), [])
+        shadow = self._assert_shadow_matches(ctx.run_dir)
+        self.assertEqual(shadow["v2Metadata"]["rateMode"], "material")
+        self.assertAlmostEqual(shadow["v2Metadata"]["nativeDefaultRate"], 0.0, delta=1e-12)
+        self._assert_no_v2_metadata(result.metadata)
+        self.assertEqual(_events_of(ctx.run_dir, "v2-plugin-shadow-skipped"), [])
+        self.assertEqual(_events_of(ctx.run_dir, "v2-plugin-applied"), [])
 
     def test_geometric_mode_is_skipped_without_a_bridge_call(self) -> None:
         # Thickness 0.3 um is >= gridDelta 0.2 um, so the explicit geometric
@@ -458,7 +460,7 @@ class V2PluginApplyTests(_V2WorkerStepTestBase):
         self.assertEqual(simulate.surface_state(ctx.domain, 2)["digest"], applied["newDigest"])
         self._assert_no_v2_metadata(result.metadata)
 
-    def test_apply_is_refused_for_material_rate_mode(self) -> None:
+    def test_apply_accepts_material_rate_mode(self) -> None:
         step = isotropic_step("etch", rate=0.0, duration=1.0)
         step["rateMode"] = "material"
         step["materialRates"] = {"Si": 0.2}
@@ -466,18 +468,16 @@ class V2PluginApplyTests(_V2WorkerStepTestBase):
         original_domain = ctx.domain
         before = _top(ctx.domain)
 
-        with _v2_flags(apply=True), mock.patch("worker.process_models_v2.run_v2_step") as bridge:
-            run_process_step(ctx, 1, step)
+        with _v2_flags(apply=True):
+            result = run_process_step(ctx, 1, step)
 
-        bridge.assert_not_called()
-        # The old path mutated its own domain in place; nothing was applied.
-        self.assertIs(ctx.domain, original_domain)
+        self.assertIsNot(ctx.domain, original_domain)
         self.assertAlmostEqual(_top(ctx.domain) - before, -0.2, delta=1e-6)
-        skipped = _events_of(ctx.run_dir, "v2-plugin-shadow-skipped")
-        self.assertEqual(len(skipped), 1, skipped)
-        self.assertIn("material", skipped[0]["reason"].lower())
-        self.assertEqual(_events_of(ctx.run_dir, "v2-plugin-shadow"), [])
-        self.assertEqual(_events_of(ctx.run_dir, "v2-plugin-applied"), [])
+        shadow, applied = self._assert_applied_event_matches(ctx.run_dir)
+        self.assertEqual(shadow["v2Metadata"]["rateMode"], "material")
+        self.assertEqual(simulate.surface_state(ctx.domain, 2)["digest"], applied["newDigest"])
+        self._assert_no_v2_metadata(result.metadata)
+        self.assertEqual(_events_of(ctx.run_dir, "v2-plugin-shadow-skipped"), [])
 
     def test_apply_is_refused_for_geometric_mode(self) -> None:
         self.assertGreaterEqual(0.3, GRID_DELTA)

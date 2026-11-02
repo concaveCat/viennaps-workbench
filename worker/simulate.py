@@ -1033,8 +1033,12 @@ def directional_material_rate_records(step: dict[str, Any]) -> dict[str, Any]:
     if not directional_material_mode(step):
         raise RuntimeError("directional step does not use the material rate map overload")
     etch = step["operation"] == "etch"
-    directional_sign = 1.0 if etch else -1.0
-    isotropic_sign = -1.0 if etch else 1.0
+    if step.get("rateSigns") == "native":
+        directional_sign = 1.0
+        isotropic_sign = 1.0
+    else:
+        directional_sign = 1.0 if etch else -1.0
+        isotropic_sign = -1.0 if etch else 1.0
     rows: list[dict[str, Any]] = []
     native: dict[str, tuple[float, float]] = {}
     for name, raw in (step.get("materialRates") or {}).items():
@@ -1061,6 +1065,7 @@ def directional_material_rate_records(step: dict[str, Any]) -> dict[str, Any]:
         "defaultOmitted": step.get("defaultMaterialRate") is None,
         "directionalSign": directional_sign,
         "isotropicSign": isotropic_sign,
+        "rateSigns": step.get("rateSigns") or "operation",
     }
 
 
@@ -2657,12 +2662,14 @@ def save_snapshot(
             raise RuntimeError("native volume-mesh output is only available for 3D domains")
         prefix = artifact_dir / f"{step_id}-volume.vtk"
         volume_export_domain = ps.Domain(render_domain)
-        volume_export_domain.saveVolumeMesh(str(prefix), 0.01)
+        volume_delta = float(output_settings.get("volumeMeshDelta") or 0.01)
+        volume_export_domain.saveVolumeMesh(str(prefix), volume_delta)
         path = artifact_dir / f"{prefix.name}_volume.vtu"
         if not path.is_file() or path.stat().st_size <= 0:
             raise RuntimeError("ViennaPS saveVolumeMesh did not produce its native VTU file")
         output_rows.append(output_artifact(path, run_dir, run_id, step_id, "volumeMesh", "VTU",
-                                           association="native volume mesh", dimension=3))
+                                           association="native volume mesh", dimension=3,
+                                           wrappingLayerEpsilon=volume_delta))
     # Keep the native surface snapshot for the viewer. A full VTU is written
     # only when explicitly requested above; never create one just to derive a
     # second, closed material surface for the ordinary surface view.
@@ -2983,7 +2990,23 @@ def apply_particle_shape(ps: Any, domain: Any, project: dict[str, Any], step: di
     grid_delta = float(project["domain"]["gridDelta"])
     shape = str(step["shape"])
     sign = -1.0 if step["operation"] == "etch" else 1.0
-    requested_masks = protected_material_names(project, step)
+    deposit_handle = None
+    if sign > 0.0 and step.get("depositMaterial") is not None:
+        deposit_handle = material_handle(ps, str(step["depositMaterial"]))
+        domain.duplicateTopLevelSet(deposit_handle)
+    if step.get("maskMaterials") is not None:
+        if step.get("maskMode") == "allExcept":
+            excluded = set(str(name) for name in step["maskMaterials"])
+            registry = ps.MaterialRegistry.instance()
+            requested_masks = []
+            for handle in domain.getMaterialsInDomain():
+                name = registry.getName(handle)
+                if name not in excluded and name not in requested_masks:
+                    requested_masks.append(name)
+        else:
+            requested_masks = [str(name) for name in step["maskMaterials"]]
+    else:
+        requested_masks = protected_material_names(project, step)
     applied_masks: list[tuple[str, Any]] = []
     omitted_masks: list[str] = []
     if sign > 0.0:
@@ -3078,10 +3101,17 @@ def apply_particle_shape(ps: Any, domain: Any, project: dict[str, Any], step: di
         "levelSetPointCountsAfter": [int(level_set.getNumberOfPoints()) for level_set in domain.getLevelSets()],
         "materialIdsByLevelSetIndex": [int(mapping.getMaterialIdAtIdx(i)) for i in range(mapping.size())],
         "gridDeltaUm": grid_delta,
+        **({"depositMaterial": step["depositMaterial"],
+            "depositMaterialId": int(deposit_handle) if deposit_handle is not None else None,
+            "duplicateTopLevelSet": deposit_handle is not None}
+           if step.get("depositMaterial") is not None else {}),
         "nativeMask": {
-            "mode": "material" if applied_masks else "none",
+            "mode": ("allExcept" if step.get("maskMode") == "allExcept" else "material")
+            if applied_masks or step.get("maskMaterials") is not None else "none",
             "applied": bool(applied_masks),
             "materials": [name for name, _ in applied_masks],
+            "requestedMaterials": list(requested_masks),
+            "maskMode": step.get("maskMode") or "explicit",
             "omittedMaterials": omitted_masks,
             "reason": (
                 "the etch protects the project's native mask materials through addMaskMaterial; "
@@ -3178,6 +3208,29 @@ def apply_geometry_operation(ps: Any, domain: Any, project: dict[str, Any], step
                 "operand": "box", "position": position, "width": width, "height": height,
                 "depth": float(step["depth"]) if project["dimension"] == 3 else None,
                 "angle": angle, "applyToAll": bool(step["applyToAll"]), "nativeBooleanEnum": enum_name}
+    if model == "insertBox":
+        handle = material_handle(ps, step["material"])
+        before = int(domain.getNumberOfLevelSets())
+        box = ps.LevelSet(domain.getGrid())
+        ps.MakeGeometry(box, ps.Box([float(value) for value in step["min"]],
+                                    [float(value) for value in step["max"]])).apply()
+        domain.insertNextLevelSetAsMaterial(box, handle)
+        return {"geometryOperation": "insertBox",
+                "min": [float(value) for value in step["min"]],
+                "max": [float(value) for value in step["max"]],
+                "material": step["material"], "materialId": int(handle),
+                "levelSetCountBefore": before,
+                "levelSetCountAfter": int(domain.getNumberOfLevelSets()),
+                "boxPointCount": int(box.getNumberOfPoints())}
+    if model == "removeTopLevelSet":
+        before = int(domain.getNumberOfLevelSets())
+        if before <= 1:
+            raise RuntimeError("removeTopLevelSet would remove the only level set; the domain would have no material surface")
+        removed_id = int(domain.getMaterialMap().getMaterialIdAtIdx(before - 1))
+        domain.removeTopLevelSet()
+        return {"geometryOperation": "removeTopLevelSet", "removedMaterialId": removed_id,
+                "levelSetCountBefore": before,
+                "levelSetCountAfter": int(domain.getNumberOfLevelSets())}
     if model == "gdsBoolean":
         if project["dimension"] != 3 or project["geometry"]["kind"] != "gds":
             raise RuntimeError("GDS boolean requires a 3D project whose geometry.kind is gds")
