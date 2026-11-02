@@ -62,16 +62,7 @@ class ImplantNativeVariant(EngineVariant):
 
     def validate(self, ctx: ProcessContext, params: ImplantParams) -> list[Issue]:
         """Return issues the canonical parameter model cannot express."""
-        issues: list[Issue] = []
-        if params.cellSet.substrateDepth is None:
-            issues.append(
-                Issue(
-                    path="cellSet.substrateDepth",
-                    message="the first field step must declare a positive substrateDepth",
-                )
-            )
-        issues.extend(_periodic_issue(ctx, bool(params.cellSet.periodic)))
-        return issues
+        return _periodic_issue(ctx, bool(params.cellSet.periodic))
 
     def execute(
         self,

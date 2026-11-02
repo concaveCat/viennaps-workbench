@@ -114,7 +114,7 @@ class FieldParamTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_anneal(PROJECT, _anneal(mode="Explicit", implicitSolver={"maxIterations": 10}))
 
-    def test_missing_substrate_depth_is_a_validation_issue(self) -> None:
+    def test_variant_does_not_reject_missing_depth_before_state_is_known(self) -> None:
         registry = ProcessRegistry()
         register_implant(registry)
         register_anneal(registry)
@@ -128,7 +128,7 @@ class FieldParamTest(unittest.TestCase):
             step=raw,
         )
         issues = registry.get_variant(spec.id, "native").variant.variant.validate(context, params)
-        self.assertTrue(any(issue.path == "cellSet.substrateDepth" for issue in issues))
+        self.assertFalse(any(issue.path == "cellSet.substrateDepth" for issue in issues))
 
     def test_periodic_cell_set_requires_a_periodic_domain(self) -> None:
         registry = ProcessRegistry()

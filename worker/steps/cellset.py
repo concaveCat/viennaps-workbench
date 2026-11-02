@@ -30,7 +30,7 @@ def run_cell_set_step(ctx: RunContext, index: int, step: dict[str, Any]) -> dict
                     "step mutated the geometry after the field sequence; this version does not remap"
                 )
             next_step = ctx.actual_steps[index] if index < len(ctx.actual_steps) else None
-            next_is_field = next_step is not None and next_step.get("model") in {"implant", "anneal", "analysis"}
+            next_is_field = next_step is not None and dispatch_step(registry, ctx.project, next_step).kind == "field"
             metadata = run_v2_claimed_step(
                 ctx,
                 index,

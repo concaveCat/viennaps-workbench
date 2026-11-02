@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import shutil
 from typing import Any
 
@@ -13,6 +14,19 @@ from worker.steps.context import RunContext, simulate_module
 
 def run_no_op_step(ctx: RunContext, index: int, step: dict[str, Any]) -> dict[str, Any]:
     simulate = simulate_module()
+    if os.environ.get("VIENNAPS_WORKBENCH_V2_EXECUTION") == "1":
+        from process_models.execution import load_execution_registry
+        from process_models.v2.dispatch import dispatch_step
+
+        decision = dispatch_step(load_execution_registry(), ctx.project, step)
+        ctx.event(
+            {
+                "type": "v2-execution-noop",
+                "stepId": step["id"],
+                "dispatch": decision.kind,
+                "reason": decision.error or decision.reason,
+            }
+        )
     no_op_parameters: dict[str, Any] = {}
     if ctx.project["schemaVersion"] in (4, 5, 6, 7) and step.get("rateMode") == "material":
         fallback, no_op_rates = simulate.signed_rates(step)
@@ -98,6 +112,10 @@ def run_no_op_step(ctx: RunContext, index: int, step: dict[str, Any]) -> dict[st
         copied.update(
             {"stepId": step["id"], "stepName": step["name"], "stepIndex": index, "noOp": True, "mesh": copied_mesh}
         )
+        # A no-op is not a v2 execution, even when the preceding step was.
+        # Do not carry its plan/metadata/output provenance into this snapshot.
+        for key in ("v2Plan", "v2Metadata", "v2Outputs", "cellSetProcess"):
+            copied.pop(key, None)
         # The copied surface is the previous step's; its measured
         # add/remove record belongs to that step, not to this no-op.
         for key in ("measuredRemoval", "measuredAdded"):

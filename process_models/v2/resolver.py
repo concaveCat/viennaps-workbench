@@ -286,18 +286,19 @@ def resolve_execution(
     try:
         if adapter is None:
             config = None
-            if "fields" in capabilities.reads or process.execution_kind == "field":
-                # The canonical parameter model is authoritative. The raw step
-                # is only a compatibility fallback for callers whose params
-                # class does not expose a cellSet object.
+            if process.execution_kind == "field":
+                # The canonical parameter model is authoritative. A later field
+                # step may omit substrateDepth and inherit the canonical lattice
+                # from the existing snapshot instead of from the raw step.
                 config = _cellset_config_from_params(request.params)
+                if config is None and request.state.fields is not None:
+                    config = CellSetConfig.from_state(request.state.fields)
+                    if config is None:
+                        raise ExecutionResolutionError(
+                            "existing cell-set state has no recoverable height/substrateDepth config"
+                        )
                 if config is None:
-                    raw_cell_set = request.context.step.get("cellSet")
-                    if raw_cell_set is not None:
-                        try:
-                            config = CellSetConfig.from_mapping(raw_cell_set)
-                        except CellSetBackendError as error:
-                            raise ExecutionResolutionError(str(error)) from error
+                    raise ExecutionResolutionError("the first field step must declare cellSet.substrateDepth")
             selected_adapter = DefaultStateAdapter(
                 cellset_backend=getattr(lease, "cellset_backend", None),
                 context=request.context,
@@ -486,6 +487,8 @@ def _cellset_config_from_params(params: BaseModel) -> CellSetConfig | None:
     elif isinstance(cell_set, Mapping):
         payload = dict(cell_set)
     else:
+        return None
+    if payload.get("substrateDepth") is None:
         return None
     try:
         return CellSetConfig.from_mapping(payload)
