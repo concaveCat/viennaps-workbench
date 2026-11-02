@@ -8,7 +8,8 @@ v2.4 是当前工艺模型插件契约：把“工艺身份 / 实现 / 引擎 / 
 ViennaPS helper 移到 `process_models/v2/engines/`。v1 已冻结，只作历史保留；完整设计与
 边界见 [`docs/process-model-plugins-v2.md`](../../docs/process-model-plugins-v2.md)。
 
-它仍是运行时基础，不接 backend/API/UI。见下面的
+它仍是运行时基础；execution catalog 已通过 API 暴露，worker 有默认关闭的 v2 执行桥，
+UI 尚未接入。见下面的
 [Runtime / storage / conformance](#runtime--storage--conformance) 和
 [`docs/plugin-architecture.md`](../../docs/plugin-architecture.md)。
 
@@ -16,7 +17,7 @@ ViennaPS helper 移到 `process_models/v2/engines/`。v1 已冻结，只作历�
 
 | 层 | 模块 | 职责 |
 | --- | --- | --- |
-| Runtime | `executor.py` + `storage.py` | 跨步骤 flow state、`mutates_input` checkpoint、逐步骤 `state`/`outputs`/plan identity 落盘；未接 backend |
+| Runtime | `executor.py` + `storage.py` | 跨步骤 flow state、`mutates_input` checkpoint、逐步骤 `state`/`outputs`/plan identity 落盘；worker 有默认关闭的 v2 执行桥（`VIENNAPS_WORKBENCH_V2_EXECUTION=1`） |
 | Engine | `engine.py` + `engines/viennaps.py` + `engines/viennaps_cellset.py` | `EngineRequirement` / `EngineLease` / `StaticEngineProvider`，严格租用、不回退；ViennaPS helper 与 native cell-set 生命周期只依赖传入的 `ps`，不 import backend/worker |
 | Geometry | `geometry/` | 一个共享 `GeometryEngine` 承载 `planarize` / `particleShape` / `boolean` / `gdsBoolean` / `removeMaterial`；每个 operation 是 `execution_kind="geometry"` 的 step spec |
 | Service | `registry.py` + `resolver.py` + `process_models/execution.py` | 多版本 spec/variant 目录、`resolve_step` / `default_variant_id`、准入检查、产出 `ExecutionPlan`；`load_execution_registry()` 合并插件与内置 geometry specs，`dispatch_step()` 区分 process/field/geometry/legacy/invalid |
@@ -99,8 +100,8 @@ S_i -> resolve -> checkpoint (mutates_input) -> prepare -> execute
 
 边界：
 
-- **没有 API/UI**；`output_contract_schema()` 只是给未来 API/UI 的契约，不改变项目
-  schema，也不代表服务端已能查询 v2 run。
+- **有 catalog API，没有 UI**；`output_contract_schema()` 是输出契约，不改变项目
+  schema，也不代表前端已消费 v2 run。
 - **没有原生 geometry replay loader**：`state.json` 只记录 `geometry.ref`，重载需要
   调用方传 `geometry_loader`。
 - **版本 pin 只覆盖 process/variant**：`expected_process_version` /
@@ -272,8 +273,7 @@ bridge 本身的直接测试：`tests.test_worker_v2_isotropic`（不需要开�
   `implementation_hash` / engine fingerprint pin；replay 目前只 pin process/variant
   版本。
 - 没有 stress / device simulator；`Artifact(kind="device")` 只是报告类型。
-- 没有 API/UI：`output_contract_schema()` 只是输出契约描述，项目 JSON、HTTP API 和
-  前端都还没有消费 v2 run。
+- 已有 execution catalog API；前端和 run 查询还没有消费 v2 plan/output 记录。
 - 纯 level-set 工艺（如 `isotropic`）返回空或少量 `OutputSet`；`analysis` 输出
   sheet-resistance/junction metrology，`csvProcess` 等按各自能力报告。`voxel_probe`
   仍是 proof，不产出 metrology/artifact。

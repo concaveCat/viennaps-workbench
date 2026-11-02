@@ -2,7 +2,7 @@
 
 > 状态：v2.5 契约 + 生命周期 + isotropic/sf6o2/cf4o2/hbro2/sf6c4f8/fluorocarbon/ionBeam/faradayCage/wetEtch/teosDeposition/teospecvd/directional/selectiveEpitaxy/geometricTrenchDeposition/ald/oxidation/singleParticle/multiParticle/oxideRegrowth/csvProcess/implant/anneal/analysis + cell-set field 序列 + GeometryEngine（含 gdsBoolean）+ runtime/storage/conformance
 > 基础已落地。本文描述**插件应该如何组织、数据如何流动**；这一片是运行时基础，
-> 不是生产 backend 接入，也没有 API/UI，文中明确标出。v2.5 在 v2.4 之上增加了
+> 不是默认生产 cutover，也没有 UI；execution catalog 已通过 API 暴露。v2.5 在 v2.4 之上增加了
 > 执行 profile（CPU/GPU backend + kernel）和引擎中立的状态 backend；v2.4 完成了
 > 3C 清理：单步 dispatch 走 `ProcessSpec.parse_step`、插件包拆出 `step.py`、
 > 引擎 helper 移到 `process_models/v2/engines/`。
@@ -399,8 +399,8 @@ S_0 → step_1 → S_1 → step_2 → S_2 → ... → S_n
 
 ### 6.1 当前仍未完成
 
-- **没有 API/UI**：`output_contract_schema()` 只是契约描述，项目 JSON、HTTP API 和前端
-  都还不会引用 v2 run。
+- **有 catalog API，没有 UI**：`output_contract_schema()` 只是契约描述，项目 JSON 和
+  前端还没有消费 v2 run。
 - **没有原生几何 replay loader**：`StateStore` 记录 `geometry.ref`（以及可选的
   `geometry.vpsd`），但把 ref 重新加载成引擎 handle 的 loader 由调用方提供；
   缺失时 `load_state()` 直接报错。
