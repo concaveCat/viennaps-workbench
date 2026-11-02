@@ -3,7 +3,7 @@ import LegacyApp from './LegacyApp';
 import WorkflowApp from './workflow/WorkflowApp';
 
 export default function App() {
-  const [legacy, setLegacy] = useState(() => window.location.hash === '#legacy');
+  const [legacy, setLegacy] = useState(() => window.location.hash.startsWith('#legacy'));
   if (legacy) {
     return (
       <>

@@ -353,6 +353,30 @@ export default function App() {
     } catch (error) { setNotice(prettyError(error)); }
   }, [fetchRunInfo, fetchSnapshot, fetchFluxResult, latestRunId, fluxResultRunId]);
 
+  const deepLinkLoaded = useRef(false);
+  useEffect(() => {
+    if (deepLinkLoaded.current) return;
+    const runId = new URLSearchParams(window.location.search).get('run')?.trim() ?? '';
+    if (!/^[a-f0-9]{24}$/.test(runId)) return;
+    deepLinkLoaded.current = true;
+    void (async () => {
+      try {
+        const replay = await api<{ normalizedProject?: Project }>(`/api/runs/${runId}/replay-project`);
+        if (replay.normalizedProject) {
+          setProject(replay.normalizedProject);
+          setProjectId(null);
+          setSavedProjectJson('');
+          setSelectedStep(null);
+          setSelection({ kind: 'run', id: runId });
+          setActivity('results');
+        }
+      } catch {
+        // Keep the default project; the run inspector still loads below.
+      }
+      await loadRun(runId, true);
+    })();
+  }, [loadRun]);
+
   const startRun = async (kind: 'preview' | 'simulate') => {
     if (kind === 'simulate' && artifactEstimate?.risk === 'reject') {
       setNotice(`运行产物预估约 ${formatEstimateMiB(artifactEstimate.estimatedMiB)}，超过 ${artifactEstimate.capMiB} MiB 上限；工作台会在启动前拒绝该运行。请按“运行产物预估”中的建议调整网格、步骤或输出后再试。`);
