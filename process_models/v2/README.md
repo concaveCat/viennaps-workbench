@@ -19,7 +19,7 @@ ViennaPS helper 移到 `process_models/v2/engines/`。v1 已冻结，只作历�
 | Runtime | `executor.py` + `storage.py` | 跨步骤 flow state、`mutates_input` checkpoint、逐步骤 `state`/`outputs`/plan identity 落盘；未接 backend |
 | Engine | `engine.py` + `engines/viennaps.py` + `engines/viennaps_cellset.py` | `EngineRequirement` / `EngineLease` / `StaticEngineProvider`，严格租用、不回退；ViennaPS helper 与 native cell-set 生命周期只依赖传入的 `ps`，不 import backend/worker |
 | Geometry | `geometry/` | 一个共享 `GeometryEngine` 承载 `planarize` / `particleShape` / `boolean` / `gdsBoolean` / `removeMaterial`；每个 operation 是 `execution_kind="geometry"` 的 step spec |
-| Service | `registry.py` + `resolver.py` | 多版本 spec/variant 目录、`resolve_step` / `default_variant_id`、准入检查、产出 `ExecutionPlan` |
+| Service | `registry.py` + `resolver.py` + `process_models/execution.py` | 多版本 spec/variant 目录、`resolve_step` / `default_variant_id`、准入检查、产出 `ExecutionPlan`；`load_execution_registry()` 合并插件与内置 geometry specs，`dispatch_step()` 区分 process/field/geometry/legacy/invalid |
 | State | `state.py` + `adapters.py` | `ProcessState{geometry, materials, layers, fields, voxels}`、`StateDelta`（只有 flow state）、`OutputSet`/`StepResult`、`prepare/commit` |
 | Conformance | `conformance.py` + `output_schema.py` | `check_variant()` 契约级一致性检查；`output_contract_schema()` 输出描述 |
 

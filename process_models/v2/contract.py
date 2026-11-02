@@ -335,3 +335,4 @@ class ModelDescriptor:
     operations: tuple[str, ...]
     variants: tuple[VariantDescriptor, ...]
     description: str = ""
+    execution_kind: Literal["process", "field", "geometry"] = "process"

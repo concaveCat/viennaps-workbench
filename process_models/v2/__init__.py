@@ -51,6 +51,7 @@ from .contract import (
     VariantDescriptor,
     VariantRegistration,
 )
+from .dispatch import DispatchDecision, DispatchKind, dispatch_step
 from .engine import (
     Backend,
     ComputePolicy,
@@ -145,6 +146,8 @@ __all__ = [
     "ComputePolicy",
     "ConformanceReport",
     "DefaultStateAdapter",
+    "DispatchDecision",
+    "DispatchKind",
     "Engine",
     "EngineCapabilities",
     "EngineKind",
@@ -212,6 +215,7 @@ __all__ = [
     "VoxelState",
     "check_variant",
     "compute_implementation_hash",
+    "dispatch_step",
     "execute_plan",
     "output_contract_schema",
     "register_geometry",

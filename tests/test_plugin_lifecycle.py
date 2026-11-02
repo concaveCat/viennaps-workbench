@@ -589,7 +589,7 @@ class WorkerBridgeLifecycleTests(unittest.TestCase):
 
     def test_bridge_resolves_isotropic_from_the_discovered_registry(self) -> None:
         discovered = load_registry()
-        with mock.patch("worker.process_models_v2.load_registry", return_value=discovered) as loader:
+        with mock.patch("worker.process_models_v2.load_execution_registry", return_value=discovered) as loader:
             with tempfile.TemporaryDirectory() as tmp:
                 ctx = SimpleNamespace(
                     project=plane_project(2),
@@ -606,7 +606,7 @@ class WorkerBridgeLifecycleTests(unittest.TestCase):
 
     def test_bridge_accepts_a_caller_supplied_registry(self) -> None:
         discovered = load_registry()
-        with mock.patch("worker.process_models_v2.load_registry") as loader:
+        with mock.patch("worker.process_models_v2.load_execution_registry") as loader:
             with tempfile.TemporaryDirectory() as tmp:
                 ctx = SimpleNamespace(
                     project=plane_project(2),
@@ -626,7 +626,7 @@ class WorkerBridgeLifecycleTests(unittest.TestCase):
 
     def test_bridge_has_no_hardcoded_fallback_registration(self) -> None:
         empty = ProcessRegistry()
-        with mock.patch("worker.process_models_v2.load_registry", return_value=empty):
+        with mock.patch("worker.process_models_v2.load_execution_registry", return_value=empty):
             with self.assertRaises(RuntimeError):
                 ctx = SimpleNamespace(
                     project=plane_project(2),

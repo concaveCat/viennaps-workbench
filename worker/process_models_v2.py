@@ -36,6 +36,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Mapping
 
+from process_models.execution import load_execution_registry
 from process_models.plugins import load_registry
 from process_models.v2.contract import ProcessContext, ProcessSpec
 from process_models.v2.engine import (
@@ -153,8 +154,9 @@ def run_v2_step(
     CPU.
     """
     if registry is None:
-        registry = load_registry()
-    register_geometry(registry)
+        registry = load_execution_registry()
+    else:
+        register_geometry(registry)
     resolved = registry.resolve_step(ctx.project, step)
     if resolved is None:
         raise RuntimeError(f"no registered v2 process matches step {step['id']!r}")

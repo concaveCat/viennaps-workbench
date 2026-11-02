@@ -107,20 +107,22 @@ def run_geometry_step(ctx: RunContext, index: int, step: dict[str, Any]) -> dict
     shadow_domain = None
     v2_registry = None
     if _v2_plugin_shadow_enabled() or _v2_plugin_apply_enabled():
-        from process_models.plugins import load_registry
-        from process_models.v2.geometry import register_geometry
-        from worker.process_models_v2 import find_v2_process
+        from process_models.execution import load_execution_registry, resolve_dispatch
 
-        v2_registry = load_registry()
-        register_geometry(v2_registry)
-        if find_v2_process(ctx.project, step, registry=v2_registry) is not None:
+        v2_registry = load_execution_registry()
+        decision = resolve_dispatch(ctx.project, step, registry=v2_registry)
+        if decision.kind == "invalid":
+            raise RuntimeError(
+                f"v2 geometry dispatch rejected step {step['id']!r}: {decision.error or decision.reason}"
+            )
+        if decision.kind == "geometry":
             shadow_domain = ctx.ps.Domain(ctx.domain)
         else:
             ctx.event(
                 {
                     "type": "v2-plugin-shadow-skipped",
                     "stepId": step["id"],
-                    "reason": f"no registered v2 geometry or process matches model={step.get('model')!r}",
+                    "reason": decision.reason,
                 }
             )
     previous_tops = ctx.snapshots[-1].get("materialTops")

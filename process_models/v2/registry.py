@@ -226,6 +226,7 @@ class ProcessRegistry:
                     operations=spec.operations,
                     variants=tuple(self._variant_descriptors(process_id)),
                     description=spec.description,
+                    execution_kind=spec.execution_kind,
                 )
             )
         return descriptors

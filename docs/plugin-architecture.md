@@ -14,11 +14,16 @@
 | Runtime / executor | `worker/`、`process_models/v2/executor.py`、`storage.py` | 跨步骤 flow state、checkpoint、on-disk state/outputs、plan identity、引擎策略；v2 runner 尚未接入 backend |
 | Conformance | `process_models/v2/conformance.py`、`output_schema.py` | 变体一致性检查、可序列化的输出契约描述 |
 | Engine | `process_models/v2/engine.py`、`engines/viennaps.py` | `EngineRequirement` / `EngineLease` / provider；ViennaPS 纯 Python helper（材料、速率、advection），不 import backend/worker |
-| Service | `process_models/plugins/`、`registry.py`、`resolver.py` | manifest、发现、lock、版本解析、`resolve_step` / `default_variant_id`、准入、`ExecutionPlan` |
+| Service | `process_models/plugins/`、`registry.py`、`resolver.py`、`process_models/execution.py` | manifest、发现、lock、版本解析、`resolve_step` / `default_variant_id`、准入、`ExecutionPlan`；`load_execution_registry()` 合并锁定插件与内置 geometry specs，`DispatchDecision` 标明 process/field/geometry/legacy/invalid |
 | State | `process_models/v2/state.py`、`adapters.py` | `ProcessState`、`StateDelta`、`StepResult`、`OutputSet`、表示转换 |
 | Plugin | `plugins/<id>/` | 工艺参数、`parse_step`、spec、variant 实现、物理模型 |
 
 原则：**plugin 只描述和执行工艺；runtime、持久化、快照、replay、UI 属于平台。**
+
+步骤派发先做一次**纯判定**：`process_models/execution.py` 加载锁定插件并注册内置
+geometry specs，`dispatch_step()` 返回 `process` / `field` / `geometry` / `legacy` /
+`invalid`。没有 spec 认领是显式 `legacy`；解析失败或歧义是 `invalid`，不允许静默回退。
+`ModelDescriptor.execution_kind` 让 API/UI 能区分三类 step。
 
 ## 2. 插件包布局
 
